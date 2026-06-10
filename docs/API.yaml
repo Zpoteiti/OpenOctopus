@@ -1,0 +1,2581 @@
+openapi: 3.1.0
+info:
+  title: OpenOctopus HTTP API
+  version: 0.1.0
+  description: |
+    Python-main HTTP API contract for `openoctopus_server`. Pairs with
+    [DECISIONS.md](DECISIONS.md) and [TOOLS.md](TOOLS.md).
+
+    **Current implementation status:** `python-main` is a rewrite branch. This
+    file is the target API contract for the Python implementation, not a record
+    of the archived Rust server's current route coverage. Historical milestone
+    labels such as M1b/M1c/M1d remain only where a route description is
+    explicitly documenting Rust-era provenance.
+
+    **Target design principle:** user-meaningful agent capabilities should have
+    browser/programmatic REST entrances where the product needs them, and those
+    entrances should share the same domain contract: authorization boundary,
+    path semantics, validation rules, quota/accounting rules, and stable error
+    codes. This does not require REST handlers and agent tools to share the same
+    implementation function. REST, server-side tools, client-routed tools, and
+    channel adapters may have different execution paths as long as they preserve
+    the same externally visible contract. Some routes remain later-slice
+    contracts until their implementation milestone is reached.
+
+    **Parallel with tools (see TOOLS.md):**
+
+    | Agent tool | REST equivalent | Notes |
+    |---|---|---|
+    | `read_file` | `GET /api/workspace/files/{path}` | Query: required `openoctopus_device` |
+    | `write_file` | `PUT /api/workspace/files/{path}` | Query: required `openoctopus_device`; implicit mkdir -p |
+    | `edit_file` | `PATCH /api/workspace/files/{path}` | Query: required `openoctopus_device`; body mirrors nanobot edit_file args |
+    | `apply_patch` | `POST /api/workspace/patch` | Query: required `openoctopus_device`; body mirrors nanobot apply_patch args |
+    | `delete_file` | `DELETE /api/workspace/files/{path}` | Query: required `openoctopus_device`; always allowed for quota release |
+    | `delete_folder` | `DELETE /api/workspace/folders/{path}` | Query: required `openoctopus_device`; recursive, no flag |
+    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, max_entries |
+    | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/head_limit/offset |
+    | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, etc. |
+    | `notebook_edit` | — | REST equivalent not specified |
+    | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args |
+    | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
+    | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
+    | `message` | — | No REST parallel (browser composes via chat) |
+    | `exec` | — | No REST parallel (rare UI need in v1) |
+    | `write_stdin` | — | No REST parallel; client-only companion for background `exec` sessions |
+    | `list_exec_sessions` | — | No REST parallel; client-only background exec recovery aid |
+
+    **Auth model:**
+
+    - `ADMIN_TOKEN` env var: permanent secret. Anyone who presents it during
+      registration becomes admin. Multiple admins are supported — share the
+      token with teammates who should have admin rights.
+    - All other endpoints use JWT, delivered either via `HttpOnly` cookie
+      (browser) or `Authorization: Bearer <jwt>` (programmatic).
+    - Admin-only endpoints require a valid JWT. The server reloads the current
+      user row and requires `users.is_admin=true`; the database row is
+      authoritative for admin authorization.
+
+    **Wire conventions:**
+
+    - JSON bodies everywhere except file reads, which return raw file bytes
+      with an appropriate `Content-Type`, and streaming message POST responses,
+      which return newline-delimited JSON events.
+    - Errors always return a JSON body: `{code, message}`. `code` values come
+      from the `ErrorCode` enum in `openoctopus_common/src/errors/`.
+    - Timestamps are ISO 8601 with timezone offset.
+    - UUIDs unless noted.
+
+    **Python-main chat consumption pattern (ADR-121):**
+    `POST /api/sessions/{id}/messages` durably accepts the user message, wakes
+    the session runner, and may stream best-effort newline-delimited JSON events
+    for that HTTP connection. `GET /api/sessions/{id}/messages` reads only
+    PostgreSQL-backed canonical messages and run status. Reconnect falls back to
+    polling `GET messages`; missed token deltas are not replayed.
+
+    **Python-main deployment/concurrency boundary (ADR-122):**
+    The Python server alpha runs one ASGI worker and uses asyncio tasks for
+    I/O-bound concurrency. Redis and cross-worker command routing are not
+    server-alpha dependencies. LLM
+    provider concurrency is controlled by the admin-configured
+    `llm_max_concurrent_requests` semaphore. File IO, hashing, recursive
+    grep/find_files, and transfers must not block the event loop.
+
+    **Not in this spec:**
+
+    - Discord and Telegram ingress. Those are internal adapter modules inside
+      `openoctopus_server`, not public HTTP endpoints. The only public ingress for
+      chat messages is `POST /api/sessions/{id}/messages` (browser) plus the
+      `WS /ws/device` handshake for devices.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://openoctopus.example.com
+    description: Production (behind TLS reverse proxy)
+
+tags:
+  - name: Auth
+    description: Registration, login, session management
+  - name: Me
+    description: The authenticated user's own account
+  - name: Sessions
+    description: Chat sessions, canonical messages, and best-effort POST streaming
+  - name: Workspaces
+    description: Personal and shared workspace management
+  - name: Workspace Files
+    description: Workspace file operations and device-routed file access
+  - name: Devices
+    description: Client device registration and configuration
+  - name: Channels
+    description: Discord and Telegram bot configurations per user
+  - name: Cron
+    description: Scheduled agent invocations
+  - name: Admin
+    description: Admin-only system config, user management, and server-side MCPs
+
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+paths:
+  #
+  # --- Auth ---
+  #
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new account
+      description: |
+        Creates a new user and their auto-created personal workspace.
+        If `admin_token` in the body matches `ADMIN_TOKEN` env var, the
+        new user is created with `is_admin=true`. Otherwise a regular
+        user. On success, returns the JWT and sets the auth cookie.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, name]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                name: { type: string }
+                admin_token:
+                  type: string
+                  description: Optional. Present it to claim `is_admin`.
+      responses:
+        '201':
+          description: Created
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: Sets the `openoctopus_session` HttpOnly cookie.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jwt: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Email already in use.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: OK
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jwt: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out (clear session cookie)
+      security: []
+      responses:
+        '204':
+          description: Cookie cleared.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+
+  #
+  # --- Me ---
+  #
+  /api/me:
+    get:
+      tags: [Me]
+      summary: Get the authenticated user's profile
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Me]
+      summary: Update profile (name, email, password)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Email already belongs to another user.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [Me]
+      summary: Delete own account (cascades to all user data)
+      description: |
+        Cascades to devices, sessions, messages, cron_jobs, discord_configs,
+        telegram_configs, and personal workspace files (ADR-058).
+        Shared workspace memberships are removed; shared workspaces the user
+        was in persist for other members.
+      responses:
+        '204': { description: Account deleted. }
+
+  #
+  # --- Sessions ---
+  #
+  /api/sessions:
+    description: Python-main browser chat session list route.
+    get:
+      tags: [Sessions]
+      summary: List the user's chat sessions
+      description: |
+        Returns sessions owned by the authenticated user, including web,
+        channel, cron, and heartbeat sessions. Sorts by `last_inbound_at DESC
+        NULLS LAST`, then `created_at DESC`.
+
+        Each returned `Session` includes a derived `unread` boolean for the
+        browser inbox. `unread` is true when the session has user-visible
+        messages newer than the session's `last_read_at` marker. The list does
+        not include message previews or live run status.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Session' }
+
+  /api/sessions/{id}:
+    description: Python-main browser chat session route.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Sessions]
+      summary: Update session title or browser read marker
+      description: |
+        Updates user-owned session metadata. `title` renames the human-facing
+        title for any owned session, including web, Discord, Telegram, cron, and
+        heartbeat sessions. `read_through_message_id` marks canonical messages
+        up to that message's `created_at` as read for the browser inbox.
+
+        These metadata updates are allowed for web and non-web sessions because
+        they do not write messages into the session, do not wake the runner, and
+        do not affect `session_key` routing. `GET /api/sessions/{id}/messages`
+        is a pure read and never updates `last_read_at`; frontends call this
+        PATCH only after the relevant messages are actually visible to the user.
+
+        `id`, `chat_id`, and `session_key` are server-owned and never change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              anyOf:
+                - required: [title]
+                - required: [read_through_message_id]
+              properties:
+                title:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                read_through_message_id:
+                  type: string
+                  format: uuid
+                  description: |
+                    User-visible canonical message id in this session. Server
+                    sets `last_read_at` to the greater of the current
+                    `last_read_at` and that message's `created_at`, so stale
+                    tabs cannot move the marker backward. Pending messages do
+                    not qualify until they drain into canonical `messages`. The
+                    request fails if the message is not visible in this session.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Sessions]
+      summary: Delete a session and its message history
+      description: |
+        Hard-deletes any session owned by the authenticated user, including
+        web, Discord, Telegram, cron, and heartbeat sessions. Existing sessions
+        owned by another user return `404` without revealing whether the id
+        exists.
+
+        Deletion is a hard stop, not a safe-boundary cancel. The server first
+        terminates any in-memory runner and live/queued POST streams for this
+        session, then deletes the `sessions` row. `ON DELETE CASCADE` removes
+        canonical `messages` and durable `pending_messages`. The server does
+        not insert a stop marker or synthetic tool results because the
+        transcript is being removed.
+      responses:
+        '204': { description: Deleted. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/sessions/{id}/messages:
+    description: Python-main browser chat message route.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: |
+          Browser session UUID. The frontend generates this id before the
+          first send. `POST` creates the web session if it is missing; `GET`
+          only reads existing sessions.
+    get:
+      tags: [Sessions]
+      summary: Canonical message history and run status
+      description: |
+        Returns only PostgreSQL-backed canonical state for this browser chat:
+        persisted complete messages, durable pending user messages, and
+        session/turn run status. It never returns in-flight token deltas from a
+        running assistant response.
+
+        Frontend recovery uses this endpoint after a broken POST stream. If the
+        response reports `status=running`, the frontend may poll with `after`
+        or another cursor to observe message-level progress such as persisted
+        assistant/tool-result rows and the eventual final assistant message.
+
+        Cursor pagination applies only to canonical `messages`. If no cursor is
+        supplied, the response returns the latest `limit` persisted messages in
+        chronological order. `before` and `after` are mutually exclusive. The
+        response always includes the session's full durable `pending_messages`
+        queue, ordered by `(received_at, id)`, because those rows represent the
+        user's immediate accepted-but-not-yet-provider-visible input.
+      parameters:
+        - name: after
+          in: query
+          schema: { type: string, format: uuid }
+          description: |
+            Return messages created strictly after this `message_id`.
+            Used by reconnect/polling clients to fetch persisted progress.
+            Cannot be combined with `before`.
+        - name: before
+          in: query
+          schema: { type: string, format: uuid }
+          description: |
+            Return messages created strictly before this `message_id`.
+            Used for scroll-back pagination. Cannot be combined with `after`.
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK — persisted messages plus run status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagesResponse' }
+        '400':
+          description: Invalid cursor, both cursors supplied, or invalid limit.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Sessions]
+      summary: Send a user message, wake runner, stream best-effort preview
+      description: |
+        Durably accepts the user message, creates a `turn_id`, and wakes or
+        reserves the session runner. The response is a best-effort streaming
+        body for this HTTP connection only. Disconnecting the response does not
+        cancel the runner, roll back the message, or stop tool execution.
+
+        If `{id}` does not exist, the server atomically creates a browser web
+        session owned by the authenticated user: `id={id}`,
+        `chat_id={id}`, `session_key=web:{id}`, and `title="New chat"`. If
+        `{id}` already exists, the server verifies ownership before accepting
+        the message. Existing sessions owned by another user return `404`
+        without revealing whether the id exists.
+
+        If no runner is active for the session, the message is written directly
+        to provider-visible `messages` and a runner is started. If a runner is
+        active, the message is written to `pending_messages` and is drained into
+        `messages` only after the current assistant tool batch is fully
+        addressed.
+
+        Pending browser messages use latest-wins streaming. The newest queued
+        POST response may stay open as the live preview subscriber for the next
+        pending batch. Older queued POST responses receive `stream_replaced`
+        and close after their own message has been durably accepted. At the
+        safe boundary, all pending rows for the session are drained in order and
+        become one provider-visible batch; the latest still-connected queued
+        stream receives that batch's token/tool preview. Reconnect/recovery uses
+        `GET /api/sessions/{id}/messages`; missed token deltas are not replayed.
+
+        **Browser write allow-list (ADR-098).** `{id}` is `sessions.id`, not
+        `session_key`. The server accepts writes only when `channel == "web"`
+        and `session_key` starts with `web:`. Discord/Telegram/cron/heartbeat
+        sessions are read-only through browser REST and receive messages
+        exclusively from their own pipelines.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effort:
+                  allOf:
+                    - $ref: '#/components/schemas/Effort'
+                  nullable: true
+                  description: |
+                    Optional per-turn thinking effort. If omitted, `null`, or
+                    `off`, OpenOctopus sends `thinking.type=disabled` and omits
+                    `output_config`. Non-off values send
+                    `thinking.type=adaptive` plus `output_config.effort` set to
+                    the same enum value. Gateways for non-Anthropic runtimes
+                    must translate these values if their backend uses a
+                    different thinking control shape.
+                content:
+                  type: array
+                  description: |
+                    Required Anthropic user content blocks. Browser callers may
+                    send `text` and inline base64 `image` blocks.
+                    `tool_use`, `tool_result`, `thinking`,
+                    `redacted_thinking`, `document`, and OpenAI `image_url`
+                    blocks are rejected.
+                  items: { $ref: '#/components/schemas/ContentBlock' }
+                attachments:
+                  type: array
+                  description: |
+                    Required workspace file references. Message send validates
+                    and reads existing files only; it never moves, copies, or
+                    writes attachment files. The request is rejected if both
+                    `content` and `attachments` are empty. Structural
+                    validation failures reject before persistence. Runtime
+                    remote-read failures for known devices, such as
+                    unreachable or timed-out targets, accept the message and
+                    insert a sanitized text block explaining that the
+                    attachment was unavailable.
+                  items: { $ref: '#/components/schemas/MessageAttachmentRef' }
+              required: [content, attachments]
+              additionalProperties: false
+      responses:
+        '200':
+          description: |
+            Streaming response opened. The body is newline-delimited JSON. Each
+            line is a `PostMessageStreamEvent`. The first event is always
+            `message_accepted`. Events are best-effort preview data except
+            accepted/persisted-message notifications, which reference rows that
+            are already committed to Postgres. A queued response may close with
+            `stream_replaced` if a newer queued POST becomes the live subscriber
+            for the next pending batch.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Newline-delimited `PostMessageStreamEvent` objects.
+        '400':
+          description: |
+            Session id is not a valid UUID, session is not browser-writable,
+            JSON/content shape is invalid, or an image block is malformed.
+            Attachment refs must include `openoctopus_device` and `path`;
+            Python-main accepts `server` or a paired device name. If present,
+            `effort` must be `null` or one of `off`, `low`, `medium`, `high`,
+            `xhigh`, or `max`.
+        '404':
+          description: Session id exists for another user, or another ownership check failed without revealing existence.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/sessions/{id}/cancel:
+    description: Session runner cancellation route.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Sessions]
+      summary: Request cancellation at next safe boundary (ADR-035)
+      description: |
+        Requests safe-boundary cancellation for any session owned by the
+        authenticated user. This is a session-control operation, not a browser
+        message write, so it is allowed for web and non-web sessions. Existing
+        sessions owned by another user return `404` without revealing whether
+        the id exists.
+
+        If no runner is active, this is a no-op and returns
+        `cancel_requested=false`; the server must not leave an idle session with
+        a stale cancel flag. If a runner is active, the server sets
+        `cancel_requested=true`. The agent loop lets the current LLM request or
+        tool call finish. If the current external action is an LLM request, the
+        assistant response is persisted first and `cancel_requested` is checked
+        before dispatching any returned `tool_use`. The loop then inserts
+        synthetic `tool_result` blocks with `code="user_cancelled"` for
+        unstarted tools in the current assistant batch, inserts
+        `"[User pressed stop]"` as a `message_kind="human"` message, clears the
+        flag, emits `turn_finished` with `status="cancelled"` on any active
+        POST preview stream, and exits without another LLM call for that turn.
+      responses:
+        '202':
+          description: Cancellation requested.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancel_requested: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  #
+  # --- Workspaces ---
+  #
+  /api/workspaces:
+    description: Workspace management route.
+    get:
+      tags: [Workspaces]
+      summary: List workspaces the user has access to (personal + shared)
+      description: |
+        Returns the authenticated user's personal workspace plus all shared
+        workspaces they can access. Each `Workspace` includes quota state
+        (`quota_bytes`, `bytes_used`, `locked`), so there is no separate
+        personal quota endpoint.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Workspace' }
+    post:
+      tags: [Workspaces]
+      summary: Create a shared workspace (caller auto-added to allow-list)
+      description: |
+        Creates a shared workspace with a fresh UUID and the supplied display
+        name. Names are NOT globally unique — two unrelated teams may use the
+        same name. The server returns the workspace's id and computed
+        addressing form (`name@suffix`, see ADR-108) which is used in
+        subsequent URLs and in the agent's tool paths.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, quota_bytes]
+              properties:
+                name:
+                  type: string
+                  description: |
+                    Display name. Validated per ADR-109 — denylist of `/`, `\`, `\0`,
+                    `@`, `:`, `<>"|?*`, control chars; NFC-normalized; trim + collapse
+                    internal whitespace; max 64 chars after normalization.
+                quota_bytes:
+                  type: integer
+                  format: int64
+                  description: Requested quota. Python-main caps this at configured `system_config.shared_workspace_quota_bytes`; if that key is missing, setup must handle it explicitly.
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workspace' }
+        '400':
+          description: Name failed validation (per ADR-109).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: |
+            Caller is already a member of a workspace whose `name@suffix` form
+            collides with the new one (suffix auto-extension exhausted, or the
+            caller already has a same-named workspace and would not be able to
+            disambiguate). Caller picks a different name.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/workspaces/{workspace_ref}:
+    description: Workspace management route.
+    parameters:
+      - name: workspace_ref
+        in: path
+        required: true
+        description: |
+          The `name@suffix` addressing form (ADR-108). `suffix` is the first 8
+          hex chars of the workspace's UUID id (auto-extended on collision).
+          Example: `Xmas%20gift@a4f7e2d1`. Spaces in the name URL-encode normally;
+          `@` itself does not require encoding (RFC 3986 `pchar`).
+        schema: { type: string }
+    get:
+      tags: [Workspaces]
+      summary: Get a workspace's details
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Workspace' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Workspaces]
+      summary: Update a shared workspace (rename, change quota)
+      description: |
+        Any member of the allow-list can rename or change the quota cap
+        (ADR-flat-permissions). Rename only mutates `workspaces.name` —
+        the MinIO object prefix and `workspaces.id` are unchanged, so no
+        object moves happen. The `suffix` portion of the addressing form is
+        also unchanged (it is derived from `id`). However, since strict
+        mode (ADR-108) requires both `name` and `suffix` to match in
+        tool paths, any stored references using the old name return
+        404 until the agent re-reads the system prompt.
+
+        Name validation per ADR-109 applies on rename.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                quota_bytes: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Workspace' } } }
+        '400':
+          description: Name failed validation (per ADR-109) or quota exceeds the admin ceiling.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/workspaces/{workspace_ref}/members:
+    description: Workspace membership route.
+    parameters:
+      - name: workspace_ref
+        in: path
+        required: true
+        description: The `name@suffix` form (ADR-108).
+        schema: { type: string }
+    get:
+      tags: [Workspaces]
+      summary: List allow-list for a shared workspace
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WorkspaceMember' }
+    post:
+      tags: [Workspaces]
+      summary: Add a user to the allow-list
+      description: |
+        Any existing member can add new members. Caller looks up by email or
+        user_id. If adding the prospective user would put them into two
+        workspaces whose computed `name@suffix` form would collide (rare —
+        defended by suffix auto-extension at workspace-create time per
+        ADR-108, but still possible on edge cases), the server returns 409
+        and the workspace's owner can rename to disambiguate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              oneOf:
+                - { required: [user_id], properties: { user_id: { type: string } } }
+                - { required: [email], properties: { email: { type: string, format: email } } }
+      responses:
+        '201':
+          description: Member added.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WorkspaceMember' } } }
+        '409':
+          description: Adding this user would create an unresolvable `name@suffix` collision in their accessible set.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/workspaces/{workspace_ref}/members/{user_id}:
+    description: Workspace membership route.
+    parameters:
+      - name: workspace_ref
+        in: path
+        required: true
+        description: The `name@suffix` form (ADR-108).
+        schema: { type: string }
+      - name: user_id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Workspaces]
+      summary: Remove a user from the allow-list
+      description: |
+        Any member can remove anyone (including themselves). Removing
+        the last member triggers automatic workspace deletion (files
+        purged, quota released).
+      responses:
+        '204': { description: Removed. }
+
+  #
+  # --- Workspace Files ---
+  #
+  # NOTE on path params: the server accepts a URL-encoded absolute path as a
+  # single `{path}` path-param. Clients should encode `/` as `%2F` inside the
+  # param value, OR the server can route via a wildcard and keep slashes raw.
+  # Implementation choice — the OpenAPI shape is the same either way.
+  #
+  /api/workspace/files/{path}:
+    description: |
+      Workspace file route for explicit `openoctopus_device`. `server` targets the
+      server-side workspace service. Paired device names route over
+      `/ws/device`; offline-but-paired targets return `device_unreachable`.
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: |
+          Path on the target `openoctopus_device`. With `server`, relative paths
+          resolve to the authenticated user's personal server workspace, while
+          absolute `/name@suffix/...` paths address shared workspaces. With a
+          device name, the client resolves relative paths against its
+          configured `workspace_path`; absolute paths outside that tree are
+          allowed only when the device `sandbox_mode=false`. Sandbox mode must
+          still enforce containment after resolution.
+        schema: { type: string }
+      - $ref: '#/components/parameters/OpenOctopusDevice'
+    get:
+      tags: [Workspace Files]
+      summary: Read workspace file contents
+      description: |
+        For `openoctopus_device=server`, reads from `workspace_fs` and streams the
+        server workspace object bytes. For a paired device target, the server
+        relays the authenticated HTTP response to the device WebSocket file
+        stream with bounded buffering/backpressure; it does not stage the file
+        into MinIO. This route is also how the browser resolves online-only web
+        `MessageDeliveryRef` device-file chips.
+      responses:
+        '200':
+          description: OK — returns raw file bytes as `application/octet-stream`.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Workspace Files]
+      summary: Write workspace file contents
+      description: |
+        Full-content replace. Accepts raw `application/octet-stream` bytes.
+        For `openoctopus_device=server`, implicit `mkdir -p` on the parent path
+        (ADR-088) and workspace_fs quota checks apply. Device targets route the
+        write over `/ws/device` and the client applies its local fs policy.
+        Server-side writes, hashes, and recursive operations must use the
+        workspace service's background/thread boundary rather than blocking the
+        FastAPI or agent event loop.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204': { description: Written. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Quota lock (SoftLocked), operation exceeds 80% single-op cap, or operation exceeds the 64 MiB REST request body collection cap (UploadTooLarge).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    patch:
+      tags: [Workspace Files]
+      summary: Edit a workspace file by text replacement
+      description: |
+        Text edit. Request body mirrors nanobot's `edit_file` schema:
+        `old_text`/`new_text` plus optional `replace_all`, `occurrence`,
+        `line_hint`, and `expected_replacements`. `old_text=""` keeps
+        nanobot's create-file shortcut when the target does not exist; ordinary
+        create/replace remains available through `PUT`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_text, new_text]
+              additionalProperties: false
+              properties:
+                old_text: { type: string }
+                new_text: { type: string }
+                replace_all: { type: boolean, default: false }
+                occurrence:
+                  type: [integer, "null"]
+                  minimum: 1
+                  description: Optional 1-based occurrence to replace when old_text appears multiple times.
+                line_hint:
+                  type: [integer, "null"]
+                  minimum: 1
+                  description: Optional 1-based line hint used to choose the nearest match.
+                expected_replacements:
+                  type: [integer, "null"]
+                  minimum: 1
+                  description: Optional guard for the number of replacements that must be made.
+      responses:
+        '200':
+          description: Edit applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replacements: { type: integer }
+                  created: { type: boolean, default: false }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Quota lock or operation exceeds quota.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: Invalid SKILL.md after edit, if skill validation is active for the edited path.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [Workspace Files]
+      summary: Delete a single workspace file
+      description: |
+        Deletes a file from the selected install site. Server deletes are
+        always allowed regardless of quota lock state.
+      responses:
+        '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/workspace/folders/{path}:
+    description: Workspace folder route for explicit `openoctopus_device`.
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: Path on the target `openoctopus_device`, with the same resolution rules as `/api/workspace/files/{path}`.
+        schema: { type: string }
+      - $ref: '#/components/parameters/OpenOctopusDevice'
+    delete:
+      tags: [Workspace Files]
+      summary: Recursively delete a workspace folder
+      responses:
+        '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Path is a file — use `DELETE /api/workspace/files/{path}`.
+
+  /api/workspace/patch:
+    description: |
+      Workspace apply_patch route for explicit `openoctopus_device`. Request body
+      mirrors nanobot's `apply_patch` schema. Applies structured multi-file
+      edits in the selected install site.
+    parameters:
+      - $ref: '#/components/parameters/OpenOctopusDevice'
+    post:
+      tags: [Workspace Files]
+      summary: Apply structured workspace edits
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [edits]
+              additionalProperties: false
+              properties:
+                edits:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  description: List of edits to apply. Each edit specifies a file and the change to make.
+                  items:
+                    type: object
+                    required: [path, action]
+                    additionalProperties: false
+                    properties:
+                      path:
+                        type: string
+                        description: Relative path to the file to edit. OpenOctopus shared workspace absolute paths still follow ADR-108.
+                      action:
+                        type: string
+                        enum: [replace, add]
+                        description: Operation type.
+                      old_text:
+                        type: [string, "null"]
+                        description: Exact text to search for in the file. Required for replace.
+                      new_text:
+                        type: [string, "null"]
+                        description: Text to replace with or append. Required for replace and add.
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: Validate and summarize the patch without writing files.
+      responses:
+        '200':
+          description: Patch applied or dry-run summary generated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied: { type: boolean }
+                  summaries:
+                    type: array
+                    items: { type: string }
+                  warnings:
+                    type: array
+                    items: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: No match, quota lock, invalid patch, or operation exceeds quota.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/workspace/list/{path}:
+    description: Workspace directory listing route for explicit `openoctopus_device`.
+    parameters:
+      - name: path
+        in: path
+        required: true
+        description: Directory path on the target `openoctopus_device`, with the same resolution rules as `/api/workspace/files/{path}`.
+        schema: { type: string }
+      - $ref: '#/components/parameters/OpenOctopusDevice'
+      - { name: recursive, in: query, required: false, schema: { type: boolean, default: false }, description: 'Recursively list all files (default false).' }
+      - { name: max_entries, in: query, required: false, schema: { type: integer, minimum: 1, default: 200 }, description: 'Maximum entries to return (default 200).' }
+    get:
+      tags: [Workspace Files]
+      summary: List workspace directory contents
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ListDirEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/workspace/find-files:
+    description: Workspace find_files route for explicit `openoctopus_device`.
+    get:
+      tags: [Workspace Files]
+      summary: Find workspace files by path fragment, glob, or type
+      parameters:
+        - $ref: '#/components/parameters/OpenOctopusDevice'
+        - { name: path, in: query, required: false, schema: { type: string }, description: "Directory or file to search in. Defaults to `.` inside the selected device/workspace." }
+        - { name: query, in: query, required: false, schema: { type: string }, description: 'Optional case-insensitive path fragment search. Whitespace-separated terms must all be present.' }
+        - { name: glob, in: query, required: false, schema: { type: string }, description: 'Optional file filter, e.g. `*.py` or `tests/**/test_*.py`.' }
+        - { name: type, in: query, required: false, schema: { type: string }, description: 'Optional file type shorthand, e.g. `py`, `ts`, `md`, or `json`.' }
+        - { name: include_dirs, in: query, required: false, schema: { type: boolean, default: false }, description: 'Include matching directories as well as files.' }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [path, modified], default: path }, description: 'Sort by path or most recently modified first.' }
+        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 200 }, description: 'Maximum number of paths to return. 0 means all matches up to internal safety limits.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N matching entries.' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/workspace/grep:
+    description: Workspace grep route for explicit `openoctopus_device`.
+    get:
+      tags: [Workspace Files]
+      summary: Search workspace file contents
+      parameters:
+        - $ref: '#/components/parameters/OpenOctopusDevice'
+        - { name: pattern, in: query, required: true, schema: { type: string }, description: 'Regex pattern.' }
+        - { name: path, in: query, required: false, schema: { type: string }, description: 'Optional file or directory path inside the selected install site. Omit to search its workspace root.' }
+        - { name: glob, in: query, required: false, schema: { type: string }, description: 'Optional file filter, e.g. `*.py` or `tests/**/test_*.py`.' }
+        - { name: type, in: query, required: false, schema: { type: string }, description: 'Optional ripgrep-style file type shorthand, e.g. `py`, `ts`, `md`, or `json`.' }
+        - { name: fixed_strings, in: query, required: false, schema: { type: boolean, default: false }, description: 'Treat pattern as plain text instead of regex.' }
+        - { name: case_insensitive, in: query, required: false, schema: { type: boolean, default: false }, description: 'Case-insensitive search.' }
+        - { name: output_mode, in: query, required: false, schema: { type: string, enum: [content, files_with_matches, count], default: files_with_matches }, description: 'Shape of grep results.' }
+        - { name: context_before, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context before a match in content mode.' }
+        - { name: context_after, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context after a match in content mode.' }
+        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 250 }, description: 'Maximum number of file entries or content match blocks.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N results before applying `head_limit`.' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/workspace/transfer:
+    description: |
+      Workspace file transfer route. Mirrors the `file_transfer` tool args,
+      rejects destination overwrite, verifies SHA-256 for streamed
+      cross-device copies, and performs moves as copy-then-delete only after
+      the destination write is verified.
+    post:
+      tags: [Workspace Files]
+      summary: Copy or move a file/folder between devices (mirrors `file_transfer`)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+      responses:
+        '200':
+          description: Transfer completed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bytes_transferred: { type: integer, format: int64 }
+                  warnings:
+                    type: array
+                    items: { type: string }
+                    description: Non-fatal issues (e.g. cross-device move's delete-after-copy failed).
+        '409':
+          description: Destination exists, quota lock, operation exceeds single-op cap, or target device is offline/unreachable.
+
+  #
+  # --- Devices ---
+  #
+  /api/devices:
+    description: Target M1 device management route; not implemented in M1b.
+    get:
+      tags: [Devices]
+      summary: Target route — list user's devices (not M1b)
+      description: |
+        Returns all device details for the authenticated user in one array.
+        M1e does not paginate this route and does not implement
+        `GET /api/devices/{name}`. Responses include `token_hint` for user
+        confirmation and never include the plaintext token. `token_hint` is
+        computed as `token[:16] + "..." + token[-6:]`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Device' }
+    post:
+      tags: [Devices]
+      summary: Target route — register a new device (returns the token ONCE; not M1b)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: |
+                    Raw device name. The server canonicalizes it into the
+                    stored routing slug: NFC normalize, trim, ASCII-lowercase,
+                    convert whitespace runs to a single hyphen, then require
+                    `^[a-z0-9]+(-[a-z0-9]+)*$`. Example: `"Alice Laptop"` is
+                    stored as `alice-laptop`. The stored value is unique
+                    within the user's devices, at most 64 characters, and must
+                    not be `server`.
+                workspace_path:
+                  type: string
+                  description: |
+                    Optional. Defaults to the literal string `~/openoctopus/workspace`
+                    for every OS (Linux/macOS/Windows) per ADR-111 if omitted.
+                    The client expands `~` against its own home directory at
+                    startup; the server stores and returns the unexpanded form.
+                sandbox_mode:
+                  type: boolean
+                  default: true
+                  description: |
+                    Optional. Defaults to `true`. When true, client file tools
+                    and Workspace Files routes are confined to `workspace_path`,
+                    and client `web_fetch` applies `ssrf_denylist`. When false,
+                    the device is treated as trusted: client file tools may use
+                    paths outside `workspace_path`, and private/internal network
+                    access is allowed unless explicit deny entries remain.
+                shell_timeout_max:
+                  type: integer
+                  minimum: 0
+                  default: 600
+                  description: |
+                    Per-device cap for exec hard timeouts in seconds. Positive
+                    values bound positive `exec.timeout` requests; `0` means
+                    this device owner permits exec sessions with no hard
+                    timeout, such as long-running services started with
+                    `timeout=0` and `yield_time_ms`.
+                ssrf_denylist:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Optional. CIDR, host, or `host:port` entries blocked by
+                    client-site `web_fetch`. Sandbox devices created without an
+                    explicit value are seeded with private/reserved network
+                    ranges and common metadata-service addresses. Trusted
+                    devices (`sandbox_mode=false`) created without an explicit
+                    value store an empty array. Users remove entries to permit a
+                    blocked internal target.
+                env_allowlist:
+                  type: array
+                  items: { type: string }
+                  default: [PATH, HOME, LANG, TERM]
+                  description: |
+                    Optional parent-process environment variable names allowed
+                    into `exec` and client MCP subprocesses. Env remains an
+                    allowlist because secret names are not enumerable.
+                command_denylist:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Optional command-name deny entries enforced before client
+                    `exec` spawns. Created devices receive a small default list
+                    of obvious host-management/destructive commands.
+                mcp_servers:
+                  type: object
+                  additionalProperties: true
+                  description: |
+                    Map of MCP server configs. Stored with full env secrets as
+                    the device's desired config. A newly-created device is not
+                    online yet, so these MCP entries are validated on the
+                    device's first WebSocket connection; failed entries are
+                    removed from stored config by the normal `register_mcp`
+                    rejection path. Requests reject the redaction marker
+                    `"<redacted>"` in any `mcp_servers.*.env.*` value.
+      responses:
+        '201':
+          description: |
+            Device created. The response includes the token ONCE — it is
+            never returned again. Tokens are random bearer credentials with the
+            `openoctopus_dev_` prefix. Lost tokens require
+            `POST /api/devices/{name}/regenerate-token`.
+            Client startup uses the token via the `OPENOCTOPUS_DEVICE_TOKEN` env
+            var; everything else (workspace_path, sandbox_mode, ssrf_denylist,
+            env_allowlist, command_denylist,
+            etc.) is fetched from the server's `hello_ack` frame at the
+            WebSocket handshake (see PROTOCOL.md, ADR-096 / ADR-097).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, device]
+                properties:
+                  token:
+                    type: string
+                    description: Bearer token with `openoctopus_dev_` prefix. The device sends it at WebSocket handshake. Shown once.
+                  device: { $ref: '#/components/schemas/Device' }
+        '400':
+          description: Invalid name after canonicalization, invalid config shape, invalid device policy fields, or redacted MCP env marker supplied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: |
+            A device with the same canonicalized name already exists for this
+            user. Different users may reuse the same device name.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/devices/{name}/config:
+    description: Target M1 device management route; not implemented in M1b.
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Devices]
+      summary: Target route — update device config (sandbox mode, timeouts, SSRF/env/command policy, MCPs; not M1b)
+      description: |
+        Target M1 device route. Not implemented in M1b.
+
+        If `mcp_servers` changes while the device is online, the server sends a
+        validation-only `config_validate` frame first. The client attempts
+        MCP spawn/introspection without activating the candidate config or
+        sending `register_mcp`. Spawn or initial introspection failure returns
+        `400 Bad Request`; within-server duplicate names, cross-install schema
+        drift, name conflicts, or validation disconnect/timeout return
+        `409 Conflict`. In all validation-failure cases, the DB row is not
+        changed. After successful validation and DB commit, or after any
+        non-MCP config commit, the server pushes the authoritative
+        `config_update` frame to the connected device. If the device is
+        offline, `mcp_servers` is stored as desired config and validated on the
+        next WebSocket connection. If `name` changes and the device is online,
+        the authoritative `config_update` includes the new canonical
+        `device_name` so the client updates local display/log state without a
+        reconnect.
+
+        PATCH is a partial top-level update. Omitted fields keep their existing
+        values. If `ssrf_denylist`, `env_allowlist`, `command_denylist`, or
+        `mcp_servers` is provided, it replaces that entire stored field;
+        Python-main does not deep-merge any of them.
+        An empty body or `{}` is a no-op that returns the current `Device`
+        response and does not push `config_update`.
+
+        `sandbox_mode` is a persisted per-device policy. Sessions cannot
+        temporarily override it. If `name` is provided, the server canonicalizes
+        it with the same device-name rules as `POST /api/devices`, then renames
+        the device to that stored routing slug; `server` remains reserved and is
+        rejected. The existing device token remains valid across rename.
+        Requests reject the redaction marker `"<redacted>"` in any
+        `mcp_servers.*.env.*` value.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: |
+                    Optional raw rename. Canonicalized to the stored per-user
+                    routing slug using the same rules as `POST /api/devices`
+                    and must not be `server`.
+                sandbox_mode:
+                  type: boolean
+                  description: |
+                    Persisted per-device policy switch. `true` confines client
+                    file tools to `workspace_path` and applies `ssrf_denylist`
+                    for client `web_fetch`; `false` treats the device as
+                    trusted for filesystem and private-network access.
+                shell_timeout_max:
+                  type: integer
+                  minimum: 0
+                  description: |
+                    Per-device cap for exec hard timeouts in seconds. Positive
+                    values bound positive `exec.timeout` requests; `0` permits
+                    no-hard-timeout exec sessions on this device.
+                ssrf_denylist:
+                  type: array
+                  items: { type: string }
+                  description: Whole-field replacement client `web_fetch` denylist.
+                env_allowlist:
+                  type: array
+                  items: { type: string }
+                  description: Whole-field replacement env allowlist for `exec` and client MCP subprocesses.
+                command_denylist:
+                  type: array
+                  items: { type: string }
+                  description: Whole-field replacement command denylist for client `exec`.
+                mcp_servers:
+                  type: object
+                  additionalProperties: true
+                  description: |
+                    Whole-field replacement map of MCP server configs. Stored
+                    with full env secrets.
+                    REST responses redact every `env` value as `"<redacted>"`;
+                    writes reject that marker.
+                workspace_path:
+                  type: string
+                  description: |
+                    Optional non-empty path string. Stored verbatim; the server
+                    does not expand `~` or verify the path exists on the
+                    device. The client expands/creates/reports errors when it
+                    receives `hello_ack` or `config_update`.
+      responses:
+        '200':
+          description: Updated.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Device' } } }
+        '400':
+          description: |
+            Invalid name after canonicalization, invalid config shape,
+            invalid device policy fields, redacted MCP env marker supplied, or online
+            MCP spawn/introspection validation failed.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Rename conflicts with an existing canonical device name, online MCP
+            schema validation found a collision, or the device disconnected /
+            timed out during validation before the DB row changed.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/devices/{name}:
+    description: Target M1 device management route; not implemented in M1b.
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Devices]
+      summary: Target route — remove a device (revokes its token; not M1b)
+      description: |
+        Deletes the device row. This is the state-3 complete wipe from ADR-110:
+        the token immediately stops authenticating, any active WebSocket
+        connection is closed with 4401, in-flight tool calls on that connection
+        fail as `device_unreachable`, and the device disappears from future
+        `openoctopus_device` enums.
+      responses:
+        '204': { description: Removed. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/devices/{name}/regenerate-token:
+    description: Target M1 device token route; not implemented in M1b.
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Devices]
+      summary: Target route — regenerate the device's auth token (not M1b)
+      description: |
+        Target M1 device route. Not implemented in M1b.
+
+        Invalidates the old token, returns a new one exactly once, and
+        preserves the existing device row, name, workspace path, sandbox mode,
+        SSRF/env/command policy, shell timeout cap, and MCP config. Any active
+        connection for the old token is closed with 4401; in-flight tool calls
+        on that connection fail as `device_unreachable`. The device remains
+        paired but appears offline until the user restarts/reconfigures the
+        client with the new token.
+      responses:
+        '200':
+          description: New token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, device]
+                properties:
+                  token: { type: string }
+                  device: { $ref: '#/components/schemas/Device' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  #
+  # --- Channels ---
+  #
+  /api/channels:
+    description: User channel configuration list route.
+    get:
+      tags: [Channels]
+      summary: List all supported channel configs
+      description: |
+        Returns every channel type supported by this server, including
+        unconfigured entries. There is no separate
+        `GET /api/channels/{channel}` route; frontends can filter this list.
+        Secret fields are never returned. Configured bot channels return
+        platform-specific config field names such as `bot_token_hint`,
+        `partner_chat_id`, and `allow_list`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ChannelConfigView' }
+
+  /api/channels/{channel}:
+    description: Generic per-channel configuration mutation route.
+    parameters:
+      - name: channel
+        in: path
+        required: true
+        schema: { type: string, enum: [discord, telegram] }
+        description: Supported channel type. Unknown values fail with `unknown_channel`.
+    patch:
+      tags: [Channels]
+      summary: Create or partially update a channel config
+      description: |
+        Partial top-level update. Omitted fields remain unchanged. Platform
+        payloads keep platform-specific field names instead of abstracting
+        everything into a generic config map.
+
+        Config existence means enabled; there is no `enabled` flag. `DELETE`
+        disables a channel by deleting its config row. `allow_list`, when
+        present, replaces the whole list. Sending `bot_token: "<redacted>"` is
+        rejected; omit `bot_token` to keep the existing secret. A `bot_token`
+        change is validated against the platform before persistence. A
+        `partner_chat_id` change is validated by sending a pairing/success
+        message to that target before persistence. `allow_list` gets schema
+        validation only; adapters resolve and classify entries at receive time.
+
+        Runtime hot reload is a Py10 contract: after a successful DB write, the
+        ChannelManager reloads or starts the affected user's adapter. Py-Prep
+        only fixes the API/storage contract.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelConfigPatch' }
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelConfigView' }
+        '400':
+          description: Malformed payload, unknown channel, or `"<redacted>"` sent as a secret value.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: Platform validation failed, pairing message failed, or runtime config could not be applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [Channels]
+      summary: Delete a channel config
+      description: |
+        Deletes the user's config row for this channel. The channel is disabled
+        because config existence is the enablement state. Py10 hot reload stops
+        the affected adapter after successful deletion.
+      responses:
+        '204': { description: Removed. }
+        '400':
+          description: Unknown channel.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  #
+  # --- Cron ---
+  #
+  /api/cron:
+    description: Target M1 cron management route; not implemented in M1b.
+    get:
+      tags: [Cron]
+      summary: Target route — list the user's cron jobs (not M1b)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CronJob' }
+    post:
+      tags: [Cron]
+      summary: Target route — create a cron job (mirrors `cron` tool, ADR-053; not M1b)
+      description: |
+        Target M1 cron route. Not implemented in M1b.
+
+        REST-created jobs provide their delivery channel + chat_id
+        explicitly. Agent-created jobs use the same shared write helper
+        but inherit channel + chat_id from ToolContext. Each firing
+        synthesizes an `InboundMessage` into a dedicated cron session.
+
+        The shared helper validates the schedule before storing it:
+        exactly one of `every_seconds`, `cron_expr`, or `at`; positive
+        intervals; valid cron expressions; known IANA timezone when `tz`
+        is present; and a future `next_fire_at`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description, channel, chat_id]
+              properties:
+                name:
+                  type: string
+                  description: Optional short human-readable label. Defaults to the first 30 characters of description.
+                description:
+                  type: string
+                  description: Becomes the synthesized user message at firing time.
+                every_seconds:
+                  type: integer
+                  minimum: 1
+                  description: Interval in seconds for recurring jobs. Mutually exclusive with cron_expr and at.
+                cron_expr:
+                  type: string
+                  description: Cron expression like "0 9 * * *". Mutually exclusive with every_seconds and at.
+                tz:
+                  type: string
+                  description: Optional IANA timezone for cron_expr and naive at timestamps.
+                at:
+                  type: string
+                  format: date-time
+                  description: One-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
+                deliver:
+                  type: boolean
+                  default: true
+                  description: Whether to deliver the final response to the stored channel/chat_id.
+                channel:
+                  type: string
+                  description: Delivery channel for the final response, e.g. "web", "discord", or "telegram".
+                chat_id:
+                  type: string
+                  description: Delivery target within the channel.
+      responses:
+        '201':
+          description: Created.
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/cron/{id}:
+    description: Target M1 cron management route; not implemented in M1b.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Cron]
+      summary: Target route — get a cron job (not M1b)
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+    patch:
+      tags: [Cron]
+      summary: Target route — update schedule, delivery, or description (not M1b)
+      description: |
+        Target M1 cron route. Not implemented in M1b.
+
+        Uses the same shared cron write helper as create/delete, so schedule
+        updates are validated and the cron ticker is notified after the row
+        changes.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                every_seconds:
+                  type: integer
+                  minimum: 1
+                  description: Replaces the schedule with an interval schedule. Mutually exclusive with cron_expr and at.
+                cron_expr:
+                  type: string
+                  description: Replaces the schedule with a cron expression. Mutually exclusive with every_seconds and at.
+                tz:
+                  type: string
+                  description: Optional IANA timezone for cron_expr and naive at timestamps.
+                at:
+                  type: string
+                  format: date-time
+                  description: Replaces the schedule with a one-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
+                deliver: { type: boolean }
+                channel: { type: string }
+                chat_id: { type: string }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      tags: [Cron]
+      summary: Target route — delete a cron job (not M1b)
+      responses:
+        '204': { description: Deleted. }
+
+  #
+  # --- Admin ---
+  #
+  /api/admin/config:
+    get:
+      tags: [Admin]
+      summary: Get system-wide config (admin only)
+      description: |
+        Returns admin-visible `system_config` values. Bootstrap does not seed
+        default rows, so a fresh server may return `{}`. Secret-bearing values
+        such as a configured `llm_api_key` are redacted. Known keys:
+
+          - `quota_bytes` (int) — per-user workspace quota (ADR-046).
+          - `shared_workspace_quota_bytes` (int) — quota ceiling that any
+            single shared workspace may request. ADR-108.
+          - `llm_endpoint` (string) — base URL of the Anthropic-compatible
+            Messages API or gateway endpoint. ADR-101.
+          - `llm_api_key` (string) — bearer credential the server uses on
+            outbound LLM requests. Write-only in admin API responses: once
+            configured, GET/PATCH responses return `"<redacted>"` instead of
+            the raw key. ADR-101.
+          - `llm_model` (string) — model name passed in the Anthropic Messages
+            request body. ADR-101.
+          - `llm_max_context_tokens` (int) — LLM context window in tokens
+            (e.g. `128000`). Counted with the Python tokenizer strategy
+            selected for ADR-025. ADR-101.
+          - `llm_compaction_threshold_tokens` (int) — accepted/reserved
+            config for later compaction decisions. Missing means not
+            configured; future compaction code must handle that explicitly.
+            The intended future trigger compares
+            `llm_max_context_tokens − tokenizer_count(prompt)` with
+            `llm_compaction_threshold_tokens`; summary `max_output_tokens`
+            = `threshold − 4000`. The Python server alpha may store the value
+            before compaction is implemented. ADR-028, ADR-101.
+          - `llm_max_concurrent_requests` (int) — optional
+            in-process semaphore in the shared LLM provider layer. A configured
+            `0` means unlimited and creates no semaphore. A positive integer
+            caps concurrent in-flight Anthropic Messages calls made through
+            the shared provider adapter, including chat, cron, heartbeat,
+            compaction, and future autonomous flows. If missing at server
+            startup, only the runtime limiter treats it as `0`; no row is
+            persisted. ADR-101, ADR-122.
+          - `object_storage_endpoint` (string) — MinIO/S3-compatible endpoint
+            URL for server workspace persistence. ADR-123.
+          - `object_storage_bucket` (string) — bucket used for all server
+            workspace objects. ADR-123.
+          - `object_storage_region` (string) — S3 region string passed to the
+            object client; MinIO deployments may use `us-east-1`. ADR-123.
+          - `object_storage_access_key` (string) — object-store access key.
+            Write-only in admin API responses: once configured, GET/PATCH
+            responses return `"<redacted>"` instead of the raw key. ADR-123.
+          - `object_storage_secret_key` (string) — object-store secret key.
+            Write-only in admin API responses: once configured, GET/PATCH
+            responses return `"<redacted>"` instead of the raw key. ADR-123.
+          - `server_mcp` (array of `McpServerConfig`) — admin-configured
+            shared-service MCPs, exposed as install site `server`.
+            ADR-114. Reserved for the later MCP slice; not accepted by M1b.
+
+        GET response schema uses `additionalProperties: true` because
+        deployments may carry deployment-local keys inserted outside the
+        admin API; everything not listed above is treated as opaque metadata
+        by OpenOctopus. PATCH accepts only documented supported keys and rejects
+        unsupported keys.
+
+        Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` on PATCH
+        after validating the merged provider identity with `GET
+        {llm_endpoint}/models`. `GET /api/admin/config` redacts configured
+        secret values (`llm_api_key`, `object_storage_access_key`,
+        `object_storage_secret_key`) as `"<redacted>"`; callers rotate a secret
+        by sending a new value and keep an existing secret by omitting that key.
+        Sending `"<redacted>"` as a new secret value is rejected. `server_mcp`
+        remains documented for the later MCP slice.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [Admin]
+      summary: Update system-wide config keys
+      description: |
+        Partial update — keys present are updated, keys absent are untouched.
+        When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
+        the server validates the provider before writing: `GET
+        {llm_endpoint}/models` must be reachable with the configured bearer
+        credential, return a well-formed models response accepted by OpenOctopus,
+        and include the configured `llm_model`. Validation failure returns
+        `400 Bad Request` and leaves the existing DB config unchanged.
+
+        First-time LLM identity setup requires `llm_endpoint`, `llm_api_key`,
+        and `llm_model` in the same PATCH. After a valid identity exists,
+        later PATCHes may reuse stored values by omitting unchanged identity
+        keys. `GET /api/admin/config` and successful PATCH responses redact a
+        configured `llm_api_key` as `"<redacted>"`; callers rotate the key by
+        sending a new value and keep the existing key by omitting
+        `llm_api_key`. Sending `"<redacted>"` as a new key is rejected.
+
+        Python-main treats configured `llm_max_concurrent_requests=0` as
+        unlimited/no semaphore and positive integers as an in-process cap for
+        outbound Anthropic Messages calls. If the key is missing at startup,
+        only the runtime limiter treats it as `0`; no default row is persisted.
+        Negative values and values above the server maximum are invalid.
+
+        Python-main requires object-storage config before server workspace
+        features are enabled. `object_storage_endpoint`,
+        `object_storage_bucket`, `object_storage_region`,
+        `object_storage_access_key`, and `object_storage_secret_key` are the
+        supported MinIO/S3-compatible keys. `object_storage_access_key` and
+        `object_storage_secret_key` are redacted as `"<redacted>"`; callers
+        rotate them by sending new values and keep existing values by omitting
+        them. Sending `"<redacted>"` as a new object-storage secret value is
+        rejected.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              description: Partial update — keys present are updated, keys absent are untouched.
+              properties:
+                quota_bytes: { type: integer, format: int64, minimum: 1 }
+                shared_workspace_quota_bytes: { type: integer, format: int64, minimum: 1 }
+                llm_endpoint: { type: string }
+                llm_api_key: { type: string }
+                llm_model: { type: string }
+                llm_max_context_tokens: { type: integer, format: int64, minimum: 1 }
+                llm_compaction_threshold_tokens: { type: integer, format: int64, minimum: 4001 }
+                llm_max_concurrent_requests: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
+                object_storage_endpoint: { type: string }
+                object_storage_bucket: { type: string }
+                object_storage_region: { type: string }
+                object_storage_access_key: { type: string }
+                object_storage_secret_key: { type: string }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/admin/users:
+    description: Target M1 admin user management route; not implemented in M1b.
+    get:
+      tags: [Admin]
+      summary: Target route — list all users (admin only; not M1b)
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+
+  /api/admin/users/{id}:
+    description: Target M1 admin user management route; not implemented in M1b.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Admin]
+      summary: Target route — get a user (admin only; not M1b)
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/User' } } }
+    delete:
+      tags: [Admin]
+      summary: Target route — delete a user (admin only; cascades to all their resources; not M1b)
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      responses:
+        '204': { description: Deleted. }
+
+  /api/admin/server-mcp:
+    description: Target M1 admin server MCP management route; not implemented in M1b.
+    get:
+      tags: [Admin]
+      summary: Target route — list server-side (admin-configured) MCPs (not M1b)
+      description: |
+        Target M1 admin server MCP route. Not implemented in M1b.
+
+        Lists admin shared-service MCPs only. These use admin-provided
+        shared credentials, are intended for stateless or low-state service
+        tools such as search and internal KB lookup, and appear to agents
+        as install site `openoctopus_device="server"`.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/McpServerConfig' }
+    put:
+      tags: [Admin]
+      summary: Target route — replace the server-side MCP list (admin only; not M1b)
+      description: |
+        Target M1 admin server MCP route. Not implemented in M1b.
+
+        Replaces admin shared-service MCPs stored in
+        `system_config.server_mcp`. M1 supports one runtime per configured
+        MCP server with a bounded per-MCP call queue. User-scoped server
+        MCPs and session-scoped MCPs are out of scope; users who need
+        personal OAuth/session/browser/IDE state should configure MCPs on
+        their own devices.
+
+        Collision detection per ADR-049, two cases:
+          - **Within-server dup** — an MCP server advertises two
+            capabilities that wrap to the same name (intra-surface only;
+            cross-surface collisions impossible by ADR-048's typed-infix
+            naming). Returns `409 Conflict` and does not apply.
+          - **Cross-install schema drift** — a new MCP's wrapped name
+            matches an existing install with a different `input_schema`
+            across any surface (tool / resource / prompt). Returns
+            `409 Conflict` with a structured diff and does not apply.
+
+        Spawn or initial `list_tools/resources/prompts` failure returns
+        `400 Bad Request` and does not apply. The server validates the new
+        list before replacing `system_config.server_mcp`.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/McpServerConfig' }
+      responses:
+        '200':
+          description: Applied.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Schema collision with an existing MCP install.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: openoctopus_session
+      description: HttpOnly; SameSite=Strict JWT cookie set by `/api/auth/login` and `/api/auth/register`. `Secure` is controlled by `OPENOCTOPUS_COOKIE_SECURE`; production deployments should enable it behind TLS, while local dev may omit it.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: For programmatic clients (CLI, scripts). Same JWT as the cookie, just delivered differently (ADR-004).
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0, minimum: 0 }
+    OpenOctopusDevice:
+      name: openoctopus_device
+      in: query
+      required: true
+      description: |
+        Install site for file operations. `server` names OpenOctopus's built-in
+        server workspace. Paired device names route over `/ws/device`; the
+        client applies its `workspace_path` and `sandbox_mode`. Paired-but-offline
+        devices remain valid names and return an error with code
+        `device_unreachable` at dispatch.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Missing or invalid authentication.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authenticated but not authorized for this resource.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource does not exist.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable error code from `openoctopus_common/src/errors/`.
+            Examples: `not_found`, `forbidden`, `soft_locked`,
+            `upload_too_large`, `invalid_skill_format`,
+            `private_address_blocked`, `ambiguous_edit`,
+            `no_match`, `invalid_schedule`, `destination_exists`.
+        message: { type: string }
+
+    User:
+      type: object
+      required: [id, email, name, is_admin, created_at]
+      properties:
+        id: { type: string, description: UUID v4. }
+        email: { type: string, format: email }
+        name: { type: string }
+        is_admin: { type: boolean }
+        bytes_used: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    Session:
+      type: object
+      required: [id, user_id, session_key, channel, chat_id, title, unread, created_at]
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        session_key:
+          type: string
+          description: Composite key; usually `{channel}:{chat_id}` (ADR-006). Browser sessions use `web:{id}` and clients cannot set or rename it.
+        channel: { type: string }
+        chat_id: { type: string }
+        title:
+          type: string
+          description: Human-facing mutable title. Defaults to `New chat`.
+        last_inbound_at: { type: string, format: date-time }
+        unread:
+          type: boolean
+          description: |
+            Derived browser inbox flag. True when this session has
+            user-visible messages newer than the server-side `last_read_at`
+            marker. Not a live run status and not an unread count.
+        cancel_requested: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Message:
+      type: object
+      required: [id, session_id, role, message_kind, content, delivery_refs, created_at]
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        message_kind:
+          type: string
+          enum: [human, assistant, tool_result, synthetic_tool_result, synthetic_assistant_error, compaction_summary]
+          description: OpenOctopus semantic discriminator for rendering, audit, recovery, and provider request folding.
+        is_compaction_summary:
+          type: boolean
+          description: If true, this assistant row is a compaction summary (ADR-089), not a regular assistant turn.
+        content:
+          type: array
+          items: { $ref: '#/components/schemas/ContentBlock' }
+          description: |
+            Sanitized Anthropic content blocks. Normal `thinking.thinking`
+            blocks are returned when present so the frontend can decide whether
+            to display them. `thinking.signature` and raw
+            `redacted_thinking.data` are omitted from public responses.
+        delivery_refs:
+          type: array
+          items: { $ref: '#/components/schemas/MessageDeliveryRef' }
+          description: |
+            API-only user-visible delivery references, usually file chips
+            created by the `message` tool for web delivery. These refs are not
+            part of provider replay. Device refs are online-only and are
+            resolved by calling the Workspace Files `GET` route with the
+            recorded `openoctopus_device` and `path`.
+        created_at: { type: string, format: date-time }
+
+    PendingMessage:
+      type: object
+      required: [id, session_id, content, received_at]
+      description: |
+        Durable user message accepted while the session runner is active but
+        not yet visible to provider replay. On safe-boundary drain, this row is
+        inserted into `messages` with the same `id`, so frontends can reconcile
+        pending UI state without duplicates.
+      properties:
+        id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        content:
+          type: array
+          items: { $ref: '#/components/schemas/ContentBlock' }
+          description: |
+            Sanitized Anthropic user content blocks that will later become the
+            `messages.content` value for the drained human message.
+        effort:
+          allOf:
+            - $ref: '#/components/schemas/Effort'
+          nullable: true
+          description: Pending per-turn thinking effort, if supplied.
+        received_at: { type: string, format: date-time }
+
+    MessagesResponse:
+      type: object
+      required: [messages, pending_messages, status, pending_count, has_more_before]
+      description: |
+        Canonical PostgreSQL-backed chat state. This response never includes
+        in-flight token deltas from a running assistant response. The
+        `messages` array is cursor-paginated canonical history; the
+        `pending_messages` array is the full durable pending queue for this
+        session and is not counted against `limit`.
+      properties:
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+          description: |
+            Persisted canonical messages in chronological order for the
+            requested cursor window.
+        pending_messages:
+          type: array
+          items: { $ref: '#/components/schemas/PendingMessage' }
+          description: |
+            All durable pending user messages for the session, ordered by
+            `(received_at, id)`. These are accepted inputs that have not yet
+            been drained into provider-visible `messages`.
+        status:
+          type: string
+          enum: [idle, running, failed, abandoned]
+          description: Current session/turn state derived from persisted run/lease state.
+        active_turn_id:
+          type: string
+          nullable: true
+          description: Running turn id when a runner currently owns the session.
+        last_message_id:
+          type: string
+          nullable: true
+          description: Most recent persisted canonical message id in the whole session.
+        pending_count:
+          type: integer
+          minimum: 0
+          description: Durable pending user messages waiting for a safe drain boundary.
+        has_more_before:
+          type: boolean
+          description: True when older persisted canonical messages exist before the earliest returned `messages` row.
+
+    PostMessageStreamEvent:
+      oneOf:
+        - type: object
+          required: [type, message_id, disposition, created_session]
+          properties:
+            type: { type: string, enum: [message_accepted] }
+            message_id: { type: string, description: User message id durably accepted by this POST. }
+            disposition: { type: string, enum: [started, queued] }
+            created_session: { type: boolean, description: Whether this POST implicitly created the web session. }
+        - type: object
+          required: [type, turn_id, message_ids]
+          properties:
+            type: { type: string, enum: [turn_started] }
+            turn_id: { type: string }
+            message_ids:
+              type: array
+              items: { type: string }
+              description: User message ids included in this provider-visible turn after direct insert or pending batch drain.
+        - type: object
+          required: [type, turn_id, channel, text]
+          properties:
+            type: { type: string, enum: [token_delta] }
+            turn_id: { type: string }
+            channel: { type: string, enum: [text, thinking] }
+            text: { type: string, description: Coalesced best-effort token text. Not persisted and not replayed. }
+        - type: object
+          required: [type, turn_id, kind]
+          properties:
+            type: { type: string, enum: [tool_progress] }
+            turn_id: { type: string }
+            kind: { type: string, description: Tool progress phase, for example `tool_started` or `tool_finished`. }
+            tool_call_id: { type: string }
+            tool_name: { type: string }
+        - type: object
+          required: [type, turn_id, message]
+          properties:
+            type: { type: string, enum: [message_persisted] }
+            turn_id: { type: string }
+            message: { $ref: '#/components/schemas/Message' }
+        - type: object
+          required: [type, turn_id, status]
+          properties:
+            type: { type: string, enum: [turn_finished] }
+            turn_id: { type: string }
+            status: { type: string, enum: [completed, failed, cancelled, abandoned] }
+            final_message_id: { type: string, nullable: true }
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, enum: [session_deleted] }
+            session_id: { type: string, format: uuid, description: Deleted session id, if available to the closing stream. }
+        - type: object
+          required: [type, message_id, by_message_id]
+          properties:
+            type: { type: string, enum: [stream_replaced] }
+            message_id: { type: string, description: Accepted queued message id for this closing POST response. }
+            by_message_id: { type: string, description: Newer queued message id whose POST response became the live subscriber. }
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, enum: [keepalive] }
+            message_id: { type: string, description: Accepted queued message id for this waiting POST response. }
+
+    Effort:
+      type: string
+      enum: [off, low, medium, high, xhigh, max]
+      description: |
+        Optional browser-selected per-turn thinking effort. `null`, omitted, or
+        `off` sends `thinking.type=disabled`. Non-off values send
+        `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+
+    ContentBlock:
+      description: Anthropic Messages content block. See ADR-059, ADR-101, ADR-117.
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type: { type: string, enum: [text] }
+            text: { type: string }
+        - type: object
+          required: [type, source]
+          properties:
+            type: { type: string, enum: [image] }
+            source:
+              type: object
+              required: [type, media_type, data]
+              properties:
+                type: { type: string, enum: [base64] }
+                media_type: { type: string, example: image/png }
+                data:
+                  type: string
+                  description: Base64-encoded image bytes, without a data URL prefix.
+        - type: object
+          required: [type, id, name, input]
+          properties:
+            type: { type: string, enum: [tool_use] }
+            id: { type: string }
+            name: { type: string }
+            input: { type: object, additionalProperties: true }
+        - type: object
+          required: [type, tool_use_id, content]
+          properties:
+            type: { type: string, enum: [tool_result] }
+            tool_use_id: { type: string }
+            content:
+              type: array
+              description: |
+                Provider-facing and public history shape. Raw device WebSocket
+                frames may submit a string or safe block array, but OpenOctopus
+                normalizes persisted `tool_result.content` to safe blocks
+                before DB storage, SSE, history, or provider replay.
+              items: { $ref: '#/components/schemas/ToolResultContentBlock' }
+            is_error: { type: boolean, default: false }
+            code: { type: string }
+        - type: object
+          required: [type, thinking]
+          properties:
+            type: { type: string, enum: [thinking] }
+            thinking:
+              type: string
+              description: Publicly returned sanitized thinking text when present; frontend decides whether to render it.
+            signature:
+              type: string
+              description: Stored internally for provider replay; omitted from public sanitized responses.
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, enum: [redacted_thinking] }
+            redacted:
+              type: boolean
+              description: Public sanitized placeholder. Raw `data` is stored internally only.
+
+    ToolResultContentBlock:
+      description: |
+        Safe content block allowed inside normalized tool_result.content arrays
+        and raw device tool_result frames. For real tool outputs, OpenOctopus
+        prepends a server-generated text warning block before the raw result
+        blocks; base64 image data is never modified.
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type: { type: string, enum: [text] }
+            text: { type: string }
+        - type: object
+          required: [type, source]
+          properties:
+            type: { type: string, enum: [image] }
+            source:
+              type: object
+              required: [type, media_type, data]
+              properties:
+                type: { type: string, enum: [base64] }
+                media_type: { type: string }
+                data: { type: string }
+
+    MessageAttachmentRef:
+      type: object
+      required: [openoctopus_device, path]
+      additionalProperties: false
+      properties:
+        openoctopus_device:
+          type: string
+          description: |
+            Required file target. `server` names the built-in server workspace;
+            known device names route over `/ws/device` when online. Unknown/deleted
+            devices fail structural validation. Known devices that are offline
+            or too slow during message attachment expansion do not reject the
+            message; OpenOctopus inserts a sanitized unavailable-marker text block
+            in the persisted user content.
+        path:
+          type: string
+          description: Existing file path on the selected install site.
+
+    MessageDeliveryRef:
+      type: object
+      required: [type, openoctopus_device, path, filename, online_only]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [workspace_file, device_file]
+          description: |
+            `workspace_file` points at durable server workspace bytes.
+            `device_file` points at a paired device path and is resolved only
+            when the user clicks/downloads it.
+        openoctopus_device:
+          type: string
+          description: |
+            `server` for durable workspace refs, or a paired device name for
+            online-only device refs. Frontends pass this value back as the
+            Workspace Files `openoctopus_device` query parameter.
+        path:
+          type: string
+          description: Existing file path on the selected install site.
+        filename:
+          type: string
+          description: Display filename. Defaults to the final path segment if the adapter cannot infer anything better.
+        mime:
+          type: string
+          nullable: true
+          description: Optional media type hint for rendering.
+        size:
+          type: integer
+          format: int64
+          nullable: true
+          description: Optional size hint. Device refs may omit it because the file is not read until click time.
+        online_only:
+          type: boolean
+          description: |
+            True for device refs. False for durable server workspace refs.
+            Online-only refs may fail later with `device_unreachable`,
+            `not_found`, or device policy errors.
+
+    Workspace:
+      type: object
+      required: [id, name, type, quota_bytes, bytes_used]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            UUID. For personal workspaces, equals the owner's `users.id`.
+            For shared workspaces, the `workspaces.id` row PK (ADR-108).
+            Drives the MinIO object prefix: `users/{id}/` for personal
+            workspaces and `workspaces/{id}/` for shared workspaces
+            (ADR-123).
+        name:
+          type: string
+          description: |
+            Display name. For personal workspaces, the owner's `users.name`.
+            For shared workspaces, the row's `workspaces.name` — NOT
+            globally unique; ADR-109 validation rules apply.
+        suffix:
+          type: string
+          description: |
+            Present for shared workspaces. First 8 hex chars of `id` (auto-extended
+            on collision per ADR-108). The agent and the REST API both address the
+            workspace via the `name@suffix` form derived from these two fields.
+        ref:
+          type: string
+          description: |
+            Present for shared workspaces. The fully-composed `name@suffix`
+            addressing form, ready to drop into a tool path or URL.
+            Example: `Xmas gift@a4f7e2d1`. The frontend uses this verbatim
+            for `/api/workspaces/{workspace_ref}` URLs.
+        type: { type: string, enum: [personal, shared] }
+        quota_bytes: { type: integer, format: int64 }
+        bytes_used: { type: integer, format: int64 }
+        locked: { type: boolean, description: bytes_used > quota_bytes. }
+        created_by:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Present for shared workspaces. NULL if the creator's account was
+            deleted but the workspace still has other members (ADR-108
+            exception to ADR-058's cascade rule).
+        members:
+          type: array
+          description: Present for shared workspaces.
+          items: { $ref: '#/components/schemas/WorkspaceMember' }
+
+    WorkspaceMember:
+      type: object
+      required: [user_id, email, name]
+      properties:
+        user_id: { type: string }
+        email: { type: string, format: email }
+        name: { type: string }
+
+    Device:
+      type: object
+      required: [name, sandbox_mode, workspace_path, shell_timeout_max, ssrf_denylist, env_allowlist, command_denylist, mcp_servers, online, token_hint, created_at]
+      properties:
+        name:
+          type: string
+          description: |
+            Canonical per-user slug used in REST paths and tool routing.
+            Matches `^[a-z0-9]+(-[a-z0-9]+)*$`, is at most 64 characters,
+            and must not be `server`.
+        workspace_path:
+          type: string
+          description: |
+            May contain a leading `~`; the client expands at startup.
+            Default `~/openoctopus/workspace` (ADR-111) on every OS when not
+            supplied at create time. Explicit overrides are stored verbatim.
+        sandbox_mode:
+          type: boolean
+          description: |
+            Persisted per-device policy switch. `true` is restricted mode;
+            `false` is trusted-device mode. Sessions cannot override it.
+        shell_timeout_max:
+          type: integer
+          minimum: 0
+          description: |
+            Per-device cap for exec hard timeouts in seconds. `0` means no cap
+            and permits no-hard-timeout exec sessions on this device.
+        ssrf_denylist:
+          type: array
+          items: { type: string }
+        env_allowlist:
+          type: array
+          items: { type: string }
+        command_denylist:
+          type: array
+          items: { type: string }
+        mcp_servers:
+          type: object
+          additionalProperties: true
+          description: |
+            MCP server configs with every `mcp_servers.*.env.*` value
+            redacted as `"<redacted>"` in REST responses. The database stores
+            the full unredacted config; device WebSocket config uses the
+            stored unredacted value.
+        online:
+          type: boolean
+          description: |
+            Derived from the in-memory device WebSocket registry. There are no
+            `online` or `last_seen_at` columns in the database.
+        token_hint:
+          type: string
+          description: |
+            Confirmation hint computed as `token[:16] + "..." + token[-6:]`;
+            plaintext tokens are not returned by list/update/delete responses.
+        created_at: { type: string, format: date-time }
+
+    ChannelConfigView:
+      type: object
+      required: [channel, configured, config]
+      properties:
+        channel:
+          type: string
+          enum: [discord, telegram]
+        configured:
+          type: boolean
+          description: True when the user's per-platform config row exists.
+        config:
+          oneOf:
+            - $ref: '#/components/schemas/DiscordConfig'
+            - $ref: '#/components/schemas/TelegramConfig'
+            - type: "null"
+          description: Platform-specific config view, or null when not configured.
+
+    ChannelConfigPatch:
+      oneOf:
+        - $ref: '#/components/schemas/DiscordConfigPatch'
+        - $ref: '#/components/schemas/TelegramConfigPatch'
+      description: |
+        Platform-specific partial update body. The path parameter chooses which
+        platform parser is used; this oneOf documents the supported shapes.
+
+    DiscordConfig:
+      type: object
+      required: [bot_token_hint, partner_chat_id, allow_list]
+      additionalProperties: false
+      properties:
+        bot_token_hint:
+          type: string
+          description: Display-only secret hint, e.g. first visible chars + `...` + last visible chars. Never accepted for authentication or update.
+        partner_chat_id: { type: string }
+        allow_list:
+          type: array
+          items: { type: string }
+          description: |
+            Heterogeneous list of Discord-snowflake-shaped strings. An entry can
+            be a User ID (the user is allowed to DM/@-mention), a Channel ID
+            (every member of that channel can @-mention the bot in that channel),
+            or a Guild ID (every member of that guild can @-mention the bot
+            anywhere in the guild). The adapter classifies each entry by Discord
+            API lookup at receive time. Inbound is allowed if sender_id matches
+            a User entry OR the message-context (channel/guild) matches a
+            Channel/Guild entry. Allowed messages still get the
+            `[untrusted message from <name>]:` wrap (ADR-007); only the partner
+            is unwrapped.
+
+    DiscordConfigPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        bot_token:
+          type: string
+          description: New Discord bot token. Omit to keep the current token; `"<redacted>"` is rejected.
+        partner_chat_id:
+          type: string
+          description: Partner Discord user/chat id. Changing it triggers a pairing message before persistence.
+        allow_list:
+          type: array
+          items: { type: string }
+          description: Whole-array replacement. Entries get schema/length validation only.
+
+    TelegramConfig:
+      type: object
+      required: [bot_token_hint, partner_chat_id, allow_list]
+      additionalProperties: false
+      properties:
+        bot_token_hint:
+          type: string
+          description: Display-only secret hint, e.g. first visible chars + `...` + last visible chars. Never accepted for authentication or update.
+        partner_chat_id: { type: string }
+        allow_list:
+          type: array
+          items: { type: string }
+          description: |
+            Heterogeneous list of Telegram identifiers. An entry can be a User ID
+            (DM allowed), a group Chat ID (every group member can @-mention the
+            bot in the group), or a broadcast Channel ID (per Telegram's
+            bot-in-channel API rules). Match logic identical to Discord's
+            `allow_list`; allowed messages still get the untrusted wrap.
+
+    TelegramConfigPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        bot_token:
+          type: string
+          description: New Telegram bot token. Omit to keep the current token; `"<redacted>"` is rejected.
+        partner_chat_id:
+          type: string
+          description: Partner Telegram chat id. Changing it triggers a pairing message before persistence.
+        allow_list:
+          type: array
+          items: { type: string }
+          description: Whole-array replacement. Entries get schema/length validation only.
+
+    CronJob:
+      type: object
+      required: [id, user_id, name, schedule, description, channel, chat_id, deliver, next_fire_at, created_at]
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        name:
+          type: string
+          description: Short user-facing label.
+        schedule:
+          type: string
+          description: Canonical schedule string after server-side parsing.
+        tz:
+          type: [string, "null"]
+          description: IANA timezone used for cron expressions or naive one-shot timestamps.
+        description: { type: string }
+        channel: { type: string }
+        chat_id: { type: string }
+        deliver:
+          type: boolean
+          description: Whether the final response is delivered to channel/chat_id.
+        one_shot: { type: boolean }
+        last_fired_at: { type: [string, "null"], format: date-time }
+        next_fire_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    TransferRequest:
+      type: object
+      required: [openoctopus_src_device, src_path, openoctopus_dst_device, dst_path, mode]
+      description: |
+        Mirrors the `file_transfer` tool's args. The reserved `openoctopus_`
+        prefix on the two device fields matches the agent-visible tool
+        schema exactly (see docs/TOOLS.md) so REST and tool callers use
+        the same names.
+      properties:
+        openoctopus_src_device: { type: string, description: "`server` or a device name." }
+        src_path: { type: string }
+        openoctopus_dst_device: { type: string, description: "`server` or a device name. Must not already exist at dst_path." }
+        dst_path: { type: string }
+        mode: { type: string, enum: [copy, move] }
+
+    ListDirEntry:
+      type: object
+      required: [name, path, kind, size]
+      properties:
+        name: { type: string, description: Entry name (basename). }
+        path: { type: string, description: Relative path from the personal server workspace root. }
+        kind: { type: string, enum: [file, directory, symlink, other] }
+        size: { type: integer, format: int64, description: File byte length; zero for non-files. }
+
+    McpServerConfig:
+      type: object
+      required: [name, command]
+      description: |
+        MCP server configuration. In `system_config.server_mcp`, entries are
+        admin shared-service MCPs using shared credentials and the `server`
+        install site. In `devices.mcp_servers`, entries run on that device
+        and use the device name as the install site.
+      properties:
+        name:
+          type: string
+          description: |
+            Identifier used in wrapped capability names. OpenOctopus exposes
+            tools, resources, and prompts uniformly into the agent's tool
+            registry (ADR-047/048):
+              - tools     → `mcp_<name>_<tool_name>`
+              - resources → `mcp_<name>_resource_<resource_name>`
+              - prompts   → `mcp_<name>_prompt_<prompt_name>`
+            Typed infixes (`_resource_` / `_prompt_`) prevent cross-surface
+            name collisions; intra-surface dups are rejected at install
+            time (ADR-049).
+        command:
+          type: array
+          items: { type: string }
+          description: Argv to spawn the MCP subprocess (e.g. `["npx", "@foo/mcp-server"]`).
+        env:
+          type: object
+          additionalProperties: { type: string }
+        enabled:
+          type: array
+          items: { type: string }
+          description: |
+            Optional allow-list of glob patterns matched against the
+            post-wrap entry name (ADR-100). When present, only matching
+            entries register. When absent, every advertised capability
+            registers (default-allow). Examples:
+              - `["mcp_notion_*"]` — every notion entry
+              - `["mcp_notion_search", "mcp_notion_resource_*"]` — one
+                tool plus every resource
+              - `["mcp_*_resource_*"]` — every resource from every MCP
+        description: { type: string }
