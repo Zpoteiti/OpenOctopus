@@ -320,3 +320,57 @@ generic API.
 - Py10 hot reload is a later runtime contract: after successful DB write/delete,
   ChannelManager starts, reloads, or stops the affected user's adapter. Py-Prep
   only fixes the storage/API boundary.
+
+## Accepted API Theme: Cron
+
+`docs/API.yaml`, `docs/SCHEMA.md`, `docs/DECISIONS.md`, and `docs/TOOLS.md`
+are updated for Python-main to treat cron as a durable trigger that injects a
+normal user message into an isolated cron session.
+
+- `/api/cron` is the Py9 REST surface for listing, creating, updating, and
+  deleting jobs. It shares the same schedule validation contract as the agent
+  `cron` tool.
+- `POST /api/cron` and `cron(action="add")` require `message` plus exactly one
+  schedule form: `every_seconds`, `cron_expr`, or `at`. `name` and `tz` remain
+  optional. `PATCH /api/cron/{id}` can update the label, message, and schedule.
+- There is no cron `enabled` flag, no pause/resume endpoint, and no delivery
+  switch. Jobs that should stop firing are deleted.
+- `cron_jobs` stores `session_id` for the dedicated cron session and the
+  scheduler-injected `message`. It does not store `channel`, `chat_id`,
+  `deliver`, or `description`.
+- Each job session uses `session_key = "cron:{job_id}"`. It does not inherit the
+  creating chat's history or delivery target, and browser REST cannot write user
+  messages into it via `POST /api/sessions/{id}/messages`.
+- Cron result delivery is normal agent behavior: if a scheduled task should
+  notify a user through Telegram, Discord, web, or another channel, that intent
+  belongs in the scheduled message and the agent sends it with the `message`
+  tool.
+
+## Accepted API Theme: Admin
+
+`docs/API.yaml`, `docs/SCHEMA.md`, `docs/DECISIONS.md`, and `docs/TOOLS.md`
+are updated for Python-main to keep Admin API narrow: runtime product config,
+basic user management, and a Py8-reserved server MCP surface.
+
+- `GET /api/admin/config` returns only OpenOctopus-recognized LLM/quota keys.
+  Unknown `system_config` keys are ignored in this API view, and
+  `PATCH /api/admin/config` rejects unknown keys with `400 Bad Request`.
+- Admin config keeps LLM and quota policy in the database. Object storage is
+  deployment infrastructure config, supplied through environment / deployment
+  secrets before server startup, and is not editable through the admin API.
+- Missing quota rows use an effective 500 MiB default (`524288000`) for both
+  personal workspace quota and shared-workspace quota ceiling. PATCHed quota
+  values must be positive integers; `null` / empty values are invalid.
+- `llm_endpoint`, `llm_api_key`, and `llm_model` remain admin API settings.
+  First setup requires all three; later patches may omit unchanged values.
+  Identity changes validate `/models` before any DB write. Configured
+  `llm_api_key` is returned as `"<redacted>"`.
+- `GET /api/admin/users` returns flat user identity fields plus personal server
+  workspace `quota_bytes`, `bytes_used`, and `locked` derived through
+  `workspace_fs`. There is no single-user admin GET route.
+- `DELETE /api/admin/users/{id}` protects the last admin and returns
+  `409 last_admin_required` when deletion would remove it.
+- `/api/admin/server-mcp` remains a Py8 later route. Each configured server MCP
+  gets one shared runtime/client and a bounded FIFO queue. There is no pool,
+  per-user runtime, or session-scoped runtime in the Py8 contract. MCP `env` is
+  returned as stored because admin is the trust boundary for that route.

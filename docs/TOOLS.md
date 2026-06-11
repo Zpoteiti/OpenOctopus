@@ -909,11 +909,6 @@ before exposing the tool to the model.
         "type": "string",
         "description": "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). Naive values use the tool's default timezone."
       },
-      "deliver": {
-        "type": "boolean",
-        "description": "Whether to deliver the execution result to the user channel (default true)",
-        "default": true
-      },
       "job_id": {
         "type": "string",
         "description": "REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."
@@ -926,17 +921,17 @@ before exposing the tool to the model.
 ```
 
 **Mechanism:**
-- **`action="add"`** — requires `message` plus exactly one of `every_seconds`, `cron_expr`, or `at`. Calls the shared cron write helper, which validates the schedule, computes a future `next_fire_at`, inserts a row in `cron_jobs` with `user_id`, `channel`, `chat_id` (from the calling session per ADR-053), the schedule parameters, `message`, `name`, `deliver`, `tz`, and wakes the cron ticker. Returns the created row's `job_id` and a human-readable confirmation.
+- **`action="add"`** — requires `message` plus exactly one of `every_seconds`, `cron_expr`, or `at`. Calls the shared cron write helper, which validates the schedule, computes a future `next_fire_at`, creates a dedicated cron session with `session_key="cron:<job_id>"`, inserts a row in `cron_jobs` with `user_id`, `session_id`, the schedule parameters, `message`, `name`, and `tz`, and wakes the cron ticker. Returns the created row's `job_id` and a human-readable confirmation.
 - **`action="list"`** — returns a summary of the user's cron jobs: `job_id`, `name`, schedule (as stored), next-fire estimate, `last_fired_at`.
 - **`action="remove"`** — requires `job_id`. Calls the shared cron write helper to delete the row, cancel pending fires, and wake the cron ticker.
 - A single server-side ticker scans `cron_jobs` across all users, fires due jobs by synthesizing an `InboundMessage` with `session_key_override = "cron:<job_id>"` (ADR-010, ADR-012). The synthesized message's `content` is the job's `message` field. If the job has `at` (one-shot), the row is deleted after firing; otherwise `last_fired_at` updates and `next_fire_at` advances to the next future occurrence.
 - The ticker sleeps until the earliest `next_fire_at`, capped at 60s, and also wakes immediately when the shared write helper sends its process-local notify signal. Missed recurring fires are silently skipped on restart; expired one-shots are dropped rather than delivered late.
-- Each firing creates / continues a dedicated cron session; the reply routes to the channel + chat_id stored on the row. If `deliver=false`, the result is logged to the cron session but not delivered to the user-facing channel.
+- Each firing continues the dedicated cron session. The final response is recorded there; user-visible notifications happen only if the agent explicitly calls the normal `message` tool as part of the cron task.
 
 **Timeout:** 10s — DB write ops, fast.
 **Result cap:** 16,000 characters.
 **Errors:** `ToolError::InvalidSchedule`, `ToolError::MissingRequiredField`, `ToolError::DBError`, `ToolError::CronJobNotFound`.
-**Related ADRs:** 010 (autonomous flows), 012 (synthesizers), 053 (cron channel/chat inheritance), 095 (result wrap), 112 (cron ticker mechanics).
+**Related ADRs:** 010 (autonomous flows), 012 (synthesizers), 053 (cron dedicated session), 095 (result wrap), 112 (cron ticker mechanics).
 
 ---
 
@@ -1135,11 +1130,11 @@ MCP servers advertise three capability surfaces — **tools**, **resources**, **
 
 The typed infixes (`_resource_` / `_prompt_`) make cross-surface name collisions impossible by construction. Tools stay unprefixed for back-compat with the original ADR-048 convention.
 
-M1 supports two MCP tenancy scopes (ADR-114):
-- **Admin shared-service MCPs** live in `system_config.server_mcp`, are configured only by admins, use shared credentials, and appear as install site `openoctopus_device="server"`. They are intended for stateless or low-state shared services such as search and internal KB lookup. OpenOctopus runs one runtime per configured MCP server with a bounded per-MCP call queue.
+Py8 supports two MCP tenancy scopes (ADR-114):
+- **Admin shared-service MCPs** live in `system_config.server_mcp`, are configured only by admins, use shared credentials, and appear as install site `openoctopus_device="server"`. They are intended for stateless or low-state shared services such as search and internal KB lookup. OpenOctopus runs one shared runtime/client per configured MCP server with a bounded per-MCP FIFO queue. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract.
 - **Device MCPs** live in `devices.mcp_servers`, run on the user's device, register over the device WebSocket, and appear as `openoctopus_device="<device-name>"`.
 
-User-scoped server MCP and session-scoped MCP are out of scope for M1. Personal OAuth, browser/IDE state, and resource-heavy MCPs should be installed on a user device.
+User-scoped server MCP and session-scoped MCP are out of scope for Py8. Personal OAuth, browser/IDE state, and resource-heavy MCPs should be installed on a user device.
 
 ### Wrapping — tools
 

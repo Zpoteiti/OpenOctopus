@@ -23,19 +23,14 @@ unsupported keys return `400 Bad Request`):
 
 | Key | Type | ADR | Purpose |
 |---|---|---|---|
-| `quota_bytes` | int | ADR-046 | Per-user workspace quota. Missing means not configured; later workspace slices must handle that explicitly instead of assuming a fallback. |
-| `shared_workspace_quota_bytes` | int | ADR-108 | Quota ceiling that any single shared workspace may request at create or rename time. Missing means not configured; later shared-workspace slices must handle that explicitly. |
+| `quota_bytes` | int | ADR-046 | Per-user workspace quota. Missing means the effective default is 500 MiB (`524288000`). |
+| `shared_workspace_quota_bytes` | int | ADR-108 | Quota ceiling that any single shared workspace may request at create or rename time. Missing means the effective default is 500 MiB (`524288000`). |
 | `llm_endpoint` | string | ADR-101 | Anthropic-compatible Messages API base URL. |
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with tiktoken-rs (ADR-025). |
 | `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101 | Accepted/reserved config for later compaction decisions. Missing means not configured; future compaction code must handle that explicitly. M1b stores the value but does not perform compaction decisions. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
-| `object_storage_endpoint` | string | ADR-123 | MinIO/S3-compatible endpoint URL for server workspace persistence. Missing means server workspace features are not configured. |
-| `object_storage_bucket` | string | ADR-123 | Bucket used for all server workspace objects. Missing means server workspace features are not configured. |
-| `object_storage_region` | string | ADR-123 | S3 region string passed to the object-storage client; MinIO deployments may use a conventional value such as `us-east-1`. Missing must be handled explicitly by workspace setup. |
-| `object_storage_access_key` | string | ADR-123 | Access key for the MinIO/S3-compatible endpoint; redacted in admin API responses. |
-| `object_storage_secret_key` | string | ADR-123 | Secret key for the MinIO/S3-compatible endpoint; redacted in admin API responses. |
 
 Reserved/future known keys (not PATCH-editable until their milestone):
 
@@ -44,10 +39,11 @@ Reserved/future known keys (not PATCH-editable until their milestone):
 | `server_mcp` | array of `McpServerConfig` | ADR-114 | Admin-configured shared-service MCPs exposed as install site `server`; shared credentials, one runtime per MCP, bounded queue. |
 
 Bootstrap does not seed `system_config` rows. Fresh `GET /api/admin/config`
-therefore returns `{}` until an admin writes values. Deployments may carry
-additional opaque keys inserted outside the M1b admin API; OpenOctopus reads only the
-ones it knows about. M1b `PATCH /api/admin/config` rejects keys outside the
-admin-editable table above.
+therefore returns the effective quota defaults and omits unconfigured LLM keys
+until an admin writes values. Deployments may carry additional opaque keys
+inserted outside the admin API; OpenOctopus ignores them in the admin config
+view. `PATCH /api/admin/config` rejects keys outside the admin-editable table
+above, including `server_mcp` and `object_storage_*`.
 
 M1b accepts `llm_endpoint`, `llm_api_key`, and `llm_model` only after provider
 validation succeeds. First setup must provide all three identity values; later
@@ -56,8 +52,10 @@ uses `GET {llm_endpoint}/models` before any DB write, so failed identity
 changes do not persist paired config updates. `llm_api_key` is stored in
 `system_config` for outbound calls but redacted as `"<redacted>"` in admin
 config read and patch responses. Sending the literal redaction marker as a new
-key is rejected. `server_mcp` is documented for the overall M1/MCP scope and
-is not accepted by the M1b admin-config endpoint.
+key is rejected. `server_mcp` is documented for the Py8 MCP scope and is not
+accepted by the admin-config endpoint. Object storage is deployment
+infrastructure config supplied through environment / deployment secrets, not
+`system_config`.
 
 ---
 
@@ -75,7 +73,7 @@ CREATE TABLE IF NOT EXISTS users (
 ```
 
 - `password_hash` — argon2 (or bcrypt — implementer's choice within reason). Never returned by any API.
-- `is_admin` — true for any user who registered with the `ADMIN_TOKEN` (ADR — multi-admin, no last-admin invariant per ADR-065).
+- `is_admin` — true for any user who registered with the `ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
 - **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
 - **No inline channel fields** — Discord/Telegram live in their own tables (ADR-090).
 - **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing MinIO object sizes under the workspace prefix (or maintained via a denormalized counter/index hidden inside `workspace_fs`; not part of the API contract).
@@ -158,7 +156,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
 - `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true.
-- `DELETE /api/sessions/{id}` removes the session row after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes this session's `messages` and `pending_messages`; channel configuration rows are not tied to session deletion.
+- `DELETE /api/sessions/{id}` removes session rows after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes that session's `messages` and `pending_messages`; channel configuration rows are not tied to session deletion. Active cron sessions are rejected by the FK from `cron_jobs.session_id`; delete the cron job through `/api/cron/{id}` so the job row and its dedicated history stay consistent. Completed one-shot cron sessions with no remaining `cron_jobs` row can be deleted as normal history.
 
 ---
 
@@ -311,14 +309,12 @@ CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_
 CREATE TABLE IF NOT EXISTS cron_jobs (
     id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id      UUID         NOT NULL REFERENCES sessions(id),
     name            TEXT         NOT NULL,
     schedule        TEXT         NOT NULL,
     tz              TEXT,
     one_shot        BOOLEAN      NOT NULL DEFAULT FALSE,
-    description     TEXT         NOT NULL,
-    channel         TEXT         NOT NULL,
-    chat_id         TEXT         NOT NULL,
-    deliver         BOOLEAN      NOT NULL DEFAULT TRUE,
+    message         TEXT         NOT NULL,
     last_fired_at   TIMESTAMPTZ,
     next_fire_at    TIMESTAMPTZ  NOT NULL,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -331,11 +327,10 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 
 - `schedule` — normalized cron expression (server parses agent-supplied `every_seconds` / `cron_expr` / `at` into a single canonical form at insert time).
 - `name` — short user-facing label. The cron tool defaults it from the first 30 characters of the message; REST callers may provide it explicitly.
+- `session_id` — dedicated cron session created by the shared cron write helper. The session uses `channel='cron'`, `chat_id=<job_id>`, and `session_key='cron:<job_id>'`.
 - `tz` — optional IANA timezone used when parsing cron expressions or naive one-shot timestamps.
-- `one_shot` — true when the agent created the job from a `cron(action="add", at=...)` call (one-time future trigger). Once fired and delivered, the row is deleted.
-- `description` — the agent-facing instruction the scheduler will inject into the cron session when the job fires.
-- `channel` + `chat_id` — inherited from the creating session per ADR-053. The reply lands where the user originally set up the cron.
-- `deliver` — when false, the agent runs but the result doesn't post back to the channel (silent maintenance jobs).
+- `one_shot` — true when the agent created the job from a `cron(action="add", at=...)` call (one-time future trigger). Once fired, the row is deleted and the dedicated cron session remains as normal session history.
+- `message` — the agent-facing instruction the scheduler injects into the cron session as a synthesized user message when the job fires.
 - `next_fire_at` — denormalized for the scheduler index. Recomputed each time the job fires.
 - Cron writes must validate the schedule before insert/update: exactly one timing form, positive intervals, known timezone, valid cron expression, and a future `next_fire_at`. Past one-shots and unrunnable schedules are rejected rather than stored.
 - **No `kind` column** — heartbeat is a tick loop, not a cron row, and Dream is deferred (ADR-055, ADR-092).

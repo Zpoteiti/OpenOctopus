@@ -345,10 +345,12 @@ paths:
       tags: [Sessions]
       summary: Delete a session and its message history
       description: |
-        Hard-deletes any session owned by the authenticated user, including
-        web, Discord, Telegram, cron, and heartbeat sessions. Existing sessions
-        owned by another user return `404` without revealing whether the id
-        exists.
+        Hard-deletes sessions owned by the authenticated user. Existing
+        sessions owned by another user return `404` without revealing whether
+        the id exists. Active cron sessions are rejected; delete the cron job
+        through `/api/cron/{id}` so the job row and its history stay consistent.
+        Completed one-shot cron sessions with no remaining `cron_jobs` row may
+        be deleted here like other history.
 
         Deletion is a hard stop, not a safe-boundary cancel. The server first
         terminates any in-memory runner and live/queued POST streams for this
@@ -359,6 +361,9 @@ paths:
       responses:
         '204': { description: Deleted. }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Active cron session; delete the cron job through `/api/cron/{id}` first.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/sessions/{id}/messages:
     description: Python-main browser chat message route.
@@ -1470,10 +1475,10 @@ paths:
   # --- Cron ---
   #
   /api/cron:
-    description: Target M1 cron management route; not implemented in M1b.
+    description: Py9 cron management route.
     get:
       tags: [Cron]
-      summary: Target route — list the user's cron jobs (not M1b)
+      summary: List the user's cron jobs
       responses:
         '200':
           description: OK
@@ -1484,14 +1489,16 @@ paths:
                 items: { $ref: '#/components/schemas/CronJob' }
     post:
       tags: [Cron]
-      summary: Target route — create a cron job (mirrors `cron` tool, ADR-053; not M1b)
+      summary: Create a cron job (mirrors `cron` tool, ADR-053)
       description: |
-        Target M1 cron route. Not implemented in M1b.
+        Py9 cron route.
 
-        REST-created jobs provide their delivery channel + chat_id
-        explicitly. Agent-created jobs use the same shared write helper
-        but inherit channel + chat_id from ToolContext. Each firing
-        synthesizes an `InboundMessage` into a dedicated cron session.
+        REST-created and agent-created jobs use the same shared write helper.
+        The helper creates a dedicated cron session with
+        `session_key="cron:{job_id}"`; the job's `message` is injected into
+        that session as a synthesized user message when the schedule fires.
+        Cron sessions do not inherit the creator session's chat history and
+        are not writable through `POST /api/sessions/{id}/messages`.
 
         The shared helper validates the schedule before storing it:
         exactly one of `every_seconds`, `cron_expr`, or `at`; positive
@@ -1503,12 +1510,12 @@ paths:
           application/json:
             schema:
               type: object
-              required: [description, channel, chat_id]
+              required: [message]
               properties:
                 name:
                   type: string
-                  description: Optional short human-readable label. Defaults to the first 30 characters of description.
-                description:
+                  description: Optional short human-readable label. Defaults to the first 30 characters of message.
+                message:
                   type: string
                   description: Becomes the synthesized user message at firing time.
                 every_seconds:
@@ -1525,16 +1532,6 @@ paths:
                   type: string
                   format: date-time
                   description: One-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
-                deliver:
-                  type: boolean
-                  default: true
-                  description: Whether to deliver the final response to the stored channel/chat_id.
-                channel:
-                  type: string
-                  description: Delivery channel for the final response, e.g. "web", "discord", or "telegram".
-                chat_id:
-                  type: string
-                  description: Delivery target within the channel.
       responses:
         '201':
           description: Created.
@@ -1542,7 +1539,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
 
   /api/cron/{id}:
-    description: Target M1 cron management route; not implemented in M1b.
+    description: Py9 cron management route.
     parameters:
       - name: id
         in: path
@@ -1550,20 +1547,21 @@ paths:
         schema: { type: string }
     get:
       tags: [Cron]
-      summary: Target route — get a cron job (not M1b)
+      summary: Get a cron job
       responses:
         '200':
           description: OK
           content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
     patch:
       tags: [Cron]
-      summary: Target route — update schedule, delivery, or description (not M1b)
+      summary: Update a cron job's schedule, label, or message
       description: |
-        Target M1 cron route. Not implemented in M1b.
+        Py9 cron route.
 
         Uses the same shared cron write helper as create/delete, so schedule
         updates are validated and the cron ticker is notified after the row
-        changes.
+        changes. There is no `enabled` flag and no pause/resume endpoint;
+        delete jobs that should stop firing.
       requestBody:
         content:
           application/json:
@@ -1571,7 +1569,7 @@ paths:
               type: object
               properties:
                 name: { type: string }
-                description: { type: string }
+                message: { type: string }
                 every_seconds:
                   type: integer
                   minimum: 1
@@ -1586,9 +1584,6 @@ paths:
                   type: string
                   format: date-time
                   description: Replaces the schedule with a one-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
-                deliver: { type: boolean }
-                channel: { type: string }
-                chat_id: { type: string }
       responses:
         '200':
           description: OK
@@ -1596,7 +1591,8 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
     delete:
       tags: [Cron]
-      summary: Target route — delete a cron job (not M1b)
+      summary: Delete a cron job
+      description: Deletes the cron job and its dedicated cron session/history through the shared cron write helper.
       responses:
         '204': { description: Deleted. }
 
@@ -1608,13 +1604,17 @@ paths:
       tags: [Admin]
       summary: Get system-wide config (admin only)
       description: |
-        Returns admin-visible `system_config` values. Bootstrap does not seed
-        default rows, so a fresh server may return `{}`. Secret-bearing values
-        such as a configured `llm_api_key` are redacted. Known keys:
+        Returns OpenOctopus-recognized admin config keys only. Deployment-local
+        or unknown `system_config` keys are ignored by this API.
+        Secret-bearing values such as a configured `llm_api_key` are redacted.
+        Known keys:
 
           - `quota_bytes` (int) — per-user workspace quota (ADR-046).
+            If no row is configured, the effective default is 500 MiB
+            (`524288000`).
           - `shared_workspace_quota_bytes` (int) — quota ceiling that any
-            single shared workspace may request. ADR-108.
+            single shared workspace may request. If no row is configured, the
+            effective default is 500 MiB (`524288000`). ADR-108.
           - `llm_endpoint` (string) — base URL of the Anthropic-compatible
             Messages API or gateway endpoint. ADR-101.
           - `llm_api_key` (string) — bearer credential the server uses on
@@ -1642,36 +1642,18 @@ paths:
             compaction, and future autonomous flows. If missing at server
             startup, only the runtime limiter treats it as `0`; no row is
             persisted. ADR-101, ADR-122.
-          - `object_storage_endpoint` (string) — MinIO/S3-compatible endpoint
-            URL for server workspace persistence. ADR-123.
-          - `object_storage_bucket` (string) — bucket used for all server
-            workspace objects. ADR-123.
-          - `object_storage_region` (string) — S3 region string passed to the
-            object client; MinIO deployments may use `us-east-1`. ADR-123.
-          - `object_storage_access_key` (string) — object-store access key.
-            Write-only in admin API responses: once configured, GET/PATCH
-            responses return `"<redacted>"` instead of the raw key. ADR-123.
-          - `object_storage_secret_key` (string) — object-store secret key.
-            Write-only in admin API responses: once configured, GET/PATCH
-            responses return `"<redacted>"` instead of the raw key. ADR-123.
-          - `server_mcp` (array of `McpServerConfig`) — admin-configured
-            shared-service MCPs, exposed as install site `server`.
-            ADR-114. Reserved for the later MCP slice; not accepted by M1b.
 
-        GET response schema uses `additionalProperties: true` because
-        deployments may carry deployment-local keys inserted outside the
-        admin API; everything not listed above is treated as opaque metadata
-        by OpenOctopus. PATCH accepts only documented supported keys and rejects
-        unsupported keys.
+        Object storage is deployment infrastructure config, like Postgres: it
+        is read from environment / deployment secrets at server startup and is
+        not exposed through this admin API. `server_mcp` is managed through the
+        later Py8 `/api/admin/server-mcp` route, not through config patching.
 
         Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` on PATCH
         after validating the merged provider identity with `GET
         {llm_endpoint}/models`. `GET /api/admin/config` redacts configured
-        secret values (`llm_api_key`, `object_storage_access_key`,
-        `object_storage_secret_key`) as `"<redacted>"`; callers rotate a secret
-        by sending a new value and keep an existing secret by omitting that key.
-        Sending `"<redacted>"` as a new secret value is rejected. `server_mcp`
-        remains documented for the later MCP slice.
+        `llm_api_key` as `"<redacted>"`; callers rotate the key by sending a new
+        value and keep the existing key by omitting it. Sending `"<redacted>"` as
+        a new secret value is rejected.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1680,15 +1662,17 @@ paths:
           description: OK
           content:
             application/json:
-              schema:
-                type: object
-                additionalProperties: true
+              schema: { $ref: '#/components/schemas/AdminConfig' }
         '403': { $ref: '#/components/responses/Forbidden' }
     patch:
       tags: [Admin]
       summary: Update system-wide config keys
       description: |
         Partial update — keys present are updated, keys absent are untouched.
+        Unknown keys, `null` values, empty strings, and unsupported keys such as
+        `server_mcp` or `object_storage_*` return `400 Bad Request` and do not
+        write any config changes. Quota values must be positive integers.
+
         When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
         the server validates the provider before writing: `GET
         {llm_endpoint}/models` must be reachable with the configured bearer
@@ -1709,16 +1693,6 @@ paths:
         outbound Anthropic Messages calls. If the key is missing at startup,
         only the runtime limiter treats it as `0`; no default row is persisted.
         Negative values and values above the server maximum are invalid.
-
-        Python-main requires object-storage config before server workspace
-        features are enabled. `object_storage_endpoint`,
-        `object_storage_bucket`, `object_storage_region`,
-        `object_storage_access_key`, and `object_storage_secret_key` are the
-        supported MinIO/S3-compatible keys. `object_storage_access_key` and
-        `object_storage_secret_key` are redacted as `"<redacted>"`; callers
-        rotate them by sending new values and keep existing values by omitting
-        them. Sending `"<redacted>"` as a new object-storage secret value is
-        rejected.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1733,28 +1707,28 @@ paths:
               properties:
                 quota_bytes: { type: integer, format: int64, minimum: 1 }
                 shared_workspace_quota_bytes: { type: integer, format: int64, minimum: 1 }
-                llm_endpoint: { type: string }
-                llm_api_key: { type: string }
-                llm_model: { type: string }
+                llm_endpoint: { type: string, minLength: 1 }
+                llm_api_key: { type: string, minLength: 1 }
+                llm_model: { type: string, minLength: 1 }
                 llm_max_context_tokens: { type: integer, format: int64, minimum: 1 }
                 llm_compaction_threshold_tokens: { type: integer, format: int64, minimum: 4001 }
                 llm_max_concurrent_requests: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
-                object_storage_endpoint: { type: string }
-                object_storage_bucket: { type: string }
-                object_storage_region: { type: string }
-                object_storage_access_key: { type: string }
-                object_storage_secret_key: { type: string }
       responses:
         '200':
           description: OK
-          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/AdminConfig' } } }
         '400': { $ref: '#/components/responses/BadRequest' }
 
   /api/admin/users:
-    description: Target M1 admin user management route; not implemented in M1b.
+    description: Python-main admin user management route.
     get:
       tags: [Admin]
-      summary: Target route — list all users (admin only; not M1b)
+      summary: List users (admin only)
+      description: |
+        Lists user identity rows plus personal server workspace quota state.
+        `quota_bytes`, `bytes_used`, and `locked` are flat response fields for
+        the user's personal server workspace, derived through `workspace_fs`;
+        they are not columns on `users` and do not aggregate shared workspaces.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1768,46 +1742,46 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: '#/components/schemas/User' }
+                items: { $ref: '#/components/schemas/AdminUser' }
 
   /api/admin/users/{id}:
-    description: Target M1 admin user management route; not implemented in M1b.
+    description: Python-main admin user management route.
     parameters:
       - name: id
         in: path
         required: true
-        schema: { type: string }
-    get:
-      tags: [Admin]
-      summary: Target route — get a user (admin only; not M1b)
-      security:
-        - cookieAuth: [admin]
-        - bearerAuth: [admin]
-      responses:
-        '200':
-          description: OK
-          content: { application/json: { schema: { $ref: '#/components/schemas/User' } } }
+        schema: { type: string, format: uuid }
     delete:
       tags: [Admin]
-      summary: Target route — delete a user (admin only; cascades to all their resources; not M1b)
+      summary: Delete a user (admin only)
+      description: |
+        Deletes a user and relies on DB cascades plus subsystem cleanup for their
+        resources. Admins may delete themselves unless doing so would delete the
+        last admin. If the target is the only remaining admin, the server returns
+        `409 Conflict` with code `last_admin_required`.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
       responses:
         '204': { description: Deleted. }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Deleting this user would remove the last admin.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/admin/server-mcp:
-    description: Target M1 admin server MCP management route; not implemented in M1b.
+    description: Py8 admin server MCP management route.
     get:
       tags: [Admin]
-      summary: Target route — list server-side (admin-configured) MCPs (not M1b)
+      summary: Py8 route — list server-side MCPs
       description: |
-        Target M1 admin server MCP route. Not implemented in M1b.
+        Py8 server-side MCP route.
 
         Lists admin shared-service MCPs only. These use admin-provided
         shared credentials, are intended for stateless or low-state service
         tools such as search and internal KB lookup, and appear to agents
-        as install site `openoctopus_device="server"`.
+        as install site `openoctopus_device="server"`. Admins are the trust
+        boundary for this route, so `env` values are returned exactly as stored.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1821,16 +1795,17 @@ paths:
                 items: { $ref: '#/components/schemas/McpServerConfig' }
     put:
       tags: [Admin]
-      summary: Target route — replace the server-side MCP list (admin only; not M1b)
+      summary: Py8 route — replace the server-side MCP list
       description: |
-        Target M1 admin server MCP route. Not implemented in M1b.
+        Py8 server-side MCP route.
 
         Replaces admin shared-service MCPs stored in
-        `system_config.server_mcp`. M1 supports one runtime per configured
-        MCP server with a bounded per-MCP call queue. User-scoped server
-        MCPs and session-scoped MCPs are out of scope; users who need
-        personal OAuth/session/browser/IDE state should configure MCPs on
-        their own devices.
+        `system_config.server_mcp`. Py8 supports one shared runtime/client per
+        configured MCP server with a bounded per-MCP FIFO queue. There is no
+        client pool, per-user runtime, session-scoped runtime, or `pool_size`
+        config field. User-scoped server MCPs and session-scoped MCPs are out
+        of scope; users who need personal OAuth/session/browser/IDE state should
+        configure MCPs on their own devices.
 
         Collision detection per ADR-049, two cases:
           - **Within-server dup** — an MCP server advertises two
@@ -1924,7 +1899,8 @@ components:
             Examples: `not_found`, `forbidden`, `soft_locked`,
             `upload_too_large`, `invalid_skill_format`,
             `private_address_blocked`, `ambiguous_edit`,
-            `no_match`, `invalid_schedule`, `destination_exists`.
+            `no_match`, `invalid_schedule`, `destination_exists`,
+            `unsupported_config_key`, `last_admin_required`.
         message: { type: string }
 
     User:
@@ -1935,8 +1911,54 @@ components:
         email: { type: string, format: email }
         name: { type: string }
         is_admin: { type: boolean }
-        bytes_used: { type: integer, format: int64 }
         created_at: { type: string, format: date-time }
+
+    AdminConfig:
+      type: object
+      additionalProperties: false
+      required: [quota_bytes, shared_workspace_quota_bytes]
+      description: |
+        Admin-visible effective config. Quota keys are always present because
+        missing rows default to 500 MiB (`524288000`). Unconfigured LLM keys are
+        omitted. Configured `llm_api_key` is returned as `"<redacted>"`.
+      properties:
+        quota_bytes:
+          type: integer
+          format: int64
+          description: Effective per-user personal workspace quota. Defaults to 500 MiB when no row is configured.
+        shared_workspace_quota_bytes:
+          type: integer
+          format: int64
+          description: Effective quota ceiling for a single shared workspace. Defaults to 500 MiB when no row is configured.
+        llm_endpoint: { type: string }
+        llm_api_key:
+          type: string
+          description: Present as `"<redacted>"` when configured; raw value is never returned here.
+        llm_model: { type: string }
+        llm_max_context_tokens: { type: integer, format: int64 }
+        llm_compaction_threshold_tokens: { type: integer, format: int64 }
+        llm_max_concurrent_requests: { type: integer, format: int64 }
+
+    AdminUser:
+      type: object
+      required: [id, email, name, is_admin, created_at, quota_bytes, bytes_used, locked]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        is_admin: { type: boolean }
+        created_at: { type: string, format: date-time }
+        quota_bytes:
+          type: integer
+          format: int64
+          description: Personal server workspace quota from `workspace_fs`.
+        bytes_used:
+          type: integer
+          format: int64
+          description: Personal server workspace usage from `workspace_fs`; not a `users` table column.
+        locked:
+          type: boolean
+          description: Personal server workspace is over quota (`bytes_used > quota_bytes`).
 
     Session:
       type: object
@@ -2490,10 +2512,13 @@ components:
 
     CronJob:
       type: object
-      required: [id, user_id, name, schedule, description, channel, chat_id, deliver, next_fire_at, created_at]
+      required: [id, user_id, session_id, name, schedule, message, next_fire_at, created_at]
       properties:
         id: { type: string }
         user_id: { type: string }
+        session_id:
+          type: string
+          description: Dedicated cron session id; its session_key is `cron:{job_id}`.
         name:
           type: string
           description: Short user-facing label.
@@ -2503,12 +2528,9 @@ components:
         tz:
           type: [string, "null"]
           description: IANA timezone used for cron expressions or naive one-shot timestamps.
-        description: { type: string }
-        channel: { type: string }
-        chat_id: { type: string }
-        deliver:
-          type: boolean
-          description: Whether the final response is delivered to channel/chat_id.
+        message:
+          type: string
+          description: Synthesized user message injected into the cron session when the job fires.
         one_shot: { type: boolean }
         last_fired_at: { type: [string, "null"], format: date-time }
         next_fire_at: { type: string, format: date-time }

@@ -1157,11 +1157,11 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 
 ## 8. Autonomous Flows
 
-### ADR-053 · Cron: per-job dedicated session, inherits channel+chat_id at creation
+### ADR-053 · Cron: per-job dedicated isolated session
 
 **Status:** accepted
-**Decision:** When the agent creates a cron job, the job row stores the current session's `channel` + `chat_id` so the eventual reply lands where the user set it up. `session_key_override = "cron:{job_id}"` isolates each job's history.
-**Consequences:** User on Discord says "remind me every morning" → the reminder fires on Discord. Each cron job has an auditable conversation history independent of others.
+**Decision:** Every cron job owns a dedicated session with `session_key = "cron:{job_id}"`. Cron does not inherit the creating chat's history, `channel`, or `chat_id`, and the cron row does not store delivery routing fields. When the schedule fires, the scheduler injects the row's `message` into that session as a synthesized user message. Users cannot write to cron sessions through `POST /api/sessions/{id}/messages`; jobs are created, updated, and deleted only through `/api/cron` or the agent `cron` tool.
+**Consequences:** Cron is a durable trigger for normal agent work, not a delivery router. Each cron job has an auditable conversation history independent of other jobs and the chat that created it. If a job should notify a user through Telegram, Discord, web, or another channel, that instruction belongs in the cron message and the agent sends it with the normal `message` tool.
 
 ### ADR-054 · Heartbeat: 2-phase, only Phase 2 goes through the bus
 
@@ -1609,8 +1609,8 @@ See ADR-055.
 ### ADR-064 · No server-side Whisper/ASR
 Voice notes save to workspace as-is. Users wire their own transcription by running whisper.cpp (or similar) on a client device and invoking via shell tool.
 
-### ADR-065 · No last-admin invariant enforced
-Admin can delete their own account with a warn log. If they were the only admin, re-bootstrapping requires direct DB access. Acceptable for self-hosted deployments.
+### ADR-065 · Last admin is protected
+Admin users can delete ordinary users, other admins, and themselves, but deletion is rejected when it would remove the last remaining admin. Re-bootstrapping through direct DB access is avoidable product friction even for self-hosted deployments, so the admin API returns `409 Conflict` with code `last_admin_required` instead.
 
 ### ADR-066 · No frontend test harness (Vitest/RTL/Playwright)
 Manual smoke testing in v1. Wire up later if frontend complexity grows.
@@ -2603,20 +2603,24 @@ responses and computed or cached behind `workspace_fs`; there is no public
 performance or consistency, that table is an implementation detail of
 `workspace_fs`, not a second file API.
 
-Object storage configuration is deployment/admin state in `system_config`.
-Python-main recognizes:
+Object storage configuration is deployment infrastructure state, like Postgres.
+It is supplied through environment variables, Docker Compose, Kubernetes
+Secrets, or equivalent deployment tooling before `openoctopus_server` starts.
+It is not stored in `system_config` and is not editable through
+`PATCH /api/admin/config`. Python-main recognizes deployment variables such as:
 
 | Key | Purpose |
 |---|---|
-| `object_storage_endpoint` | MinIO/S3-compatible endpoint URL. |
-| `object_storage_bucket` | Bucket used for all server workspace objects. |
-| `object_storage_region` | S3 region string; MinIO deployments may use a conventional value such as `us-east-1`. |
-| `object_storage_access_key` | Access key, redacted in admin API responses. |
-| `object_storage_secret_key` | Secret key, redacted in admin API responses. |
+| `OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT` | MinIO/S3-compatible endpoint URL. |
+| `OPENOCTOPUS_OBJECT_STORAGE_BUCKET` | Bucket used for all server workspace objects. |
+| `OPENOCTOPUS_OBJECT_STORAGE_REGION` | S3 region string; MinIO deployments may use a conventional value such as `us-east-1`. |
+| `OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY` | Access key. |
+| `OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY` | Secret key. |
 
-Missing object-storage config means server workspace features are not
-configured; setup/admin UI must surface that directly rather than falling back
-to durable local disk.
+Missing or unreachable object-storage config means server workspace features are
+not configured; startup/health checks and setup UI must surface that directly
+rather than falling back to durable local disk or waiting for an admin config
+patch.
 
 **Consequences:** Python-main no longer has a durable
 `OPENOCTOPUS_WORKSPACE_ROOT`-style server directory. Deployments must provide
