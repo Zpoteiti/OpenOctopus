@@ -2,7 +2,9 @@
 
 The wire protocol between `openoctopus_server` and `openoctopus_client`. Single connection per device carries both control plane (JSON text frames) and bulk plane (binary frames). Headline decisions are fixed in **ADR-096**; this doc is the operational spec.
 
-Browser ↔ server uses REST + SSE (ADR-003). This protocol is for devices only.
+Browser ↔ server uses REST: `POST messages` may stream best-effort current-turn
+preview events, while `GET messages` returns canonical Postgres-backed history
+and recovery state (ADR-003, ADR-121). This protocol is for devices only.
 
 ---
 

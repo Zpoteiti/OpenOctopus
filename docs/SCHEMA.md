@@ -1,10 +1,17 @@
 # OpenOctopus — Database Schema
 
-The PostgreSQL schema for `openoctopus_server`. Lives at `openoctopus_server/src/db/schema.sql`, applied at startup via `sqlx::raw_sql(include_str!("schema.sql"))` with `IF NOT EXISTS` semantics (ADR-057). If the connected database is empty, server startup creates the tables automatically. v1 has no migration framework; rebuild-era schema changes require resetting the dev database (ADR-069).
+The PostgreSQL schema contract for `openoctopus_server`. During Py-Prep this doc
+is the canonical reference for table, column, index, constraint, and storage
+semantics. The concrete Python bootstrap/migration mechanism is not inherited
+from the Rust `schema.sql`/`sqlx` design and must be decided before server
+persistence implementation depends on it (ADR-057, ADR-069).
 
 **Ten tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
 
-This doc is the canonical reference for the schema's *shape*. The SQL file is the canonical reference for the schema's *bytes* — when they disagree, the SQL wins, this doc is then updated.
+This doc is the canonical reference for the schema's *shape*. When Python
+implementation SQL or ORM metadata exists, it must be kept in sync with this
+contract; if they disagree, update the implementation or this spec deliberately
+instead of treating drift as incidental.
 
 ---
 
@@ -29,7 +36,7 @@ unsupported keys return `400 Bad Request`):
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with tiktoken-rs (ADR-025). |
-| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101 | Accepted/reserved config for later compaction decisions. Missing means not configured; future compaction code must handle that explicitly. M1b stores the value but does not perform compaction decisions. |
+| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101 | Accepted/reserved config for later compaction decisions. Missing means not configured; future compaction code must handle that explicitly. Python-main may store the value before compaction is implemented. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 
 Reserved/future known keys (not PATCH-editable until their milestone):
@@ -45,7 +52,7 @@ inserted outside the admin API; OpenOctopus ignores them in the admin config
 view. `PATCH /api/admin/config` rejects keys outside the admin-editable table
 above, including `server_mcp` and `object_storage_*`.
 
-M1b accepts `llm_endpoint`, `llm_api_key`, and `llm_model` only after provider
+Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` only after provider
 validation succeeds. First setup must provide all three identity values; later
 PATCHes may reuse stored values by omitting unchanged identity keys. Validation
 uses `GET {llm_endpoint}/models` before any DB write, so failed identity

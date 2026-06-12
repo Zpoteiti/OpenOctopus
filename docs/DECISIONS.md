@@ -31,7 +31,7 @@ These supersede the historical ADR set in the previous Plexus codebase — most 
 **Decision:** In release builds, the React frontend is compiled by `npm run build` and baked into the server binary via `rust-embed`. In dev, `npm run dev` runs Vite on `:5173` with a proxy for `/api/*` and `/ws/device` pointing to the running server on `:8080`.
 **Consequences:** Single artifact in prod (one `cargo build --release` produces a deployable binary). Fast dev loop (frontend HMR via Vite, server compiled separately).
 
-### ADR-003 · Browser uses REST + SSE; devices use WebSocket
+### ADR-003 · Browser REST; devices use WebSocket
 
 **Status:** accepted
 **Context:** Prior OpenOctopus used WebSocket for browser chat. This required a bespoke frame protocol, reconnect bookkeeping, and ws-fan-out in the gateway crate.
@@ -174,21 +174,40 @@ old POST stream.
 ### ADR-015 · Two outbound variants: Hint + Final
 
 **Status:** accepted
+**Python-main clarification:** ADR-121 supersedes the Rust `Outbound` enum.
+Python-main uses durable persisted messages plus transient per-connection turn
+events.
 **Decision:**
-```rust
-enum Outbound {
-    Hint  { channel, chat_id, kind: HintKind, text: String },
-    Final { channel, chat_id, content, media, reply_to, metadata },
-}
-```
-**Consequences:** Hint is ephemeral and channel-discretion; Final is persistent and universal. Channel adapter trait has `deliver_hint` (default: drop) and `deliver_final` (required). New channels implement `deliver_final` only.
+- **Durable output:** completed assistant messages, tool results, synthetic rows,
+  and channel-delivery messages are persisted in Postgres and surfaced through
+  authoritative reads such as `GET /api/sessions/{id}/messages`.
+- **Live preview:** an active browser `POST /api/sessions/{id}/messages`
+  response may receive best-effort `token_delta`, `tool_progress`,
+  `message_persisted`, and `turn_finished` events. These events are subscribers
+  to the runner, not durable replay state.
+- **Channel delivery:** Discord/Telegram/later adapters deliver durable final
+  messages and may aggregate or drop transient progress according to channel
+  capability. They do not inherit the old browser SSE hint contract.
+**Consequences:** The product still separates transient progress from durable
+conversation state, but the transport is Python-main POST streaming + canonical
+message polling rather than the prior Rust outbound enum.
 
-### ADR-016 · No token-level streaming
+### ADR-016 · Best-effort browser token preview; complete messages are durable
 
 **Status:** accepted
 **Context:** Many channels (Discord, Telegram, SMS, email) don't support token streaming natively. Doing it anyway requires bespoke per-channel batch-and-edit logic with rate limits.
-**Decision:** LLM calls are non-streaming. Outbound events are (a) mechanical tool-dispatch hints and (b) final completed messages.
-**Consequences:** No delta-accumulation buffers. No partial-message rendering in the frontend. No cancel-mid-stream edge cases. Provider layer is simpler (single request, single response).
+**Python-main clarification:** ADR-121 supersedes the old blanket
+no-token-streaming rule for browser/API consumers. The durable transcript and
+channel delivery still use complete messages only.
+**Decision:** The provider adapter may stream token deltas to an active browser
+`POST /api/sessions/{id}/messages` subscriber as best-effort preview data. Token
+deltas are coalesced into `PostMessageStreamEvent(type="token_delta")`, are not
+inserted into `messages`, and are not replayed after disconnect or restart.
+Non-browser channel adapters are not required to stream tokens; they deliver the
+durable final message or aggregate progress according to ADR-019.
+**Consequences:** Browser UI can show live progress without making partial text
+the unit of record. Recovery, provider replay, and channel delivery remain based
+on complete persisted messages.
 
 ### ADR-017 · Hints are mechanical, not LLM-narrated
 
@@ -200,21 +219,39 @@ enum Outbound {
 
 **Status:** accepted
 **Context:** LLMs sometimes emit text alongside tool_use blocks: *"I'll check the weather. Let me run this command."* followed by the tool_use block.
-**Decision:** This interim text is **persisted in DB** as part of the assistant message's content blocks (per ADR-032), but is **NOT emitted as an Outbound::Final** — the user doesn't see it in the chat surface. Only the terminal assistant message (the one with no remaining tool_use blocks) becomes the Final.
+**Python-main clarification:** ADR-121 allows live token previews on the active
+browser POST stream, so interim text may be visible transiently while the turn is
+running. That preview is not durable state.
+**Decision:** Complete provider assistant responses, including responses that
+contain `tool_use` blocks and adjacent text, are persisted in DB as assistant
+message content blocks per ADR-032. Partial token deltas are not persisted and
+are not replayed after disconnect/restart. Channel adapters do not publish a
+separate durable final message for interim tool-use narration; durable final
+delivery remains tied to the terminal assistant response or explicit `message`
+tool output.
 **Consequences:**
 - **Continuity for the LLM:** on subsequent iterations within the same turn, the history reconstruction (ADR-022) includes the interim text, so the LLM sees its own prior reasoning and stays coherent across multi-step tool chains.
-- **Clean user-facing chat:** the UI/channel shows mechanical tool hints (ADR-017) and the final answer. No "thinking aloud" spam between tool calls.
+- **Clean user-facing chat:** transient browser preview can show progress while connected, but canonical replay is complete persisted messages and final channel delivery. No separate durable "thinking aloud" messages are created between tool calls.
 - **Audit trail preserved:** if debugging a bad agent turn later, the full reasoning chain is in DB.
 
 ### ADR-019 · Per-channel hint rendering contract
 
 **Status:** accepted
+**Python-main clarification:** ADR-121 supersedes the browser SSE part of this
+ADR. Browser progress is now delivered, best-effort, on the `POST messages`
+stream that started or subscribed to the turn.
 **Decision:**
-- **Browser (SSE):** emit `event: hint { kind, text }` on the session's SSE stream
-- **Discord:** `sendChatAction("typing")` or ignore (NOT a visible message — avoids spam)
-- **Telegram:** `sendChatAction("typing")` (same reasoning)
-- **Future channels (SMS, email, etc.):** drop entirely
-**Consequences:** Hints add no clutter to persistent channel histories. Only SSE surfaces them as events because the browser chat UI can benefit.
+- **Browser:** active POST streams may receive `tool_progress`, `token_delta`,
+  `message_persisted`, `turn_finished`, `stream_replaced`, and keepalive events
+  defined by `PostMessageStreamEvent` in `docs/API.yaml`.
+- **Discord:** use native typing/progress affordances when useful, or drop
+  transient progress. Do not create visible spam messages for every tool event.
+- **Telegram:** use native chat actions when useful, or drop transient progress.
+- **Future channels:** define capability-specific aggregation before surfacing
+  progress; durable final messages remain the portable baseline.
+**Consequences:** Transient progress adds no clutter to persistent channel
+histories. Browser preview exists only while a POST stream is connected; recovery
+uses canonical message polling.
 
 ### ADR-020 · Direct replies route to current session; `message` tool defaults to current session and allows explicit cross-channel override
 
@@ -337,8 +374,16 @@ The collapse happens only in provider projection when constructing the next Anth
 ### ADR-030 · One hint per tool_use at dispatch time, no end-hint
 
 **Status:** accepted
-**Decision:** Immediately before dispatching a tool call, emit one Outbound::Hint. No hint on completion (the next LLM call will incorporate the result; the final message is the summary).
-**Consequences:** UI shows activity in order. No "tool X started / tool X finished" noise.
+**Python-main clarification:** ADR-121 supersedes the old hint mechanic.
+**Decision:** Immediately before dispatching a tool call, an active browser POST
+stream may receive `tool_progress(kind="tool_started")`. After the result row is
+persisted, the stream may receive `tool_progress(kind="tool_finished")` when the
+frontend needs closure for an in-progress indicator. These events are transient;
+the authoritative durable state is the persisted `tool_result` row and later
+assistant message.
+**Consequences:** Browser UI can show ordered tool progress without requiring a
+durable hint log. Non-browser channels may aggregate/drop progress under
+ADR-019.
 
 ### ADR-031 · Tool failures propagate as `tool_result` error content
 
@@ -366,7 +411,11 @@ instructions to re-run skipped work automatically.
 ### ADR-033 · `publish_final` when: no more tool calls, hard cap, or fatal error
 
 **Status:** accepted
-**Decision:** The agent loop emits Outbound::Final in exactly three cases:
+**Python-main clarification:** ADR-121 and the Python-main API replace the old
+`publish_final`/outbound-enum shape with persisted assistant messages,
+`message_persisted`/`turn_finished` POST-stream events, and channel delivery.
+**Decision:** The agent loop produces a durable terminal assistant outcome in
+exactly three cases:
 1. LLM returns an assistant response with no tool_use blocks (normal completion)
 2. Hard iteration cap hit (200)
 3. Unrecoverable error (LLM persistent failure after vision-retry)
@@ -457,9 +506,25 @@ Once fired, in-flight tools complete (bounded by their own timeout), then the lo
 ### ADR-040 · Server-only tools live in `openoctopus_server`
 
 **Status:** accepted
-**Decision:** `message`, `cron`, and `file_transfer` are openoctopus_server-owned
-and defined there. The original server-only listing included `web_fetch`, but
-ADR-052 supersedes that part: `web_fetch` is a shared server/client tool.
+**Python-main clarification:** The authoritative tool ownership matrix is the
+inventory table in `docs/TOOLS.md`.
+**Decision:** Python-main has four tool ownership classes:
+- **Shared tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`,
+  `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`,
+  `notebook_edit`, and `web_fetch`) use source schemas in `openoctopus_common`
+  and implementations on both server and client install sites.
+- **Server-only/orchestrated tools** (`message`, `cron`, and `file_transfer`)
+  live in `openoctopus_server`. `message` and `file_transfer` are
+  intrinsic-device tools: their source schemas contain marked
+  `openoctopus_*device*` fields whose enums are extended at merge time.
+- **Client-only tools** (`exec`) live in `openoctopus_client`; clients advertise
+  schemas during device registration/handshake and the server routes calls
+  without importing client executors.
+- **MCP-wrapped tools/resources/prompts** are dynamic and run wherever the MCP is
+  installed: admin shared-service server MCP or a user's paired device.
+
+The original server-owned listing included `web_fetch`, but ADR-052 supersedes
+that part: `web_fetch` is a shared server/client tool.
 
 ### ADR-041 · `openoctopus_device` routes file tool calls (injected at merge)
 
@@ -489,6 +554,16 @@ Dispatch:
 ### ADR-071 · Tools with the same name + schema are merged; `openoctopus_device` enum lists install sites
 
 **Status:** accepted
+**Python-main clarification:** Device MCP capabilities are maintained by
+`register_mcp`, which devices send on every fresh `hello_ack` (initial
+handshake and every reconnect) and whenever the local MCP snapshot changes
+(ADR-105). The agent-loop schema build reads the current per-user tool
+registry/cache; it does not synchronously query devices. MCP capabilities are
+first wrapped into stable names (e.g. `mcp_MCP-1_analyze_image`), then
+merged by canonical schema equivalence. Stable canonicalization is required:
+Python-main must normalize JSON schema key order, whitespace, and
+OpenAI-compatibility transforms so equal schemas on different install sites
+merge correctly.
 **Context:** Without this rule, if `read_file` exists on server + three devices, the agent would see four separate tools or four overlapping schemas. That defeats the point of the unified tool surface (ADR-041) and blows up the agent's tool-registry cognitive load.
 **Decision:** At tool-schema-build time (per session), `tools_registry::build_tool_schemas` deduplicates:
 
@@ -569,6 +644,11 @@ If the user or agent later deletes a workspace attachment to reclaim quota:
 ### ADR-075 · Tool timeouts are decentralized; agent may override where the schema advertises
 
 **Status:** accepted
+**Python-main clarification:** Python-main preserves per-tool timeout ownership.
+Blocking tool work (file IO, hashing, recursive find_files/grep, transfer
+staging) must cross an explicit background/thread boundary so the single
+asyncio event loop stays responsive. This applies to both server-side
+`workspace_fs` operations and client-side device tools.
 **Context:** Nanobot's tool timeout model (confirmed empirically). Tools that have legitimately variable duration (shell commands, some MCPs) expose `timeout` as a schema parameter the agent can set within bounds. Tools with bounded scope (file ops, web_fetch, message, cron) enforce fixed internal timeouts with no agent override.
 **Decision:**
 - **No central dispatcher-level timeout wrapper.** Each tool owns its timeout enforcement in its own `execute()`.
@@ -625,6 +705,13 @@ If the user or agent later deletes a workspace attachment to reclaim quota:
 ### ADR-077 · `Tool` trait pattern with default methods
 
 **Status:** accepted
+**Python-main clarification:** The Rust `Tool` trait translates to a Python
+protocol/ABC concept. Python-main defines a tool contract with `name()`,
+`schema()`, `max_output_chars()`, and `execute()` — each tool implements
+this contract. The exact Python implementation shape (ABC, Protocol, or
+duck typing) is chosen at Py0. Cross-cutting concerns (truncation, timeout,
+permission pre-check) can be added via default methods/mixins without
+breaking implementers.
 **Context:** Nanobot uses an abstract base class (`Tool` ABC) with default methods and per-tool overrides. Rust's trait system gives us the same shape natively.
 **Decision:**
 ```rust
@@ -658,9 +745,22 @@ pub trait Tool: Send + Sync {
 ### ADR-078 · Quota: one global value + workspace_fs-owned usage
 
 **Status:** accepted
+**Python-main clarification:** Python-main has two quota layers:
+- **Personal workspace quota:** admin-global `quota_bytes`, effective default
+  500 MiB (`524288000`) when missing.
+- **Shared workspace quota ceiling:** admin-global `shared_workspace_quota_bytes`,
+  effective default 500 MiB (`524288000`) when missing. The ceiling is the maximum
+  `quota_bytes` a shared workspace may request at create or rename time. The
+  creator chooses a quota ≤ the current ceiling for each shared workspace.
+- **Shared workspace usage** counts only against the shared workspace's own
+  `quota_bytes`, not against any member's personal quota.
+- **Shared workspace members** have equal permissions: creator and invited
+  members share the same read/write/delete rights. No role-based ACL.
+- `workspace_fs` enforces both personal and shared workspace quota depending
+  on which workspace path is being written.
 **Context:** Python-main hosts server workspaces in MinIO-compatible object storage (ADR-123). Without bounds, an agent or user can fill object storage and break the service for everyone. Prior OpenOctopus had no quota at all. Nanobot runs single-user and didn't need one.
 **Decision:**
-- **One global quota value.** Stored in `system_config` under key `quota_bytes`. Admin-editable via admin UI; takes effect immediately for all users. No per-user override. Bootstrap does not seed a default; setup/admin UI must guide the admin when it is missing.
+- **One global quota value.** Stored in `system_config` under key `quota_bytes`. Admin-editable via admin UI; takes effect immediately for all users. No per-user override. Effective default 500 MiB when missing.
 - **Usage authority.** `workspace_fs` is the only authority for server-side workspace usage. The schema does not require a `users.bytes_used` column. Implementations may compute usage on demand by listing object sizes under the workspace's object prefix, or maintain an internal cache/counter hidden behind `workspace_fs`; either way, API callers see the same result.
 - **Two-layer check before every write (enforced at the single workspace_fs choke point per ADR-045):**
   1. **Lock rule:** if current usage is greater than `quota_bytes`, all writes/edits/adds are rejected with `WorkspaceError::SoftLocked`. Only `delete_file` and `delete_folder` are allowed. Lock auto-lifts as soon as a delete pulls usage back under quota — no explicit unlock step.
@@ -673,6 +773,9 @@ pub trait Tool: Send + Sync {
   details. Each `Workspace` includes `{ quota_bytes, bytes_used, locked }`.
   There is no separate `GET /api/workspace/quota` route. Admin sets personal
   quota and shared-workspace quota ceilings via `PATCH /api/admin/config`.
+- **Shared workspace quota ceiling.** Stored under `shared_workspace_quota_bytes`
+  in `system_config`. Effective default 500 MiB (`524288000`) when missing. Shared
+  workspace `quota_bytes` must be ≤ the current ceiling at create or rename time.
 
 **Consequences:** One admin knob for all users; simple mental model. One enforcement choke point. Predictable degradation — "workspace full, delete files to continue" — surfaced uniformly to agent (as a tool error per ADR-031) and UI (as a lock flag + error variant).
 
@@ -694,20 +797,35 @@ because that column does not exist. Quota reads remain user-visible through
 ### ADR-080 · Byte-ingress attachments degrade gracefully under quota lock
 
 **Status:** accepted
+**Python-main clarification:** Python-main uses best-effort per-attachment
+handling for channel byte ingress into the user's personal server workspace:
+- The text portion of the message is always delivered normally to the session.
+- Each attachment is attempted independently. Successful attachments are
+  preserved (workspace file written, image block inserted into DB per ADR-059).
+  Failed attachments are skipped with a per-attachment note appended to the
+  user's text block: `[attachment skipped: workspace over quota]`.
+- No rollback: if attachment N fails, attachments 1..N-1 remain.
+- This applies only to channel byte-ingress into personal server workspace.
+  Browser message attachments (refs to existing workspace files) are not
+  byte-ingress; if a ref is missing or unreadable, the whole message is
+  rejected before persistence. Shared workspace writes are not the default
+  channel inbound target.
 **Context:** A user can hit their quota mid-conversation, then send a Discord/Telegram message with an image attachment. The attachment write would hit `SoftLocked`. Dropping the entire message would lose the user's text and make the agent miss the turn.
 **Decision:** When a channel adapter receives an inbound message with attachment bytes while the user is over quota:
 - The text portion of the message is delivered normally to the session.
-- Each attachment is dropped entirely — no workspace file is written AND no base64 `image` block is inserted into `messages.content` (the DB-side of ADR-059 is also skipped). The agent sees no image at all for that message.
-- A system note is appended to the user's text block: `[attachment skipped: workspace over quota]`.
+- Each attachment is attempted independently — successful attachments are kept; failed attachments are skipped. No workspace file is written AND no base64 `image` block is inserted into `messages.content` for failed attachments (the DB-side of ADR-059 is also skipped).
+- A system note is appended to the user's text block for each failed attachment: `[attachment skipped: workspace over quota]`.
 
 The agent sees the note in context, can reference it in its reply, and the user can delete files and resend.
-**Consequences:** Messages are never lost wholesale. The "you are over quota" signal surfaces through the conversation itself, not as an out-of-band error. Identical note format across channels.
-
-**M1d browser correction:** Browser message attachments are not byte-ingress writes. They are refs to existing workspace files after a prior upload/write has completed. If any M1d browser attachment ref is missing, unreadable, outside the workspace, or targets a non-server device, the whole message is rejected before persistence.
+**Consequences:** Messages are never lost wholesale. The "you are over quota" signal surfaces through the conversation itself, not as an out-of-band error. Identical note format across channels. Best-effort per attachment preserves maximum information.
 
 ### ADR-081 · No server-side `.attachments/` sweeper — users manage their own quota
 
 **Status:** rejected (initially proposed as a 30-day TTL sweeper; withdrawn)
+**Python-main clarification:** `.attachments/` files are normal workspace objects
+counting toward quota. No background cleanup, no TTL, no auto-deletion.
+Users clean up via workspace UI or agent tools (`delete_file`/`delete_folder`).
+Users who want automatic retention can use agent + cron (ADR-053).
 **Context:** Channel-adapter chat-drop images may land in the server workspace's virtual `.attachments/{inbound_id}/{filename}` prefix (ADR-044, ADR-123). Browser-uploaded files can also accumulate anywhere the frontend writes them, including `.attachments/uploads/...`. Without cleanup, these MinIO objects accumulate monotonically and consume quota. A background sweeper (every 6 hours, 30-day age threshold) was proposed.
 **Decision:** No server-side sweeper. The user is responsible for managing their own workspace usage. If `.attachments/` fills their quota, the soft-lock behavior from ADR-078 surfaces the problem through the UI (`Workspace.locked` from `GET /api/workspaces` shows `true`) and through agent tool errors (`WorkspaceError::SoftLocked`). From there the user — or the agent, on the user's behalf — deletes old attachments via the workspace browser or `delete_file` / `delete_folder` tools.
 **Consequences:**
@@ -777,16 +895,29 @@ Rejected: a dedicated `install_skill` server tool. Would require URL allowlistin
 ### ADR-087 · `file_transfer` unified with `mode`; folder semantics are recursive
 
 **Status:** accepted
+**Python-main clarification:** Python-main includes `client -> client` bridging
+in the Tools contract. The server bridges bytes from source device WebSocket to
+destination device WebSocket. All four direction combinations are active:
+`server -> server`, `server -> client`, `client -> server`, `client -> client`.
+Destination exists always rejects — no overwrite flag. Partial transfer cleanup
+is server-orchestrated, destination-executed, best-effort: the server knows
+the transfer manifest and tells the destination to delete already-written
+paths; if cleanup fails (e.g. device disconnect), the tool result returns
+warning and user/agent handles manually. Server workspace writes go through
+`workspace_fs` to MinIO; temporary disk staging is allowed only as internal
+implementation detail and must be cleaned after success/failure. Shared
+workspace members have equal permissions; `file_transfer` into a locked
+shared workspace is rejected like any other write.
 **Context:** Originally `file_transfer` was a cross-device-only copy primitive. A separate `move_file` was considered for same-device rename. Keeping them separate felt cleaner conceptually, but a unified tool is fewer tool slots for the agent to learn and reuses the cross-device byte-moving machinery for all file relocations.
 **Decision:**
 - **Schema: five required fields** — `openoctopus_src_device`, `src_path`, `openoctopus_dst_device`, `dst_path`, `mode`. `mode` enum: `"copy" | "move"`. The two device fields use the reserved `openoctopus_` prefix (per ADR-041) with source stub `enum: ["server"]`; merge extends.
 - **Behavior matrix:**
   - Same-device `copy`: native filesystem copy on that device.
-  - Same-device `move`: atomic rename (`tokio::fs::rename`).
-  - Cross-device `copy`: server orchestrates streaming pull-and-push over the device WebSocket; source remains intact.
+  - Same-device `move`: atomic rename.
+  - Cross-device `copy` (`server -> client`, `client -> server`, `client -> client`): server orchestrates streaming pull-and-push over the device WebSocket; source remains intact.
   - Cross-device `move`: same stream copy, then delete source only on successful write. If delete fails after a successful copy, both copies exist and the tool result flags a warning. The inverse (neither copy exists) cannot happen — we order copy-then-delete.
-- **Folder semantics.** If `src_path` points to a folder, the operation is recursive. Same-device folder moves remain atomic (single directory-entry rename). Cross-device folder transfers stream each entry; mid-transfer failure triggers partial-dst cleanup.
-- **Rejection cases.** `dst_path` already exists → reject (no implicit overwrite). `src_path` does not exist → reject. Symlink-outside-workspace checks apply per each side's `sandbox_mode`.
+- **Folder semantics.** If `src_path` points to a folder, the operation is recursive. Same-device folder moves remain atomic (single directory-entry rename). Cross-device folder transfers stream each entry; mid-transfer failure triggers best-effort destination cleanup (server-orchestrated, destination-executed).
+- **Rejection cases.** `dst_path` already exists → reject (no implicit overwrite, no overwrite flag). `src_path` does not exist → reject. Symlink-outside-workspace checks apply per each side's `sandbox_mode`.
 - **Quota.** Applies when `openoctopus_dst_device="server"`. Single-op cap (ADR-078) uses total bytes being written (folder sum for recursive). Move from server refunds on successful delete.
 - **SKILL.md validation (applies to BOTH single-file AND folder transfers).** Before any bytes move, the server enumerates every destination path the transfer would produce. For each path that would match `skills/*/SKILL.md` (exactly one level deep, exact filename — same rule as ADR-082), the validator runs against the source content.
   - **Single-file transfer:** if `dst_path` matches `skills/*/SKILL.md` and content is malformed → reject the transfer; no bytes land.
@@ -878,7 +1009,7 @@ synchronous on the HTTP request. Within-server dup and cross-install schema
 drift return `409 Conflict`; spawn or initial introspection failure returns
 `400 Bad Request`; either way the new list is not applied.
 
-**Coarse-grained removal:** if any tool/resource/prompt within an MCP server triggers rejection, the **whole MCP server** is removed from config — not just the offending capability. Simpler implementation, simpler mental model. User re-adds with a tighter `enabled` filter (ADR-100) or a renamed server if they want partial coexistence.
+**Coarse-grained removal:** if any tool/resource/prompt within an MCP server triggers rejection, the **whole MCP server** is removed from config — not just the offending capability. Simpler implementation, simpler mental model. User re-adds with a tighter `enabled_tools` filter (ADR-100) or a renamed server if they want partial coexistence.
 
 **Consequences:** Never auto-version / suffix. User renames their local install
 if they want two versions to coexist. Single canonical schema per wrapped name.
@@ -907,35 +1038,56 @@ Agent calls `mcp_notion_resource_page(page_id="abc")` → wrapper computes `noti
 
 **Consequences:** Templated resources become first-class agent capabilities (OpenOctopus divergence from nanobot, justified by the meaningful UX win). Implementation is small (~30 lines in the wrap step). If a template variable name collides with `openoctopus_device` (the reserved merge-time field), wrapping fails at install time with a clear error — MCP author renames the placeholder. No support for advanced URI Template syntax (RFC 6570 — query strings, fragments, etc.); only simple `{var}` substitution. If a real MCP needs more, we revisit.
 
-### ADR-100 · MCP `enabled` filter applies uniformly across tools, resources, prompts
+### ADR-100 · MCP `enabled_tools` filter — tools only, simple string list
 
 **Status:** accepted
-**Context:** Nanobot's `enabledTools` config filters `list_tools()` output but does not filter resources or prompts (`mcp.py:511–540` vs `553–577`). Asymmetric — the user can suppress noisy tools but not noisy resources from the same MCP.
-**Decision:** Each MCP server config carries an optional `enabled: [<wrapped_name_pattern>...]` field (single allow-list, glob-style patterns matched against the post-wrap name). When present, only matching wrapped entries are registered, regardless of surface. When absent, every advertised capability registers (default-allow). Nanobot's `enabledTools` is renamed to `enabled` in OpenOctopus configs; conversion is mechanical for users importing nanobot configs.
+**Python-main clarification:** Python-main simplifies the enabled filter:
+- Field name is `enabled_tools`, not `enabled`.
+- It is a simple string list of exact post-wrap tool names (e.g.
+  `["mcp_github_create_issue", "mcp_github_list_issues"]`), not glob
+  patterns.
+- It applies to **tools only**. Resources and prompts are always registered
+  (default-allow). This matches nanobot's `enabledTools` behavior.
+- When `enabled_tools` is empty or absent, all tools register (default-allow).
+- Discovered capabilities (tools, resources, prompts) are returned in the
+  config validation response as `mcp_discovered` so admins/users can see
+  what is available before deciding the filter.
+**Context:** Nanobot's `enabledTools` config filters `list_tools()` output but does not filter resources or prompts (`mcp.py:511–540` vs `553–577`). Python-main follows nanobot's simpler tools-only filtering.
+**Decision:** Each MCP server config carries an optional `enabled_tools: [<tool_name>...]` field. When present, only matching tools are registered; resources and prompts are always registered. When absent, every advertised capability registers (default-allow). The config validation response (`PUT /api/admin/server-mcp` success, `PATCH /api/devices/{name}/config` success with online device) includes `mcp_discovered` listing all discovered tools, resources, and prompts so the user can choose which tools to enable.
 
-Examples:
-- `enabled: ["mcp_notion_*"]` → all notion entries (tools, resources, prompts).
-- `enabled: ["mcp_notion_search", "mcp_notion_resource_*"]` → the `search` tool plus every resource.
-- `enabled: ["mcp_*_resource_*"]` → every resource from every MCP, no tools or prompts.
+Example:
+```json
+{
+  "name": "github",
+  "command": ["npx", "@modelcontextprotocol/server-github"],
+  "enabled_tools": ["mcp_github_create_issue", "mcp_github_list_issues"]
+}
+```
 
-**Consequences:** Single mental model — one config field, one filter, three surfaces. OpenOctopus divergence from nanobot, justified by symmetry. Users who want nanobot's tools-only behavior write `enabled: ["mcp_<server>_*"]` excluding the resource/prompt infixes — slightly more verbose but explicit.
+**Consequences:** Simple mental model — one config field, tools only. Resources and prompts are always available. Discovery via config validation response lets users see what is available without a separate probe endpoint. Users fill the `enabled_tools` list themselves based on discovered capabilities.
 
-### ADR-114 · M1 MCP tenancy: admin shared-service + device only
+### ADR-114 · Python-main MCP tenancy: admin shared-service + device only
 
 **Status:** accepted
 **Context:** MCP sessions can carry credentials and state. A single admin-installed server-side MCP client shared by every user is acceptable for deliberately shared service-account tools (stateless search, internal KB lookup), but unsafe for personal OAuth, browser state, IDE/LSP state, shell/REPL state, or any integration whose state belongs to one user.
-**Decision:** M1 supports exactly two MCP tenancy scopes:
-- **Admin shared-service MCP.** Configured only by admins under `system_config.server_mcp` via `/api/admin/server-mcp`. Uses admin-provided shared credentials, appears in tool schemas as install site `openoctopus_device="server"`, and is intended only for stateless or low-state service tools. OpenOctopus runs one runtime per configured MCP server and protects each with a bounded per-MCP call queue; if the queue is saturated, calls fail fast as tool errors. Admins are responsible for choosing MCPs that are safe to share across all users.
+**Decision:** Python-main supports exactly two MCP tenancy scopes:
+- **Admin shared-service MCP.** Configured only by admins under `system_config.server_mcp` via `/api/admin/server-mcp`. Uses admin-provided shared credentials, appears in tool schemas as install site `openoctopus_device="server"`, and is intended only for stateless or low-state service tools. Py8 runs one shared runtime/client per configured MCP server and protects each with a bounded per-MCP FIFO queue; if the queue is saturated, calls fail fast as tool errors. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract. Admins are responsible for choosing MCPs that are safe to share across all users.
 - **Device MCP.** Configured by a user on a device row (`devices.mcp_servers`). The MCP subprocess runs on that user's device, registers through `register_mcp`, and appears as `openoctopus_device="<device-name>"`. User-specific credentials, browser/IDE state, and resource-heavy tools belong here.
 
-User-scoped server MCP and session-scoped MCP are out of scope for M1. They require per-user secret storage, runtime isolation, idle teardown, resource limits, and clear UX around "this runs on the server"; until that design exists, users who need personal MCP integrations install them on a device.
+User-scoped server MCP and session-scoped MCP are out of scope for the accepted Python-main contract. They require per-user secret storage, runtime isolation, idle teardown, resource limits, and clear UX around "this runs on the server"; until that design exists, users who need personal MCP integrations install them on a device.
 
 **Consequences:** The server avoids N users × M MCP long-lived subprocess growth and avoids accidentally granting every user access to an admin's personal credentials. Admin server MCP remains useful for shared services, while personal/stateful MCPs stay naturally isolated by device ownership and OS process boundaries.
 
 ### ADR-105 · MCP subprocess lifecycle on openoctopus_client
 
 **Status:** accepted
-**Context:** openoctopus_client manages user-installed MCP subprocesses on each device. The lifecycle has to handle: initial spawn at handshake, additions and removals via `config_update`, subprocess crashes, schema drift after recovery, `enabled` filter changes, WS reconnects, and concurrent activity from parallel tool dispatch + config edits — all while remaining diagnostically useful when something breaks. This ADR locks the design after a Codex-driven review found 8 issues in an earlier draft.
+**Python-main clarification:** `register_mcp` is the capability cache/update
+path. Devices send it on every fresh `hello_ack` (initial handshake and every
+reconnect) and whenever the local MCP snapshot changes. The server's
+per-WS-session tools cache is invalidated when the WS session ends; a fresh
+`register_mcp` repopulates it. MCP subprocesses survive WS reconnect — local
+lifecycle is independent of WS connectivity.
+**Context:** openoctopus_client manages user-installed MCP subprocesses on each device. The lifecycle has to handle: initial spawn at handshake, additions and removals via `config_update`, subprocess crashes, schema drift after recovery, `enabled_tools` filter changes, WS reconnects, and concurrent activity from parallel tool dispatch + config edits — all while remaining diagnostically useful when something breaks. This ADR locks the design after a Codex-driven review found 8 issues in an earlier draft.
 **Decision:**
 
 #### Per-MCP state model
@@ -1027,11 +1179,11 @@ When a `config_update` arrives, the worker:
 6. **Rebuild the registration snapshot** from current state:
    ```
    snapshot = ⋃ across all (Alive ∪ Dead) MCPs:
-                 { schemas filtered by that MCP's `enabled` list }
+                 { schemas filtered by that MCP's `enabled_tools` list }
    ```
 7. **Compare** new snapshot to last-sent. **Send `register_mcp`** if and only if the snapshot changed.
 
-Single algorithm covers every reason the snapshot might shift: subprocess added, removed, schema drifted on recovery, **`enabled` filter edited** (ADR-100 — filter changes ARE schema changes from the server's POV). Worker doesn't branch on which case fired.
+Single algorithm covers every reason the snapshot might shift: subprocess added, removed, schema drifted on recovery, **`enabled_tools` filter edited** (ADR-100 — filter changes ARE schema changes from the server's POV). Worker doesn't branch on which case fired.
 
 #### Crash recovery (B2 — keep registered)
 
@@ -1070,7 +1222,7 @@ The "no `register_mcp` on Alive→Dead" optimization survives but only **within*
 ```rust
 async fn spawn_mcp(config: &McpServerConfig) -> Result<(McpSession, McpSchemas), SpawnError>
 async fn teardown_mcp(child: Child, io_pumps: Vec<JoinHandle<()>>)
-fn build_register_mcp_frame(state: &McpMap) -> RegisterMcpFrame   // applies enabled filters
+fn build_register_mcp_frame(state: &McpMap) -> RegisterMcpFrame   // applies enabled_tools filters
 ```
 
 All three live in `openoctopus_client/src/mcp/`. The worker stitches them together for every lifecycle moment.
@@ -1107,7 +1259,7 @@ All three live in `openoctopus_client/src/mcp/`. The worker stitches them togeth
 ### ADR-052 · `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy
 
 **Status:** accepted
-**Context:** `web_fetch` was originally server-only with a hardcoded private-IP block. With clients in the picture (and legitimate use cases like fetching an internal company API at `10.180.20.30:8080`), making `web_fetch` shared lets the agent reach declared internal services through the same structured tool path it uses for public URLs.
+**Context:** `web_fetch` originally ran only on the server with a hardcoded private-IP block. With clients in the picture (and legitimate use cases like fetching an internal company API at `10.180.20.30:8080`), making `web_fetch` shared lets the agent reach declared internal services through the same structured tool path it uses for public URLs.
 **Decision:** `web_fetch` is a shared tool. The merger's `openoctopus_device`
 enum = `["server"] + paired_clients`. Paired-but-offline clients remain
 visible and fail at dispatch with `device_unreachable`.
@@ -1123,7 +1275,7 @@ visible and fail at dispatch with `device_unreachable`.
 ### ADR-096 · Device WebSocket protocol — single-connection JSON control + binary file transfer
 
 **Status:** accepted
-**Context:** Devices need bidirectional, low-latency dispatch (server pushes tool calls, client pushes results, both sides push file bytes for `message`-with-files and `file_transfer`). Browser already uses REST + SSE (ADR-003); devices need WebSocket because they sit behind NAT and tool dispatch is bidirectional.
+**Context:** Devices need bidirectional, low-latency dispatch (server pushes tool calls, client pushes results, both sides push file bytes for `message`-with-files and `file_transfer`). Browser uses REST with best-effort POST streaming plus canonical GET polling (ADR-003, ADR-121); devices need WebSocket because they sit behind NAT and tool dispatch is bidirectional.
 **Decision:** A single WebSocket connection per device carries both control plane (JSON text frames) and bulk plane (binary frames). The full wire spec lives in `docs/PROTOCOL.md`; this ADR fixes the headline choices that other decisions reference:
 
 - **Endpoint:** `GET /ws/device` with `Authorization: Bearer <OPENOCTOPUS_DEVICE_TOKEN>`. Device tokens are never accepted in URL query parameters.
@@ -1218,8 +1370,19 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 ### ADR-057 · Canonical `schema.sql` loaded via `include_str!`
 
 **Status:** accepted
-**Decision:** One SQL file at `openoctopus_server/src/db/schema.sql` contains every `CREATE TABLE` + index + constraint. Server startup runs the whole thing once (`sqlx::raw_sql(include_str!("schema.sql"))`). `IF NOT EXISTS` makes re-runs idempotent.
-**Consequences:** An empty database is initialized automatically on startup. No migration framework until first real user. Schema changes during rebuild require dev DB reset (`scripts/reset-db.sh`). When real users land, add `sqlx::migrate!` + proper versioned migrations.
+**Python-main clarification:** The Rust `schema.sql` + `sqlx::raw_sql(include_str!(...))`
+bootstrap mechanism does not carry forward automatically. `docs/SCHEMA.md` is
+the active schema-shape contract during Py-Prep, but the Python server bootstrap
+and migration mechanism must be decided before server persistence implementation
+depends on this ADR.
+**Decision:** Python-main keeps the product requirement that schema shape is
+explicit and reviewable in one place, with all tables, indexes, and constraints
+documented together. The concrete Python implementation boundary — SQLAlchemy
+metadata, generated SQL, raw bootstrap SQL, Alembic, or a deliberately simpler
+dev-reset-only bootstrap — needs a Python persistence decision.
+**Consequences:** Do not assume Rust `include_str!`, `sqlx`, or `sqlx::migrate!`
+in Python plans. Implementation work that creates or migrates database objects
+must first resolve the Python bootstrap/migration contract.
 
 ### ADR-058 · Every user-referencing FK has `ON DELETE CASCADE` inline
 
@@ -2704,7 +2867,7 @@ For contributors migrating from the old codebase, here's what changed and why:
 | `PromptMode::{UserTurn, Heartbeat, Dream}` | Single system prompt shape | ADR-023 |
 | `ToolAllowlist::Only(...)` for Dream | Dropped with Dream | ADR-055 |
 | 4-crate workspace (with plexus-gateway) | 3 crates | ADR-001 |
-| WebSocket for browser chat | REST + SSE | ADR-003 |
+| WebSocket for browser chat | REST with best-effort POST streaming + canonical GET polling | ADR-003, ADR-121 |
 | `InboundEvent.sender_id`, `.identity.is_partner` | Neither field on InboundMessage | ADR-007, ADR-008 |
 | Rate limiting in bus | None in v1 | ADR-056 |
 | Per-user SSRF whitelist on `web_fetch` | Server: hardcoded block (no override). Client: per-device whitelist exceptions (capability declaration, not sandbox) | ADR-052 |

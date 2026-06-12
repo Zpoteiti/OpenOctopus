@@ -9,7 +9,7 @@ This is a *design* document. Use it during implementation as the source of truth
 ## Conventions
 
 - **Source schemas are nanobot-shape.** Two patterns for how device-awareness shows up in source:
-  - **Routing-only device** — for shared tools (`read_file`, `write_file`, etc.), `shell`, and MCP-wrapped tools, the source schema has **no device field at all**. At session tool-schema-build time, `tools_registry::build_tool_schemas` injects a `openoctopus_device` property (ADR-071) with an enum populated from paired install sites, and appends `openoctopus_device` to `required`.
+  - **Routing-only device** — for shared tools (`read_file`, `write_file`, etc.), `exec`, and MCP-wrapped tools, the source schema has **no device field at all**. At session tool-schema-build time, `tools_registry::build_tool_schemas` injects a `openoctopus_device` property (ADR-071) with an enum populated from paired install sites, and appends `openoctopus_device` to `required`.
   - **Intrinsic device** — for tools that natively operate across devices (`file_transfer`, `message`), the device field IS part of the source schema. `file_transfer` uses `openoctopus_src_device` + `openoctopus_dst_device`; `message` uses `openoctopus_device`. Each source stub has `enum: ["server"]`. At merge time, each such enum is **extended** with paired device names.
 - **Reserved `openoctopus_` prefix.** The routing field name MUST use the `openoctopus_` prefix and MUST NOT be just `device` / `src_device` / `dst_device`. Why: the merger would otherwise clobber an MCP tool's native `device` arg (e.g., a tool selecting a GPU). The reserved prefix makes collision impossible.
 - **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
@@ -799,12 +799,14 @@ These three tools have no client-side counterpart. Their implementations live en
   - If `openoctopus_device="<client_name>"` and the target channel is `web`: does not fetch or stage the file at send time. It writes a visible assistant message with an online-only `device_file` entry in `delivery_refs` containing the device name and path. The frontend later downloads through `GET /api/workspace/files/{path}?openoctopus_device=<client_name>`, which relays the browser response to the live device WebSocket. Download fails at click time with `device_unreachable`, `not_found`, or policy errors if the device/path is unavailable.
   - If `openoctopus_device="<client_name>"` and the target channel is a third-party platform (`telegram`, `discord`, `feishu`, `weixin`, ...): server streams bytes from the device over `/ws/device` and forwards them directly into the platform's upload API. The bytes are not staged into MinIO or the server workspace. The platform owns the delivered copy after success.
 - `buttons` renders as inline keyboard rows on channels that support it (Telegram, Discord's button components); plain text channels ignore the param with no error.
-- Emits as `Outbound::Final` with `channel`/`chat_id` set to the resolved target.
+- Persists and delivers a durable channel message with `channel`/`chat_id` set
+  to the resolved target. Active browser streams may observe the resulting
+  `message_persisted` event, but delivery does not depend on a live stream.
 
 **Timeout:** 30s internal.
 **Result cap:** 16,000 characters.
 **Errors:** `ToolError::ChannelNotConfigured`, `WorkspaceError::NotFound`, `ToolError::DeviceUnreachable`, `ToolError::UnsupportedMedia`, `ToolError::DeliveryFailed`.
-**Related ADRs:** 015 (Outbound shape), 020 (routing + defaults), 044 (workspace as media source), 090 (channel configs), 095 (result wrap), 124 (web refs vs platform-native uploads).
+**Related ADRs:** 015 (durable output vs transient progress), 020 (routing + defaults), 044 (workspace as media source), 090 (channel configs), 095 (result wrap), 124 (web refs vs platform-native uploads).
 
 ---
 
@@ -812,7 +814,14 @@ These three tools have no client-side counterpart. Their implementations live en
 
 **Lives in:** `openoctopus_server/src/tools/file_transfer.rs`
 
-**Purpose:** Copy or move files. M1f implements server-to-server single-file copy/move through `workspace_fs` and exposes the stable cross-device protocol shape. Client Alpha extends this to `server -> client` and `client -> server` streaming over the device WebSocket. `client -> client` bridging is deferred to the next client-hardening slice. Disconnected device targets return `device_unreachable`.
+**Purpose:** Copy or move files within and across devices. Supports all four
+direction combinations: `server -> server`, `server -> client`, `client -> server`,
+and `client -> client`. Server-to-server uses `workspace_fs`. Cross-device
+directions stream over the device WebSocket. `client -> client` bridges through
+the server as a pure relay without buffering the whole file. Destination exists
+always rejects (no overwrite flag). Partial transfer cleanup is
+server-orchestrated, destination-executed, best-effort. Disconnected device
+targets return `device_unreachable`.
 
 **Agent-visible schema after merge:** the `openoctopus_common` source schema contains
 only `src_path`, `dst_path`, and `mode`; the server injects the two device fields
@@ -820,7 +829,7 @@ before exposing the tool to the model.
 ```json
 {
   "name": "file_transfer",
-  "description": "Transfer a file between devices. Server-to-server, server-to-client, and client-to-server transfers are supported in Client Alpha; client-to-client bridging is deferred. Use mode='copy' to leave source intact, mode='move' to remove source after successful transfer. Destination is rejected if it already exists.",
+  "description": "Transfer a file between devices. All four directions are supported: server-to-server, server-to-client, client-to-server, and client-to-client. Use mode='copy' to leave source intact, mode='move' to remove source after successful transfer. Destination is rejected if it already exists.",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -856,8 +865,8 @@ before exposing the tool to the model.
 - Source schema in `openoctopus_common` stays device-field-free for portability. The server merge step injects `openoctopus_src_device` and `openoctopus_dst_device`, then extends both enums with paired device names.
 - `server -> server` reads through `workspace_fs.read_file`, rejects an existing destination, writes through `workspace_fs.write_file`, and deletes the source after a successful `mode="move"`.
 - Client Alpha `server -> client` and `client -> server` first resolve the named user device and require it to be connected. If the device is offline, the tool returns `device_unreachable`. `server -> client` sends a normal `TransferBegin(ServerToClient)` followed by binary chunks and waits for the client acknowledgement. `client -> server` sends `TransferBegin(ClientToServer)` as an upload request to the client; the client streams bytes and returns `TransferEnd(ok=true, sha256=...)`, then the server verifies, writes atomically through `workspace_fs` to MinIO-compatible object storage, and sends the final acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with sha256 verification. Server-side temporary staging is deleted after success or failure.
-- `client -> client` uses the same protocol shape but is deferred. The later implementation will route through the server as a pure bridge rather than buffering the whole file.
-- **Reject** if `dst_path` already exists, `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
+- `client -> client` uses the same protocol shape. The server bridges bytes from source device WebSocket to destination device WebSocket without buffering the whole file.
+- **Reject** if `dst_path` already exists (no implicit overwrite, no overwrite flag), `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
 
 **Timeout:** Server-to-server path is normal workspace I/O. Device transfer stall detection belongs to the transfer-slot implementation.
 **Result cap:** short status text normalized as a normal tool result.
@@ -1249,14 +1258,26 @@ Two cases, both rejected at install time (ADR-049):
 
 When the agent calls any MCP-wrapped entry, the server looks up which install site matches the `openoctopus_device` enum value and forwards the call to that site's `McpSession` (server-side or via a `tool_call` frame to the client). Resources and prompts dispatch identically to tools.
 
-### `enabled` filter (ADR-100)
+### `enabled_tools` filter (ADR-100)
 
-Each MCP server config carries an optional `enabled: [<glob>...]` allow-list, matched against the post-wrap name. When present, only matching entries register; when absent, every advertised capability registers (default-allow). Single field, three surfaces.
+Each MCP server config carries an optional `enabled_tools: [<tool_name>...]`
+allow-list of exact post-wrap tool names. When present, only matching tools
+register; when absent, every advertised tool registers (default-allow).
+Resources and prompts are always registered regardless of `enabled_tools`.
 
-Examples:
-- `enabled: ["mcp_notion_*"]` — every notion entry (tools, resources, prompts).
-- `enabled: ["mcp_notion_search", "mcp_notion_resource_*"]` — the `search` tool plus every resource.
-- `enabled: ["mcp_*_resource_*"]` — every resource from every MCP, no tools or prompts.
+The config validation response (`PUT /api/admin/server-mcp` success, or
+`PATCH /api/devices/{name}/config` success with online device) includes
+`mcp_discovered` listing all discovered tools, resources, and prompts so
+users can see what is available before deciding the filter.
+
+Example:
+```json
+{
+  "name": "github",
+  "command": ["npx", "@modelcontextprotocol/server-github"],
+  "enabled_tools": ["mcp_github_create_issue", "mcp_github_list_issues"]
+}
+```
 
 ### Timeout
 
@@ -1264,7 +1285,7 @@ Per-MCP. The MCP's own session timeout governs; rmcp's defaults apply unless ove
 
 ### Related ADRs
 
-047 (shared MCP client + three surfaces), 048 (naming + prompt-output convention), 049 (collision rejection), 071 (merge), 099 (URI template expansion), 100 (`enabled` filter).
+047 (shared MCP client + three surfaces), 048 (naming + prompt-output convention), 049 (collision rejection), 071 (merge), 099 (URI template expansion), 100 (`enabled_tools` filter).
 
 ---
 

@@ -1088,13 +1088,13 @@ paths:
   # --- Devices ---
   #
   /api/devices:
-    description: Target M1 device management route; not implemented in M1b.
+    description: Python-main device management route.
     get:
       tags: [Devices]
-      summary: Target route — list user's devices (not M1b)
+      summary: List user's devices
       description: |
         Returns all device details for the authenticated user in one array.
-        M1e does not paginate this route and does not implement
+        Python-main does not paginate this route and does not implement
         `GET /api/devices/{name}`. Responses include `token_hint` for user
         confirmation and never include the plaintext token. `token_hint` is
         computed as `token[:16] + "..." + token[-6:]`.
@@ -1108,7 +1108,7 @@ paths:
                 items: { $ref: '#/components/schemas/Device' }
     post:
       tags: [Devices]
-      summary: Target route — register a new device (returns the token ONCE; not M1b)
+      summary: Register a new device (returns the token once)
       requestBody:
         required: true
         content:
@@ -1223,7 +1223,7 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}/config:
-    description: Target M1 device management route; not implemented in M1b.
+    description: Python-main device management route.
     parameters:
       - name: name
         in: path
@@ -1231,10 +1231,8 @@ paths:
         schema: { type: string }
     patch:
       tags: [Devices]
-      summary: Target route — update device config (sandbox mode, timeouts, SSRF/env/command policy, MCPs; not M1b)
+      summary: Update device config (sandbox mode, timeouts, SSRF/env/command policy, MCPs)
       description: |
-        Target M1 device route. Not implemented in M1b.
-
         If `mcp_servers` changes while the device is online, the server sends a
         validation-only `config_validate` frame first. The client attempts
         MCP spawn/introspection without activating the candidate config or
@@ -1320,8 +1318,31 @@ paths:
                     receives `hello_ack` or `config_update`.
       responses:
         '200':
-          description: Updated.
-          content: { application/json: { schema: { $ref: '#/components/schemas/Device' } } }
+          description: |
+            Updated. When `mcp_servers` changed and the device is online,
+            the response includes `mcp_discovered` listing all discovered
+            tools, resources, and prompts per MCP server. Users use this
+            to populate `enabled_tools` on subsequent requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: '#/components/schemas/Device' }
+                  mcp_discovered:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        tools:
+                          type: array
+                          items: { type: string }
+                        resources:
+                          type: array
+                          items: { type: string }
+                        prompts:
+                          type: array
+                          items: { type: string }
         '400':
           description: |
             Invalid name after canonicalization, invalid config shape,
@@ -1337,7 +1358,7 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}:
-    description: Target M1 device management route; not implemented in M1b.
+    description: Python-main device management route.
     parameters:
       - name: name
         in: path
@@ -1345,7 +1366,7 @@ paths:
         schema: { type: string }
     delete:
       tags: [Devices]
-      summary: Target route — remove a device (revokes its token; not M1b)
+      summary: Remove a device (revokes its token)
       description: |
         Deletes the device row. This is the state-3 complete wipe from ADR-110:
         the token immediately stops authenticating, any active WebSocket
@@ -1357,7 +1378,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /api/devices/{name}/regenerate-token:
-    description: Target M1 device token route; not implemented in M1b.
+    description: Python-main device token route.
     parameters:
       - name: name
         in: path
@@ -1365,10 +1386,8 @@ paths:
         schema: { type: string }
     post:
       tags: [Devices]
-      summary: Target route — regenerate the device's auth token (not M1b)
+      summary: Regenerate the device's auth token
       description: |
-        Target M1 device route. Not implemented in M1b.
-
         Invalidates the old token, returns a new one exactly once, and
         preserves the existing device row, name, workspace path, sandbox mode,
         SSRF/env/command policy, shell timeout cap, and MCP config. Any active
@@ -1820,6 +1839,11 @@ paths:
         Spawn or initial `list_tools/resources/prompts` failure returns
         `400 Bad Request` and does not apply. The server validates the new
         list before replacing `system_config.server_mcp`.
+
+        On success, the response includes `mcp_discovered`: a map from each
+        MCP server name to its discovered `tools`, `resources`, and `prompts`
+        lists. Admins use this to populate `enabled_tools` on subsequent
+        requests.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1833,6 +1857,25 @@ paths:
       responses:
         '200':
           description: Applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mcp_discovered:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        tools:
+                          type: array
+                          items: { type: string }
+                        resources:
+                          type: array
+                          items: { type: string }
+                        prompts:
+                          type: array
+                          items: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '409':
           description: Schema collision with an existing MCP install.
@@ -2588,16 +2631,15 @@ components:
         env:
           type: object
           additionalProperties: { type: string }
-        enabled:
+        enabled_tools:
           type: array
           items: { type: string }
           description: |
-            Optional allow-list of glob patterns matched against the
-            post-wrap entry name (ADR-100). When present, only matching
-            entries register. When absent, every advertised capability
-            registers (default-allow). Examples:
-              - `["mcp_notion_*"]` — every notion entry
-              - `["mcp_notion_search", "mcp_notion_resource_*"]` — one
-                tool plus every resource
-              - `["mcp_*_resource_*"]` — every resource from every MCP
+            Optional allow-list of exact post-wrap tool names (ADR-100).
+            When present, only matching tools register. When absent or
+            empty, every advertised tool registers (default-allow).
+            Resources and prompts are always registered regardless of
+            this filter. Use the `mcp_discovered` field in config
+            validation responses to see available capabilities.
+            Example: `["mcp_github_create_issue", "mcp_github_list_issues"]`
         description: { type: string }
