@@ -30,7 +30,7 @@ After the WS upgrade succeeds, **the client sends `hello` first**:
   "type": "hello",
   "id": "0190d5a7-...",          // UUID v7, used to correlate hello_ack
   "version": "1",                // protocol version
-  "client_version": "0.3.0",     // openoctopus_client crate version
+  "client_version": "0.3.0",     // openoctopus_client package version
   "os": "linux",                 // "linux" | "darwin" | "windows" | "android"
   "caps": {                      // what the client can actually do
     "exec": true,
@@ -158,7 +158,7 @@ Client → server.
 
 On failure, `is_error: true` and `content` is the error message. An optional `code` field carries a stable error enum (`exec_timeout`, `command_denied`, `cwd_outside_workspace`, etc. — see TOOLS.md error catalog).
 
-M1f also allows safe block content:
+Python-main also allows safe block content:
 
 ```jsonc
 {
@@ -183,9 +183,9 @@ Safe device result blocks are `text` and `image` only. The server rejects
 `tool_use`, `tool_result`, `thinking`, `redacted_thinking`, `document`, and
 OpenAI `image_url` blocks from device results.
 
-Validation is intentionally narrow in M1f: allowed block type, required fields,
+Validation is intentionally narrow in Python-main: allowed block type, required fields,
 base64 decodability, and image MIME shape. Device-returned images do not get a
-new M1f-specific byte/count cap beyond existing transport, DB, and provider
+Python-main tool results may carry these safe blocks; no beyond existing transport, DB, and provider
 limits.
 
 The wire-level `content` here is **raw** — the client does not pre-wrap. Before
@@ -387,7 +387,7 @@ is in effect.
 
 ## 4. File transfer (Option A — binary frames)
 
-M1f fixes this wire contract and implements server-to-server `file_transfer`.
+Python-main server implements `server -> server` `file_transfer`.
 Client Alpha implements `server -> client` and `client -> server` transfer
 streaming. `client -> client` bridging is deferred to the next client-hardening
 slice. Disconnected device targets surface `device_unreachable` to the agent.
@@ -566,7 +566,7 @@ Protocol version is independent from the binary release version (ADR-107). Most 
 
 ---
 
-## 7. Out of scope (M0–M3)
+## 7. Out of scope (current milestone)
 
 - **MessagePack / CBOR** — JSON for now. Revisit if frame size becomes meaningful.
 - **Streaming `tool_result`** — results are single-frame even if large (subject to the tool's own result cap). Real streaming would require a slot model like transfers; not justified yet.

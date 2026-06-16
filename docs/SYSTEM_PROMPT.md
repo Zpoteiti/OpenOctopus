@@ -235,7 +235,7 @@ messages: [
 
 Only the `system` message is the cacheable prefix. Prior history is effectively static within a session (new rows only append), so most of the cached prefix extends through it too — the cache boundary sits just before the current user message. Everything inside that current user message (including the runtime block) varies per turn.
 
-**M1c note:** ADR-094 now wins for browser chat. The `<runtime>` block is prepended at ingress and persisted in the user message row. Older user messages therefore replay with the runtime block they had when inserted. Future prompt-builder work may hide these blocks from frontend display, but provider history remains faithful to persisted DB rows.
+**Note:** ADR-094 now wins for browser chat. The `<runtime>` block is prepended at ingress and persisted in the user message row. Older user messages therefore replay with the runtime block they had when inserted. Future prompt-builder work may hide these blocks from frontend display, but provider history remains faithful to persisted DB rows.
 
 ---
 

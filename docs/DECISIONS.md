@@ -1275,6 +1275,12 @@ visible and fail at dispatch with `device_unreachable`.
 ### ADR-096 · Device WebSocket protocol — single-connection JSON control + binary file transfer
 
 **Status:** accepted
+**Python-main clarification:** The full WS protocol contract carries forward
+unchanged. Python server implements the same JSON text frames + binary file
+transfer over a single WebSocket per device via FastAPI/websockets. Same
+frame catalog, same heartbeat (30s ping / ~70s timeout), same device-local
+FIFO dispatch. The wire spec in `docs/PROTOCOL.md` is binding for both
+implementations.
 **Context:** Devices need bidirectional, low-latency dispatch (server pushes tool calls, client pushes results, both sides push file bytes for `message`-with-files and `file_transfer`). Browser uses REST with best-effort POST streaming plus canonical GET polling (ADR-003, ADR-121); devices need WebSocket because they sit behind NAT and tool dispatch is bidirectional.
 **Decision:** A single WebSocket connection per device carries both control plane (JSON text frames) and bulk plane (binary frames). The full wire spec lives in `docs/PROTOCOL.md`; this ADR fixes the headline choices that other decisions reference:
 
@@ -1294,6 +1300,12 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 ### ADR-097 · Device pairing — frontend-issued token, env-var startup, token-as-identity
 
 **Status:** accepted
+**Python-main clarification:** Pairing flow carries forward unchanged. Frontend
+issues `POST /api/devices`, returns token once; user exports
+`OPENOCTOPUS_DEVICE_TOKEN` env var; client connects with it. Token is shown
+once and never retrievable; lost tokens require `regenerate-token`. Python
+server implements this through FastAPI device routes; Python client reads the
+same env var name.
 **Context:** Devices need to identify themselves to the server. Must work for headless boxes (`./openoctopus_client` on a server), unattended phones, and dev laptops. No browser-side OAuth dance.
 **Decision:** Pairing is a one-shot token-issuance flow:
 
@@ -1333,6 +1345,11 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 ### ADR-112 · Cron ticker mechanics
 
 **Status:** accepted
+**Python-main clarification:** Single in-process ticker carries forward,
+implemented as an asyncio event loop task. Sleeps until earliest
+`next_fire_at` (capped at 60s), with per-write `asyncio.Event` wake. Missed
+recurring fires silently skipped; expired one-shots dropped. Write-time
+schedule validation is shared between REST cron API and agent `cron` tool.
 **Context:** Nanobot stores cron jobs in a single-user JSON store and re-arms an asyncio timer after each write. OpenOctopus is multi-user and DB-backed, but the mental model stays the same: cron is a durable trigger that injects a message when a validated future time arrives.
 **Decision:**
 - There is one in-process cron ticker per OpenOctopus server process, not one ticker per user. It scans the shared `cron_jobs` table by `next_fire_at`.
@@ -1347,6 +1364,12 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 ### ADR-113 · Heartbeat fanout and read-only session
 
 **Status:** accepted
+**Python-main clarification:** Stateless per-process pulse carries forward,
+implemented as an asyncio periodic task. 30-minute interval, concurrent
+Phase 1 fanout via `asyncio.gather()`. Missing/empty `HEARTBEAT.md` users
+are skipped without LLM calls. Phase 2 writes to `heartbeat:{user_id}`
+session; users cannot post directly into heartbeat sessions. Provider
+concurrency is bounded by `llm_max_concurrent_requests`.
 **Context:** Nanobot heartbeat is a single-user, stateless pulse over `HEARTBEAT.md`. OpenOctopus keeps that property but must handle thousands of users. Adding heartbeat rows or per-user cursors would violate ADR-092.
 **Decision:**
 - Heartbeat is a stateless per-process pulse. Every 30 minutes, the server enumerates users, reads `{ROOT}/{user_id}/HEARTBEAT.md`, and skips users whose file is missing or empty without making an LLM call.
@@ -1371,18 +1394,20 @@ Device wire `tool_result.content` accepts either a legacy string or an M1f safe 
 
 **Status:** accepted
 **Python-main clarification:** The Rust `schema.sql` + `sqlx::raw_sql(include_str!(...))`
-bootstrap mechanism does not carry forward automatically. `docs/SCHEMA.md` is
-the active schema-shape contract during Py-Prep, but the Python server bootstrap
-and migration mechanism must be decided before server persistence implementation
-depends on this ADR.
+bootstrap mechanism does not carry forward. `docs/SCHEMA.md` remains the
+canonical schema-shape contract. Python-main uses SQLAlchemy declarative
+models/metadata as the authoritative schema definition, with
+`Base.metadata.create_all()` for dev bootstrap. Alembic or equivalent
+versioned migration framework is deferred until production launch after
+frontend completion; before that point the project is dev-machine-only
+and reset-on-bootstrap is acceptable.
 **Decision:** Python-main keeps the product requirement that schema shape is
 explicit and reviewable in one place, with all tables, indexes, and constraints
-documented together. The concrete Python implementation boundary — SQLAlchemy
-metadata, generated SQL, raw bootstrap SQL, Alembic, or a deliberately simpler
-dev-reset-only bootstrap — needs a Python persistence decision.
+documented together.
 **Consequences:** Do not assume Rust `include_str!`, `sqlx`, or `sqlx::migrate!`
-in Python plans. Implementation work that creates or migrates database objects
-must first resolve the Python bootstrap/migration contract.
+in Python plans. Dev bootstrap uses SQLAlchemy `create_all()`. Production
+migration framework selection (Alembic or equivalent) happens at a later
+milestone when the project transitions from dev-machine to deployed service.
 
 ### ADR-058 · Every user-referencing FK has `ON DELETE CASCADE` inline
 
@@ -1489,6 +1514,12 @@ stays small while adapter payloads stay understandable.
 ### ADR-092 · No heartbeat state is persisted
 
 **Status:** accepted
+**Python-main clarification:** Python server alpha runs a single ASGI worker,
+so heartbeat state coordination is unnecessary — the in-process ticker has
+exclusive ownership. Phase 1 re-reads `HEARTBEAT.md` and decides fresh each
+tick. No `last_heartbeat_phase1_at` column or `heartbeat_state` table is
+introduced. If a future milestone adds multiple workers, heartbeat coordination
+must be redesigned at that point.
 **Context:** Heartbeat Phase 1 (ADR-054) runs each tick and decides skip-or-run based on current time and `HEARTBEAT.md`. A "last Phase 1 decision" column or table was considered to let admins audit tick behavior.
 **Decision:** No persisted heartbeat state. No `users.last_heartbeat_phase1_at`, no `heartbeat_state` table. Phase 1 is stateless — each tick reads current context and decides fresh.
 **Consequences:** Restart doesn't carry heartbeat baggage. If Phase 1 fires Phase 2, the only persistence is the resulting heartbeat-session message history (via the normal message-bus path, ADR-010). Admin audit of Phase 1 behavior must come from logs, not DB queries. Acceptable: heartbeats are infrequent and user-scoped, not a compliance surface.
@@ -1740,7 +1771,8 @@ cannot overlap `workspace_path`.
 | **Admin** (platform operator) | OpenOctopus itself, all users on this deployment | Install shared-service server-side MCPs, configure LLM provider, set rate policies (ADR-056 — none in v1), delete users |
 | **User** (OpenOctopus account partner) | Their own resources (workspace, devices, channels) | Manage their devices, their skills, their memory, their integrations, their conversation history |
 | **Agent** | The user for their own conversation | Read + write within the user's workspace; execute on the user's devices under each device's persisted policy; message through the user's connected channels |
-| **Partner** (the human on the other end of a channel conversation) | The agent, for responsiveness | Treated as the user by default when the channel config matches; otherwise treated as untrusted (ADR-007) |
+| **Partner** (the user's own identity on the connected channel) | The agent, for responsiveness | Treated as the user — messages are unwrapped and trusted. The partner is the user's Discord/Telegram/etc. account as configured in channel settings. |
+| **Allowed user** (a non-partner user authorized by the partner) | The agent, with structural distrust | Messages are wrapped with `[untrusted message from <name>]` per ADR-007. Agent treats them as external input, not owner commands. |
 
 **Hard boundaries:**
 - Agents never cross user boundaries (user A's agent cannot read user B's workspace).
@@ -1762,6 +1794,8 @@ Listed here so scope is clear. Each is defensible future work but out of M0–M3
 
 ### ADR-061 · No horizontal scale / multi-server coordination
 Single server process is the unit of deployment. Multi-node would require session-affinity routing, distributed locks, leader-elected autonomous tickers. Not needed at OpenOctopus's scale.
+
+**Python-main clarification:** Python server alpha runs a single ASGI worker (ADR-122). CPU-intensive synchronous work (file parsing, PDF extraction, RAG document ingestion) crosses a thread/process boundary via `loop.run_in_executor`, `ProcessPoolExecutor`, or subprocess rather than blocking the event loop or requiring multi-worker horizontal scale. Multi-node deployment requires a future ADR.
 
 ### ADR-062 · No subagents / agent-spawning
 One agent per session. Nanobot supports subagent dispatch via sender_id — we deliberately dropped sender_id from InboundMessage (ADR-008). Add back when a real use case appears.
@@ -1787,6 +1821,13 @@ When an agent writes a file, the open Workspace tab doesn't auto-refresh. User r
 ### ADR-069 · No real migrations framework in v1
 `include_str!("schema.sql")` with `IF NOT EXISTS` semantics is all. Add `sqlx::migrate!` when first real user arrives.
 
+**Python-main clarification:** Rust `sqlx` bootstrap does not carry forward.
+Python-main uses SQLAlchemy `create_all()` for dev bootstrap. No migration
+framework is introduced until production launch after frontend completion;
+before that, the project is dev-machine-only and reset-on-bootstrap is the
+operating model. This ADR is `Archive-only` — the Rust mechanism is
+historical.
+
 ### ADR-070 · No multi-instance-coordination for heartbeat
 Heartbeat tick runs per-process. If two servers run the same DB, both would fire heartbeats. Single-node deployment avoids this. Coordinating across nodes requires leader election or advisory locks — deferred.
 
@@ -1800,6 +1841,13 @@ One client process talks to exactly one OpenOctopus server. `OPENOCTOPUS_DEVICE_
 ### ADR-101 · Anthropic Messages API only; LLM config is admin-API-set, not env
 
 **Status:** accepted
+**Python-main clarification:** Anthropic Messages remains the only provider
+wire format. Six `system_config` keys carry forward (`llm_endpoint`,
+`llm_api_key`, `llm_model`, `llm_max_context_tokens`,
+`llm_compaction_threshold_tokens`, `llm_max_concurrent_requests`). Python
+server implements the provider adapter using the Anthropic Python SDK.
+Provier validation before config write is retained. Tokenizer changes from
+`tiktoken-rs` to a Python tokenizer strategy (revalidated per model).
 **Context:** OpenOctopus needs an LLM. The choices: (a) ship a per-provider client trait (Anthropic Messages API, OpenAI Chat Completions, Bedrock, Gemini, etc. — each with its own request/response/tool-call shape), (b) speak one wire format and let the admin put a compatible endpoint or gateway in front for everything else. Option (a) has been the prior-OpenOctopus pattern and produced provider-switching bugs, vision-strip drift, and tool-call-format edge cases. OpenAI chat completions was the M1b-M1d bootstrap format, but M1f needs native `tool_use`, `tool_result`, `thinking`, and image blocks.
 **Decision:** **Anthropic Messages API ONLY.** OpenOctopus speaks one request shape, one response shape, one tool-call format. If an admin wants OpenAI / Bedrock / Gemini / a local model that does not expose an Anthropic-compatible endpoint, they put a gateway in front and configure OpenOctopus to talk to it. Format translation lives in the gateway, not in OpenOctopus.
 
@@ -1874,6 +1922,13 @@ The server's macOS/Windows targets are deliberately omitted in v1 — production
 ### ADR-104 · openoctopus_client CLI surface, env vars, and failure semantics
 
 **Status:** accepted
+**Python-main clarification:** Product-level startup contract carries forward:
+`OPENOCTOPUS_DEVICE_TOKEN` and `OPENOCTOPUS_SERVER_URL` env vars, `run` and
+`version` subcommands, backoff-forever reconnect, cancel-immediately on
+SIGTERM/SIGINT. Rust-specific implementation details (`tracing` backend,
+`RUST_LOG`, `secrecy` crate) are replaced with Python equivalents (`logging`,
+`pydantic.SecretStr`). Workspace bootstrap uses Python `pathlib.Path` and
+`mkdir(parents=True)`. Version mismatch still exits immediately with code 78.
 **Context:** openoctopus_client is a long-running daemon-style process invoked by the user (or systemd / launchd / Windows service / `nohup ./openoctopus_client &`). It needs the smallest possible startup contract — env vars in, no config wizard, no flags for the common path. Failure modes also need clear conventions so users on three OSes know what "broken" looks like.
 **Decision:**
 
@@ -2598,6 +2653,11 @@ available for behavior comparison.
 ### ADR-121 · Best-effort live token streaming; canonical replay is messages only
 
 **Status:** accepted
+**Python-main clarification:** This ADR defines Python-main's core browser
+chat contract. Streaming `POST messages` for live preview + `GET messages`
+polling for canonical replay replaces the Rust-era per-session SSE stream.
+Token deltas are transient and never persisted. No Redis or durable token
+log is required in the single-worker model.
 
 **Context:** Python-main wants token-level browser/API feedback without taking
 on Redis or a durable token-delta log. Persisting every token would turn a UI
@@ -2650,6 +2710,12 @@ conversation state.
 ### ADR-122 · Python server alpha concurrency: one async worker, no Redis
 
 **Status:** accepted
+**Python-main clarification:** Single ASGI worker with asyncio concurrency is
+the definitive model. Redis is not introduced. CPU-intensive synchronous work
+(file parsing with markitdown, PDF extraction, RAG document ingestion) crosses
+a thread/process boundary via `loop.run_in_executor`, `ProcessPoolExecutor`,
+or subprocess rather than blocking the event loop or requiring multi-worker
+horizontal scale. Multi-worker deployment requires a future ADR.
 
 **Context:** OpenOctopus workload is dominated by I/O: Anthropic Messages requests,
 database access, browser streaming responses, device WebSockets, and file
@@ -2696,6 +2762,11 @@ correctness issue. Horizontal scale is intentionally deferred.
 ### ADR-123 · Python-main server workspaces are MinIO-backed; disk is temporary only
 
 **Status:** accepted
+**Python-main clarification:** Python server workspaces persist in MinIO/S3-compatible
+object storage behind `workspace_fs`. Local disk is temporary staging only and must
+be cleaned after use. Object store config is deployment infrastructure (env vars), not
+`system_config`. Python implementation uses `minio-py` SDK. Object keys:
+`users/{user_id}/...` and `workspaces/{workspace_id}/...`.
 
 **Context:** Rust-era Plexus treated the server workspace as a durable local
 filesystem tree. Python-main is designing for a larger service from the start:
@@ -2795,6 +2866,12 @@ the same virtual path semantics while the storage backend is object-based.
 ### ADR-124 · Channel file delivery: web refs vs platform-native uploads
 
 **Status:** accepted
+**Python-main clarification:** Web channel delivery creates online-only device
+file refs with `delivery_refs` metadata; the browser downloads later through
+the Workspace Files GET relay. Third-party channel delivery streams
+device/server bytes directly into the platform's native file upload API.
+Server workspace media persists in MinIO; device media does not
+auto-duplicate. Python implementation via FastAPI streaming + httpx.
 
 **Context:** The `message` tool can send media whose bytes live either in the
 server workspace or on a paired client device. Python-main also has two very

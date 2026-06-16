@@ -2,9 +2,9 @@
 
 The PostgreSQL schema contract for `openoctopus_server`. During Py-Prep this doc
 is the canonical reference for table, column, index, constraint, and storage
-semantics. The concrete Python bootstrap/migration mechanism is not inherited
-from the Rust `schema.sql`/`sqlx` design and must be decided before server
-persistence implementation depends on it (ADR-057, ADR-069).
+semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
+`create_all()`; Alembic or equivalent migration framework is deferred until
+production launch after frontend completion (ADR-057, ADR-069).
 
 **Ten tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
 
