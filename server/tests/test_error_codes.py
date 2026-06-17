@@ -2,6 +2,15 @@ import json
 from pathlib import Path
 
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import (
+    AuthError,
+    McpError,
+    NetworkError,
+    OpenOctopusError,
+    ProtocolError,
+    ToolError,
+    WorkspaceError,
+)
 
 
 def test_error_codes_match_snapshot():
@@ -12,16 +21,6 @@ def test_error_codes_match_snapshot():
 
 
 def test_all_exception_classes_exist():
-    from openctopus_server.errors.exceptions import (
-        AuthError,
-        McpError,
-        NetworkError,
-        OpenOctopusError,
-        ProtocolError,
-        ToolError,
-        WorkspaceError,
-    )
-
     assert issubclass(WorkspaceError, OpenOctopusError)
     assert issubclass(ToolError, OpenOctopusError)
     assert issubclass(NetworkError, OpenOctopusError)

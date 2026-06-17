@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from openctopus_server.dto.error import ErrorResponse
@@ -17,7 +17,7 @@ def test_message_response():
         role="user",
         message_kind="human",
         content=[{"type": "text", "text": "hi"}],
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
     assert msg.role == "user"
 
@@ -30,7 +30,7 @@ def test_session_response():
         chat_id="chat",
         title="title",
         unread=False,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
     assert sess.channel == "web"
 

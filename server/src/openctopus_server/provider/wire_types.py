@@ -55,6 +55,11 @@ class RedactedThinkingBlock(BaseModel):
 
 
 ContentBlock = Annotated[
-    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock,
+    TextBlock
+    | ImageBlock
+    | ToolUseBlock
+    | ToolResultBlock
+    | ThinkingBlock
+    | RedactedThinkingBlock,
     Field(discriminator="type"),
 ]

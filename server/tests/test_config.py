@@ -3,7 +3,6 @@ from pydantic import ValidationError
 
 from openctopus_server.config import Settings, get_settings
 
-
 REQUIRED_ENV_VARS = {
     "OPENOCTOPUS_DATABASE_URL": "postgresql+asyncpg://u:p@localhost/db",
     "OPENOCTOPUS_DATABASE_POOL_SIZE": "5",
