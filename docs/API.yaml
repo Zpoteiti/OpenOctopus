@@ -61,7 +61,7 @@ info:
       with an appropriate `Content-Type`, and streaming message POST responses,
       which return newline-delimited JSON events.
     - Errors always return a JSON body: `{code, message}`. `code` values come
-      from the `ErrorCode` enum in `openoctopus_common/src/errors/`.
+      from the `ErrorCode` enum in `openoctopus_server/errors/`.
     - Timestamps are ISO 8601 with timezone offset.
     - UUIDs unless noted.
 
@@ -1938,7 +1938,7 @@ components:
         code:
           type: string
           description: |
-            Stable error code from `openoctopus_common/src/errors/`.
+            Stable error code from `openoctopus_server/errors/`.
             Examples: `not_found`, `forbidden`, `soft_locked`,
             `upload_too_large`, `invalid_skill_format`,
             `private_address_blocked`, `ambiguous_edit`,
