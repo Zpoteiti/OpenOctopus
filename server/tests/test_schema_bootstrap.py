@@ -1,5 +1,7 @@
+"""Schema bootstrap tests against a real PostgreSQL database."""
+
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 EXPECTED_COLUMNS = {
@@ -31,14 +33,12 @@ EXPECTED_INDEXES = {
 }
 
 
-@pytest.mark.asyncio
 async def test_all_tables_exist(pg_engine):
     async with pg_engine.connect() as conn:
         tables = set(await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names()))
     assert set(EXPECTED_COLUMNS).issubset(tables)
 
 
-@pytest.mark.asyncio
 async def test_column_counts(pg_engine):
     async with pg_engine.connect() as conn:
         for table, expected in EXPECTED_COLUMNS.items():
@@ -46,21 +46,20 @@ async def test_column_counts(pg_engine):
             assert len(cols) == expected, f"{table}: expected {expected}, got {len(cols)}"
 
 
-@pytest.mark.asyncio
 async def test_indexes_exist(pg_engine):
+    def _collect_indexes(sync_conn):
+        indexes = set()
+        for table in EXPECTED_COLUMNS:
+            for idx in inspect(sync_conn).get_indexes(table):
+                indexes.add((idx["name"], table))
+        return indexes
+
     async with pg_engine.connect() as conn:
-        indexes = await conn.run_sync(
-            lambda sync_conn: {
-                (idx["name"], idx["table_name"]) for idx in inspect(sync_conn).get_indexes()
-            }
-        )
+        indexes = await conn.run_sync(_collect_indexes)
     assert EXPECTED_INDEXES.issubset(indexes)
 
 
-@pytest.mark.asyncio
 async def test_shell_timeout_max_check(pg_engine):
-    from sqlalchemy import text
-
     async with pg_engine.begin() as conn:
         with pytest.raises(IntegrityError):
             await conn.execute(

@@ -14,6 +14,16 @@ from openctopus_server.db.engine import get_engine
 from openctopus_server.main import create_app
 
 
+@pytest.fixture(autouse=True)
+def _clear_settings_and_engine_cache():
+    """Ensure singleton caches are cleared around every test."""
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    yield
+    get_engine.cache_clear()
+    get_settings.cache_clear()
+
+
 @pytest.fixture(scope="session")
 def admin_database_url():
     settings = get_settings()
@@ -30,8 +40,9 @@ async def pg_engine(admin_database_url):
         admin_database_url,
         isolation_level="AUTOCOMMIT",
     )
-    async with admin_engine.begin() as conn:
+    async with admin_engine.connect() as conn:
         await conn.execute(text(f'CREATE DATABASE "{test_db_name}"'))
+        await conn.commit()
 
     test_url = settings.database_url.rsplit("/", 1)[0] + f"/{test_db_name}"
     engine = create_async_engine(test_url)
@@ -42,13 +53,29 @@ async def pg_engine(admin_database_url):
     yield engine
 
     await engine.dispose()
-    async with admin_engine.begin() as conn:
+    async with admin_engine.connect() as conn:
+        # Force-close any lingering client connections before dropping.
+        await conn.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                f"WHERE datname = '{test_db_name}' AND pid <> pg_backend_pid()"
+            )
+        )
         await conn.execute(text(f'DROP DATABASE "{test_db_name}"'))
+        await conn.commit()
     await admin_engine.dispose()
 
 
 @pytest_asyncio.fixture
-async def async_client(pg_engine):
+async def async_client(pg_engine, monkeypatch):
+    # Point the app at the per-session test database.
+    # render_as_string preserves the password; str(URL) masks it as '***'.
+    monkeypatch.setenv(
+        "OPENOCTOPUS_DATABASE_URL", pg_engine.url.render_as_string(hide_password=False)
+    )
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+
     app = create_app()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
