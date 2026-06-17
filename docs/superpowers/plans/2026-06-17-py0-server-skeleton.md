@@ -39,7 +39,7 @@
 | `server/tests/test_error_codes.py` | Enum uniqueness + snapshot |
 | `server/tests/test_schema_bootstrap.py` | Table/column count vs SCHEMA.md |
 | `server/tests/test_health.py` | `/health` 200/503 |
-| `.github/workflows/py0.yml` | CI gate |
+| `.github/workflows/py-server.yml` | CI gate |
 
 ---
 
@@ -51,7 +51,7 @@
 - Create: `server/src/openoctopus_server/__init__.py`
 - Test: `server/tests/test_config.py` (will be filled in Task 2)
 
-- [ ] **Step 1: Write the project metadata file**
+- [x] **Step 1: Write the project metadata file**
 
 ```toml
 # server/pyproject.toml
@@ -91,7 +91,7 @@ python_version = "3.12"
 asyncio_mode = "auto"
 ```
 
-- [ ] **Step 2: Create package init and dev env file**
+- [x] **Step 2: Create package init and dev env file**
 
 ```python
 # server/src/openoctopus_server/__init__.py
@@ -116,7 +116,7 @@ OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY=minioadmin
 OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY=minioadmin
 ```
 
-- [ ] **Step 3: Verify install works**
+- [x] **Step 3: Verify install works**
 
 Run:
 ```bash
@@ -127,7 +127,7 @@ python -c "import openoctopus_server; print('ok')"
 
 Expected: prints `ok` with no import errors.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add server/pyproject.toml server/src/openoctopus_server/__init__.py server/.env
@@ -142,7 +142,7 @@ git commit -m "chore: bootstrap Py0 server package and dependencies"
 - Create: `server/src/openoctopus_server/config.py`
 - Create: `server/tests/test_config.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_config.py
@@ -196,7 +196,7 @@ def test_settings_loads_with_openoctopus_prefix(monkeypatch):
     assert settings.port == 9000
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -206,7 +206,7 @@ pytest tests/test_config.py -v
 
 Expected: `ImportError` for `openoctopus_server.config`.
 
-- [ ] **Step 3: Implement config module**
+- [x] **Step 3: Implement config module**
 
 ```python
 # server/src/openctopus_server/config.py
@@ -251,7 +251,7 @@ def get_settings() -> Settings:
     return Settings()
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -261,7 +261,7 @@ pytest tests/test_config.py -v
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/config.py server/tests/test_config.py
@@ -278,7 +278,7 @@ git commit -m "feat: pydantic-settings config with OPENOCTOPUS_ prefix and forbi
 - Create: `server/src/openctopus_server/db/__init__.py`
 - Modify: `server/tests/conftest.py` (created here, extended later)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_engine.py
@@ -296,7 +296,7 @@ async def test_engine_can_select_one():
         assert result.scalar_one() == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -306,7 +306,7 @@ pytest tests/test_engine.py -v
 
 Expected: `ImportError` for `openctopus_server.db.engine`.
 
-- [ ] **Step 3: Implement base and engine**
+- [x] **Step 3: Implement base and engine**
 
 ```python
 # server/src/openctopus_server/db/base.py
@@ -340,7 +340,7 @@ def get_engine():
 """Database package."""
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -364,7 +364,7 @@ pytest tests/test_engine.py -v
 
 Expected: 1 passed (requires PostgreSQL running).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/ server/tests/test_engine.py
@@ -381,7 +381,7 @@ git commit -m "feat: async SQLAlchemy base and engine factory"
 - Create: `server/tests/snapshots/error_codes.json`
 - Create: `server/tests/test_error_codes.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_error_codes.py
@@ -419,7 +419,7 @@ def test_all_exception_classes_exist():
 
 Create `server/tests/snapshots/error_codes.json` with the expected content (will be generated after codes.py exists, or hand-written from spec). For now, include an empty object `{}` so the test fails meaningfully.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -429,7 +429,7 @@ pytest tests/test_error_codes.py -v
 
 Expected: `ImportError` for `openctopus_server.errors.codes`.
 
-- [ ] **Step 3: Implement error codes and exceptions**
+- [x] **Step 3: Implement error codes and exceptions**
 
 ```python
 # server/src/openctopus_server/errors/codes.py
@@ -533,7 +533,7 @@ class AuthError(OpenOctopusError):
 """Errors package."""
 ```
 
-- [ ] **Step 4: Generate snapshot and run tests**
+- [x] **Step 4: Generate snapshot and run tests**
 
 Run:
 ```bash
@@ -548,7 +548,7 @@ pytest tests/test_error_codes.py -v
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/errors/ server/tests/test_error_codes.py server/tests/snapshots/error_codes.json
@@ -564,7 +564,7 @@ git commit -m "feat: ErrorCode enum, exception hierarchy, and snapshot test"
 - Create: `server/src/openctopus_server/tools/__init__.py`
 - Create: `server/tests/test_truncate.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_truncate.py
@@ -583,7 +583,7 @@ def test_truncate_head_truncates_with_marker():
     assert result.startswith("x" * 100)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -593,7 +593,7 @@ pytest tests/test_truncate.py -v
 
 Expected: `ImportError`.
 
-- [ ] **Step 3: Implement truncate helper**
+- [x] **Step 3: Implement truncate helper**
 
 ```python
 # server/src/openctopus_server/tools/truncate.py
@@ -612,7 +612,7 @@ def truncate_head(text: str, max_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS) -> 
 """Tools package."""
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -622,7 +622,7 @@ pytest tests/test_truncate.py -v
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/tools/ server/tests/test_truncate.py
@@ -638,7 +638,7 @@ git commit -m "feat: truncate_head helper with head-only truncation"
 - Create: `server/src/openctopus_server/provider/__init__.py`
 - Create: `server/tests/test_wire_types.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_wire_types.py
@@ -691,7 +691,7 @@ def test_content_block_discriminator_rejects_unknown_type():
         pydantic.TypeAdapter(ContentBlock).validate_python({"type": "unknown"})
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -701,7 +701,7 @@ pytest tests/test_wire_types.py -v
 
 Expected: `ImportError`.
 
-- [ ] **Step 3: Implement wire types**
+- [x] **Step 3: Implement wire types**
 
 ```python
 # server/src/openctopus_server/provider/wire_types.py
@@ -772,7 +772,7 @@ ContentBlock = Annotated[
 """Provider package."""
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -782,7 +782,7 @@ pytest tests/test_wire_types.py -v
 
 Expected: 5 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/provider/ server/tests/test_wire_types.py
@@ -800,7 +800,7 @@ git commit -m "feat: Anthropic content block wire types and discriminated union"
 - Create: `server/src/openctopus_server/dto/__init__.py`
 - Create: `server/tests/test_dtos.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_dtos.py
@@ -846,7 +846,7 @@ def test_error_response():
     assert err.detail == {"path": "/x"}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -856,7 +856,7 @@ pytest tests/test_dtos.py -v
 
 Expected: `ImportError`.
 
-- [ ] **Step 3: Implement DTOs**
+- [x] **Step 3: Implement DTOs**
 
 ```python
 # server/src/openctopus_server/dto/session.py
@@ -917,7 +917,7 @@ class ErrorResponse(BaseModel):
 """DTO package."""
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -927,7 +927,7 @@ pytest tests/test_dtos.py -v
 
 Expected: 4 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/dto/ server/tests/test_dtos.py
@@ -943,7 +943,7 @@ git commit -m "feat: session, message, and error DTOs"
 - Modify: `server/tests/conftest.py`
 - Test: `server/tests/test_schema_bootstrap.py` (created here, finalized later)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_schema_bootstrap.py
@@ -976,7 +976,7 @@ async def test_tables_exist(pg_engine):
 
 `pg_engine` fixture will be created in Task 22; for now, this test will fail with `FixtureLookupError`.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -986,7 +986,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: `FixtureLookupError: 'pg_engine'`.
 
-- [ ] **Step 3: Implement first four models**
+- [x] **Step 3: Implement first four models**
 
 ```python
 # server/src/openctopus_server/db/models.py
@@ -1073,7 +1073,7 @@ class TelegramConfig(Base):
 
 Note: add `from datetime import datetime` at the top of models.py.
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1083,7 +1083,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: still fails because `pg_engine` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/models.py server/tests/test_schema_bootstrap.py
@@ -1097,7 +1097,7 @@ git commit -m "feat(models): system_config, users, discord_configs, telegram_con
 **Files:**
 - Modify: `server/src/openctopus_server/db/models.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `server/tests/test_schema_bootstrap.py`:
 
@@ -1118,7 +1118,7 @@ async def test_column_counts(pg_engine):
             assert len(cols) == expected, f"{table} expected {expected} columns, got {len(cols)}"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1128,7 +1128,7 @@ pytest tests/test_schema_bootstrap.py::test_column_counts -v
 
 Expected: `FixtureLookupError`.
 
-- [ ] **Step 3: Implement sessions and messages models**
+- [x] **Step 3: Implement sessions and messages models**
 
 Append to `server/src/openctopus_server/db/models.py`:
 
@@ -1204,7 +1204,7 @@ class Message(Base):
     )
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1214,7 +1214,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: still fails because `pg_engine` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/models.py server/tests/test_schema_bootstrap.py
@@ -1228,7 +1228,7 @@ git commit -m "feat(models): sessions and messages"
 **Files:**
 - Modify: `server/src/openctopus_server/db/models.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `EXPECTED_COLUMNS` in `server/tests/test_schema_bootstrap.py`:
 
@@ -1241,7 +1241,7 @@ EXPECTED_COLUMNS = {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1251,7 +1251,7 @@ pytest tests/test_schema_bootstrap.py::test_column_counts -v
 
 Expected: AssertionError for `pending_messages` / `devices` columns or fixture error.
 
-- [ ] **Step 3: Implement pending_messages and devices models**
+- [x] **Step 3: Implement pending_messages and devices models**
 
 Append to `server/src/openctopus_server/db/models.py`:
 
@@ -1342,7 +1342,7 @@ class Device(Base):
     )
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1352,7 +1352,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: still fails because `pg_engine` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/models.py server/tests/test_schema_bootstrap.py
@@ -1366,7 +1366,7 @@ git commit -m "feat(models): pending_messages and devices"
 **Files:**
 - Modify: `server/src/openctopus_server/db/models.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `EXPECTED_COLUMNS` in `server/tests/test_schema_bootstrap.py`:
 
@@ -1382,7 +1382,7 @@ EXPECTED_COLUMNS = {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1392,7 +1392,7 @@ pytest tests/test_schema_bootstrap.py::test_column_counts -v
 
 Expected: AssertionError or fixture error.
 
-- [ ] **Step 3: Implement remaining models and indexes**
+- [x] **Step 3: Implement remaining models and indexes**
 
 Append to `server/src/openctopus_server/db/models.py`:
 
@@ -1502,7 +1502,7 @@ Index(
 )
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1512,7 +1512,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: still fails because `pg_engine` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/models.py server/tests/test_schema_bootstrap.py
@@ -1526,7 +1526,7 @@ git commit -m "feat(models): workspaces, workspace_members, cron_jobs, and index
 **Files:**
 - Modify: `server/src/openctopus_server/db/models.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `server/tests/test_schema_bootstrap.py`:
 
@@ -1542,7 +1542,7 @@ async def test_shell_timeout_max_check(pg_engine):
             )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1552,7 +1552,7 @@ pytest tests/test_schema_bootstrap.py::test_shell_timeout_max_check -v
 
 Expected: FixtureLookupError or the negative insert succeeds (if fixture existed).
 
-- [ ] **Step 3: Add CHECK constraint to Device model**
+- [x] **Step 3: Add CHECK constraint to Device model**
 
 Update `Device.__table_args__` in `server/src/openctopus_server/db/models.py`:
 
@@ -1566,7 +1566,7 @@ __table_args__ = (
 )
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1576,7 +1576,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: still fails because `pg_engine` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/db/models.py server/tests/test_schema_bootstrap.py
@@ -1593,7 +1593,7 @@ git commit -m "fix(models): add shell_timeout_max >= 0 CHECK"
 - Create: `server/src/openctopus_server/api/health.py`
 - Create: `server/tests/test_health.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_health.py
@@ -1607,7 +1607,7 @@ async def test_health_returns_ok(async_client):
     assert response.json() == {"status": "ok", "db": "connected"}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1617,7 +1617,7 @@ pytest tests/test_health.py -v
 
 Expected: `FixtureLookupError` for `async_client`.
 
-- [ ] **Step 3: Implement health endpoint and router**
+- [x] **Step 3: Implement health endpoint and router**
 
 ```python
 # server/src/openctopus_server/api/__init__.py
@@ -1699,7 +1699,7 @@ router = APIRouter()
 router.include_router(health.router)
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1709,7 +1709,7 @@ pytest tests/test_health.py -v
 
 Expected: still fails because `async_client` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/api/ server/tests/test_health.py
@@ -1724,7 +1724,7 @@ git commit -m "feat: /health endpoint with DB check and timeout"
 - Create: `server/src/openctopus_server/main.py`
 - Modify: `server/tests/test_health.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_main.py
@@ -1737,7 +1737,7 @@ async def test_app_has_health_route(async_client):
     assert response.status_code == 200
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -1747,7 +1747,7 @@ pytest tests/test_main.py -v
 
 Expected: `FixtureLookupError` for `async_client`.
 
-- [ ] **Step 3: Implement main.py**
+- [x] **Step 3: Implement main.py**
 
 ```python
 # server/src/openctopus_server/main.py
@@ -1803,7 +1803,7 @@ if __name__ == "__main__":
     uvicorn.run(app, host=settings.host, port=settings.port)
 ```
 
-- [ ] **Step 4: Run test to verify it still fails (fixture missing)**
+- [x] **Step 4: Run test to verify it still fails (fixture missing)**
 
 Run:
 ```bash
@@ -1813,7 +1813,7 @@ pytest tests/test_main.py -v
 
 Expected: still fails because `async_client` fixture does not exist yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/openctopus_server/main.py server/tests/test_main.py
@@ -1828,7 +1828,7 @@ git commit -m "feat: FastAPI app with startup DB bootstrap and /health route"
 - Create: `server/tests/conftest.py`
 - Modify: all test files to use fixtures
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `test_schema_bootstrap.py` already references `pg_engine`. Run it to confirm fixture is missing.
 
@@ -1840,7 +1840,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: `FixtureLookupError: 'pg_engine'`.
 
-- [ ] **Step 2: Implement conftest.py**
+- [x] **Step 2: Implement conftest.py**
 
 ```python
 # server/tests/conftest.py
@@ -1907,7 +1907,7 @@ async def async_client(pg_engine):
         yield client
 ```
 
-- [ ] **Step 3: Run tests to verify fixtures work**
+- [x] **Step 3: Run tests to verify fixtures work**
 
 Run:
 ```bash
@@ -1917,7 +1917,7 @@ pytest tests/test_schema_bootstrap.py tests/test_health.py -v
 
 Expected: all pass (requires PostgreSQL running).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add server/tests/conftest.py
@@ -1931,7 +1931,7 @@ git commit -m "test: session-scoped PostgreSQL fixture and async client"
 **Files:**
 - Modify: `server/tests/test_schema_bootstrap.py`
 
-- [ ] **Step 1: Write comprehensive schema test**
+- [x] **Step 1: Write comprehensive schema test**
 
 ```python
 # server/tests/test_schema_bootstrap.py
@@ -2010,7 +2010,7 @@ async def test_shell_timeout_max_check(pg_engine):
             )
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run:
 ```bash
@@ -2020,7 +2020,7 @@ pytest tests/test_schema_bootstrap.py -v
 
 Expected: 4 passed.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add server/tests/test_schema_bootstrap.py
@@ -2034,7 +2034,7 @@ git commit -m "test: schema bootstrap coverage for tables, columns, indexes, and
 **Files:**
 - Modify: `server/tests/test_health.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # server/tests/test_health.py
@@ -2062,7 +2062,7 @@ async def test_health_returns_503_when_db_check_times_out(async_client):
     assert response.json()["db"] == "disconnected"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 ```bash
@@ -2072,11 +2072,11 @@ pytest tests/test_health.py -v
 
 Expected: second test fails because `_check_db` is not imported/patched correctly or health returns wrong status.
 
-- [ ] **Step 3: Adjust health endpoint if needed**
+- [x] **Step 3: Adjust health endpoint if needed**
 
 If the test fails because the health endpoint doesn't catch `TimeoutError`, update `server/src/openctopus_server/api/health.py` to catch `asyncio.TimeoutError` explicitly. The current implementation already catches it.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run:
 ```bash
@@ -2086,7 +2086,7 @@ pytest tests/test_health.py -v
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/tests/test_health.py server/src/openctopus_server/api/health.py
@@ -2100,13 +2100,13 @@ git commit -m "test: /health 200 and 503 timeout path"
 **Files:**
 - Delete: `server/tests/test_engine.py`
 
-- [ ] **Step 1: Remove the file**
+- [x] **Step 1: Remove the file**
 
 ```bash
 rm server/tests/test_engine.py
 ```
 
-- [ ] **Step 2: Verify tests still pass**
+- [x] **Step 2: Verify tests still pass**
 
 Run:
 ```bash
@@ -2116,7 +2116,7 @@ pytest tests/ -v
 
 Expected: all tests pass.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git rm server/tests/test_engine.py
@@ -2128,9 +2128,9 @@ git commit -m "chore: remove temporary engine smoke test"
 ### Task 19: CI workflow
 
 **Files:**
-- Create: `.github/workflows/py0.yml`
+- Create: `.github/workflows/py-server.yml`
 
-- [ ] **Step 1: Create the workflow file**
+- [x] **Step 1: Create the workflow file**
 
 ```yaml
 # .github/workflows/py0.yml
@@ -2172,7 +2172,7 @@ jobs:
           OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY: minioadmin
 ```
 
-- [ ] **Step 2: Validate YAML syntax**
+- [x] **Step 2: Validate YAML syntax**
 
 Run:
 ```bash
@@ -2181,10 +2181,10 @@ python -c "import yaml; yaml.safe_load(open('.github/workflows/py0.yml'))"
 
 Expected: no errors.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
-git add .github/workflows/py0.yml
+git add .github/workflows/py-server.yml
 git commit -m "ci: py0 GitHub Actions workflow"
 ```
 
@@ -2195,7 +2195,7 @@ git commit -m "ci: py0 GitHub Actions workflow"
 **Files:**
 - Modify: any files needed to satisfy ruff/mypy
 
-- [ ] **Step 1: Run ruff**
+- [x] **Step 1: Run ruff**
 
 Run:
 ```bash
@@ -2205,7 +2205,7 @@ ruff check src/ tests/
 
 Expected: no errors. If errors, fix them.
 
-- [ ] **Step 2: Run mypy**
+- [x] **Step 2: Run mypy**
 
 Run:
 ```bash
@@ -2218,7 +2218,7 @@ Expected: no errors. Common issues:
 - Type of `ContentBlock` in DTOs
 - `Depends(get_engine)` type annotations
 
-- [ ] **Step 3: Commit fixes**
+- [x] **Step 3: Commit fixes**
 
 ```bash
 git add -A
@@ -2232,7 +2232,7 @@ git commit -m "style: ruff and mypy compliance"
 **Files:**
 - None
 
-- [ ] **Step 1: Run all tests**
+- [x] **Step 1: Run all tests**
 
 Start PostgreSQL locally if not running:
 ```bash
@@ -2252,7 +2252,7 @@ pytest tests/ -v
 
 Expected: all tests pass.
 
-- [ ] **Step 2: Run local server smoke test**
+- [x] **Step 2: Run local server smoke test**
 
 ```bash
 cd server
@@ -2262,7 +2262,7 @@ curl http://127.0.0.1:8080/health
 
 Expected: `{"status":"ok","db":"connected"}`.
 
-- [ ] **Step 3: Commit any final fixes**
+- [x] **Step 3: Commit any final fixes**
 
 ```bash
 git add -A
@@ -2311,6 +2311,30 @@ git commit -m "test: full Py0 test suite green"
 1. **mypy strict**: `Depends(get_engine)` may need an explicit return type annotation on `get_engine()` or a cast. Adjust in Task 20.
 2. **pytest-asyncio fixture scoping**: `pg_engine` is session-scoped and async; ensure `pytest_asyncio` is configured with `asyncio_mode = "auto"` (done in pyproject.toml).
 3. **Health 503 test**: the patch path assumes `_check_db` is importable from `openctopus_server.api.health`. If implementation moves it, update the patch path.
+
+---
+
+## Execution notes
+
+Implemented in the `py0-impl` worktree. Key deviations/fixes from the draft plan:
+
+- **Config env file path**: `Settings` now loads `.env` from an absolute path derived from `config.py` so tests pass regardless of the working directory.
+- **Model registration**: `db/base.py` imports `models` after `Base` is defined so `Base.metadata.create_all()` creates all 11 tables.
+- **Health 503 response**: Returns `JSONResponse(status_code=503)` instead of a tuple, because FastAPI/Starlette serializes a returned tuple as a JSON list with status 200.
+- **Test fixtures**: `async_client` passes `pg_engine.url.render_as_string(hide_password=False)` to the env var; `str(URL)` masks the password as `***` and breaks app authentication.
+- **Teardown robustness**: `pg_engine` teardown terminates lingering connections before `DROP DATABASE` to avoid `ObjectInUseError`.
+- **mypy**: Added `pydantic.mypy` plugin and a localized `# type: ignore[call-arg]` for `Settings()` because required fields are populated from environment variables at runtime.
+- **CI workflow filename**: Created as `.github/workflows/py-server.yml` (copies `server/.env.example` to `server/.env`) rather than `py0.yml`.
+
+Final verification:
+
+```bash
+ruff check server/src server/tests
+mypy server/src
+python -m pytest server/tests -v
+```
+
+All 21 tests pass; lint and type-check are clean.
 
 ---
 
