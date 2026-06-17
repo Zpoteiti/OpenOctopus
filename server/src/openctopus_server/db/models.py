@@ -185,7 +185,7 @@ class Device(Base):
         JSONB,
         nullable=False,
         server_default=text(
-            '''"[\\"127.0.0.0/8\\",\\"::1/128\\",\\"10.0.0.0/8\\",\\"172.16.0.0/12\\",\\"192.168.0.0/16\\",\\"100.64.0.0/10\\",\\"169.254.0.0/16\\",\\"169.254.169.254/32\\",\\"fc00::/7\\",\\"fe80::/10\\"]"::jsonb'''
+            "'[\"127.0.0.0/8\",\"::1/128\",\"10.0.0.0/8\",\"172.16.0.0/12\",\"192.168.0.0/16\",\"100.64.0.0/10\",\"169.254.0.0/16\",\"169.254.169.254/32\",\"fc00::/7\",\"fe80::/10\"]'::jsonb"
         ),
     )
     env_allowlist: Mapped[list] = mapped_column(
@@ -197,7 +197,7 @@ class Device(Base):
         JSONB,
         nullable=False,
         server_default=text(
-            '''"[\\"shutdown\\",\\"reboot\\",\\"halt\\",\\"poweroff\\",\\"mkfs\\",\\"dd\\",\\"mount\\",\\"umount\\",\\"systemctl\\",\\"service\\"]"::jsonb'''
+            "'[\"shutdown\",\"reboot\",\"halt\",\"poweroff\",\"mkfs\",\"dd\",\"mount\",\"umount\",\"systemctl\",\"service\"]'::jsonb"
         ),
     )
     mcp_servers: Mapped[dict] = mapped_column(
@@ -209,6 +209,7 @@ class Device(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name"),
+        CheckConstraint("shell_timeout_max >= 0", name="check_shell_timeout_max_non_negative"),
         CheckConstraint(
             "name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server'",
             name="check_device_name",
