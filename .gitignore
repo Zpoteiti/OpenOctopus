@@ -219,3 +219,5 @@ __marimo__/
 
 # Server env file (copy from .env.example)
 server/.env
+opencode.json
+.codegraph
