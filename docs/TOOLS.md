@@ -19,10 +19,10 @@ This is a *design* document. Use it during implementation as the source of truth
   - **Extend:** for every property carrying `x-openoctopus-device: true`, replace its enum with the extended list of install sites. Applies to intrinsic-device tools.
   - Nothing else mutates. All other property names, types, descriptions, non-device enums, and the rest of `required` are strictly pass-through. See pseudocode in the Cross-cutting concerns section below.
 - **Three package locations for tool code:**
-  - **Shared schemas** → `openoctopus_common/tools/<tool>.py`
-  - **Shared tool implementations** → both `openoctopus_server/tools/<tool>.py` and `openoctopus_client/tools/<tool>.py` (each side runs natively when the agent dispatches with the matching `device`).
-  - **Server-only tools** → schema + implementation in `openoctopus_server/tools/<tool>.py`
-  - **Client-only tools** → schema + implementation in `openoctopus_client/tools/<tool>.py`
+  - **Shared source schemas** → `openoctopus_common/tools/schemas/<tool>.py` (11 tools — Py0)
+  - **Shared tool implementations** → both `openoctopus_server/tools/<tool>.py` and `openoctopus_client/tools/<tool>.py` (later milestones)
+  - **Server-only tools** → source schema + implementation in `openoctopus_server/tools/<tool>.py` (3 tools — later milestones)
+  - **Client-only tools** → source schema + implementation in `openoctopus_client/tools/<tool>.py` (3 tools — later milestones)
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
@@ -52,10 +52,12 @@ This is a *design* document. Use it during implementation as the source of truth
 | `message` | server-only | openoctopus_server | openoctopus_server | Deliver text/media/buttons to a channel chat |
 | `file_transfer` | server-only | openoctopus_server | openoctopus_server | Copy or move files within/across devices (OpenOctopus addition) |
 | `cron` | server-only | openoctopus_server | openoctopus_server | Add/list/remove scheduled agent invocations |
-| `exec` | client-only | openoctopus_client | openoctopus_client | Execute a shell command on a device |
+| `exec` | client-only | openoctopus_client | openoctopus_client | Execute a shell command on a device; supports long-running background sessions via `yield_time_ms` |
+| `write_stdin` | client-only | openoctopus_client | openoctopus_client | Write stdin, poll output, send EOF, or terminate a background exec session |
+| `list_exec_sessions` | client-only | openoctopus_client | openoctopus_client | List active background exec sessions with status and resource usage |
 | `mcp_<server>_<tool>`, `mcp_<server>_resource_<name>`, `mcp_<server>_prompt_<name>` | dynamic | MCP (Python `mcp` SDK) | wherever the MCP is installed | Wrapped MCP capabilities — tools, resources, prompts (ADR-048) |
 
-11 shared + 3 server-only + 1 client-only = 15 first-class tools, plus any number of MCP-wrapped tools.
+11 shared + 3 server-only + 3 client-only = 17 first-class tools, plus any number of MCP-wrapped tools.
 
 Schemas below are the **source** schemas (what gets written in code). The agent sees these plus the merger's additions per ADR-071 (`openoctopus_device` property on routing-only tools, enum extension on intrinsic-device tools).
 
