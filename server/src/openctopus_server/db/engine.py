@@ -1,9 +1,9 @@
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from openctopus_server.config import get_settings
 
 
-def get_engine():
+def get_engine() -> AsyncEngine:
     settings = get_settings()
     return create_async_engine(
         settings.database_url,
