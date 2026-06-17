@@ -214,3 +214,90 @@ class Device(Base):
             name="check_device_name",
         ),
     )
+
+
+class Workspace(Base):
+    __tablename__ = "workspaces"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    quota_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    joined_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CronJob(Base):
+    __tablename__ = "cron_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule: Mapped[str] = mapped_column(Text, nullable=False)
+    tz: Mapped[str | None] = mapped_column(Text)
+    one_shot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("FALSE")
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    next_fire_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+Index("idx_sessions_user_id", Session.user_id)
+Index("idx_sessions_user_session_key", Session.user_id, Session.session_key, unique=True)
+Index("idx_messages_session_created", Message.session_id, Message.created_at)
+Index(
+    "idx_pending_messages_session_received",
+    PendingMessage.session_id,
+    PendingMessage.received_at,
+    PendingMessage.id,
+)
+Index(
+    "idx_pending_messages_session_key_received",
+    PendingMessage.session_key,
+    PendingMessage.received_at,
+    PendingMessage.id,
+)
+Index("idx_devices_user_id", Device.user_id)
+Index("idx_workspace_members_user", WorkspaceMember.user_id)
+Index("idx_cron_jobs_user_id", CronJob.user_id)
+Index(
+    "idx_cron_jobs_next_fire",
+    CronJob.next_fire_at,
+    postgresql_where=text("next_fire_at IS NOT NULL"),
+)
