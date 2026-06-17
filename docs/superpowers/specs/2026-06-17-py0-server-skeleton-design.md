@@ -89,20 +89,24 @@ openoctopus/
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="forbid")
 
-    # PostgreSQL (Py0)
-    database_url: str  # postgresql+asyncpg://...
+    # PostgreSQL (Py0) — all required, no defaults
+    database_url: str
+    database_pool_size: int
+    database_max_overflow: int
+    database_pool_timeout: int
+    database_pool_pre_ping: bool
 
-    # Server
-    host: str          # 127.0.0.1
-    port: int          # 8080
+    # Server — required
+    host: str
+    port: int
 
-    # Auth (Py1 — read, not used in Py0)
+    # Auth (Py1 — read, Py0 placeholder)
     jwt_secret: str
-    cookie_secure: bool = False
+    cookie_secure: bool
 
-    # Object Storage (Py4 — read, not used in Py0)
+    # Object Storage (Py4 — read, Py0 placeholder)
     object_storage_endpoint: str
     object_storage_bucket: str
     object_storage_region: str
@@ -110,72 +114,73 @@ class Settings(BaseSettings):
     object_storage_secret_key: str
 ```
 
-- `Settings()` reads from `.env` file at startup.
-- All fields are required. Missing any → `ValidationError` → startup fails.
-- `SettingsConfigDict(env_file=".env")` auto-loads the `.env` in the working directory.
+- `extra="forbid"` — rejects unknown env vars, catches typos.
+- All fields are required (no defaults). Missing any → `ValidationError` → `sys.exit(1)`.
+- `SettingsConfigDict(env_file=".env")` auto-loads `.env` in working directory.
 - CI/container deployments set env vars directly (no `.env` file).
+
+### `.env` file (dev)
+
+```bash
+# PostgreSQL — required (no defaults)
+DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
+DATABASE_POOL_SIZE=5
+DATABASE_MAX_OVERFLOW=10
+DATABASE_POOL_TIMEOUT=30
+DATABASE_POOL_PRE_PING=true
+
+# Server — required
+OPENOCTOPUS_HOST=127.0.0.1
+OPENOCTOPUS_PORT=8080
+
+# Auth (Py1 — read, Py0 placeholder)
+OPENOCTOPUS_JWT_SECRET=change-me-in-production
+OPENOCTOPUS_COOKIE_SECURE=false
+
+# Object Storage - MinIO (Py4 — read, Py0 placeholder)
+OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT=localhost:9000
+OPENOCTOPUS_OBJECT_STORAGE_BUCKET=openoctopus
+OPENOCTOPUS_OBJECT_STORAGE_REGION=us-east-1
+OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY=minioadmin
+OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY=minioadmin
+```
 
 ## DB models (11 tables from SCHEMA.md)
 
-All models live in `db/models.py` as SQLAlchemy 2.0 declarative classes with `Mapped[]` column types.
+All models live in `db/models.py` as SQLAlchemy 2.0 declarative classes with `Mapped[]` column types. Every column from SCHEMA.md is declared — Py0 creates the tables but reads/writes none. Fields unused in Py0 carry `# Py0 placeholder` comments.
 
-| Table | Key columns | Notes |
+| Table | Columns | Notes |
 |---|---|---|
-| `system_config` | `key TEXT PK`, `value JSONB`, `updated_at` | No seed rows |
-| `users` | `id UUID PK`, `email`, `password_hash`, `name`, `is_admin`, `created_at` | No seed rows |
-| `discord_configs` | `user_id UUID PK FK→users` | No seed rows |
-| `telegram_configs` | `user_id UUID PK FK→users` | No seed rows |
-| `sessions` | `id UUID PK`, `user_id FK`, `session_key UNIQUE`, `channel`, `chat_id`, `title`, `last_read_at`, `cancel_requested`, `created_at` | No seed rows |
-| `messages` | `id UUID PK`, `session_id FK`, `role`, `message_kind`, `content JSONB`, `delivery_refs JSONB`, `is_compaction_summary`, `created_at` | No seed rows |
-| `pending_messages` | `id UUID PK`, `session_id FK`, `user_id FK`, `session_key`, `content JSONB`, `effort`, `received_at` | No seed rows |
-| `devices` | `token TEXT PK`, `user_id FK`, `name UNIQUE per user`, `workspace_path`, `sandbox_mode`, `shell_timeout_max`, `ssrf_denylist JSONB`, `env_allowlist JSONB`, `command_denylist JSONB`, `mcp_servers JSONB`, `created_at` | No seed rows |
-| `workspaces` | `id UUID PK`, `name`, `quota_bytes`, `created_by FK→users`, `created_at` | No seed rows |
-| `workspace_members` | `workspace_id FK + user_id FK` composite PK | No seed rows |
-| `cron_jobs` | `id UUID PK`, `user_id FK`, `session_id FK`, `name`, `message`, `schedule JSONB`, `next_fire_at`, `last_fired_at`, `created_at` | No seed rows |
+| `system_config` | `key TEXT PK`, `value JSONB NOT NULL`, `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
+| `users` | `id UUID PK DEFAULT gen_random_uuid()`, `email TEXT NOT NULL UNIQUE`, `password_hash TEXT NOT NULL`, `name TEXT NOT NULL`, `is_admin BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
+| `discord_configs` | `user_id UUID PK FK→users ON DELETE CASCADE`, `bot_token TEXT NOT NULL`, `partner_chat_id TEXT NOT NULL`, `allow_list JSONB NOT NULL DEFAULT '[]'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
+| `telegram_configs` | `user_id UUID PK FK→users ON DELETE CASCADE`, `bot_token TEXT NOT NULL`, `partner_chat_id TEXT NOT NULL`, `allow_list JSONB NOT NULL DEFAULT '[]'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
+| `sessions` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `channel TEXT NOT NULL`, `chat_id TEXT NOT NULL`, `title TEXT NOT NULL DEFAULT 'New chat'`, `last_inbound_at TIMESTAMPTZ`, `last_read_at TIMESTAMPTZ`, `cancel_requested BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | UNIQUE(user_id, session_key). Py0 placeholder. |
+| `messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `role TEXT NOT NULL CHECK (IN ('user','assistant'))`, `message_kind TEXT NOT NULL CHECK (IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary'))`, `content JSONB NOT NULL`, `delivery_refs JSONB NOT NULL DEFAULT '[]'`, `llm_fingerprint TEXT`, `is_compaction_summary BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
+| `pending_messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `content JSONB NOT NULL`, `effort TEXT CHECK (effort IS NULL OR effort IN ('off','low','medium','high','xhigh','max'))`, `received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
+| `devices` | `token TEXT PK`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `name TEXT NOT NULL CHECK (slug regex) CHECK (name <> 'server')`, `workspace_path TEXT NOT NULL`, `sandbox_mode BOOLEAN NOT NULL DEFAULT TRUE`, `shell_timeout_max INTEGER NOT NULL DEFAULT 600 CHECK (>=0)`, `ssrf_denylist JSONB NOT NULL DEFAULT [...]`, `env_allowlist JSONB NOT NULL DEFAULT [...]`, `command_denylist JSONB NOT NULL DEFAULT [...]`, `mcp_servers JSONB NOT NULL DEFAULT '{}'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, UNIQUE(user_id, name) | Py0 placeholder. |
+| `workspaces` | `id UUID PK DEFAULT gen_random_uuid()`, `name TEXT NOT NULL`, `quota_bytes BIGINT NOT NULL`, `created_by UUID FK→users ON DELETE SET NULL` (exception to ADR-058), `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
+| `workspace_members` | `workspace_id UUID NOT NULL FK→workspaces ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, PRIMARY KEY(workspace_id, user_id) | Py0 placeholder. |
+| `cron_jobs` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_id UUID NOT NULL FK→sessions` (RESTRICT — 有 cron job 时不能删 session), `name TEXT NOT NULL`, `schedule TEXT NOT NULL`, `tz TEXT`, `one_shot BOOLEAN NOT NULL DEFAULT FALSE`, `message TEXT NOT NULL`, `last_fired_at TIMESTAMPTZ`, `next_fire_at TIMESTAMPTZ NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 
-Constraints modeled:
-- `users.email UNIQUE`
-- `sessions.session_key UNIQUE`
-- `devices UNIQUE(user_id, name)`, `devices.name CHECK (is slug)`
-- `messages CHECK (role IN ('user','assistant'))`, `messages CHECK (message_kind IN (...))`
-- `pending_messages CHECK (effort IN (...))`
-- FK `ON DELETE CASCADE` on all user-referencing FKs (except `workspaces.created_by`)
-- All indexes from SCHEMA.md
+All indexes from SCHEMA.md §Indexes summary are created via `Index()` in model metadata.
 
 Implementation notes:
-- Models are `mapped_column()` with `nullable=False` where SCHEMA.md says `NOT NULL`
-- JSONB columns use `sqlalchemy.dialects.postgresql.JSONB` type
+- `mapped_column()` with `nullable=False` where SCHEMA.md says `NOT NULL`
+- JSONB columns use `sqlalchemy.dialects.postgresql.JSONB`
 - `CHECK` constraints use SQLAlchemy `CheckConstraint` where the ORM can't express them natively
-- No relationships defined in Py0 (none needed until queries exist)
+- No relationships defined in Py0 (none needed until queries exist — Py1+)
+- `gen_random_uuid()` default requires `server_default=text("gen_random_uuid()")`
 
-## Bootstrap logic
+## Startup sequence
 
-On startup event:
+1. Load config from `.env` + os.environ via `pydantic-settings`. Any missing required field → `ValidationError` → `sys.exit(1)`.
+2. Create async engine with pool settings from config.
+3. Try `async with engine.connect() as conn: await conn.execute(text("SELECT 1"))`. If this fails → log error, `sys.exit(1)`. No retry. Config is wrong; admin must fix.
+4. `await conn.run_sync(Base.metadata.create_all)` — idempotent, no-op if tables exist. On fresh DB creates all 11 tables + indexes.
+5. Start uvicorn, listen on `{host}:{port}`.
 
-```python
-async def on_startup():
-    async with engine.begin() as conn:
-        # Check if this is a fresh DB (no tables exist)
-        await conn.run_sync(Base.metadata.create_all)
-```
-
-`create_all()` is no-op if tables exist. On fresh DB, creates all 11 tables + indexes. No Alembic in Py0 (deferred per ADR-069).
-
-Health check:
-
-```python
-@router.get("/health")
-async def health():
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return {"status": "ok", "db": "connected"}
-    except Exception:
-        return JSONResponse(
-            {"status": "error", "db": "disconnected"},
-            status_code=503,
-        )
-```
+`/health` runs the same `SELECT 1` check on every call — returns 200 if connected, 503 if the connection died (pool exhausted, network lost, etc.).
 
 ## Anthropic wire types
 
@@ -412,27 +417,19 @@ asyncio_mode = "auto"
 
 ### Test infrastructure
 
-- `conftest.py` provides an async fixture that creates a fresh SQLite in-memory DB with `create_all()`, yields an async session, and drops after each test.
-- API tests use `httpx.AsyncClient` against the FastAPI app (TestClient pattern with `httpx.ASGITransport`).
+All tests run against a real PostgreSQL database. Local dev starts PG via Docker; CI uses a service container. Tests that need a DB use a session-scoped fixture that creates a fresh DB (`template openoctopus_test` → `CREATE DATABASE ... TEMPLATE`) per test run, runs `create_all()`, and drops at the end. No SQLite — the production backend is PostgreSQL and only PG exercises JSONB, CHECK constraints, and PG-specific index types correctly.
+
+API tests use `httpx.AsyncClient` against the FastAPI app (TestClient pattern with `httpx.ASGITransport`).
 
 ### Test suite
 
 | Test file | What it verifies |
 |---|---|
 | `test_health.py` | `GET /health` → 200, body has `status: "ok"` |
-| `test_schema_bootstrap.py` | `create_all()` produces correct table names and column counts matching SCHEMA.md |
+| `test_schema_bootstrap.py` | `create_all()` on empty PG → 11 tables present; table names and column counts match SCHEMA.md §1–§11 |
 | `test_wire_types.py` | Each content block type serializes to JSON and back; discriminated union works |
 | `test_truncate.py` | `truncate_head("hello", 10)` → no-op; `truncate_head("x" * 20000, 100)` → truncated with marker |
 | `test_error_codes.py` | Every ErrorCode value is unique; every exception class exists |
-
-### Schema bootstrap test
-
-The schema test runs `create_all()` on an empty SQLite, then introspects with `inspect(engine).get_table_names()` and `get_columns()`. It verifies:
-- 11 table names match SCHEMA.md
-- Column counts per table match
-- This is a lightweight diff — it catches accidental model drift but doesn't validate exact DDL types (SQLite vs PG differences)
-
-For full PG type validation, the CI pipeline runs the same test against a real PostgreSQL container.
 
 ### CI gate (GitHub Actions)
 
@@ -460,6 +457,10 @@ jobs:
       - run: pytest server/tests/ -v
         env:
           DATABASE_URL: postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
+          DATABASE_POOL_SIZE: 5
+          DATABASE_MAX_OVERFLOW: 10
+          DATABASE_POOL_TIMEOUT: 30
+          DATABASE_POOL_PRE_PING: true
 ```
 
 ## Dev setup
@@ -482,8 +483,24 @@ docker run --rm --name oo-minio \
 
 # Terminal 3: Server
 cd server
-cp .env.example .env   # or create from scratch
+# Create .env with all required vars (see .env section above)
 pip install -e ".[dev]"
+
+# Start with env vars (or use .env)
+DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus \
+DATABASE_POOL_SIZE=5 \
+DATABASE_MAX_OVERFLOW=10 \
+DATABASE_POOL_TIMEOUT=30 \
+DATABASE_POOL_PRE_PING=true \
+OPENOCTOPUS_HOST=127.0.0.1 \
+OPENOCTOPUS_PORT=8080 \
+OPENOCTOPUS_JWT_SECRET=dev-secret \
+OPENOCTOPUS_COOKIE_SECURE=false \
+OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT=localhost:9000 \
+OPENOCTOPUS_OBJECT_STORAGE_BUCKET=openoctopus \
+OPENOCTOPUS_OBJECT_STORAGE_REGION=us-east-1 \
+OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY=minioadmin \
+OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY=minioadmin \
 python -m openoctopus_server.main
 # → http://127.0.0.1:8080/health
 ```
