@@ -590,7 +590,7 @@ merge correctly.
 
 **Status:** accepted
 **Decision:** Matcher levels: (1) exact substring, (2) line-trimmed sliding window (handles indentation drift), (3) smart-quote normalization. Multi-match uses nanobot's current selectors: `replace_all=true`, `occurrence`, or `line_hint`; `expected_replacements` guards the selected replacement count. Create-file shortcut: `old_text=""` + file doesn't exist → create with `new_text`.
-**Consequences:** Same matcher on server and client (lives in `openoctopus_server`). Tool args mirror nanobot: `path`, `old_text`, `new_text`, `replace_all`, `occurrence`, `line_hint`, `expected_replacements`.
+**Consequences:** Matcher lives in `openoctopus_server`. The client implements the same algorithm independently against the tool contract. Tool args mirror nanobot: `path`, `old_text`, `new_text`, `replace_all`, `occurrence`, `line_hint`, `expected_replacements`.
 
 ### ADR-043 · Tool path policy — relative paths resolve to personal workspace; shared workspaces use `name@suffix` absolute form
 
@@ -2599,24 +2599,42 @@ by later ADRs.
 
 The Python rewrite uses a staged implementation map. `Py-Prep` is docs-only and
 does not count as production code. Numbered implementation milestones start at
-`Py0`, and `Py0` is common-only:
+`Py0`. Client language (Go or Rust) is decided at Py5.
 
-| Milestone | Scope |
-|---|---|
-| `Py-Prep` | Audit old ADRs/docs, remove stale cognitive load, and pin the Python rewrite sequence. |
-| `Py0` | Server foundation: FastAPI app, SQLAlchemy/PostgreSQL, tool source schemas (Pydantic models for all 17 tools), typed errors (`ErrorCode` enum, domain exceptions), identity validation (ADR-109), tool result normalization (ADR-095), truncation helper, session/message DTOs, provider wire types, merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`). No agent loop, no tool implementations, no workspace I/O. |
-| `Py1` | Auth + config: user registration/login, JWT/cookies/bearer auth (ADR-004), admin config API (`system_config` for LLM keys, quota), admin user management. |
-| `Py2` | Single-turn Anthropic Messages chat: `POST/GET messages`, Postgres transcript integration, Anthropic SDK adapter, and no agent loop yet. |
-| `Py3` | Agent loop and server tools: hand-written ReAct loop, JIT tool-result collapsing, best-effort token preview, cancel/restart repair, `web_fetch`, `message`, and account/context helpers. |
-| `Py4` | Workspace files: `workspace_fs`, file APIs/tools, quota, transfer basics, and MinIO-compatible object storage as the persistent server file layer. |
-| `Py5` | Client Alpha: Python client WebSocket runtime, shared tools, and agent access to client files. |
-| `Py6` | Client shell hardening: persistent shell, reconnect behavior, diagnostics, and stronger execution ergonomics. |
-| `Py7` | Client sandbox and client-side MCP. |
-| `Py8` | Server sandbox and server-side MCP. |
-| `Py9` | Cron/heartbeat autonomous message injection. |
-| `Py10` | Channel adapters such as Discord, Telegram, Feishu, and similar integrations. |
-| `Py11` | Memory/Dream-style consolidation. |
-| `Py12+` | Frontend, packaging, hardening, scale-out, extra channels, and later expansion. |
+### Milestone map
+
+| ID | Type | Scope | Depends on | Exit criteria |
+|---|---|---|---|---|
+| **Py-Prep** | Docs | Audit old ADRs/docs, remove stale cognitive load, pin Python rewrite sequence | — | Complete |
+| **Py-Setup** | Docs (gate) | 4 ADRs (client language, wire protocol as sole shared contract, tool schema ownership, matcher pattern) + fix 3 pseudo-sharing doc residuals | Py-Prep | 4 ADRs accepted; TOOLS.md:245 / DECISIONS.md:593 / ADR-042 audit row updated |
+| **Py0** | Server skeleton | FastAPI app + `/health` + SQLAlchemy/PostgreSQL bootstrap + DB schema apply on empty DB + DTOs (session/message/error) + `ErrorCode` enum + error normalization + truncation helper + Anthropic Messages wire types | Py-Setup | `/health` 200; OpenAPI docs generated; ruff/mypy/pytest green; fake-provider wire shape tests pass |
+| **Py1** | Auth + config | Registration/login + JWT + cookie/bearer + admin `system_config` + admin user management | Py0 | Auth + admin config tests pass; admin can configure fake LLM; no chat yet |
+| **Py2** | Single-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript + Anthropic SDK adapter + `llm_max_concurrent_requests` semaphore | Py1 | Browser can create session, fake provider completes one turn, GET recovers history |
+| **Py3** | Agent loop + first tools | Hand-written ReAct loop + JIT tool-result collapsing + best-effort token preview + cancel/restart + **only** web_fetch and message schemas + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers | Py2 | web_fetch + message work end-to-end; tool_result normalization; cancel/restart; pending drain |
+| **Py4a** | Design spike | `workspace_fs` 2–3 page spec: object-client pool size/lifecycle, quota race resolution strategy, temp cleanup triggers, MinIO error normalization checklist | Py3 | Spec doc reviewed; answers the four points explicitly |
+| **Py4** | Workspace files | `workspace_fs` (per Py4a spec) + file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + MinIO integration + quota | Py4a | File API/tool tests pass through workspace_fs; no API touches MinIO directly |
+| **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
+| **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
+| **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
+| **Py8** | Server sandbox + server-side MCP | Server sandbox + explicit security design + admin shared-service MCP (one shared runtime per MCP + bounded FIFO queue) | Py7 | Fake admin shared MCP exposes tools via `server`; collision/failure paths covered |
+| **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
+| **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
+| **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
+| **Py12** | Frontend | React/Vite SPA with static assets; dev proxy to server; workspace/files, sessions, devices, system config management UIs | — | — |
+| **Py13** | Packaging + scale-out | Docker images, pip distribution, deployment docs; multi-worker scale-out (future ADR) | Py12 | — |
+| **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
+
+### Parallel tracks (post-Py3)
+
+```
+Py3 ──────────┬── Py4a → Py4 → Py5 → Py6 → Py7 → Py8
+               │
+               ├── Py9 (cron/heartbeat)
+               │
+               └── Py10 (channels)
+```
+
+Py9 and Py10 depend only on Py3 and can develop concurrently with Py4–Py8.
 
 Server milestones use first-party async application code and a OpenOctopus-owned
 Anthropic Messages adapter built on the Anthropic Python SDK where the SDK fits
@@ -2942,7 +2960,7 @@ For contributors migrating from the old codebase, here's what changed and why:
 | `EventKind::{UserTurn, Cron, Dream, Heartbeat}` | No kind; autonomous = user-message injection | ADR-005, ADR-010 |
 | `PromptMode::{UserTurn, Heartbeat, Dream}` | Single system prompt shape | ADR-023 |
 | `ToolAllowlist::Only(...)` for Dream | Dropped with Dream | ADR-055 |
-| 4-crate workspace (with plexus-gateway) | 3 crates | ADR-001 |
+| 4-crate workspace (with plexus-gateway) | 2-project monorepo (server + client, no common) | ADR-001 |
 | WebSocket for browser chat | REST with best-effort POST streaming + canonical GET polling | ADR-003, ADR-121 |
 | `InboundEvent.sender_id`, `.identity.is_partner` | Neither field on InboundMessage | ADR-007, ADR-008 |
 | Rate limiting in bus | None in v1 | ADR-056 |

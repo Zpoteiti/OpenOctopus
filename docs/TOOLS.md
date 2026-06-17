@@ -242,7 +242,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 ```
 
 **Mechanism:**
-- **Three-level fuzzy match** (ADR-042), in order, lives in `openoctopus_server/tools/edit_file/matcher.py` so server + client share it:
+- **Three-level fuzzy match** (ADR-042), in order, lives in `openoctopus_server/tools/edit_file/matcher.py`. The client implements the same algorithm independently against the tool contract.
   1. Exact substring match.
   2. Line-trimmed sliding window — strips leading/trailing whitespace per line for the comparison while preserving original indentation in the replacement.
   3. Smart-quote normalization — treats `'`/`'`/`"`/`"` as equivalent to ASCII `'`/`"`.
