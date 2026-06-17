@@ -175,7 +175,7 @@ All models live in `db/models.py` as SQLAlchemy 2.0 declarative classes with `Ma
 | `sessions` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `channel TEXT NOT NULL`, `chat_id TEXT NOT NULL`, `title TEXT NOT NULL DEFAULT 'New chat'`, `last_inbound_at TIMESTAMPTZ`, `last_read_at TIMESTAMPTZ`, `cancel_requested BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | UNIQUE(user_id, session_key). `last_inbound_at` powers session-list ordering (ADR-006, ADR-121). Py0 placeholder. |
 | `messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `role TEXT NOT NULL CHECK (role IN ('user','assistant'))`, `message_kind TEXT NOT NULL CHECK (message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary'))`, `content JSONB NOT NULL`, `delivery_refs JSONB NOT NULL DEFAULT '[]'`, `llm_fingerprint TEXT`, `is_compaction_summary BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 | `pending_messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `content JSONB NOT NULL`, `effort TEXT CHECK (effort IS NULL OR effort IN ('off','low','medium','high','xhigh','max'))`, `received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
-| `devices` | `token TEXT PK`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `name TEXT NOT NULL CHECK (name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server')`, `workspace_path TEXT NOT NULL`, `sandbox_mode BOOLEAN NOT NULL DEFAULT TRUE`, `shell_timeout_max INTEGER NOT NULL DEFAULT 600 CHECK (shell_timeout_max >= 0)`, `ssrf_denylist JSONB NOT NULL DEFAULT '["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "169.254.169.254/32", "fc00::/7", "fe80::/10"]'`, `env_allowlist JSONB NOT NULL DEFAULT '["HOME", "USER", "PATH", "SHELL", "LANG", "LC_ALL", "TMPDIR", "PWD", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"]'`, `command_denylist JSONB NOT NULL DEFAULT '["rm -rf /", "mkfs.", "dd if=/dev/zero", ">:/dev/sda", "chmod -R 777 /", "chown -R root /", "passwd", "sudo", "su -", "curl", "wget"]'`, `mcp_servers JSONB NOT NULL DEFAULT '{}'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, UNIQUE(user_id, name) | Py0 placeholder. |
+| `devices` | `token TEXT PK`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `name TEXT NOT NULL CHECK (name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server')`, `workspace_path TEXT NOT NULL`, `sandbox_mode BOOLEAN NOT NULL DEFAULT TRUE`, `shell_timeout_max INTEGER NOT NULL DEFAULT 600 CHECK (shell_timeout_max >= 0)`, `ssrf_denylist JSONB NOT NULL DEFAULT '["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "169.254.169.254/32", "fc00::/7", "fe80::/10"]'`, `env_allowlist JSONB NOT NULL DEFAULT '["PATH", "HOME", "LANG", "TERM"]'`, `command_denylist JSONB NOT NULL DEFAULT '["shutdown", "reboot", "halt", "poweroff", "mkfs", "dd", "mount", "umount", "systemctl", "service"]'`, `mcp_servers JSONB NOT NULL DEFAULT '{}'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, UNIQUE(user_id, name) | Py0 placeholder. |
 | `workspaces` | `id UUID PK DEFAULT gen_random_uuid()`, `name TEXT NOT NULL`, `quota_bytes BIGINT NOT NULL`, `created_by UUID FK→users ON DELETE SET NULL` (exception to ADR-058), `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 | `workspace_members` | `workspace_id UUID NOT NULL FK→workspaces ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, PRIMARY KEY(workspace_id, user_id) | Py0 placeholder. |
 | `cron_jobs` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_id UUID NOT NULL FK→sessions` (NO ACTION — matches SCHEMA.md §5 deletion rule; having cron jobs blocks session deletion), `name TEXT NOT NULL`, `schedule TEXT NOT NULL`, `tz TEXT`, `one_shot BOOLEAN NOT NULL DEFAULT FALSE`, `message TEXT NOT NULL`, `last_fired_at TIMESTAMPTZ`, `next_fire_at TIMESTAMPTZ NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
@@ -196,20 +196,21 @@ class Base(DeclarativeBase):
 
 ### Indexes
 
-All indexes from SCHEMA.md §Indexes summary are declared via `Index()` in `db/models.py` so `create_all()` creates them. The list below mirrors SCHEMA.md:
+All indexes from SCHEMA.md §Indexes summary are declared via `Index()` in `db/models.py` so `create_all()` creates them. The list below is a verbatim mirror of SCHEMA.md:
 
 | Index | Table | Columns | Options |
 |---|---|---|---|
-| `idx_users_email` | users | `email` | unique=True |
+| `users_email_key` | users | `email` | unique=True |
 | `idx_sessions_user_id` | sessions | `user_id` |  |
 | `idx_sessions_user_session_key` | sessions | `user_id`, `session_key` | unique=True |
-| `idx_sessions_last_inbound_at` | sessions | `last_inbound_at` |  |
-| `idx_messages_session_id_created_at` | messages | `session_id`, `created_at` |  |
-| `idx_pending_messages_session_key` | pending_messages | `session_key` |  |
+| `idx_messages_session_created` | messages | `session_id`, `created_at` |  |
+| `idx_pending_messages_session_received` | pending_messages | `session_id`, `received_at`, `id` |  |
+| `idx_pending_messages_session_key_received` | pending_messages | `session_key`, `received_at`, `id` |  |
 | `idx_devices_user_id` | devices | `user_id` |  |
 | `devices_user_id_name_key` | devices | `user_id`, `name` | unique=True |
-| `idx_workspaces_created_by` | workspaces | `created_by` |  |
-| `idx_workspace_members_user_id` | workspace_members | `user_id` |  |
+| `workspace_members_pkey` | workspace_members | `workspace_id`, `user_id` | primary_key=True |
+| `idx_workspace_members_user` | workspace_members | `user_id` |  |
+| `idx_cron_jobs_user_id` | cron_jobs | `user_id` |  |
 | `idx_cron_jobs_next_fire` | cron_jobs | `next_fire_at` | postgresql_where=text("next_fire_at IS NOT NULL") |
 
 Implementation notes:
@@ -403,7 +404,7 @@ class SessionResponse(BaseModel):
 `dto/message.py`:
 ```python
 from typing import Any
-from provider.wire_types import ContentBlock
+from ..provider.wire_types import ContentBlock
 
 class PostMessageRequest(BaseModel):
     content: str
@@ -484,6 +485,8 @@ All tests run against a real PostgreSQL database. Local dev starts PG via Docker
 
 No SQLite — the production backend is PostgreSQL and only PG exercises JSONB, CHECK constraints, and PG-specific index types correctly.
 
+The test database user must have `CREATEDB` privilege (the Docker `postgres` image grants this by default via `POSTGRES_USER`; production-like restricted users will fail the fixture).
+
 API tests use `httpx.AsyncClient` against the FastAPI app (`httpx.ASGITransport`).
 
 ### Test suite
@@ -498,6 +501,16 @@ API tests use `httpx.AsyncClient` against the FastAPI app (`httpx.ASGITransport`
 | `test_config.py` | Typo env var like `OPENOCTOPUS_HTST=...` triggers `ValidationError` because `extra="forbid"` |
 
 `tests/snapshots/error_codes.json` is a hand-curated snapshot of every `ErrorCode.value`. Rename or reorder without updating the snapshot → test fails.
+
+Regenerate from the canonical enum:
+```bash
+cd server
+python -c "
+import json
+from openoctopus_server.errors.codes import ErrorCode
+print(json.dumps({e.name: e.value for e in ErrorCode}, indent=2, sort_keys=True))
+" > tests/snapshots/error_codes.json
+```
 
 ### CI gate (GitHub Actions)
 
