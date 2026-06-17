@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
 EXPECTED_COLUMNS = {
     "system_config": 3,
@@ -61,7 +62,7 @@ async def test_shell_timeout_max_check(pg_engine):
     from sqlalchemy import text
 
     async with pg_engine.begin() as conn:
-        with pytest.raises(Exception):
+        with pytest.raises(IntegrityError):
             await conn.execute(
                 text(
                     "INSERT INTO devices (token, user_id, name, workspace_path, shell_timeout_max) "

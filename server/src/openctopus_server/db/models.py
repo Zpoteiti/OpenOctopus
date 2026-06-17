@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -22,7 +23,7 @@ class SystemConfig(Base):
     __tablename__ = "system_config"
 
     key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -55,7 +56,7 @@ class DiscordConfig(Base):
     )
     bot_token: Mapped[str] = mapped_column(Text, nullable=False)
     partner_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
-    allow_list: Mapped[list] = mapped_column(
+    allow_list: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -73,7 +74,7 @@ class TelegramConfig(Base):
     )
     bot_token: Mapped[str] = mapped_column(Text, nullable=False)
     partner_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
-    allow_list: Mapped[list] = mapped_column(
+    allow_list: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -119,8 +120,8 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(Text, nullable=False)
     message_kind: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    delivery_refs: Mapped[list] = mapped_column(
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    delivery_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     llm_fingerprint: Mapped[str | None] = mapped_column(Text)
@@ -153,7 +154,7 @@ class PendingMessage(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     session_key: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     effort: Mapped[str | None] = mapped_column(Text)
     received_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -182,26 +183,26 @@ class Device(Base):
     shell_timeout_max: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("600")
     )
-    ssrf_denylist: Mapped[list] = mapped_column(
+    ssrf_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
         server_default=text(
             "'[\"127.0.0.0/8\",\"::1/128\",\"10.0.0.0/8\",\"172.16.0.0/12\",\"192.168.0.0/16\",\"100.64.0.0/10\",\"169.254.0.0/16\",\"169.254.169.254/32\",\"fc00::/7\",\"fe80::/10\"]'::jsonb"
         ),
     )
-    env_allowlist: Mapped[list] = mapped_column(
+    env_allowlist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
         server_default=text("'[\"PATH\",\"HOME\",\"LANG\",\"TERM\"]'::jsonb"),
     )
-    command_denylist: Mapped[list] = mapped_column(
+    command_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
         server_default=text(
             "'[\"shutdown\",\"reboot\",\"halt\",\"poweroff\",\"mkfs\",\"dd\",\"mount\",\"umount\",\"systemctl\",\"service\"]'::jsonb"
         ),
     )
-    mcp_servers: Mapped[dict] = mapped_column(
+    mcp_servers: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
