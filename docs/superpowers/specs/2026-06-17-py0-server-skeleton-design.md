@@ -1,6 +1,6 @@
 # Py0 — Server Skeleton Design
 
-**Status:** design-approved
+**Status:** accepted
 **Milestone:** Py0
 **Date:** 2026-06-17
 **Depends on:** Py-Setup (complete)
@@ -18,7 +18,7 @@ Produce a minimal but working FastAPI server skeleton: connect to PostgreSQL, ap
 | FastAPI app | `main.py` creates app, mounts routes, registers startup event |
 | `/health` endpoint | Returns `{"status":"ok","db":"connected"}` after verifying DB reachable |
 | SQLAlchemy models | 11 declarative models matching SCHEMA.md (see table below) |
-| DB bootstrap | On startup: if DB is empty → `Base.metadata.create_all()` → 11 tables + indexes |
+| DB bootstrap | On startup: `Base.metadata.create_all()` — idempotent, no-op if tables already exist |
 | Config module | `pydantic-settings` with `.env` file, fails fast on missing required vars |
 | DTOs | `session.py`, `message.py`, `error.py` — Pydantic models for API shapes |
 | `ErrorCode` enum | Full StrEnum per DECISIONS.md (40-ish values), living in `errors/codes.py` |
@@ -44,12 +44,15 @@ openoctopus/
     .env                          # dev credentials (see §Config)
     pyproject.toml
     tests/
-      conftest.py                 # async SQLite fixture for model tests + async client for API tests
+      conftest.py                 # async PostgreSQL fixture (per-session DB) + async client for API tests
       test_health.py              # /health 200
       test_schema_bootstrap.py    # create_all on empty DB, diff against SCHEMA.md
       test_wire_types.py          # content block serialize/deserialize round-trip
       test_truncate.py            # truncate_head edge cases
-      test_error_codes.py         # uniqueness check
+      test_error_codes.py         # uniqueness + snapshot check
+      test_config.py              # extra="forbid" typo guard
+      snapshots/
+        error_codes.json          # canonical ErrorCode values
     src/
       openoctopus_server/
         __init__.py
@@ -61,6 +64,7 @@ openoctopus/
           health.py               # GET /health
         db/
           __init__.py
+          base.py                 # DeclarativeBase
           engine.py               # create_async_engine, session factory
           models.py               # 11 SQLAlchemy declarative models
         dto/
@@ -86,10 +90,16 @@ openoctopus/
 
 ```python
 # server/src/openoctopus_server/config.py
+from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="forbid")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="forbid",
+        env_prefix="OPENOCTOPUS_",
+    )
 
     # PostgreSQL (Py0) — all required, no defaults
     database_url: str
@@ -112,22 +122,29 @@ class Settings(BaseSettings):
     object_storage_region: str
     object_storage_access_key: str
     object_storage_secret_key: str
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
 ```
 
-- `extra="forbid"` — rejects unknown env vars, catches typos.
-- All fields are required (no defaults). Missing any → `ValidationError` → `sys.exit(1)`.
+- `env_prefix="OPENOCTOPUS_"` — all env vars and `.env` keys use the `OPENOCTOPUS_` prefix.
+- `extra="forbid"` — rejects unknown env vars, catches typos (verify with a test).
+- All fields are required (no defaults). Missing any → `ValidationError` → startup fails.
 - `SettingsConfigDict(env_file=".env")` auto-loads `.env` in working directory.
+- `get_settings()` is lazily cached. Do **not** instantiate `Settings()` at module import time; use `Depends(get_settings)` in FastAPI endpoints or call `get_settings()` inside functions. This keeps pytest fixtures from triggering config validation before they set up the test environment.
 - CI/container deployments set env vars directly (no `.env` file).
 
 ### `.env` file (dev)
 
 ```bash
 # PostgreSQL — required (no defaults)
-DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
-DATABASE_POOL_SIZE=5
-DATABASE_MAX_OVERFLOW=10
-DATABASE_POOL_TIMEOUT=30
-DATABASE_POOL_PRE_PING=true
+OPENOCTOPUS_DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
+OPENOCTOPUS_DATABASE_POOL_SIZE=5
+OPENOCTOPUS_DATABASE_MAX_OVERFLOW=10
+OPENOCTOPUS_DATABASE_POOL_TIMEOUT=30
+OPENOCTOPUS_DATABASE_POOL_PRE_PING=true
 
 # Server — required
 OPENOCTOPUS_HOST=127.0.0.1
@@ -151,36 +168,67 @@ All models live in `db/models.py` as SQLAlchemy 2.0 declarative classes with `Ma
 
 | Table | Columns | Notes |
 |---|---|---|
-| `system_config` | `key TEXT PK`, `value JSONB NOT NULL`, `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
+| `system_config` | `key TEXT PK`, `value JSONB NOT NULL`, `updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. `value` has no default — callers must supply. Py0 placeholder. |
 | `users` | `id UUID PK DEFAULT gen_random_uuid()`, `email TEXT NOT NULL UNIQUE`, `password_hash TEXT NOT NULL`, `name TEXT NOT NULL`, `is_admin BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
 | `discord_configs` | `user_id UUID PK FK→users ON DELETE CASCADE`, `bot_token TEXT NOT NULL`, `partner_chat_id TEXT NOT NULL`, `allow_list JSONB NOT NULL DEFAULT '[]'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
 | `telegram_configs` | `user_id UUID PK FK→users ON DELETE CASCADE`, `bot_token TEXT NOT NULL`, `partner_chat_id TEXT NOT NULL`, `allow_list JSONB NOT NULL DEFAULT '[]'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | No seed rows. Py0 placeholder. |
-| `sessions` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `channel TEXT NOT NULL`, `chat_id TEXT NOT NULL`, `title TEXT NOT NULL DEFAULT 'New chat'`, `last_inbound_at TIMESTAMPTZ`, `last_read_at TIMESTAMPTZ`, `cancel_requested BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | UNIQUE(user_id, session_key). Py0 placeholder. |
-| `messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `role TEXT NOT NULL CHECK (IN ('user','assistant'))`, `message_kind TEXT NOT NULL CHECK (IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary'))`, `content JSONB NOT NULL`, `delivery_refs JSONB NOT NULL DEFAULT '[]'`, `llm_fingerprint TEXT`, `is_compaction_summary BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
+| `sessions` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `channel TEXT NOT NULL`, `chat_id TEXT NOT NULL`, `title TEXT NOT NULL DEFAULT 'New chat'`, `last_inbound_at TIMESTAMPTZ`, `last_read_at TIMESTAMPTZ`, `cancel_requested BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | UNIQUE(user_id, session_key). `last_inbound_at` powers session-list ordering (ADR-006, ADR-121). Py0 placeholder. |
+| `messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `role TEXT NOT NULL CHECK (role IN ('user','assistant'))`, `message_kind TEXT NOT NULL CHECK (message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary'))`, `content JSONB NOT NULL`, `delivery_refs JSONB NOT NULL DEFAULT '[]'`, `llm_fingerprint TEXT`, `is_compaction_summary BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 | `pending_messages` | `id UUID PK DEFAULT gen_random_uuid()`, `session_id UUID NOT NULL FK→sessions ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_key TEXT NOT NULL`, `content JSONB NOT NULL`, `effort TEXT CHECK (effort IS NULL OR effort IN ('off','low','medium','high','xhigh','max'))`, `received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
-| `devices` | `token TEXT PK`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `name TEXT NOT NULL CHECK (slug regex) CHECK (name <> 'server')`, `workspace_path TEXT NOT NULL`, `sandbox_mode BOOLEAN NOT NULL DEFAULT TRUE`, `shell_timeout_max INTEGER NOT NULL DEFAULT 600 CHECK (>=0)`, `ssrf_denylist JSONB NOT NULL DEFAULT [...]`, `env_allowlist JSONB NOT NULL DEFAULT [...]`, `command_denylist JSONB NOT NULL DEFAULT [...]`, `mcp_servers JSONB NOT NULL DEFAULT '{}'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, UNIQUE(user_id, name) | Py0 placeholder. |
+| `devices` | `token TEXT PK`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `name TEXT NOT NULL CHECK (name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server')`, `workspace_path TEXT NOT NULL`, `sandbox_mode BOOLEAN NOT NULL DEFAULT TRUE`, `shell_timeout_max INTEGER NOT NULL DEFAULT 600 CHECK (shell_timeout_max >= 0)`, `ssrf_denylist JSONB NOT NULL DEFAULT '["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "169.254.169.254/32", "fc00::/7", "fe80::/10"]'`, `env_allowlist JSONB NOT NULL DEFAULT '["HOME", "USER", "PATH", "SHELL", "LANG", "LC_ALL", "TMPDIR", "PWD", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"]'`, `command_denylist JSONB NOT NULL DEFAULT '["rm -rf /", "mkfs.", "dd if=/dev/zero", ">:/dev/sda", "chmod -R 777 /", "chown -R root /", "passwd", "sudo", "su -", "curl", "wget"]'`, `mcp_servers JSONB NOT NULL DEFAULT '{}'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, UNIQUE(user_id, name) | Py0 placeholder. |
 | `workspaces` | `id UUID PK DEFAULT gen_random_uuid()`, `name TEXT NOT NULL`, `quota_bytes BIGINT NOT NULL`, `created_by UUID FK→users ON DELETE SET NULL` (exception to ADR-058), `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 | `workspace_members` | `workspace_id UUID NOT NULL FK→workspaces ON DELETE CASCADE`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, PRIMARY KEY(workspace_id, user_id) | Py0 placeholder. |
-| `cron_jobs` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_id UUID NOT NULL FK→sessions` (RESTRICT — 有 cron job 时不能删 session), `name TEXT NOT NULL`, `schedule TEXT NOT NULL`, `tz TEXT`, `one_shot BOOLEAN NOT NULL DEFAULT FALSE`, `message TEXT NOT NULL`, `last_fired_at TIMESTAMPTZ`, `next_fire_at TIMESTAMPTZ NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
+| `cron_jobs` | `id UUID PK DEFAULT gen_random_uuid()`, `user_id UUID NOT NULL FK→users ON DELETE CASCADE`, `session_id UUID NOT NULL FK→sessions` (NO ACTION — matches SCHEMA.md §5 deletion rule; having cron jobs blocks session deletion), `name TEXT NOT NULL`, `schedule TEXT NOT NULL`, `tz TEXT`, `one_shot BOOLEAN NOT NULL DEFAULT FALSE`, `message TEXT NOT NULL`, `last_fired_at TIMESTAMPTZ`, `next_fire_at TIMESTAMPTZ NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` | Py0 placeholder. |
 
-All indexes from SCHEMA.md §Indexes summary are created via `Index()` in model metadata.
+### Base declaration
+
+`db/base.py` declares the shared declarative base:
+
+```python
+# server/src/openoctopus_server/db/base.py
+from sqlalchemy.orm import DeclarativeBase
+
+class Base(DeclarativeBase):
+    pass
+```
+
+`db/models.py` imports `Base` from `.base`. `main.py` imports `Base` from `db.base` and calls `Base.metadata.create_all()`.
+
+### Indexes
+
+All indexes from SCHEMA.md §Indexes summary are declared via `Index()` in `db/models.py` so `create_all()` creates them. The list below mirrors SCHEMA.md:
+
+| Index | Table | Columns | Options |
+|---|---|---|---|
+| `idx_users_email` | users | `email` | unique=True |
+| `idx_sessions_user_id` | sessions | `user_id` |  |
+| `idx_sessions_user_session_key` | sessions | `user_id`, `session_key` | unique=True |
+| `idx_sessions_last_inbound_at` | sessions | `last_inbound_at` |  |
+| `idx_messages_session_id_created_at` | messages | `session_id`, `created_at` |  |
+| `idx_pending_messages_session_key` | pending_messages | `session_key` |  |
+| `idx_devices_user_id` | devices | `user_id` |  |
+| `devices_user_id_name_key` | devices | `user_id`, `name` | unique=True |
+| `idx_workspaces_created_by` | workspaces | `created_by` |  |
+| `idx_workspace_members_user_id` | workspace_members | `user_id` |  |
+| `idx_cron_jobs_next_fire` | cron_jobs | `next_fire_at` | postgresql_where=text("next_fire_at IS NOT NULL") |
 
 Implementation notes:
 - `mapped_column()` with `nullable=False` where SCHEMA.md says `NOT NULL`
 - JSONB columns use `sqlalchemy.dialects.postgresql.JSONB`
 - `CHECK` constraints use SQLAlchemy `CheckConstraint` where the ORM can't express them natively
 - No relationships defined in Py0 (none needed until queries exist — Py1+)
-- `gen_random_uuid()` default requires `server_default=text("gen_random_uuid()")`
+- `gen_random_uuid()` default requires `server_default=text("gen_random_uuid()")` and the `pgcrypto` extension
 
 ## Startup sequence
 
 1. Load config from `.env` + os.environ via `pydantic-settings`. Any missing required field → `ValidationError` → `sys.exit(1)`.
 2. Create async engine with pool settings from config.
 3. Try `async with engine.connect() as conn: await conn.execute(text("SELECT 1"))`. If this fails → log error, `sys.exit(1)`. No retry. Config is wrong; admin must fix.
-4. `await conn.run_sync(Base.metadata.create_all)` — idempotent, no-op if tables exist. On fresh DB creates all 11 tables + indexes.
-5. Start uvicorn, listen on `{host}:{port}`.
+4. In the same connection, run `await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))`. The DB user needs CREATE privilege on the database (true for the application owner in dev/CI; ops must grant in production).
+5. `await conn.run_sync(Base.metadata.create_all)` — idempotent, no-op if tables exist. On fresh DB creates all 11 tables + indexes.
+6. Start uvicorn, listen on `{host}:{port}`.
 
-`/health` runs the same `SELECT 1` check on every call — returns 200 if connected, 503 if the connection died (pool exhausted, network lost, etc.).
+`/health` runs the same `SELECT 1` check on every call, wrapped in `asyncio.wait_for(..., timeout=2.0)`. Returns `{"status":"ok","db":"connected"}` on success, `503` if the connection is dead, pool is exhausted, or the query times out.
 
 ## Anthropic wire types
 
@@ -190,8 +238,8 @@ Implementation notes:
 # provider/wire_types.py
 
 from enum import StrEnum
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
-from typing import Annotated, Literal
 
 class Effort(StrEnum):
     OFF = "off"
@@ -218,12 +266,14 @@ class ToolUseBlock(BaseModel):
     type: Literal["tool_use"] = "tool_use"
     id: str
     name: str
-    input: dict
+    input: dict[str, Any]
 
 class ToolResultBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
-    content: str | list  # string or array of text/image blocks
+    # Raw client return: str (plain text) or list[TextBlock|ImageBlock].
+    # Normalized to a block array in tools/result.py (Py3). DB stores the list form.
+    content: str | list[Any]
     is_error: bool = False
 
 class ThinkingBlock(BaseModel):
@@ -242,7 +292,7 @@ ContentBlock = Annotated[
 ```
 
 - `ContentBlock` is the annotated discriminated union. Pass it as the type for `messages.content` JSONB columns.
-- `ToolResultBlock.content` is `str | list` — Python-main allows both raw string and safe block array (per ADR-095 normalisation).
+- `ToolResultBlock.content` accepts both raw string and block array; the array form is canonical for DB storage and LLM delivery (per ADR-095 normalisation).
 
 ## Error codes + exceptions
 
@@ -352,6 +402,9 @@ class SessionResponse(BaseModel):
 
 `dto/message.py`:
 ```python
+from typing import Any
+from provider.wire_types import ContentBlock
+
 class PostMessageRequest(BaseModel):
     content: str
 
@@ -359,16 +412,18 @@ class MessageResponse(BaseModel):
     id: UUID
     role: str
     message_kind: str
-    content: list  # ContentBlock array parsed from JSONB
+    content: list[ContentBlock]  # parsed from JSONB
     created_at: datetime
 ```
 
 `dto/error.py`:
 ```python
+from typing import Any
+
 class ErrorResponse(BaseModel):
     code: str       # ErrorCode value
     message: str
-    detail: dict | None = None
+    detail: dict[str, Any] | None = None
 ```
 
 Py0 only defines the shapes. Routes that use them land in Py1+.
@@ -386,8 +441,8 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
 ]
 
 [project.optional-dependencies]
@@ -417,19 +472,32 @@ asyncio_mode = "auto"
 
 ### Test infrastructure
 
-All tests run against a real PostgreSQL database. Local dev starts PG via Docker; CI uses a service container. Tests that need a DB use a session-scoped fixture that creates a fresh DB (`template openoctopus_test` → `CREATE DATABASE ... TEMPLATE`) per test run, runs `create_all()`, and drops at the end. No SQLite — the production backend is PostgreSQL and only PG exercises JSONB, CHECK constraints, and PG-specific index types correctly.
+All tests run against a real PostgreSQL database. Local dev starts PG via Docker; CI uses a service container.
 
-API tests use `httpx.AsyncClient` against the FastAPI app (TestClient pattern with `httpx.ASGITransport`).
+`conftest.py` provides a **session-scoped** async fixture that:
+1. Connects to the admin database (usually `postgres`) with `isolation_level="AUTOCOMMIT"`.
+2. Creates a uniquely-named test database (`oo_test_<random>`).
+3. Runs `CREATE EXTENSION IF NOT EXISTS pgcrypto` in the test database.
+4. Runs `Base.metadata.create_all()`.
+5. Yields an async engine / session factory.
+6. At teardown, drops the test database.
+
+No SQLite — the production backend is PostgreSQL and only PG exercises JSONB, CHECK constraints, and PG-specific index types correctly.
+
+API tests use `httpx.AsyncClient` against the FastAPI app (`httpx.ASGITransport`).
 
 ### Test suite
 
 | Test file | What it verifies |
 |---|---|
-| `test_health.py` | `GET /health` → 200, body has `status: "ok"` |
+| `test_health.py` | `GET /health` → 200, body has `status: "ok"`; simulated slow DB → 503 |
 | `test_schema_bootstrap.py` | `create_all()` on empty PG → 11 tables present; table names and column counts match SCHEMA.md §1–§11 |
 | `test_wire_types.py` | Each content block type serializes to JSON and back; discriminated union works |
 | `test_truncate.py` | `truncate_head("hello", 10)` → no-op; `truncate_head("x" * 20000, 100)` → truncated with marker |
-| `test_error_codes.py` | Every ErrorCode value is unique; every exception class exists |
+| `test_error_codes.py` | ErrorCode values are unique and match `tests/snapshots/error_codes.json`; every exception class exists |
+| `test_config.py` | Typo env var like `OPENOCTOPUS_HTST=...` triggers `ValidationError` because `extra="forbid"` |
+
+`tests/snapshots/error_codes.json` is a hand-curated snapshot of every `ErrorCode.value`. Rename or reorder without updating the snapshot → test fails.
 
 ### CI gate (GitHub Actions)
 
@@ -441,7 +509,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18.4
         env:
           POSTGRES_USER: openoctopus
           POSTGRES_PASSWORD: octopus
@@ -451,19 +519,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e "server/[dev]"
-      - run: ruff check server/
-      - run: mypy server/
-      - run: pytest server/tests/ -v
+      - run: cd server && pip install -e ".[dev]"
+      - run: cd server && ruff check src/
+      - run: cd server && mypy src/
+      - run: cd server && pytest tests/ -v
         env:
-          DATABASE_URL: postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
-          DATABASE_POOL_SIZE: 5
-          DATABASE_MAX_OVERFLOW: 10
-          DATABASE_POOL_TIMEOUT: 30
-          DATABASE_POOL_PRE_PING: true
+          OPENOCTOPUS_DATABASE_URL: postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus
+          OPENOCTOPUS_DATABASE_POOL_SIZE: 5
+          OPENOCTOPUS_DATABASE_MAX_OVERFLOW: 10
+          OPENOCTOPUS_DATABASE_POOL_TIMEOUT: 30
+          OPENOCTOPUS_DATABASE_POOL_PRE_PING: true
+          OPENOCTOPUS_HOST: 127.0.0.1
+          OPENOCTOPUS_PORT: 8080
+          OPENOCTOPUS_JWT_SECRET: ci-secret
+          OPENOCTOPUS_COOKIE_SECURE: false
+          OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT: localhost:9000
+          OPENOCTOPUS_OBJECT_STORAGE_BUCKET: openoctopus
+          OPENOCTOPUS_OBJECT_STORAGE_REGION: us-east-1
+          OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY: minioadmin
+          OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY: minioadmin
 ```
 
 ## Dev setup
+
+All server-side commands below assume the working directory is `server/`.
 
 ```bash
 # Terminal 1: PostgreSQL
@@ -472,7 +551,7 @@ docker run --rm --name oo-pg \
   -e POSTGRES_PASSWORD=octopus \
   -e POSTGRES_DB=openoctopus \
   -p 5432:5432 \
-  postgres:18
+  postgres:18.4
 
 # Terminal 2: MinIO (optional in Py0, required by Py4)
 docker run --rm --name oo-minio \
@@ -483,15 +562,15 @@ docker run --rm --name oo-minio \
 
 # Terminal 3: Server
 cd server
-# Create .env with all required vars (see .env section above)
+# Create .env with all required vars (see §Config)
 pip install -e ".[dev]"
 
 # Start with env vars (or use .env)
-DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus \
-DATABASE_POOL_SIZE=5 \
-DATABASE_MAX_OVERFLOW=10 \
-DATABASE_POOL_TIMEOUT=30 \
-DATABASE_POOL_PRE_PING=true \
+OPENOCTOPUS_DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@localhost:5432/openoctopus \
+OPENOCTOPUS_DATABASE_POOL_SIZE=5 \
+OPENOCTOPUS_DATABASE_MAX_OVERFLOW=10 \
+OPENOCTOPUS_DATABASE_POOL_TIMEOUT=30 \
+OPENOCTOPUS_DATABASE_POOL_PRE_PING=true \
 OPENOCTOPUS_HOST=127.0.0.1 \
 OPENOCTOPUS_PORT=8080 \
 OPENOCTOPUS_JWT_SECRET=dev-secret \
@@ -507,6 +586,4 @@ python -m openoctopus_server.main
 
 ## Open questions (deferred)
 
-- Exact Pydantic version floor — `>=2.0` is broad; will tighten at implementation time
 - `ContentBlock` JSONB serialization in SQLAlchemy — need a `TypeDecorator` to convert Pydantic models ↔ JSON. Implementation detail, not design concern
-- `pytest-asyncio` mode — `"auto"` may need `"strict"` if fixture scoping gets complex
