@@ -22,11 +22,6 @@ REQUIRED_ENV_VARS = {
 }
 
 
-@pytest.fixture(autouse=True)
-def _clear_settings_cache():
-    get_settings.cache_clear()
-
-
 @pytest.fixture
 def valid_env(monkeypatch):
     for key, value in REQUIRED_ENV_VARS.items():
