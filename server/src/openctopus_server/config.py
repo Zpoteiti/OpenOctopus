@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Auth (Py1 — read, Py0 placeholder)
     jwt_secret: str
     cookie_secure: bool
+    admin_token: str | None = None
 
     # Object Storage (Py4 — read, Py0 placeholder)
     object_storage_endpoint: str
