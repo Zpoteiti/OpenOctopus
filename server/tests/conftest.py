@@ -24,6 +24,15 @@ def _clear_settings_and_engine_cache():
     get_settings.cache_clear()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _truncate_tables(pg_engine):
+    """Clean tables before each test for isolation (pg_engine is session-scoped)."""
+    yield
+    table_names = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
+    async with pg_engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE TABLE {table_names} CASCADE"))
+
+
 @pytest.fixture(scope="session")
 def admin_database_url():
     settings = get_settings()
@@ -80,3 +89,77 @@ async def async_client(pg_engine, monkeypatch):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+# --- Shared auth test helpers (importable as fixtures) ---
+
+
+@pytest_asyncio.fixture
+async def register_user_fn(async_client):
+    async def _register(email="user@test.com", password="testpassword", name="User"):
+        response = await async_client.post(
+            "/api/auth/register",
+            json={"email": email, "password": password, "name": name},
+        )
+        return response.json()
+    return _register
+
+
+@pytest_asyncio.fixture
+async def register_admin_fn(async_client):
+    async def _register(email="admin@test.com", password="testpassword", name="Admin"):
+        response = await async_client.post(
+            "/api/auth/register",
+            json={
+                "email": email,
+                "password": password,
+                "name": name,
+                "admin_token": "dev-admin-token",
+            },
+        )
+        return response.json()
+    return _register
+
+
+@pytest_asyncio.fixture
+async def login_fn(async_client):
+    async def _login(email, password="testpassword"):
+        response = await async_client.post(
+            "/api/auth/login",
+            json={"email": email, "password": password},
+        )
+        return response.json()
+    return _login
+
+
+@pytest_asyncio.fixture
+async def admin_client(async_client):
+    """Register an admin and login so the client has an admin cookie."""
+    await async_client.post(
+        "/api/auth/register",
+        json={
+            "email": "admin@test.com",
+            "password": "testpassword",
+            "name": "Admin",
+            "admin_token": "dev-admin-token",
+        },
+    )
+    await async_client.post(
+        "/api/auth/login",
+        json={"email": "admin@test.com", "password": "testpassword"},
+    )
+    return async_client
+
+
+@pytest_asyncio.fixture
+async def user_client(async_client):
+    """Register a regular user and login so the client has a user cookie."""
+    await async_client.post(
+        "/api/auth/register",
+        json={"email": "user@test.com", "password": "testpassword", "name": "User"},
+    )
+    await async_client.post(
+        "/api/auth/login",
+        json={"email": "user@test.com", "password": "testpassword"},
+    )
+    return async_client

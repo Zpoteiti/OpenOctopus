@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Auth (Py1 — read, Py0 placeholder)
     jwt_secret: str
     cookie_secure: bool
+    admin_token: str | None = None
 
     # Object Storage (Py4 — read, Py0 placeholder)
     object_storage_endpoint: str
@@ -54,4 +55,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     # Settings values are populated from environment variables / .env at runtime.
-    return Settings()  # type: ignore[call-arg]
+    return Settings()  # type: ignore[call-arg,unused-ignore]

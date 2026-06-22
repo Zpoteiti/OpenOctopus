@@ -30,3 +30,7 @@ class McpError(OpenOctopusError):
 
 class AuthError(OpenOctopusError):
     pass
+
+
+class ConfigError(OpenOctopusError):
+    pass

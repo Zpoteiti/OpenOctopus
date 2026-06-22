@@ -1,4 +1,5 @@
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,10 +9,11 @@ from openctopus_server.api.router import router as api_router
 from openctopus_server.config import get_settings
 from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
+from openctopus_server.errors.http import register_error_handler
 
 
 @asynccontextmanager
-async def _lifespan(app: FastAPI):
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         get_settings()
     except Exception as exc:
@@ -36,6 +38,7 @@ async def _lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="OpenOctopus", lifespan=_lifespan)
     app.include_router(api_router)
+    register_error_handler(app)
     return app
 
 

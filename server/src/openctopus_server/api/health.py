@@ -11,8 +11,8 @@ from openctopus_server.db.engine import get_engine
 router = APIRouter()
 
 
-@router.get("/health")
-async def health(engine: AsyncEngine = Depends(get_engine)):
+@router.get("/health", response_model=None)
+async def health(engine: AsyncEngine = Depends(get_engine)) -> JSONResponse | dict[str, str]:
     try:
         await asyncio.wait_for(_check_db(engine), timeout=2.0)
     except (TimeoutError, DBAPIError):
