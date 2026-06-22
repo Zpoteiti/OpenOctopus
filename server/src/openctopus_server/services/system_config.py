@@ -1,3 +1,5 @@
+from typing import Any
+
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +24,7 @@ _CONFIG_KEYS = {
 }
 
 
-async def _get_all_rows(db: AsyncSession) -> dict[str, object]:
+async def _get_all_rows(db: AsyncSession) -> dict[str, Any]:
     result = await db.execute(select(SystemConfig))
     return {row.key: row.value for row in result.scalars().all()}
 
@@ -30,20 +32,20 @@ async def _get_all_rows(db: AsyncSession) -> dict[str, object]:
 async def get_config_view(db: AsyncSession) -> AdminConfig:
     rows = await _get_all_rows(db)
     return AdminConfig(
-        quota_bytes=rows.get("quota_bytes", _QUOTA_DEFAULT),  # type: ignore[arg-type]
+        quota_bytes=rows.get("quota_bytes", _QUOTA_DEFAULT),
         shared_workspace_quota_bytes=rows.get(
             "shared_workspace_quota_bytes", _QUOTA_DEFAULT
-        ),  # type: ignore[arg-type]
-        llm_endpoint=rows.get("llm_endpoint"),  # type: ignore[arg-type]
+        ),
+        llm_endpoint=rows.get("llm_endpoint"),
         llm_api_key=_REDACTED if "llm_api_key" in rows else None,
-        llm_model=rows.get("llm_model"),  # type: ignore[arg-type]
-        llm_max_context_tokens=rows.get("llm_max_context_tokens"),  # type: ignore[arg-type]
+        llm_model=rows.get("llm_model"),
+        llm_max_context_tokens=rows.get("llm_max_context_tokens"),
         llm_compaction_threshold_tokens=rows.get(
             "llm_compaction_threshold_tokens"
-        ),  # type: ignore[arg-type]
+        ),
         llm_max_concurrent_requests=rows.get(
             "llm_max_concurrent_requests"
-        ),  # type: ignore[arg-type]
+        ),
     )
 
 

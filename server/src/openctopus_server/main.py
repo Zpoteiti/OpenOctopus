@@ -1,4 +1,5 @@
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,7 +13,7 @@ from openctopus_server.errors.http import register_error_handler
 
 
 @asynccontextmanager
-async def _lifespan(app: FastAPI):
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         get_settings()
     except Exception as exc:

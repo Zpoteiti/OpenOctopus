@@ -55,4 +55,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     # Settings values are populated from environment variables / .env at runtime.
-    return Settings()  # type: ignore[call-arg]
+    return Settings()  # type: ignore[call-arg,unused-ignore]
