@@ -24,6 +24,18 @@ def _clear_settings_and_engine_cache():
     get_settings.cache_clear()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _truncate_tables(pg_engine):
+    """Clean tables before each test for isolation (pg_engine is session-scoped)."""
+    yield
+    async with pg_engine.begin() as conn:
+        await conn.execute(text(
+            "TRUNCATE TABLE users, system_config, sessions, messages, "
+            "pending_messages, devices, workspaces, workspace_members, "
+            "cron_jobs, discord_configs, telegram_configs CASCADE"
+        ))
+
+
 @pytest.fixture(scope="session")
 def admin_database_url():
     settings = get_settings()
@@ -80,3 +92,11 @@ async def async_client(pg_engine, monkeypatch):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest_asyncio.fixture
+async def db_session(pg_engine):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async with AsyncSession(pg_engine, expire_on_commit=False) as session:
+        yield session
