@@ -1,3 +1,4 @@
+import hmac
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -25,8 +26,8 @@ async def create_user(
     is_admin = False
     if admin_token is not None:
         settings = get_settings()
-        if settings.admin_token is not None and admin_token == settings.admin_token:
-            is_admin = True
+        if settings.admin_token is not None:
+            is_admin = hmac.compare_digest(admin_token, settings.admin_token)
 
     user = User(
         email=email,
@@ -52,7 +53,7 @@ async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
 
 async def list_users(db: AsyncSession, limit: int, offset: int) -> list[User]:
     result = await db.execute(
-        select(User).order_by(User.created_at).limit(limit).offset(offset)
+        select(User).order_by(User.created_at, User.id).limit(limit).offset(offset)
     )
     return list(result.scalars().all())
 

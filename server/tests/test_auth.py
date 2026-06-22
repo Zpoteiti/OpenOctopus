@@ -73,3 +73,53 @@ async def test_logout_returns_204_and_clears_cookie(async_client):
     assert response.status_code == 204
     set_cookie = response.headers.get("set-cookie", "")
     assert COOKIE_NAME in set_cookie
+
+
+async def test_register_wrong_admin_token_creates_regular_user(async_client):
+    response = await async_client.post(
+        "/api/auth/register",
+        json={
+            "email": "wrongtoken@test.com",
+            "password": "testpassword",
+            "name": "Wrong Token",
+            "admin_token": "not-the-right-token",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["user"]["is_admin"] is False
+
+
+async def test_bearer_token_auth_works(async_client):
+    await async_client.post(
+        "/api/auth/register",
+        json={"email": "bearer@test.com", "password": "testpassword", "name": "Bearer"},
+    )
+    login_resp = await async_client.post(
+        "/api/auth/login",
+        json={"email": "bearer@test.com", "password": "testpassword"},
+    )
+    token = login_resp.json()["jwt"]
+    # Use a fresh client without cookies — bearer header only
+    response = await async_client.get(
+        "/api/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["email"] == "bearer@test.com"
+
+
+async def test_register_admin_token_unset_ignored(async_client, monkeypatch):
+    monkeypatch.setenv("OPENOCTOPUS_ADMIN_TOKEN", "")
+    from openctopus_server.config import get_settings
+    get_settings.cache_clear()
+    response = await async_client.post(
+        "/api/auth/register",
+        json={
+            "email": "unsettoken@test.com",
+            "password": "testpassword",
+            "name": "Unset Token",
+            "admin_token": "dev-admin-token",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["user"]["is_admin"] is False

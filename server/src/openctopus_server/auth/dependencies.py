@@ -16,7 +16,7 @@ def get_current_user_id(request: Request) -> UUID:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
+        if auth_header.lower().startswith("bearer "):
             token = auth_header[7:]
     if not token:
         raise AuthError(ErrorCode.AUTH_UNAUTHORIZED, "Not authenticated")

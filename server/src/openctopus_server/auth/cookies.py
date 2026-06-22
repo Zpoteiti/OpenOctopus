@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse, Response
 from openctopus_server.config import get_settings
 
 COOKIE_NAME = "openoctopus_session"
+_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days, matches JWT exp
 
 
 def set_auth_cookie(response: JSONResponse, jwt: str) -> None:
@@ -14,6 +15,7 @@ def set_auth_cookie(response: JSONResponse, jwt: str) -> None:
         samesite="strict",
         secure=settings.cookie_secure,
         path="/",
+        max_age=_COOKIE_MAX_AGE,
     )
 
 

@@ -56,6 +56,7 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
             "Cannot set llm_api_key to the redaction marker",
         )
 
+    # Validate LLM identity before opening the write transaction.
     llm_identity_keys = {"llm_endpoint", "llm_api_key", "llm_model"}
     if llm_identity_keys & data.keys():
         existing = await _get_all_rows(db)
@@ -69,6 +70,7 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
             )
         await validate_llm_identity(str(endpoint), str(api_key), str(model))
 
+    # Upsert rows after validation succeeds.
     for key, value in data.items():
         if key not in _CONFIG_KEYS:
             continue
@@ -96,19 +98,20 @@ async def validate_llm_identity(
     try:
         response = await client.get(
             f"{endpoint}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
         )
         if response.status_code != 200:
             raise ConfigError(
                 ErrorCode.CONFIG_VALIDATION_FAILED,
                 f"LLM endpoint returned HTTP {response.status_code}",
             )
-        body = response.json()
-        model_ids = [m.get("id") for m in body.get("data", [])]
-        if model not in model_ids:
+        if model not in response.text:
             raise ConfigError(
                 ErrorCode.CONFIG_VALIDATION_FAILED,
-                f"Model '{model}' not found in endpoint models list",
+                f"Model '{model}' not found in endpoint models response",
             )
     except httpx.HTTPError as exc:
         raise ConfigError(
