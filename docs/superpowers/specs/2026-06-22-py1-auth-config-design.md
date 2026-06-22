@@ -197,10 +197,10 @@ Allowed config keys (per `SCHEMA.md` admin-editable table):
 - `get_config_view(db) -> dict` — loads rows; returns effective config: `quota_bytes`/`shared_workspace_quota_bytes` default `524288000` (500 MiB) when missing; LLM keys included only when configured; `llm_api_key` redacted as `"<redacted>"`.
 - `patch_config(db, payload: dict) -> dict`:
   1. Unknown key → `CONFIG_UNKNOWN_KEY`.
-  2. If any LLM identity key (`llm_endpoint`/`llm_api_key`/`llm_model`) is present, gather the effective triple (patch value or currently-stored), require all three present, then `validate_llm_identity`. Failure → `CONFIG_VALIDATION_FAILED`.
+  2. If any LLM identity key (`llm_endpoint`/`llm_api_key`/`llm_model`) is present, gather the effective triple (patch value or currently-stored), require all three present, then `validate_llm_identity(endpoint, api_key, model)`. Failure → `CONFIG_VALIDATION_FAILED`.
   3. Reject the literal `"<redacted>"` as `llm_api_key` → `CONFIG_VALIDATION_FAILED`.
   4. Upsert rows, commit, return `get_config_view(db)`.
-- `validate_llm_identity(endpoint, api_key, *, client: httpx.AsyncClient | None = None)` — `GET {endpoint}/models` with `Authorization: Bearer {api_key}`; non-200 → `CONFIG_VALIDATION_FAILED`. The optional `client` enables test injection via `MockTransport`.
+- `validate_llm_identity(endpoint, api_key, model, *, client: httpx.AsyncClient | None = None)` — `GET {endpoint}/models` with `Authorization: Bearer {api_key}`; per ADR-101, the response must be HTTP 200 **and** include the configured `llm_model` in the models list. Non-200 or model absent → `CONFIG_VALIDATION_FAILED`. The optional `client` enables test injection via `MockTransport`. Real provider credentials are only needed for live smoke testing, not automated tests (ADR-101).
 
 `server_mcp` is not accepted (Py8); `object_storage_*` is not accepted (env config).
 
@@ -212,11 +212,11 @@ Added to `server/pyproject.toml` runtime deps: `argon2-cffi`, `pyjwt`, `email-va
 
 - Reuse the Py0 `pg_engine` + `async_client` fixtures. Add a `db_session` fixture (`AsyncSession` on `pg_engine`) for service-level tests.
 - Auth fixtures: a `register(...)` helper returning `{jwt, user}`; `auth_client` (regular user, cookie set); `admin_client` (admin via `OPENOCTOPUS_ADMIN_TOKEN`, cookie set).
-- Fake LLM via DI: `validate_llm_identity(..., client=...)` with an httpx `MockTransport` returning 200 for `GET /models` (and a failure variant).
+- Fake LLM via DI: `validate_llm_identity(..., client=...)` with an httpx `MockTransport` returning 200 + a models list containing the configured `llm_model` (and failure variants: non-200, model absent).
 - Tests:
   - auth: register `201` + cookie; duplicate email `409 auth_email_taken`; `admin_token` promotes to `is_admin`; login `200` + cookie; login wrong password `401 auth_invalid_credentials`; logout `204` clears cookie.
   - me: GET `200` / `401` without token; PATCH name/email/password; PATCH email taken `409`; DELETE `204`; DELETE last admin `409 auth_last_admin_required`.
-  - admin config: GET `200` effective defaults (no rows); PATCH LLM triple with fake validation → `200` redacted; PATCH unknown key `400 config_unknown_key`; PATCH LLM with failing `/models` → `400 config_validation_failed`; non-admin GET/PATCH → `403 auth_forbidden`.
+  - admin config: GET `200` effective defaults (no rows); PATCH LLM triple with fake validation (model present) → `200` redacted; PATCH unknown key `400 config_unknown_key`; PATCH LLM with failing `/models` (non-200) → `400 config_validation_failed`; PATCH LLM with model absent from `/models` response → `400 config_validation_failed`; non-admin GET/PATCH → `403 auth_forbidden`.
   - admin users: GET list `200` (paginated); DELETE `204`; DELETE missing `404 user_not_found`; DELETE last admin `409`; non-admin → `403`.
   - error shape: every error response is `{code, message}`.
   - jwt: `verify_jwt` rejects tampered/expired tokens (unit).
