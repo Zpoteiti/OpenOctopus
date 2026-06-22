@@ -1,4 +1,4 @@
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from openctopus_server.config import get_settings
 
@@ -17,5 +17,5 @@ def set_auth_cookie(response: JSONResponse, jwt: str) -> None:
     )
 
 
-def clear_auth_cookie(response: JSONResponse) -> None:
+def clear_auth_cookie(response: Response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path="/")
