@@ -52,6 +52,12 @@ class ErrorCode(StrEnum):
     # Auth
     AUTH_UNAUTHORIZED = "auth_unauthorized"
     AUTH_LAST_ADMIN_REQUIRED = "auth_last_admin_required"
+    AUTH_EMAIL_TAKEN = "auth_email_taken"
+    AUTH_INVALID_CREDENTIALS = "auth_invalid_credentials"
+    AUTH_FORBIDDEN = "auth_forbidden"
+    USER_NOT_FOUND = "user_not_found"
+    # Config
+    CONFIG_VALIDATION_FAILED = "config_validation_failed"
     # System
     SERVER_RESTART = "server_restart"
     USER_CANCELLED = "user_cancelled"

@@ -1,6 +1,10 @@
 {
+  "AUTH_EMAIL_TAKEN": "auth_email_taken",
+  "AUTH_FORBIDDEN": "auth_forbidden",
+  "AUTH_INVALID_CREDENTIALS": "auth_invalid_credentials",
   "AUTH_LAST_ADMIN_REQUIRED": "auth_last_admin_required",
   "AUTH_UNAUTHORIZED": "auth_unauthorized",
+  "CONFIG_VALIDATION_FAILED": "config_validation_failed",
   "MCP_SCHEMA_COLLISION": "mcp_schema_collision",
   "MCP_SPAWN_FAILED": "mcp_spawn_failed",
   "MCP_WITHIN_SERVER_COLLISION": "mcp_within_server_collision",
@@ -38,6 +42,7 @@
   "TOOL_PATH_OUTSIDE_WORKSPACE": "tool_path_outside_workspace",
   "TOOL_UNSUPPORTED_MEDIA": "tool_unsupported_media",
   "USER_CANCELLED": "user_cancelled",
+  "USER_NOT_FOUND": "user_not_found",
   "WORKSPACE_BLOCKED_PATH": "workspace_blocked_path",
   "WORKSPACE_INVALID_SKILL_FORMAT": "workspace_invalid_skill_format",
   "WORKSPACE_NOT_FOUND": "workspace_not_found",
