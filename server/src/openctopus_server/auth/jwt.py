@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import jwt
@@ -13,7 +13,7 @@ _EXP_DAYS = 30
 
 def create_jwt(user_id: UUID) -> str:
     settings = get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload = {
         "sub": str(user_id),
         "exp": now + timedelta(days=_EXP_DAYS),

@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from openctopus_server.errors.codes import ErrorCode
@@ -16,8 +16,9 @@ ERROR_STATUS: dict[ErrorCode, int] = {
 
 
 async def openoctopus_error_handler(
-    request: object, exc: OpenOctopusError
+    request: Request, exc: Exception
 ) -> JSONResponse:
+    assert isinstance(exc, OpenOctopusError)
     status = ERROR_STATUS.get(exc.code, 500)
     return JSONResponse(
         status_code=status,

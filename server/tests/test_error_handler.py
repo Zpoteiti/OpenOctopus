@@ -1,5 +1,4 @@
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import AuthError
 
 
 async def test_error_handler_returns_code_and_message(async_client):
