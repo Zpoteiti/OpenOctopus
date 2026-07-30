@@ -6,7 +6,7 @@ semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
 `create_all()`; Alembic or equivalent migration framework is deferred until
 production launch after frontend completion (ADR-057, ADR-069).
 
-**Ten tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
+**Twelve tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
 
 This doc is the canonical reference for the schema's *shape*. When Python
 implementation SQL or ORM metadata exists, it must be kept in sync with this
@@ -36,6 +36,7 @@ unsupported keys return `400 Bad Request`):
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with tiktoken-rs (ADR-025). |
+| `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
 | `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101 | Accepted/reserved config for later compaction decisions. Missing means not configured; future compaction code must handle that explicitly. Python-main may store the value before compaction is implemented. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 
@@ -46,11 +47,13 @@ Reserved/future known keys (not PATCH-editable until their milestone):
 | `server_mcp` | array of `McpServerConfig` | ADR-114 | Admin-configured shared-service MCPs exposed as install site `server`; shared credentials, one runtime per MCP, bounded queue. |
 
 Bootstrap does not seed `system_config` rows. Fresh `GET /api/admin/config`
-therefore returns the effective quota defaults and omits unconfigured LLM keys
-until an admin writes values. Deployments may carry additional opaque keys
-inserted outside the admin API; OpenOctopus ignores them in the admin config
-view. `PATCH /api/admin/config` rejects keys outside the admin-editable table
-above, including `server_mcp` and `object_storage_*`.
+therefore returns the effective quota defaults and
+`llm_max_output_tokens=16384`, while omitting the unconfigured LLM identity and
+context/compaction/concurrency keys until an admin writes values. Deployments
+may carry additional opaque keys inserted outside the admin API; OpenOctopus
+ignores them in the admin config view. `PATCH /api/admin/config` rejects keys
+outside the admin-editable table above, including `server_mcp` and
+`object_storage_*`.
 
 Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` only after provider
 validation succeeds. First setup must provide all three identity values; later
@@ -63,6 +66,11 @@ key is rejected. `server_mcp` is documented for the Py8 MCP scope and is not
 accepted by the admin-config endpoint. Object storage is deployment
 infrastructure config supplied through environment / deployment secrets, not
 `system_config`.
+
+`llm_max_output_tokens` is validated as an integer in `1..1_000_000`. When
+`llm_max_context_tokens` is configured, a merged config update must also keep
+`llm_max_output_tokens <= llm_max_context_tokens`. The output budget includes
+thinking and visible output and does not expand the context window.
 
 ---
 
@@ -163,7 +171,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
 - `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true.
-- `DELETE /api/sessions/{id}` removes session rows after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes that session's `messages` and `pending_messages`; channel configuration rows are not tied to session deletion. Active cron sessions are rejected by the FK from `cron_jobs.session_id`; delete the cron job through `/api/cron/{id}` so the job row and its dedicated history stay consistent. Completed one-shot cron sessions with no remaining `cron_jobs` row can be deleted as normal history.
+- `DELETE /api/sessions/{id}` removes session rows after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes that session's `turn_runs`, `messages`, and `pending_messages`; channel configuration rows are not tied to session deletion. Active cron sessions are rejected by the FK from `cron_jobs.session_id`; delete the cron job through `/api/cron/{id}` so the job row and its dedicated history stay consistent. Completed one-shot cron sessions with no remaining `cron_jobs` row can be deleted as normal history.
 
 ---
 
@@ -200,7 +208,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
 - `message_kind` — OpenOctopus semantic discriminator exposed through SSE/history: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. It avoids JSONB inspection for latest-human detection, JIT collapsing, frontend rendering, and audit.
 - `is_compaction_summary` — retained as the fast compaction marker. Compaction summary rows also use `message_kind='compaction_summary'`.
 - The `idx_messages_session_created` index powers the `GET /api/sessions/{id}/messages` cursor scan.
-- Runtime block (ADR-094) is prepended into the user-row's `content` JSONB at ingress time; not a separate column.
+- Runtime block (ADR-094) is prepended into the user-row's `content` JSONB at
+  ingress time; not a separate column. Public history projection inspects only
+  the first text block, validates the exact anchored server grammar and matching
+  session `channel`/`chat_id`, and omits that block from the DTO. Stored content
+  and provider replay remain unchanged.
 
 ---
 
@@ -228,12 +240,78 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
 
 - `pending_messages` stores inbound user messages that arrive while a session worker is active. These rows are durable but not provider-visible history yet. Browser HTTP stream ownership is not stored here: an older queued POST can close with `stream_replaced` while its row remains durable, and the newest queued POST is only an in-memory live preview subscriber. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
 - `session_key` is stored alongside `session_id` so channel/session routing can recover pending work without recomputing the key.
-- At the safe boundary after the current assistant tool batch is fully addressed (ADR-034), the worker drains all rows for the session in one DB transaction: select pending rows in `(received_at, id)` order, insert them into `messages` with the same `id` and `message_kind='human'`, delete the selected pending rows, commit, then the resulting user messages become visible to canonical history and the latest live POST preview stream. `GET /api/sessions/{id}/messages` returns these rows separately as `pending_messages` until they drain; the stable `id` lets the frontend reconcile the pending item with the eventual canonical message. When no session is in flight, this table should normally be empty.
-- The Python server alpha uses passive recovery instead of startup scans. A process restart drops live token previews and in-memory stream subscribers; the next inbound POST/channel activity rebuilds from Postgres and drains durable pending rows at the next safe boundary.
+- At the safe boundary, the worker drains all rows for the session in one DB
+  transaction: select pending rows in `(received_at, id)` order, insert them
+  into `messages` with the same `id` and `message_kind='human'`, delete the
+  selected pending rows, commit, then the resulting user messages become
+  visible to canonical history and the latest live POST preview stream. In
+  tool-less Py2, the boundary follows persistence of the current complete
+  assistant response and terminal run state. From Py3 onward, the current
+  assistant tool batch must also be fully addressed (ADR-034, ADR-125).
+  `GET /api/sessions/{id}/messages` returns these rows separately as
+  `pending_messages` until they drain; its public projection removes a valid
+  server-generated first runtime block without mutating the row. The stable
+  `id` lets the frontend reconcile the pending item with the eventual canonical
+  message. When no session is in flight, this table should normally be empty.
+- A process restart drops live token previews and in-memory stream subscribers.
+  Startup reconciles only stale `turn_runs` lifecycle rows; it does not drain or
+  reorder `pending_messages`. The next inbound POST/channel activity rebuilds
+  from PostgreSQL and drains durable pending rows at the next safe boundary. If
+  there is no running turn, that new inbound is first inserted as pending and
+  drained with the older rows in `(received_at, id)` order before the recovered
+  provider turn starts; it must not leapfrog the surviving queue.
 
 ---
 
-## 8. `devices` — per-user client devices
+## 8. `turn_runs` — durable provider-turn lifecycle
+
+```sql
+CREATE TABLE IF NOT EXISTS turn_runs (
+    id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id          UUID         NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    runner_instance_id  UUID         NOT NULL,
+    status              TEXT         NOT NULL CHECK (
+                                      status IN (
+                                          'running',
+                                          'completed',
+                                          'failed',
+                                          'abandoned',
+                                          'cancelled'
+                                      )
+                                  ),
+    started_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    finished_at         TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_runs_one_running_per_session
+    ON turn_runs(session_id)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_turn_runs_session_started
+    ON turn_runs(session_id, started_at DESC, id DESC);
+```
+
+- `id` is the `turn_id` emitted by `turn_started`, `token_delta`,
+  `message_persisted`, and `turn_finished`.
+- A runner inserts `status='running'` before `turn_started`. Normal completion
+  updates the row to `completed`; exhausted provider failure updates it to
+  `failed`; safe-boundary cancellation updates it to `cancelled`.
+- The partial unique index is the durable backstop for one active turn per
+  session. The in-memory reservation remains the fast scheduler path.
+- The server process creates one boot-scoped `runner_instance_id`. During
+  startup, before accepting traffic, it performs one indexed reconciliation
+  update that marks leftover `status='running'` rows from the prior process as
+  `abandoned` and sets `finished_at`. Partial tokens were never durable; pending
+  user rows remain available for the next normal recovery/drain.
+- `GET /api/sessions/{id}/messages` derives its public status from the latest
+  run: `running`/`failed`/`abandoned` map directly; no run, `completed`, or
+  `cancelled` maps to `idle`. `active_turn_id` is present only for `running`.
+- Run rows are lifecycle/audit state, not provider messages. They are never
+  projected into Anthropic history.
+
+---
+
+## 9. `devices` — per-user client devices
 
 ```sql
 CREATE TABLE IF NOT EXISTS devices (
@@ -270,7 +348,7 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 
 ---
 
-## 9. `workspaces` — shared workspace registry (ADR-108)
+## 10. `workspaces` — shared workspace registry (ADR-108)
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -291,7 +369,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 
 ---
 
-## 10. `workspace_members` — shared workspace allow-list (ADR-108)
+## 11. `workspace_members` — shared workspace allow-list (ADR-108)
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspace_members (
@@ -310,7 +388,7 @@ CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_
 
 ---
 
-## 11. `cron_jobs` — scheduled agent invocations
+## 12. `cron_jobs` — scheduled agent invocations
 
 ```sql
 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -362,6 +440,8 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 | `idx_messages_session_created` | messages (`session_id, created_at`) | History replay + cursor scan. |
 | `idx_pending_messages_session_received` | pending_messages (`session_id, received_at, id`) | Safe-boundary drain order. |
 | `idx_pending_messages_session_key_received` | pending_messages (`session_key, received_at, id`) | Recovery and channel-key lookup for queued inbound. |
+| `idx_turn_runs_one_running_per_session` | turn_runs (partial UNIQUE on `session_id WHERE status='running'`) | Durable one-active-turn invariant. |
+| `idx_turn_runs_session_started` | turn_runs (`session_id, started_at DESC, id DESC`) | Latest run status for GET recovery. |
 | `idx_devices_user_id` | devices | List user's devices. |
 | `devices_user_id_name_key` | devices (UNIQUE on `(user_id, name)`) | URL resolution `/api/devices/{name}`. |
 | `workspace_members_pkey` | workspace_members (PK on `(workspace_id, user_id)`) | Membership lookup at workspace-fs entry. |

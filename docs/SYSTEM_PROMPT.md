@@ -1,15 +1,26 @@
 # OpenOctopus — System Prompt Spec
 
-The shape of the context every agent turn sees. Split into two pieces so prompt caching stays effective:
+The shape of the context every agent turn sees. Model-visible context and
+server-authoritative execution state are deliberately separate:
 
-- **Static system prompt** — identical byte-for-byte across a session's turns. Cached by the OpenAI-compatible provider (ADR-101).
-- **Runtime context block** — fresh each turn. Injected as a text block glued onto the user message, not the system prompt. Contains only what changes per turn (current time, channel, chat_id).
+- **Cacheable system configuration snapshot** — rendered in a stable order and
+  reused byte-for-byte while its source configuration is unchanged. It may
+  legitimately change between turns when SOUL, MEMORY, channels, skills,
+  workspace membership, or device capabilities change.
+- **Runtime context block** — generated once at message ingress and prepended
+  to that user message. It contains per-message facts such as time, inbound
+  routing provenance, sender/trust classification, and request-relevant
+  execution context.
+- **Out-of-band execution context** — authoritative session ownership, tool
+  authorization, live device connections, locks, and routing handles. Tools
+  receive these values from server infrastructure and validate model-selected
+  destinations; prompt text is never the authority.
 
 ---
 
 ## Section order
 
-The static system prompt is assembled in this order:
+The cacheable system configuration snapshot is assembled in this order:
 
 1. **SOUL** — personality (contents of personal SOUL.md)
 2. **MEMORY** — personal long-term memory (contents of personal MEMORY.md)
@@ -17,7 +28,7 @@ The static system prompt is assembled in this order:
 4. **Channels** — reachable channels + per-channel format notes
 5. **Skills** — always-on full bodies, then conditional one-liners
 6. **Workspaces** — file trees the agent can read/write
-7. **Devices** — execution targets
+7. **Devices** — configured execution targets and stable capabilities
 8. **Operating Notes** — meta rules on paths and boundaries
 
 Rationale for this order: identity feeds channel handling (put them adjacent); skills live inside the personal workspace (put them adjacent to the workspaces section).
@@ -30,7 +41,7 @@ Per ADR-023, mode branching is absent — cron, heartbeat, and any future autono
 
 User: Alice, account `a4f7e2d1-e29b-41d4-a716-446655440000`. Channels: Discord + Telegram. Devices: server + laptop + phone. Skills: one always-on + one conditional. Workspaces: 1 personal + 2 shared.
 
-### Static system prompt
+### System configuration snapshot
 
 ```
 ## SOUL
@@ -133,19 +144,22 @@ match exactly when used in tool paths.
 ### Personal — /a4f7e2d1-e29b-41d4-a716-446655440000/
 Default for relative paths. Holds your SOUL.md, MEMORY.md, skills/,
 .attachments/, and Alice's personal files. Strictly private.
-Quota: 487 MB / 500 MB used.
+Quota policy: personal workspace quota applies. Current usage is checked by
+workspace tools, not embedded in this snapshot.
 
 ### Shared: production-department [@a4f7e2d1]
 Path: /production-department@a4f7e2d1/
 Allow-list (12 members): alice, bob, carol, dan, ...
 Read+write for all members. Immediate visibility to the group.
-Quota: 2.3 GB / 5 GB used.
+Quota policy: shared workspace quota applies. Current usage is checked by
+workspace tools, not embedded in this snapshot.
 
 ### Shared: journey-to-japan [@b3c89f04]
 Path: /journey-to-japan@b3c89f04/
 Allow-list (4 members): alice, dave, ellen, frank.
 Read+write for all members. Created by Alice for trip planning.
-Quota: 156 MB / 1 GB used.
+Quota policy: shared workspace quota applies. Current usage is checked by
+workspace tools, not embedded in this snapshot.
 
 ---
 
@@ -158,15 +172,15 @@ chosen device's filesystem.
 Hosts every workspace listed above. File tool calls with
 openoctopus_device="server" target a workspace by path prefix.
 
-### laptop (online)
+### laptop
 fs_policy: sandbox (Linux bwrap, rooted at /home/alice/.openoctopus/).
 exec available. Default timeout 60s, max 600s.
 No server-side quota — Alice manages her own disk.
 
-### phone (offline since 2026-04-23 18:42 UTC)
+### phone
 fs_policy: unrestricted.
 Workspace root: /data/data/com.openoctopus/files/.
-Tools will fail until phone reconnects.
+Current connectivity is checked at tool execution time.
 
 ---
 
@@ -197,22 +211,32 @@ Tools will fail until phone reconnects.
 
 ### Runtime context block — lives on the USER message, NOT in the system prompt
 
-The static system prompt above stops at Operating Notes. Everything that changes per turn (current time, channel, chat_id) is prepended as a text block on the user-role message — **not** appended to the system prompt. That's what keeps the system prompt cacheable byte-for-byte across the session.
+The system snapshot above stops at Operating Notes. Per-message facts are
+prepended as a server-generated text block on the user-role message, not
+appended to the system prompt. This preserves a long reusable prefix without
+pretending that user configuration is immutable.
 
-The runtime block on the user message looks like:
+The Py2 browser runtime block uses this deterministic form:
 
 ```
 <runtime>
 time: 2026-04-24 17:00 UTC+3
-channel: discord
-chat_id: 184729384
+channel: web
+chat_id: a13c239e-80b3-4fd0-a0f4-bf4fd91c31cc
+sender: partner:a4f7e2d1-e29b-41d4-a716-446655440000
+trust: partner
 </runtime>
 ```
+
+Later ingress adapters may add versioned fields, such as a selected active
+workspace or channel-specific sender ID, but must keep a deterministic
+server-owned grammar. Volatile global catalogs do not belong here: include
+only state relevant to this inbound message.
 
 The wire shape of a turn makes the separation explicit. Chronology goes **system → all prior history (oldest → newest) → current user turn (with runtime block prepended)**:
 
 ```
-system: "<static system prompt>",
+system: "<system configuration snapshot>",
 messages: [
 
   // --- all prior history, in chronological order (oldest → newest) ---
@@ -233,9 +257,28 @@ messages: [
 ]
 ```
 
-Only the `system` message is the cacheable prefix. Prior history is effectively static within a session (new rows only append), so most of the cached prefix extends through it too — the cache boundary sits just before the current user message. Everything inside that current user message (including the runtime block) varies per turn.
+The system snapshot and prior history form the reusable prefix. Prior history
+is append-only during ordinary turns, so the cache boundary can extend through
+it and stop before the current user message. Everything inside the current
+user message, including its runtime block, varies per turn.
 
-**Note:** ADR-094 now wins for browser chat. The `<runtime>` block is prepended at ingress and persisted in the user message row. Older user messages therefore replay with the runtime block they had when inserted. Future prompt-builder work may hide these blocks from frontend display, but provider history remains faithful to persisted DB rows.
+**Persistence and public projection:** ADR-094 applies to browser chat. The
+`<runtime>` block is prepended at ingress and persisted in the user message or
+pending row, so provider replay retains the provenance captured at that
+moment. Public `GET /api/sessions/{id}/messages` responses omit it. Projection
+code examines only the first text block, parses the exact anchored
+server-generated grammar, verifies `channel` and `chat_id` against the session,
+and removes only that block. It never applies a loose regex to concatenated
+user text.
+
+### Prompt placement summary
+
+| Surface | Contains | Does not contain |
+|---|---|---|
+| System configuration snapshot | OpenOctopus identity, user SOUL and MEMORY, stable trust rules, configured partner channel destinations, skill names/descriptions, full always-on skill bodies, workspace catalog/policies, registered device capabilities, operating notes | Current time, inbound sender, current connectivity/last-seen, current quota usage, locks, active run state |
+| User-message runtime block | Ingress time, current channel/chat ID, sender classification, trust level, and only request-relevant current context | Full channel/device/workspace catalogs, secrets, authorization decisions |
+| Tool-result safety prefix | Server-authored provenance and the untrusted-tool-result instruction before external tool output | User runtime metadata, channel directory, tool credentials |
+| Out-of-band execution context | Authoritative user/session IDs, permissions, live connection handles, locks, routing and validated tool destinations | Model instructions or user-visible transcript text |
 
 ---
 
@@ -270,13 +313,19 @@ Only the `system` message is the cacheable prefix. Prior history is effectively 
 ### Workspaces
 - Personal workspace always listed first.
 - Shared workspaces listed in any stable order (alphabetical by name, or creation order — implementation choice).
-- Each entry shows: path, privacy status, quota usage, allow-list summary.
+- Each entry shows: path, privacy status, quota policy, allow-list summary.
+  Current byte usage is volatile and is queried by workspace operations rather
+  than embedded in the cacheable snapshot.
 - The `first-path-segment = workspace` convention is stated once here; Operating Notes reinforces.
 
 ### Devices
 - Execution targets (where shell / file tools can run).
 - The server always appears. Clients appear if registered to this user.
-- Per-device attributes: fs_policy, shell timeout bounds, online/offline status + last-seen timestamp.
+- Per-device attributes: stable name, fs_policy, workspace root, shell timeout
+  bounds, and declared capabilities.
+- Online/offline state and last-seen timestamps are volatile, server-authoritative
+  execution state. Tool dispatch checks them out of band and reports failure;
+  they do not churn the system-prompt prefix.
 - **No explicit tool listing** — the agent's tool schemas already enumerate which tools exist and their `device` enum tells the agent which devices each tool can target.
 
 ### Operating Notes
@@ -287,4 +336,11 @@ Only the `system` message is the cacheable prefix. Prior history is effectively 
 
 ## Change propagation
 
-Any of the underlying state that feeds into the system prompt (memory edit, skill install, device connect, workspace membership change) invalidates the cache on the next turn. The static system prompt rebuild is cheap (single function per ADR-022); the provider re-caches. Within a single turn, the context stays frozen — an agent editing MEMORY.md mid-turn does not see the new memory until the next inbound triggers a rebuild.
+Any source that feeds the system snapshot (SOUL/MEMORY edit, skill install,
+channel configuration, registered-device capability change, or workspace
+membership change) invalidates the prefix on the next turn. Mere
+connect/disconnect, last-seen, quota-usage, or run-status changes do not. The
+render is cheap (single function per ADR-022); the provider re-caches when
+semantic configuration changes. Within one turn, context stays frozen—an agent
+editing MEMORY.md mid-turn sees the new memory only after the next inbound
+message rebuilds the snapshot.

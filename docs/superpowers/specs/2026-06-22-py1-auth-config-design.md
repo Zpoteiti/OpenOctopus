@@ -5,6 +5,11 @@
 
 Per the milestone map in `docs/DECISIONS.md`, Py1 is "Auth + config": registration/login + JWT + cookie/bearer + admin `system_config` + admin user management. Exit criteria: auth + admin config tests pass; an admin can configure a (fake) LLM provider ahead of Py2; no chat yet.
 
+**Py2 contract amendment (accepted 2026-07-30):** the existing admin-config
+surface also owns `llm_max_output_tokens`. This is not a new endpoint or an
+environment variable. The effective unseeded default is `16384`, and Py2 reads
+it when starting each provider turn.
+
 This spec builds on the Py0 skeleton (`server/src/openoctopus_server/`) and reuses its patterns: `api/router.py` sub-router assembly, `errors/exceptions.py` `OpenOctopusError`, `db/engine.py` `get_engine()`, plain-pydantic DTOs, and the `pg_engine`/`async_client` test fixtures.
 
 ## Scope
@@ -190,8 +195,9 @@ class ConfigPatch(BaseModel):
     llm_max_context_tokens: int | None = Field(default=None, ge=1)
     llm_compaction_threshold_tokens: int | None = Field(default=None, ge=4001)
     llm_max_concurrent_requests: int | None = Field(default=None, ge=0, le=1_000_000)
+    llm_max_output_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
 ```
-Constraints match API.yaml: `quota_bytes`/`shared_workspace_quota_bytes` ≥ 1; LLM identity strings minLength 1; `llm_max_context_tokens` ≥ 1; `llm_compaction_threshold_tokens` ≥ 4001 (because `max_output_tokens = threshold − 4000` per ADR-028, must be ≥ 1); `llm_max_concurrent_requests` 0–1000000. `null` values mean "key not in this PATCH" (untouched); sending an explicit `null` is indistinguishable from omitting the key, which is the correct partial-update semantic. Unknown keys → 422 via `extra="forbid"`.
+Constraints match API.yaml: `quota_bytes`/`shared_workspace_quota_bytes` ≥ 1; LLM identity strings minLength 1; `llm_max_context_tokens` ≥ 1; `llm_compaction_threshold_tokens` ≥ 4001 (because `max_output_tokens = threshold − 4000` per ADR-028, must be ≥ 1); `llm_max_concurrent_requests` 0–1000000; `llm_max_output_tokens` 1–1000000. The merged config must also satisfy `llm_max_output_tokens <= llm_max_context_tokens` when a context limit is configured. Unknown keys → 422 via `extra="forbid"`.
 
 `AdminConfig` (response for GET and PATCH):
 ```python
@@ -205,8 +211,9 @@ class AdminConfig(BaseModel):
     llm_max_context_tokens: int | None = None
     llm_compaction_threshold_tokens: int | None = None
     llm_max_concurrent_requests: int | None = None
+    llm_max_output_tokens: int = 16384         # always present; row is not seeded
 ```
-Matches API.yaml `AdminConfig` schema: `required: [quota_bytes, shared_workspace_quota_bytes]`; unconfigured LLM keys omitted; configured `llm_api_key` returned as `"<redacted>"`.
+Matches API.yaml `AdminConfig` schema: `required: [quota_bytes, shared_workspace_quota_bytes, llm_max_output_tokens]`; other unconfigured LLM keys omitted; configured `llm_api_key` returned as `"<redacted>"`.
 
 ### Admin users (`api/admin/users.py`) — both `require_admin`
 
@@ -229,19 +236,32 @@ Matches API.yaml `AdminConfig` schema: `required: [quota_bytes, shared_workspace
 ### `services/system_config.py`
 
 Allowed config keys (per `SCHEMA.md` admin-editable table):
-`quota_bytes`, `shared_workspace_quota_bytes`, `llm_endpoint`, `llm_api_key`, `llm_model`, `llm_max_context_tokens`, `llm_compaction_threshold_tokens`, `llm_max_concurrent_requests`.
+`quota_bytes`, `shared_workspace_quota_bytes`, `llm_endpoint`, `llm_api_key`, `llm_model`, `llm_max_context_tokens`, `llm_compaction_threshold_tokens`, `llm_max_concurrent_requests`, `llm_max_output_tokens`.
 
-- `get_config_view(db) -> AdminConfig` — loads rows; returns effective config: `quota_bytes`/`shared_workspace_quota_bytes` default `524288000` (500 MiB) when missing (always present); LLM keys included only when configured (omitted = `None`); `llm_api_key` redacted as `"<redacted>"` when configured. Does not surface unknown/opaque keys or `server_mcp`/`object_storage_*`.
+- `get_config_view(db) -> AdminConfig` — loads rows; returns effective config:
+  `quota_bytes`/`shared_workspace_quota_bytes` default `524288000` (500 MiB)
+  and `llm_max_output_tokens` defaults to `16384` when missing (all three are
+  always present); other LLM keys are included only when configured (omitted =
+  `None`); `llm_api_key` is redacted as `"<redacted>"` when configured.
+  Defaults are computed without seeding rows. Unknown/opaque keys and
+  `server_mcp`/`object_storage_*` are not surfaced.
 
 - `patch_config(db, payload: ConfigPatch) -> AdminConfig`:
   1. Pydantic validation already enforced value constraints and rejected unknown keys at the route layer (422).
   2. Reject the literal `"<redacted>"` as `llm_api_key` → `CONFIG_VALIDATION_FAILED`.
   3. If any LLM identity key (`llm_endpoint`/`llm_api_key`/`llm_model`) is present in the patch, gather the effective triple (patch value **or** currently-stored), require all three present, then `validate_llm_identity(endpoint, api_key, model)`. Failure → `CONFIG_VALIDATION_FAILED`. First-time setup requires all three in the same PATCH; later PATCHes may reuse stored values by omitting unchanged identity keys.
-  4. Upsert rows for non-None fields, commit, return `get_config_view(db)`.
+  4. Validate the merged numeric config, including
+     `llm_max_output_tokens <= llm_max_context_tokens` when the context limit
+     exists.
+  5. Upsert rows for non-None fields, commit, return `get_config_view(db)`.
 
 - `validate_llm_identity(endpoint, api_key, model, *, client: httpx.AsyncClient | None = None)` — `GET {endpoint}/models` with `Authorization: Bearer {api_key}`; per ADR-101, the response must be HTTP 200 **and** include the configured `llm_model` in the models list. The expected response shape is OpenAI-compatible: `{"object": "list", "data": [{"id": "<model_name>", "object": "model"}, ...]}`. The check looks for `llm_model` in `data[].id`. Non-200 or model absent → `CONFIG_VALIDATION_FAILED`. The optional `client` enables test injection via `MockTransport`. Real provider credentials are only needed for live smoke testing, not automated tests (ADR-101).
 
 - `llm_max_concurrent_requests` runtime behavior: Py1 only stores/retrieves the value. The actual semaphore is Py2 (provider runtime). Per ADR-101, if the key is missing at startup, the runtime limiter treats it as `0` (unlimited); no default row is persisted. Py1's `get_config_view` returns `None` for this key when no row exists.
+- `llm_max_output_tokens` runtime behavior: the config service exposes the
+  effective value `16384` when no row exists. Py2 passes the value into each
+  new Anthropic Messages call. It includes thinking and visible output; a
+  config change does not alter a call already in flight.
 
 `server_mcp` is not accepted (Py8); `object_storage_*` is not accepted (env config).
 
@@ -257,7 +277,18 @@ Added to `server/pyproject.toml` runtime deps: `argon2-cffi`, `pyjwt`, `email-va
 - Tests:
   - auth: register `201` + cookie; duplicate email `409 auth_email_taken`; `admin_token` promotes to `is_admin`; login `200` + cookie; login wrong password `401 auth_invalid_credentials`; logout `204` clears cookie.
   - me: GET `200` / `401` without token; PATCH name/email/password; PATCH email taken `409`; DELETE `204`; DELETE last admin `409 auth_last_admin_required`.
-  - admin config: GET `200` effective defaults (quota keys present, LLM keys omitted); PATCH LLM triple with fake validation (model present) → `200` redacted; PATCH unknown key → `422`; PATCH with invalid value (e.g. `quota_bytes=0`, `llm_compaction_threshold_tokens=100`) → `422`; PATCH LLM with failing `/models` (non-200) → `400 config_validation_failed`; PATCH LLM with model absent from `/models` response → `400 config_validation_failed`; PATCH `llm_api_key="<redacted>"` → `400 config_validation_failed`; non-admin GET/PATCH → `403 auth_forbidden`.
+  - admin config: GET `200` effective defaults (quota keys and
+    `llm_max_output_tokens=16384` present; other LLM keys omitted); PATCH LLM
+    triple with fake validation (model present) → `200` redacted; PATCH
+    `llm_max_output_tokens` → `200`; PATCH unknown key → `422`; invalid field
+    bounds (for example `quota_bytes=0`,
+    `llm_compaction_threshold_tokens=100`, or output above `1_000_000`) →
+    `422`; output above the configured context → `400
+    config_validation_failed` without partial writes; PATCH LLM with failing
+    `/models` (non-200) → `400 config_validation_failed`; PATCH LLM with model
+    absent from `/models` response → `400 config_validation_failed`; PATCH
+    `llm_api_key="<redacted>"` → `400 config_validation_failed`; non-admin
+    GET/PATCH → `403 auth_forbidden`.
   - admin users: GET list `200` (paginated); DELETE `204`; DELETE missing `404 user_not_found`; DELETE last admin `409`; non-admin → `403`.
   - error shape: every error response is `{code, message}`.
   - jwt: `verify_jwt` rejects tampered/expired tokens (unit).
@@ -271,3 +302,6 @@ Added to `server/pyproject.toml` runtime deps: `argon2-cffi`, `pyjwt`, `email-va
 - **`GET /api/admin/users` quota fields:** returned as `null` in Py1 (deviation from API.yaml `AdminUser` which marks them required/non-nullable); Py4 will populate them via `workspace_fs`. The DTO is forward-compatible.
 - **No token revocation:** a deleted user's JWT is only invalidated when `get_current_user` fails to load the row. Acceptable for the alpha; a revocation list is a later concern.
 - **`llm_max_concurrent_requests` stored but inert in Py1:** the semaphore itself is Py2 (provider runtime). Py1 only stores/retrieves the value; no runtime enforcement.
+- **`llm_max_output_tokens` is a Py2 amendment:** the config surface computes
+  and returns the effective `16384` default without seeding a row. The provider
+  consumes it only when Py2 starts a new turn.

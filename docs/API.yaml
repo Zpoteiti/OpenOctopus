@@ -355,9 +355,9 @@ paths:
         Deletion is a hard stop, not a safe-boundary cancel. The server first
         terminates any in-memory runner and live/queued POST streams for this
         session, then deletes the `sessions` row. `ON DELETE CASCADE` removes
-        canonical `messages` and durable `pending_messages`. The server does
-        not insert a stop marker or synthetic tool results because the
-        transcript is being removed.
+        canonical `messages`, durable `pending_messages`, and `turn_runs`. The
+        server does not insert a stop marker or synthetic tool results because
+        the transcript is being removed.
       responses:
         '204': { description: Deleted. }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -383,7 +383,9 @@ paths:
         Returns only PostgreSQL-backed canonical state for this browser chat:
         persisted complete messages, durable pending user messages, and
         session/turn run status. It never returns in-flight token deltas from a
-        running assistant response.
+        running assistant response. Server-generated `<runtime>` metadata is
+        retained in Postgres/provider replay but removed from the public
+        `content` projection of human and pending messages.
 
         Frontend recovery uses this endpoint after a broken POST stream. If the
         response reports `status=running`, the frontend may poll with `after`
@@ -425,10 +427,14 @@ paths:
       tags: [Sessions]
       summary: Send a user message, wake runner, stream best-effort preview
       description: |
-        Durably accepts the user message, creates a `turn_id`, and wakes or
-        reserves the session runner. The response is a best-effort streaming
-        body for this HTTP connection only. Disconnecting the response does not
-        cancel the runner, roll back the message, or stop tool execution.
+        Durably accepts the user message and wakes or reserves the session
+        runner. A `turn_id` is created when its provider-visible batch starts;
+        queued input does not invent one early. The response is a best-effort
+        streaming body for this HTTP connection only. Disconnecting the
+        response does not cancel the runner or roll back the message. Py2
+        streams text/thinking token deltas from one provider call and has no
+        tool progress; Py3 adds tool execution and `tool_progress` events
+        without changing this detached-runner contract.
 
         If `{id}` does not exist, the server atomically creates a browser web
         session owned by the authenticated user: `id={id}`,
@@ -437,11 +443,16 @@ paths:
         the message. Existing sessions owned by another user return `404`
         without revealing whether the id exists.
 
-        If no runner is active for the session, the message is written directly
-        to provider-visible `messages` and a runner is started. If a runner is
-        active, the message is written to `pending_messages` and is drained into
-        `messages` only after the current assistant tool batch is fully
-        addressed.
+        If no runner is active and no durable pending rows remain, the message
+        is written directly to provider-visible `messages` and a runner is
+        started. If a runner is active, the message is written to
+        `pending_messages` and is drained into `messages` only at the next safe
+        boundary. In tool-less Py2, that boundary is after the current complete
+        assistant response and terminal run state are persisted. From Py3
+        onward, the current assistant tool batch must also be fully addressed.
+        If pending rows survived a restart but no turn is running, the new
+        input joins them and the entire ordered queue drains before the
+        recovered turn starts.
 
         Pending browser messages use latest-wins streaming. The newest queued
         POST response may stay open as the live preview subscriber for the next
@@ -449,8 +460,13 @@ paths:
         and close after their own message has been durably accepted. At the
         safe boundary, all pending rows for the session are drained in order and
         become one provider-visible batch; the latest still-connected queued
-        stream receives that batch's token/tool preview. Reconnect/recovery uses
+        stream receives that batch's live preview. Reconnect/recovery uses
         `GET /api/sessions/{id}/messages`; missed token deltas are not replayed.
+
+        Py2 retries a transient provider failure only before the first
+        text/thinking delta is emitted. A later failure persists a
+        `synthetic_assistant_error`, marks the turn failed, and discards the
+        incomplete assistant preview from durable state.
 
         **Browser write allow-list (ADR-098).** `{id}` is `sessions.id`, not
         `session_key`. The server accepts writes only when `channel == "web"`
@@ -487,16 +503,12 @@ paths:
                   items: { $ref: '#/components/schemas/ContentBlock' }
                 attachments:
                   type: array
+                  maxItems: 0
                   description: |
-                    Required workspace file references. Message send validates
-                    and reads existing files only; it never moves, copies, or
-                    writes attachment files. The request is rejected if both
-                    `content` and `attachments` are empty. Structural
-                    validation failures reject before persistence. Runtime
-                    remote-read failures for known devices, such as
-                    unreachable or timed-out targets, accept the message and
-                    insert a sanitized text block explaining that the
-                    attachment was unavailable.
+                    Required for the stable request shape, but Py2 requires this
+                    array to be empty. Py2 accepts text and direct inline base64
+                    images through `content`; workspace/device attachment
+                    references begin with the Py4 workspace-files milestone.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
               additionalProperties: false
@@ -519,10 +531,9 @@ paths:
           description: |
             Session id is not a valid UUID, session is not browser-writable,
             JSON/content shape is invalid, or an image block is malformed.
-            Attachment refs must include `openoctopus_device` and `path`;
-            Python-main accepts `server` or a paired device name. If present,
-            `effort` must be `null` or one of `off`, `low`, `medium`, `high`,
-            `xhigh`, or `max`.
+            Py2 rejects a non-empty `attachments` array. If present, `effort`
+            must be `null` or one of `off`, `low`, `medium`, `high`, `xhigh`,
+            or `max`.
         '404':
           description: Session id exists for another user, or another ownership check failed without revealing existence.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1661,6 +1672,12 @@ paths:
             compaction, and future autonomous flows. If missing at server
             startup, only the runtime limiter treats it as `0`; no row is
             persisted. ADR-101, ADR-122.
+          - `llm_max_output_tokens` (int) — maximum output-token budget passed
+            to Anthropic Messages. Missing means the effective value is
+            `16384`, which GET returns without seeding a database row. The
+            budget includes thinking and visible output, applies to the next
+            provider turn, and does not expand the configured context window.
+            ADR-101, ADR-125.
 
         Object storage is deployment infrastructure config, like Postgres: it
         is read from environment / deployment secrets at server startup and is
@@ -1712,6 +1729,12 @@ paths:
         outbound Anthropic Messages calls. If the key is missing at startup,
         only the runtime limiter treats it as `0`; no default row is persisted.
         Negative values and values above the server maximum are invalid.
+
+        `llm_max_output_tokens` must be an integer in `1..1000000`. When
+        `llm_max_context_tokens` is configured, the merged config must also
+        satisfy `llm_max_output_tokens <= llm_max_context_tokens`. A successful
+        change is read by the next provider turn and does not mutate an
+        already-running call.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1732,6 +1755,7 @@ paths:
                 llm_max_context_tokens: { type: integer, format: int64, minimum: 1 }
                 llm_compaction_threshold_tokens: { type: integer, format: int64, minimum: 4001 }
                 llm_max_concurrent_requests: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
+                llm_max_output_tokens: { type: integer, format: int64, minimum: 1, maximum: 1000000 }
       responses:
         '200':
           description: OK
@@ -1959,11 +1983,13 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_max_output_tokens]
       description: |
         Admin-visible effective config. Quota keys are always present because
-        missing rows default to 500 MiB (`524288000`). Unconfigured LLM keys are
-        omitted. Configured `llm_api_key` is returned as `"<redacted>"`.
+        missing rows default to 500 MiB (`524288000`).
+        `llm_max_output_tokens` is always present and defaults to `16384`
+        without seeding a row. Other unconfigured LLM keys are omitted.
+        Configured `llm_api_key` is returned as `"<redacted>"`.
       properties:
         quota_bytes:
           type: integer
@@ -1981,6 +2007,13 @@ components:
         llm_max_context_tokens: { type: integer, format: int64 }
         llm_compaction_threshold_tokens: { type: integer, format: int64 }
         llm_max_concurrent_requests: { type: integer, format: int64 }
+        llm_max_output_tokens:
+          type: integer
+          format: int64
+          default: 16384
+          minimum: 1
+          maximum: 1000000
+          description: Effective provider output budget, including thinking and visible output.
 
     AdminUser:
       type: object
@@ -2048,7 +2081,10 @@ components:
             Sanitized Anthropic content blocks. Normal `thinking.thinking`
             blocks are returned when present so the frontend can decide whether
             to display them. `thinking.signature` and raw
-            `redacted_thinking.data` are omitted from public responses.
+            `redacted_thinking.data` are omitted from public responses. For
+            `message_kind=human`, the exact server-generated first
+            `<runtime>` text block is also omitted from this public projection;
+            stored/provider content is unchanged.
         delivery_refs:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
@@ -2076,7 +2112,9 @@ components:
           items: { $ref: '#/components/schemas/ContentBlock' }
           description: |
             Sanitized Anthropic user content blocks that will later become the
-            `messages.content` value for the drained human message.
+            `messages.content` value for the drained human message. The exact
+            server-generated first `<runtime>` text block is omitted from this
+            public projection; the pending database row retains it.
         effort:
           allOf:
             - $ref: '#/components/schemas/Effort'
@@ -2086,7 +2124,7 @@ components:
 
     MessagesResponse:
       type: object
-      required: [messages, pending_messages, status, pending_count, has_more_before]
+      required: [messages, pending_messages, status, active_turn_id, last_message_id, pending_count, has_more_before]
       description: |
         Canonical PostgreSQL-backed chat state. This response never includes
         in-flight token deltas from a running assistant response. The
@@ -2154,6 +2192,7 @@ components:
             text: { type: string, description: Coalesced best-effort token text. Not persisted and not replayed. }
         - type: object
           required: [type, turn_id, kind]
+          description: Introduced by Py3; Py2 never emits this event.
           properties:
             type: { type: string, enum: [tool_progress] }
             turn_id: { type: string }
