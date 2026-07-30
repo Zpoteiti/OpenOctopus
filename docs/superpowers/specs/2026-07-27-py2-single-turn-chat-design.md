@@ -1,8 +1,7 @@
 # Py2 — Streaming Single-Provider-Turn Chat Design
 
 **Milestone:** Py2 (depends on Py1)
-**Status:** review draft v2 — updated from maintainer review on 2026-07-30;
-production implementation waits for final approval
+**Status:** approved on 2026-07-30; production implementation is in review
 
 ## Summary
 
