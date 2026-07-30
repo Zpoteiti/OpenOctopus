@@ -442,6 +442,10 @@ order, insert matching `messages` rows with the same IDs and
 `message_kind="human"`, delete the selected pending rows, commit, then
 make the visible user rows available to canonical `GET messages` history and
 the current live POST preview stream.
+The promoted rows receive canonical `messages.created_at` values at drain time
+in pending order. `pending_messages.received_at` is the queue-order timestamp,
+not the eventual transcript position; copying it would place a queued follow-up
+before the assistant response it waited behind.
 
 For browser `POST /api/sessions/{id}/messages`, pending stream delivery is
 latest-wins. If multiple browser POSTs arrive while the session is running, all

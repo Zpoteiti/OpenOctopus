@@ -244,7 +244,10 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
   transaction: select pending rows in `(received_at, id)` order, insert them
   into `messages` with the same `id` and `message_kind='human'`, delete the
   selected pending rows, commit, then the resulting user messages become
-  visible to canonical history and the latest live POST preview stream. In
+  visible to canonical history and the latest live POST preview stream.
+  Canonical `messages.created_at` values are assigned at drain time in that
+  same order; copying the earlier `received_at` would incorrectly place queued
+  input before the assistant response whose safe boundary it waited for. In
   tool-less Py2, the boundary follows persistence of the current complete
   assistant response and terminal run state. From Py3 onward, the current
   assistant tool batch must also be fully addressed (ADR-034, ADR-125).
