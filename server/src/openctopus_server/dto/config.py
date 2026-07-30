@@ -12,6 +12,7 @@ class ConfigPatch(BaseModel):
     llm_max_context_tokens: int | None = Field(default=None, ge=1)
     llm_compaction_threshold_tokens: int | None = Field(default=None, ge=4001)
     llm_max_concurrent_requests: int | None = Field(default=None, ge=0, le=1_000_000)
+    llm_max_output_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
 
 
 class AdminConfig(BaseModel):
@@ -25,3 +26,4 @@ class AdminConfig(BaseModel):
     llm_max_context_tokens: int | None = None
     llm_compaction_threshold_tokens: int | None = None
     llm_max_concurrent_requests: int | None = None
+    llm_max_output_tokens: int

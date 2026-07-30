@@ -1,0 +1,600 @@
+import asyncio
+import json
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from openctopus_server.chat.public_projection import build_runtime_block
+from openctopus_server.chat.runner import ChatRuntime
+from openctopus_server.chat.types import AcceptedMessage
+from openctopus_server.db.models import (
+    Message,
+    PendingMessage,
+    Session,
+    SystemConfig,
+    TurnRun,
+    User,
+)
+from openctopus_server.provider.anthropic import (
+    DeltaCallback,
+    ProviderInvocationError,
+    ProviderResult,
+    provider_fingerprint,
+)
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.wire_types import Effort
+from openctopus_server.services.turn_runs import abandon_running_turns
+
+
+@dataclass(slots=True)
+class FakeStep:
+    content: list[dict[str, Any]]
+    deltas: list[tuple[str, str]] = field(default_factory=list)
+    started: asyncio.Event | None = None
+    release: asyncio.Event | None = None
+    error: ProviderInvocationError | None = None
+
+
+class FakeProvider:
+    def __init__(self, steps: list[FakeStep]) -> None:
+        self.steps = deque(steps)
+        self.calls: list[dict[str, Any]] = []
+
+    async def stream_turn(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        effort: Effort | None,
+        limiter: ProviderLimiter,
+        on_delta: DeltaCallback,
+    ) -> ProviderResult:
+        step = self.steps.popleft()
+        self.calls.append(
+            {
+                "config": config,
+                "system": system,
+                "messages": messages,
+                "effort": effort,
+            }
+        )
+        if step.started is not None:
+            step.started.set()
+        for channel, text in step.deltas:
+            await on_delta(channel, text)  # type: ignore[arg-type]
+        if step.release is not None:
+            await step.release.wait()
+        if step.error is not None:
+            raise step.error
+        return ProviderResult(
+            content=step.content,
+            fingerprint=provider_fingerprint(config),
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+async def _configure_provider(pg_engine) -> None:
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add_all(
+            [
+                SystemConfig(key="llm_endpoint", value="http://fake.test/v1"),
+                SystemConfig(key="llm_api_key", value="fake-key"),
+                SystemConfig(key="llm_model", value="fake-model"),
+            ]
+        )
+        await db.commit()
+
+
+def _install_fake_runtime(test_app, pg_engine, provider: FakeProvider) -> ChatRuntime:
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+    )
+    test_app.state.chat_runtime = runtime
+    return runtime
+
+
+def _events(response) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in response.text.splitlines()]
+
+
+async def _wait_for_pending(client, session_id: str, expected: int) -> dict[str, Any]:
+    for _ in range(100):
+        response = await client.get(f"/api/sessions/{session_id}/messages")
+        if response.status_code == 200 and response.json()["pending_count"] == expected:
+            return response.json()
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"pending_count never reached {expected}")
+
+
+async def test_post_streams_and_get_recovers_canonical_history(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider(
+        [
+            FakeStep(
+                deltas=[("thinking", "reason"), ("text", "hello")],
+                content=[
+                    {
+                        "type": "thinking",
+                        "thinking": "reason",
+                        "signature": "secret-signature",
+                    },
+                    {"type": "text", "text": "hello"},
+                ],
+            )
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "1bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "effort": "high",
+            "content": [{"type": "text", "text": "Hi"}],
+            "attachments": [],
+        },
+    )
+
+    assert response.status_code == 200
+    events = _events(response)
+    assert [event["type"] for event in events] == [
+        "message_accepted",
+        "turn_started",
+        "token_delta",
+        "token_delta",
+        "message_persisted",
+        "turn_finished",
+    ]
+    assert [event["channel"] for event in events if event["type"] == "token_delta"] == [
+        "thinking",
+        "text",
+    ]
+    assert events[-1]["status"] == "completed"
+
+    history = await user_client.get(f"/api/sessions/{session_id}/messages")
+    assert history.status_code == 200
+    body = history.json()
+    assert body["status"] == "idle"
+    assert body["pending_count"] == 0
+    assert [message["message_kind"] for message in body["messages"]] == [
+        "human",
+        "assistant",
+    ]
+    assert body["messages"][0]["content"] == [{"type": "text", "text": "Hi"}]
+    assert body["messages"][1]["content"][0] == {
+        "type": "thinking",
+        "thinking": "reason",
+    }
+    assert "<runtime>" not in json.dumps(body)
+
+    call = provider.calls[0]
+    assert call["config"].max_output_tokens == 16384
+    assert call["effort"] == Effort.HIGH
+    assert call["messages"][0]["content"][0]["text"].startswith("<runtime>\n")
+    assert call["messages"][0]["content"][1] == {"type": "text", "text": "Hi"}
+    await runtime.close()
+
+
+async def test_same_session_overlap_is_durable_and_drains(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = FakeProvider(
+        [
+            FakeStep(
+                started=started,
+                release=release,
+                content=[{"type": "text", "text": "first answer"}],
+            ),
+            FakeStep(content=[{"type": "text", "text": "second answer"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "2bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+
+    first_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={
+                "content": [{"type": "text", "text": "first"}],
+                "attachments": [],
+            },
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={
+                "content": [{"type": "text", "text": "second"}],
+                "attachments": [],
+            },
+        )
+    )
+
+    pending = await _wait_for_pending(user_client, session_id, 1)
+    pending_id = pending["pending_messages"][0]["id"]
+    assert pending["pending_messages"][0]["content"] == [{"type": "text", "text": "second"}]
+    assert pending["status"] == "running"
+
+    release.set()
+    first_response, second_response = await asyncio.gather(
+        first_task,
+        second_task,
+    )
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    second_events = _events(second_response)
+    assert second_events[0]["disposition"] == "queued"
+    assert second_events[1]["type"] == "turn_started"
+    assert second_events[1]["message_ids"] == [pending_id]
+
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert [message["content"][-1]["text"] for message in history["messages"]] == [
+        "first",
+        "first answer",
+        "second",
+        "second answer",
+    ]
+    assert history["pending_count"] == 0
+    await runtime.close()
+
+
+async def test_latest_queued_post_replaces_older_stream(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = FakeProvider(
+        [
+            FakeStep(
+                started=started,
+                release=release,
+                content=[{"type": "text", "text": "one"}],
+            ),
+            FakeStep(content=[{"type": "text", "text": "batch"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "3bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+
+    first_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "one"}], "attachments": []},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "two"}], "attachments": []},
+        )
+    )
+    await _wait_for_pending(user_client, session_id, 1)
+    third_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={
+                "content": [{"type": "text", "text": "three"}],
+                "attachments": [],
+            },
+        )
+    )
+    await _wait_for_pending(user_client, session_id, 2)
+
+    second_response = await asyncio.wait_for(second_task, timeout=2)
+    second_events = _events(second_response)
+    assert [event["type"] for event in second_events] == [
+        "message_accepted",
+        "stream_replaced",
+    ]
+
+    release.set()
+    first_response, third_response = await asyncio.gather(first_task, third_task)
+    assert first_response.status_code == 200
+    third_events = _events(third_response)
+    assert third_events[0]["disposition"] == "queued"
+    assert len(third_events[1]["message_ids"]) == 2
+    await runtime.close()
+
+
+async def test_latest_late_registration_replaces_older_running_preview(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    accepted_at = datetime.now(UTC)
+
+    async def running_location(
+        accepted: AcceptedMessage,
+    ) -> tuple[str, Any]:
+        return "running", turn_id
+
+    monkeypatch.setattr(runtime, "_queued_location", running_location)
+    older = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=uuid4(),
+            accepted_at=accepted_at,
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+    newer = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=uuid4(),
+            accepted_at=accepted_at + timedelta(microseconds=1),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+
+    older_events = [json.loads(chunk) async for chunk in older.ndjson()]
+    assert [event["type"] for event in older_events] == [
+        "message_accepted",
+        "stream_replaced",
+    ]
+    assert older.closed is True
+    assert newer.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=newer)
+    await runtime.close()
+
+
+async def test_failure_after_delta_persists_only_synthetic_error(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider(
+        [
+            FakeStep(
+                deltas=[("text", "partial")],
+                content=[],
+                error=ProviderInvocationError("stream failed"),
+            )
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "4bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "hello"}], "attachments": []},
+    )
+    events = _events(response)
+    assert [event["type"] for event in events] == [
+        "message_accepted",
+        "turn_started",
+        "token_delta",
+        "message_persisted",
+        "turn_finished",
+    ]
+    assert events[-1]["status"] == "failed"
+
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["status"] == "failed"
+    assert history["messages"][-1]["message_kind"] == "synthetic_assistant_error"
+    assert "partial" not in json.dumps(history["messages"][-1])
+    await runtime.close()
+
+
+async def test_invalid_attachment_and_unconfigured_provider_fail_before_persistence(
+    user_client,
+):
+    session_id = "5bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+    invalid = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "content": [{"type": "text", "text": "hello"}],
+            "attachments": [{"path": "file.txt"}],
+        },
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["code"] == "invalid_message_content"
+
+    unconfigured = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "hello"}], "attachments": []},
+    )
+    assert unconfigured.status_code == 503
+    assert unconfigured.json()["code"] == "provider_not_configured"
+    missing = await user_client.get(f"/api/sessions/{session_id}/messages")
+    assert missing.status_code == 404
+
+
+async def test_direct_inline_image_is_persisted_and_sent_to_provider(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider([FakeStep(content=[{"type": "text", "text": "image received"}])])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "7bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+    image = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "aQ==",
+        },
+    }
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [image], "attachments": []},
+    )
+    assert response.status_code == 200
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["messages"][0]["content"] == [image]
+    assert provider.calls[0]["messages"][0]["content"][1] == image
+    await runtime.close()
+
+
+async def test_disconnected_post_does_not_cancel_runner(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = FakeProvider(
+        [
+            FakeStep(
+                started=started,
+                release=release,
+                content=[{"type": "text", "text": "finished"}],
+            )
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = "6bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+    post_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "hello"}], "attachments": []},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    post_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await post_task
+    release.set()
+
+    for _ in range(100):
+        history = await user_client.get(f"/api/sessions/{session_id}/messages")
+        if history.status_code == 200 and history.json()["status"] == "idle":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("detached runner did not complete")
+    assert history.json()["messages"][-1]["content"] == [{"type": "text", "text": "finished"}]
+    await runtime.close()
+
+
+async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider([FakeStep(content=[{"type": "text", "text": "recovered"}])])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = uuid4()
+    pending_id = uuid4()
+    old_turn_id = uuid4()
+    now = datetime.now(UTC)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            last_inbound_at=now - timedelta(seconds=1),
+            created_at=now - timedelta(seconds=3),
+        )
+        db.add(session)
+        await db.flush()
+        db.add(
+            Message(
+                id=uuid4(),
+                session_id=session_id,
+                role="user",
+                message_kind="human",
+                content=[
+                    build_runtime_block(
+                        timestamp=(now - timedelta(seconds=2)).isoformat(),
+                        session=session,
+                        user_id=user.id,
+                    ),
+                    {"type": "text", "text": "original"},
+                ],
+                delivery_refs=[],
+                created_at=now - timedelta(seconds=2),
+            )
+        )
+        db.add(
+            PendingMessage(
+                id=pending_id,
+                session_id=session_id,
+                user_id=user.id,
+                session_key=session.session_key,
+                content=[
+                    build_runtime_block(
+                        timestamp=(now - timedelta(seconds=1)).isoformat(),
+                        session=session,
+                        user_id=user.id,
+                    ),
+                    {"type": "text", "text": "queued before crash"},
+                ],
+                received_at=now - timedelta(seconds=1),
+            )
+        )
+        db.add(
+            TurnRun(
+                id=old_turn_id,
+                session_id=session_id,
+                runner_instance_id=uuid4(),
+                status="running",
+                started_at=now - timedelta(seconds=2),
+            )
+        )
+        await db.commit()
+
+    await abandon_running_turns(
+        pg_engine,
+        runner_instance_id=runtime.runner_instance_id,
+    )
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "content": [{"type": "text", "text": "new after restart"}],
+            "attachments": [],
+        },
+    )
+    events = _events(response)
+    assert events[0]["disposition"] == "started"
+    assert events[1]["message_ids"][0] == str(pending_id)
+    assert len(events[1]["message_ids"]) == 2
+
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert [message["content"][-1]["text"] for message in history["messages"]] == [
+        "original",
+        "queued before crash",
+        "new after restart",
+        "recovered",
+    ]
+    await runtime.close()

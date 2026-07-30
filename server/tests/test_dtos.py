@@ -7,16 +7,22 @@ from openctopus_server.dto.session import SessionResponse
 
 
 def test_post_message_request():
-    req = PostMessageRequest(content="hello")
-    assert req.content == "hello"
+    req = PostMessageRequest(
+        content=[{"type": "text", "text": "hello"}],
+        attachments=[],
+    )
+    assert req.content[0].text == "hello"
 
 
 def test_message_response():
     msg = MessageResponse(
         id=uuid4(),
+        session_id=uuid4(),
         role="user",
         message_kind="human",
         content=[{"type": "text", "text": "hi"}],
+        delivery_refs=[],
+        is_compaction_summary=False,
         created_at=datetime.now(UTC),
     )
     assert msg.role == "user"

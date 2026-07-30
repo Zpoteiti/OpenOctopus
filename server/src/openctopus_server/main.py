@@ -6,10 +6,12 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from openctopus_server.api.router import router as api_router
+from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.config import get_settings
 from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
 from openctopus_server.errors.http import register_error_handler
+from openctopus_server.services.turn_runs import abandon_running_turns
 
 
 @asynccontextmanager
@@ -30,8 +32,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         print(f"Database bootstrap failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    runtime = getattr(app.state, "chat_runtime", None)
+    if runtime is None:
+        runtime = ChatRuntime(engine)
+        app.state.chat_runtime = runtime
+    await abandon_running_turns(
+        engine,
+        runner_instance_id=runtime.runner_instance_id,
+    )
+
     yield
 
+    await runtime.close()
     await engine.dispose()
 
 

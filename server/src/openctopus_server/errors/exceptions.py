@@ -34,3 +34,7 @@ class AuthError(OpenOctopusError):
 
 class ConfigError(OpenOctopusError):
     pass
+
+
+class ChatError(OpenOctopusError):
+    pass

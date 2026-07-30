@@ -23,7 +23,7 @@ class SystemConfig(Base):
     __tablename__ = "system_config"
 
     key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    value: Mapped[Any] = mapped_column(JSONB, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -38,9 +38,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    is_admin: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("FALSE")
-    )
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -94,9 +92,7 @@ class Session(Base):
     session_key: Mapped[str] = mapped_column(Text, nullable=False)
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     chat_id: Mapped[str] = mapped_column(Text, nullable=False)
-    title: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'New chat'")
-    )
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'New chat'"))
     last_inbound_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     last_read_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     cancel_requested: Mapped[bool] = mapped_column(
@@ -120,7 +116,7 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(Text, nullable=False)
     message_kind: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    content: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     delivery_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
@@ -154,7 +150,7 @@ class PendingMessage(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     session_key: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    content: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     effort: Mapped[str | None] = mapped_column(Text)
     received_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -168,6 +164,30 @@ class PendingMessage(Base):
     )
 
 
+class TurnRun(Base):
+    __tablename__ = "turn_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    runner_instance_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','completed','failed','abandoned','cancelled')",
+            name="check_turn_run_status",
+        ),
+    )
+
+
 class Device(Base):
     __tablename__ = "devices"
 
@@ -177,9 +197,7 @@ class Device(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False)
-    sandbox_mode: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("TRUE")
-    )
+    sandbox_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
     shell_timeout_max: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("600")
     )
@@ -187,19 +205,19 @@ class Device(Base):
         JSONB,
         nullable=False,
         server_default=text(
-            "'[\"127.0.0.0/8\",\"::1/128\",\"10.0.0.0/8\",\"172.16.0.0/12\",\"192.168.0.0/16\",\"100.64.0.0/10\",\"169.254.0.0/16\",\"169.254.169.254/32\",\"fc00::/7\",\"fe80::/10\"]'::jsonb"
+            '\'["127.0.0.0/8","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10"]\'::jsonb'
         ),
     )
     env_allowlist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text("'[\"PATH\",\"HOME\",\"LANG\",\"TERM\"]'::jsonb"),
+        server_default=text('\'["PATH","HOME","LANG","TERM"]\'::jsonb'),
     )
     command_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
         server_default=text(
-            "'[\"shutdown\",\"reboot\",\"halt\",\"poweroff\",\"mkfs\",\"dd\",\"mount\",\"umount\",\"systemctl\",\"service\"]'::jsonb"
+            '\'["shutdown","reboot","halt","poweroff","mkfs","dd","mount","umount","systemctl","service"]\'::jsonb'
         ),
     )
     mcp_servers: Mapped[dict[str, Any]] = mapped_column(
@@ -268,14 +286,10 @@ class CronJob(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     schedule: Mapped[str] = mapped_column(Text, nullable=False)
     tz: Mapped[str | None] = mapped_column(Text)
-    one_shot: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("FALSE")
-    )
+    one_shot: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     message: Mapped[str] = mapped_column(Text, nullable=False)
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
-    next_fire_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False
-    )
+    next_fire_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -295,6 +309,18 @@ Index(
     PendingMessage.session_key,
     PendingMessage.received_at,
     PendingMessage.id,
+)
+Index(
+    "idx_turn_runs_one_running_per_session",
+    TurnRun.session_id,
+    unique=True,
+    postgresql_where=text("status = 'running'"),
+)
+Index(
+    "idx_turn_runs_session_started",
+    TurnRun.session_id,
+    TurnRun.started_at.desc(),
+    TurnRun.id.desc(),
 )
 Index("idx_devices_user_id", Device.user_id)
 Index("idx_workspace_members_user", WorkspaceMember.user_id)

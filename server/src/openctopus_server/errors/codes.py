@@ -58,6 +58,13 @@ class ErrorCode(StrEnum):
     USER_NOT_FOUND = "user_not_found"
     # Config
     CONFIG_VALIDATION_FAILED = "config_validation_failed"
+    # Chat/provider
+    NOT_FOUND = "not_found"
+    INVALID_MESSAGE_CONTENT = "invalid_message_content"
+    INVALID_CURSOR = "invalid_cursor"
+    PROVIDER_NOT_CONFIGURED = "provider_not_configured"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
     # System
     SERVER_RESTART = "server_restart"
     USER_CANCELLED = "user_cancelled"

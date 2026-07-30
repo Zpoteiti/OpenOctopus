@@ -9,6 +9,7 @@ def _mock_models_response(model: str, status: int = 200) -> httpx.MockTransport:
             status,
             json={"object": "list", "data": [{"id": model, "object": "model"}]},
         )
+
     return httpx.MockTransport(handler)
 
 
@@ -18,6 +19,7 @@ def _mock_models_missing(model: str) -> httpx.MockTransport:
             200,
             json={"object": "list", "data": [{"id": "other-model", "object": "model"}]},
         )
+
     return httpx.MockTransport(handler)
 
 
@@ -30,6 +32,7 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_endpoint"] is None
     assert body["llm_api_key"] is None
     assert body["llm_model"] is None
+    assert body["llm_max_output_tokens"] == 16384
 
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):
@@ -74,6 +77,27 @@ async def test_patch_config_invalid_value_returns_422(admin_client):
         json={"quota_bytes": 0},
     )
     assert response.status_code == 422
+
+
+async def test_patch_max_output_tokens(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"llm_max_output_tokens": 32768},
+    )
+    assert response.status_code == 200
+    assert response.json()["llm_max_output_tokens"] == 32768
+
+
+async def test_patch_output_above_context_rejected(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "llm_max_context_tokens": 8192,
+            "llm_max_output_tokens": 8193,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
 
 
 async def test_patch_config_llm_non_200_returns_400(admin_client, monkeypatch):

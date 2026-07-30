@@ -76,7 +76,7 @@ async def pg_engine(admin_database_url):
 
 
 @pytest_asyncio.fixture
-async def async_client(pg_engine, monkeypatch):
+async def test_app(pg_engine, monkeypatch):
     # Point the app at the per-session test database.
     # render_as_string preserves the password; str(URL) masks it as '***'.
     monkeypatch.setenv(
@@ -85,8 +85,12 @@ async def async_client(pg_engine, monkeypatch):
     get_settings.cache_clear()
     get_engine.cache_clear()
 
-    app = create_app()
-    transport = ASGITransport(app=app)
+    return create_app()
+
+
+@pytest_asyncio.fixture
+async def async_client(test_app):
+    transport = ASGITransport(app=test_app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
 
@@ -102,6 +106,7 @@ async def register_user_fn(async_client):
             json={"email": email, "password": password, "name": name},
         )
         return response.json()
+
     return _register
 
 
@@ -118,6 +123,7 @@ async def register_admin_fn(async_client):
             },
         )
         return response.json()
+
     return _register
 
 
@@ -129,6 +135,7 @@ async def login_fn(async_client):
             json={"email": email, "password": password},
         )
         return response.json()
+
     return _login
 
 
