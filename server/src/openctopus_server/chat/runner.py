@@ -52,6 +52,7 @@ class ChatRuntime:
         self._provider_factory = provider_factory or AnthropicProvider
         self._providers: dict[tuple[str, str], Provider] = {}
         self._provider_lock = asyncio.Lock()
+        self._activation_tasks: set[asyncio.Task[None]] = set()
         self._states: dict[UUID, _SessionState] = {}
         self._states_lock = asyncio.Lock()
 
@@ -59,6 +60,16 @@ class ChatRuntime:
         if self._providers:
             raise RuntimeError("Cannot replace provider factory after provider use")
         self._provider_factory = factory
+
+    def schedule(self, accepted: AcceptedMessage) -> None:
+        if accepted.turn is None:
+            return
+        task = asyncio.create_task(
+            self._schedule_turn(accepted.turn),
+            name=f"chat-activate-{accepted.turn.turn_id}",
+        )
+        self._activation_tasks.add(task)
+        task.add_done_callback(self._activation_tasks.discard)
 
     async def register(self, accepted: AcceptedMessage) -> StreamSubscriber:
         subscriber = StreamSubscriber(
@@ -140,8 +151,6 @@ class ChatRuntime:
                 previous.close()
                 state.queued_subscriber = None
             state.turn_subscribers[accepted.turn.turn_id] = subscriber
-            state.starts.append(accepted.turn)
-            self._ensure_runner_locked(state)
         return subscriber
 
     async def unregister(
@@ -160,6 +169,11 @@ class ChatRuntime:
             subscriber.close()
 
     async def close(self) -> None:
+        activation_tasks = list(self._activation_tasks)
+        for task in activation_tasks:
+            task.cancel()
+        if activation_tasks:
+            await asyncio.gather(*activation_tasks, return_exceptions=True)
         async with self._states_lock:
             tasks = [
                 state.runner_task
@@ -177,6 +191,12 @@ class ChatRuntime:
             *(provider.close() for provider in providers),
             return_exceptions=True,
         )
+
+    async def _schedule_turn(self, turn: TurnStart) -> None:
+        state = await self._state_for(turn.session_id)
+        async with state.lock:
+            state.starts.append(turn)
+            self._ensure_runner_locked(state)
 
     async def _state_for(
         self,

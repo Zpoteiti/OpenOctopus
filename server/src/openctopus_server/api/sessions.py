@@ -66,6 +66,7 @@ async def post_message(
         body=body,
         runner_instance_id=runtime.runner_instance_id,
     )
+    runtime.schedule(accepted)
     subscriber = await runtime.register(accepted)
 
     async def event_stream() -> AsyncIterator[bytes]:

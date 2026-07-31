@@ -4,7 +4,14 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from ..provider.wire_types import (
     ContentBlock,
@@ -69,3 +76,13 @@ class MessagesResponse(BaseModel):
     last_message_id: UUID | None
     pending_count: int
     has_more_before: bool
+
+    @model_serializer(mode="wrap")
+    def serialize_required_nullable_fields(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        data["active_turn_id"] = self.active_turn_id
+        data["last_message_id"] = self.last_message_id
+        return data

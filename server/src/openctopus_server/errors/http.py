@@ -42,11 +42,10 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
-    if (
-        request.method == "POST"
-        and request.url.path.startswith("/api/sessions/")
-        and request.url.path.endswith("/messages")
-    ):
+    is_messages_route = request.url.path.startswith("/api/sessions/") and request.url.path.endswith(
+        "/messages"
+    )
+    if request.method == "POST" and is_messages_route:
         return JSONResponse(
             status_code=400,
             content={
@@ -54,6 +53,22 @@ async def message_validation_handler(
                 "message": "Message request is invalid",
             },
         )
+    if request.method == "GET" and is_messages_route:
+        errors = exc.errors()
+        query_fields = {"before", "after", "limit"}
+        if errors and all(
+            len(error["loc"]) >= 2
+            and error["loc"][0] == "query"
+            and error["loc"][1] in query_fields
+            for error in errors
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "code": ErrorCode.INVALID_CURSOR.value,
+                    "message": "Message query parameters are invalid",
+                },
+            )
     response = await request_validation_exception_handler(request, exc)
     assert isinstance(response, JSONResponse)
     return response

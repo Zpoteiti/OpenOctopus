@@ -211,5 +211,88 @@ async def test_transient_failure_retries_before_first_delta(monkeypatch):
     await provider.close()
 
 
+async def test_image_fallback_starts_a_fresh_retry_budget(monkeypatch):
+    config = ProviderConfig(
+        endpoint="http://fake.test/v1",
+        api_key="fake-key",
+        model="fake-model",
+        max_output_tokens=16384,
+        max_concurrent_requests=0,
+        max_context_tokens=None,
+    )
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(500, request=request)),
+        trust_env=False,
+    )
+    provider = AnthropicProvider(
+        config,
+        client=AsyncAnthropic(
+            api_key=config.api_key,
+            base_url=config.endpoint,
+            max_retries=0,
+            http_client=http_client,
+        ),
+    )
+    projected_block_types: list[list[str]] = []
+    delays: list[float] = []
+
+    class ImageCompatibilityError(Exception):
+        status_code = 415
+
+    async def failing_attempt(**kwargs):
+        projected_block_types.append([block["type"] for block in kwargs["messages"][0]["content"]])
+        attempt = len(projected_block_types)
+        if attempt in {1, 2, 4, 5}:
+            request = httpx.Request("POST", "http://fake.test/v1/messages")
+            raise anthropic.APIConnectionError(request=request)
+        if attempt == 3:
+            raise ImageCompatibilityError("image input is unsupported")
+        return [{"type": "text", "text": "done"}]
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(provider, "_stream_attempt", failing_attempt)
+    monkeypatch.setattr(
+        "openctopus_server.provider.anthropic.asyncio.sleep",
+        record_sleep,
+    )
+    result = await provider.stream_turn(
+        config=config,
+        system="system",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aW1hZ2U=",
+                        },
+                    },
+                ],
+            }
+        ],
+        effort=None,
+        limiter=ProviderLimiter(),
+        on_delta=lambda channel, text: _noop_delta(),
+    )
+
+    assert projected_block_types == [
+        ["text", "image"],
+        ["text", "image"],
+        ["text", "image"],
+        ["text"],
+        ["text"],
+        ["text"],
+    ]
+    assert delays == [0.25, 0.5, 0.25, 0.5]
+    assert result.content == [{"type": "text", "text": "done"}]
+    await provider.close()
+
+
 async def _noop_delta() -> None:
     return None

@@ -515,9 +515,12 @@ Provider persistence retains the full compatible blocks.
 
 ### Retry boundary and failures
 
-OpenOctopus owns a maximum of three attempts (first attempt plus two retries)
-with bounded exponential backoff for network errors, timeouts, HTTP 408/429,
-and provider 5xx responses.
+OpenOctopus owns a maximum of three attempts per provider projection (first
+attempt plus two retries) with bounded exponential backoff for network errors,
+timeouts, HTTP 408/429, and provider 5xx responses. An ordinary text-only turn
+has one projection. Under ADR-026, an image-bearing projection and its later
+text-only fallback have independent budgets, so one turn may make at most six
+provider attempts across both projections.
 
 Retries are permitted only while the current attempt has produced no
 text/thinking delta:
@@ -530,7 +533,7 @@ live delta:
 
 1. retain the full-fidelity persisted input;
 2. remove only image blocks from the provider projection;
-3. retry the text remainder under the same bounded policy;
+3. start a fresh maximum-three-attempt budget for the text remainder;
 4. store no `vision_stripped` session state.
 
 On exhausted pre-delta failure or any post-delta failure:
@@ -663,9 +666,10 @@ CI needs no real provider credentials.
 
 ### Retry and failure
 
-- pre-delta transient failures retry at most twice;
+- pre-delta transient failures retry at most twice per provider projection;
 - the limiter is released during backoff;
-- image compatibility fallback strips only provider projection;
+- image compatibility fallback strips only provider projection and starts a
+  fresh maximum-three-attempt budget, for at most six attempts total;
 - a failure after the first delta makes no second provider attempt;
 - post-delta failure persists only a synthetic error, never partial assistant
   content;

@@ -289,6 +289,7 @@ async def get_messages_response(
             "before and after are mutually exclusive",
         )
     session = await _owned_session(db, user_id=user_id, session_id=session_id)
+    await _advisory_lock(db, session_id, shared=True)
     anchor_id = before if before is not None else after
     anchor: Message | None = None
     if anchor_id is not None:
@@ -430,10 +431,20 @@ def _effort_from_pending(row: PendingMessage) -> Effort | None:
     return Effort(row.effort) if row.effort is not None else None
 
 
-async def _advisory_lock(db: AsyncSession, session_id: UUID) -> None:
+async def _advisory_lock(
+    db: AsyncSession,
+    session_id: UUID,
+    *,
+    shared: bool = False,
+) -> None:
     key = session_id.int & ((1 << 63) - 1)
+    statement = (
+        "SELECT pg_advisory_xact_lock_shared(:key)"
+        if shared
+        else "SELECT pg_advisory_xact_lock(:key)"
+    )
     await db.execute(
-        text("SELECT pg_advisory_xact_lock(:key)"),
+        text(statement),
         {"key": key},
     )
 

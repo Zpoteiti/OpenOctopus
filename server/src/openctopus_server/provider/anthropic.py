@@ -74,7 +74,7 @@ class AnthropicProvider:
 
         while True:
             switch_to_text_only = False
-            for attempt in range(3):
+            for projection_attempt in range(3):
                 produced_delta = False
 
                 async def emit(channel: DeltaChannel, text: str) -> None:
@@ -109,12 +109,13 @@ class AnthropicProvider:
                     ):
                         switch_to_text_only = True
                         break
-                    if attempt < 2 and _is_retryable(exc):
-                        await asyncio.sleep(0.25 * (2**attempt))
+                    if projection_attempt < 2 and _is_retryable(exc):
+                        await asyncio.sleep(0.25 * (2**projection_attempt))
                         continue
                     raise ProviderInvocationError(f"Provider request failed: {exc}") from exc
 
             if switch_to_text_only:
+                # ADR-026 gives the stripped projection a fresh retry budget.
                 projected_messages = _strip_images(projected_messages)
                 stripped_images = True
                 continue

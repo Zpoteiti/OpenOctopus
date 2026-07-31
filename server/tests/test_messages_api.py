@@ -30,6 +30,10 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
+from openctopus_server.services.messages import (
+    drain_pending_and_create_turn,
+    get_messages_response,
+)
 from openctopus_server.services.turn_runs import abandon_running_turns
 
 
@@ -115,6 +119,56 @@ async def _wait_for_pending(client, session_id: str, expected: int) -> dict[str,
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"pending_count never reached {expected}")
+
+
+async def test_get_empty_session_keeps_required_nullable_fields(
+    user_client,
+    pg_engine,
+):
+    session_id = uuid4()
+    now = datetime.now(UTC)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        db.add(
+            Session(
+                id=session_id,
+                user_id=user.id,
+                session_key=f"web:{session_id}",
+                channel="web",
+                chat_id=str(session_id),
+                title="New chat",
+                created_at=now,
+            )
+        )
+        await db.commit()
+
+    response = await user_client.get(f"/api/sessions/{session_id}/messages")
+
+    assert response.status_code == 200
+    assert response.json()["active_turn_id"] is None
+    assert response.json()["last_message_id"] is None
+
+
+async def test_get_rejects_malformed_query_with_documented_error(user_client):
+    session_id = uuid4()
+    invalid_queries = [
+        {"before": "not-a-uuid"},
+        {"after": "not-a-uuid"},
+        {"limit": "0"},
+        {"limit": "201"},
+    ]
+
+    for params in invalid_queries:
+        response = await user_client.get(
+            f"/api/sessions/{session_id}/messages",
+            params=params,
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "code": "invalid_cursor",
+            "message": "Message query parameters are invalid",
+        }
 
 
 async def test_post_streams_and_get_recovers_canonical_history(
@@ -257,6 +311,104 @@ async def test_same_session_overlap_is_durable_and_drains(
     ]
     assert history["pending_count"] == 0
     await runtime.close()
+
+
+async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
+    user_client,
+    pg_engine,
+    monkeypatch,
+):
+    session_id = uuid4()
+    pending_id = uuid4()
+    now = datetime.now(UTC)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add(
+            Message(
+                id=uuid4(),
+                session_id=session_id,
+                role="user",
+                message_kind="human",
+                content=[{"type": "text", "text": "first"}],
+                delivery_refs=[],
+                created_at=now,
+            )
+        )
+        db.add(
+            PendingMessage(
+                id=pending_id,
+                session_id=session_id,
+                user_id=user.id,
+                session_key=session.session_key,
+                content=[{"type": "text", "text": "second"}],
+                received_at=now + timedelta(microseconds=1),
+            )
+        )
+        await db.commit()
+
+    canonical_read = asyncio.Event()
+    continue_get = asyncio.Event()
+
+    async def promote_pending():
+        await canonical_read.wait()
+        async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+            return await drain_pending_and_create_turn(
+                db,
+                session_id=session_id,
+                runner_instance_id=uuid4(),
+            )
+
+    promotion_task = asyncio.create_task(promote_pending())
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        original_execute = db.execute
+        canonical_paused = False
+
+        async def execute_with_barrier(statement, *args, **kwargs):
+            nonlocal canonical_paused
+            result = await original_execute(statement, *args, **kwargs)
+            descriptions = getattr(statement, "column_descriptions", ())
+            if not canonical_paused and descriptions and descriptions[0].get("expr") is Message:
+                canonical_paused = True
+                canonical_read.set()
+                await continue_get.wait()
+            return result
+
+        monkeypatch.setattr(db, "execute", execute_with_barrier)
+        get_task = asyncio.create_task(
+            get_messages_response(
+                db,
+                user_id=user.id,
+                session_id=session_id,
+                before=None,
+                after=None,
+                limit=50,
+            )
+        )
+        await canonical_read.wait()
+        try:
+            await asyncio.wait_for(asyncio.shield(promotion_task), timeout=0.2)
+        except TimeoutError:
+            pass
+        continue_get.set()
+        response = await get_task
+        await db.rollback()
+
+    turn = await asyncio.wait_for(promotion_task, timeout=2)
+    assert turn is not None
+    visible_ids = [message.id for message in response.messages]
+    visible_ids.extend(message.id for message in response.pending_messages)
+    assert visible_ids.count(pending_id) == 1
 
 
 async def test_latest_queued_post_replaces_older_stream(
@@ -493,12 +645,85 @@ async def test_disconnected_post_does_not_cancel_runner(
 
     for _ in range(100):
         history = await user_client.get(f"/api/sessions/{session_id}/messages")
-        if history.status_code == 200 and history.json()["status"] == "idle":
-            break
+        if history.status_code == 200:
+            body = history.json()
+            if body["status"] == "idle" and body["messages"][-1]["content"] == [
+                {"type": "text", "text": "finished"}
+            ]:
+                break
         await asyncio.sleep(0.01)
     else:
         raise AssertionError("detached runner did not complete")
     assert history.json()["messages"][-1]["content"] == [{"type": "text", "text": "finished"}]
+    await runtime.close()
+
+
+async def test_cancel_before_registration_still_starts_and_drains_runner(
+    user_client,
+    test_app,
+    pg_engine,
+    monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = FakeProvider(
+        [
+            FakeStep(
+                started=started,
+                release=release,
+                content=[{"type": "text", "text": "first answer"}],
+            ),
+            FakeStep(content=[{"type": "text", "text": "second answer"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    original_register = runtime.register
+    register_entered = asyncio.Event()
+    block_first_registration = True
+
+    async def register_after_barrier(accepted):
+        nonlocal block_first_registration
+        if block_first_registration:
+            block_first_registration = False
+            register_entered.set()
+            await asyncio.Event().wait()
+        return await original_register(accepted)
+
+    monkeypatch.setattr(runtime, "register", register_after_barrier)
+    session_id = "8bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"
+    first_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "first"}], "attachments": []},
+        )
+    )
+    await asyncio.wait_for(register_entered.wait(), timeout=2)
+    first_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await first_task
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "second"}], "attachments": []},
+        )
+    )
+    await _wait_for_pending(user_client, session_id, 1)
+    release.set()
+    second_response = await asyncio.wait_for(second_task, timeout=2)
+
+    assert second_response.status_code == 200
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert [message["content"][-1]["text"] for message in history["messages"]] == [
+        "first",
+        "first answer",
+        "second",
+        "second answer",
+    ]
+    assert len(provider.calls) == 2
+    assert history["status"] == "idle"
     await runtime.close()
 
 

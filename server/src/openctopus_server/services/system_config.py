@@ -1,7 +1,7 @@
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.models import SystemConfig
@@ -12,6 +12,7 @@ from openctopus_server.errors.exceptions import ConfigError
 _QUOTA_DEFAULT = 524288000  # 500 MiB
 LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
 _REDACTED = "<redacted>"
+_TOKEN_LIMIT_KEYS = {"llm_max_context_tokens", "llm_max_output_tokens"}
 
 _CONFIG_KEYS = {
     "quota_bytes",
@@ -68,6 +69,14 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
                 "First-time LLM setup requires llm_endpoint, llm_api_key, and llm_model together",
             )
         await validate_llm_identity(str(endpoint), str(api_key), str(model))
+
+    if _TOKEN_LIMIT_KEYS & data.keys():
+        await db.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended('openoctopus:llm_token_limits', 0))"
+            )
+        )
+        existing = await _get_all_rows(db)
 
     max_output_tokens = int(
         data.get(
