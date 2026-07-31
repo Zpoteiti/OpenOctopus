@@ -4,6 +4,7 @@ from pathlib import Path
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import (
     AuthError,
+    ChatError,
     McpError,
     NetworkError,
     OpenOctopusError,
@@ -27,3 +28,4 @@ def test_all_exception_classes_exist():
     assert issubclass(ProtocolError, OpenOctopusError)
     assert issubclass(McpError, OpenOctopusError)
     assert issubclass(AuthError, OpenOctopusError)
+    assert issubclass(ChatError, OpenOctopusError)

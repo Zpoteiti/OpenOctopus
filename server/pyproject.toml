@@ -13,6 +13,7 @@ dependencies = [
     "pyjwt>=2.10",
     "email-validator>=2.2",
     "httpx>=0.28",
+    "anthropic>=0.104.1",
 ]
 
 [project.optional-dependencies]

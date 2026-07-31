@@ -1,7 +1,7 @@
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.models import SystemConfig
@@ -10,7 +10,9 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ConfigError
 
 _QUOTA_DEFAULT = 524288000  # 500 MiB
+LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
 _REDACTED = "<redacted>"
+_TOKEN_LIMIT_KEYS = {"llm_max_context_tokens", "llm_max_output_tokens"}
 
 _CONFIG_KEYS = {
     "quota_bytes",
@@ -21,6 +23,7 @@ _CONFIG_KEYS = {
     "llm_max_context_tokens",
     "llm_compaction_threshold_tokens",
     "llm_max_concurrent_requests",
+    "llm_max_output_tokens",
 }
 
 
@@ -33,24 +36,20 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
     rows = await _get_all_rows(db)
     return AdminConfig(
         quota_bytes=rows.get("quota_bytes", _QUOTA_DEFAULT),
-        shared_workspace_quota_bytes=rows.get(
-            "shared_workspace_quota_bytes", _QUOTA_DEFAULT
-        ),
+        shared_workspace_quota_bytes=rows.get("shared_workspace_quota_bytes", _QUOTA_DEFAULT),
         llm_endpoint=rows.get("llm_endpoint"),
         llm_api_key=_REDACTED if "llm_api_key" in rows else None,
         llm_model=rows.get("llm_model"),
         llm_max_context_tokens=rows.get("llm_max_context_tokens"),
-        llm_compaction_threshold_tokens=rows.get(
-            "llm_compaction_threshold_tokens"
-        ),
-        llm_max_concurrent_requests=rows.get(
-            "llm_max_concurrent_requests"
-        ),
+        llm_compaction_threshold_tokens=rows.get("llm_compaction_threshold_tokens"),
+        llm_max_concurrent_requests=rows.get("llm_max_concurrent_requests"),
+        llm_max_output_tokens=rows.get("llm_max_output_tokens", LLM_MAX_OUTPUT_TOKENS_DEFAULT),
     )
 
 
 async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
     data = payload.model_dump(exclude_none=True)
+    existing = await _get_all_rows(db)
 
     if data.get("llm_api_key") == _REDACTED:
         raise ConfigError(
@@ -61,7 +60,6 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
     # Validate LLM identity before opening the write transaction.
     llm_identity_keys = {"llm_endpoint", "llm_api_key", "llm_model"}
     if llm_identity_keys & data.keys():
-        existing = await _get_all_rows(db)
         endpoint = data.get("llm_endpoint", existing.get("llm_endpoint"))
         api_key = data.get("llm_api_key", existing.get("llm_api_key"))
         model = data.get("llm_model", existing.get("llm_model"))
@@ -71,6 +69,27 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
                 "First-time LLM setup requires llm_endpoint, llm_api_key, and llm_model together",
             )
         await validate_llm_identity(str(endpoint), str(api_key), str(model))
+
+    if _TOKEN_LIMIT_KEYS & data.keys():
+        await db.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended('openoctopus:llm_token_limits', 0))"
+            )
+        )
+        existing = await _get_all_rows(db)
+
+    max_output_tokens = int(
+        data.get(
+            "llm_max_output_tokens",
+            existing.get("llm_max_output_tokens", LLM_MAX_OUTPUT_TOKENS_DEFAULT),
+        )
+    )
+    raw_context_tokens = data.get("llm_max_context_tokens", existing.get("llm_max_context_tokens"))
+    if raw_context_tokens is not None and max_output_tokens > int(raw_context_tokens):
+        raise ConfigError(
+            ErrorCode.CONFIG_VALIDATION_FAILED,
+            "llm_max_output_tokens must not exceed llm_max_context_tokens",
+        )
 
     # Upsert rows after validation succeeds.
     for key, value in data.items():

@@ -1,5 +1,8 @@
+import asyncio
+
 import httpx
 
+from openctopus_server.services import system_config
 from openctopus_server.services.system_config import validate_llm_identity
 
 
@@ -9,6 +12,7 @@ def _mock_models_response(model: str, status: int = 200) -> httpx.MockTransport:
             status,
             json={"object": "list", "data": [{"id": model, "object": "model"}]},
         )
+
     return httpx.MockTransport(handler)
 
 
@@ -18,6 +22,7 @@ def _mock_models_missing(model: str) -> httpx.MockTransport:
             200,
             json={"object": "list", "data": [{"id": "other-model", "object": "model"}]},
         )
+
     return httpx.MockTransport(handler)
 
 
@@ -30,6 +35,7 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_endpoint"] is None
     assert body["llm_api_key"] is None
     assert body["llm_model"] is None
+    assert body["llm_max_output_tokens"] == 16384
 
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):
@@ -74,6 +80,75 @@ async def test_patch_config_invalid_value_returns_422(admin_client):
         json={"quota_bytes": 0},
     )
     assert response.status_code == 422
+
+
+async def test_patch_max_output_tokens(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"llm_max_output_tokens": 32768},
+    )
+    assert response.status_code == 200
+    assert response.json()["llm_max_output_tokens"] == 32768
+
+
+async def test_patch_output_above_context_rejected(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "llm_max_context_tokens": 8192,
+            "llm_max_output_tokens": 8193,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
+
+
+async def test_concurrent_token_limit_updates_keep_pair_valid(admin_client, monkeypatch):
+    initial = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "llm_max_output_tokens": 5000,
+            "llm_max_context_tokens": 10000,
+        },
+    )
+    assert initial.status_code == 200
+
+    original_get_all_rows = system_config._get_all_rows
+    initial_read_tasks: set[object] = set()
+    initial_read_count = 0
+    both_initial_reads = asyncio.Event()
+
+    async def synchronize_initial_reads(db):
+        nonlocal initial_read_count
+        rows = await original_get_all_rows(db)
+        task = asyncio.current_task()
+        if task not in initial_read_tasks:
+            initial_read_tasks.add(task)
+            if initial_read_count < 2:
+                initial_read_count += 1
+                if initial_read_count == 2:
+                    both_initial_reads.set()
+                try:
+                    await asyncio.wait_for(both_initial_reads.wait(), timeout=0.2)
+                except TimeoutError:
+                    pass
+        return rows
+
+    monkeypatch.setattr(system_config, "_get_all_rows", synchronize_initial_reads)
+    output_response, context_response = await asyncio.gather(
+        admin_client.patch(
+            "/api/admin/config",
+            json={"llm_max_output_tokens": 9000},
+        ),
+        admin_client.patch(
+            "/api/admin/config",
+            json={"llm_max_context_tokens": 6000},
+        ),
+    )
+
+    assert sorted([output_response.status_code, context_response.status_code]) == [200, 400]
+    stored = (await admin_client.get("/api/admin/config")).json()
+    assert stored["llm_max_output_tokens"] <= stored["llm_max_context_tokens"]
 
 
 async def test_patch_config_llm_non_200_returns_400(admin_client, monkeypatch):

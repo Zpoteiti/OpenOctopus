@@ -313,8 +313,15 @@ pub struct ContextInputs<'a> {
 ### ADR-023 · Single system prompt shape (no `PromptMode`)
 
 **Status:** accepted
-**Decision:** Every turn builds the same system prompt shape: `soul + identity + channels + memory + skills + devices + runtime`. No mode branching for cron/heartbeat/dream — those arrive as normal user messages in dedicated sessions (ADR-010).
-**Consequences:** The context builder is much smaller than its prior Plexus equivalent. One test surface. The system prompt describes static facts about the user's configuration; dynamic context lives in message history.
+**Decision:** Every turn uses the same ordered cacheable
+configuration-snapshot shape: `soul + memory + identity + channels + skills +
+workspaces + devices + operating notes`. Per-message runtime provenance is
+prepended to the inbound user message, not placed in the system prompt. No mode
+branching for cron/heartbeat/dream — those arrive as normal user messages in
+dedicated sessions (ADR-010).
+**Consequences:** The context builder is much smaller than its prior Plexus
+equivalent. One test surface. The snapshot is reusable while its semantic
+inputs are unchanged; volatile execution state does not churn it.
 
 ### ADR-024 · Skills: always-on full body; conditional name + description
 
@@ -332,7 +339,7 @@ pub struct ContextInputs<'a> {
 
 **Status:** accepted
 **Context:** Some LLMs don't support images. Prior design had `vision_stripped: bool` on session state, persisted across turns.
-**Decision:** No session state. Send the full provider payload first. Auth/config errors fail fast. Transient errors retry the same payload with exponential backoff. In the M1f Anthropic Messages wire format, if the request contained `image` blocks and the provider returns an image/payload compatibility error (`400`, `413`, `415`, `422`, or clear unsupported-image text), retry with only the `image` blocks stripped and keep all text blocks. If stripping leaves no content, send an empty content array/string rather than inventing a marker. The stripped path has its own normal transient retries. No flag propagates.
+**Decision:** No session state. Send the full provider payload first. Auth/config errors fail fast. Transient errors retry the same payload with exponential backoff. In the M1f Anthropic Messages wire format, if the request contained `image` blocks and the provider returns an image/payload compatibility error (`400`, `413`, `415`, `422`, or clear unsupported-image text), retry with only the `image` blocks stripped and keep all text blocks. If stripping leaves no content, send an empty content array/string rather than inventing a marker. Each projection has its own normal maximum-three-attempt budget (first attempt plus two retries): the original image-bearing projection may use up to three attempts, and switching to the stripped projection starts a fresh budget of up to three attempts. One turn therefore makes at most six provider attempts across both projections. No flag propagates.
 **Consequences:** DB stores full-fidelity messages always. Switching to a VLM mid-session works immediately — no stale flag. Non-VLM providers can still answer text-only content after image stripping.
 
 ### ADR-027 · Path-text markers accompany every chat attachment
@@ -435,6 +442,10 @@ order, insert matching `messages` rows with the same IDs and
 `message_kind="human"`, delete the selected pending rows, commit, then
 make the visible user rows available to canonical `GET messages` history and
 the current live POST preview stream.
+The promoted rows receive canonical `messages.created_at` values at drain time
+in pending order. `pending_messages.received_at` is the queue-order timestamp,
+not the eventual transcript position; copying it would place a queued follow-up
+before the assistant response it waited behind.
 
 For browser `POST /api/sessions/{id}/messages`, pending stream delivery is
 latest-wins. If multiple browser POSTs arrive while the session is running, all
@@ -1577,12 +1588,24 @@ shape: the best-effort streaming response for the active
 ### ADR-094 · Runtime block is persisted per user message as historical metadata
 
 **Status:** accepted
-**Context:** Each inbound user message carries a small `<runtime>` block with time, channel, and chat_id (per SYSTEM_PROMPT.md). Earlier wording left it ambiguous whether this block is part of the persisted message or injected fresh per LLM call. Codex flagged the risk of stale timestamps leaking from old history. The concern dissolves if we treat runtime blocks as timestamped historical metadata — each old runtime block correctly records *when that message arrived*, not "current state."
+**Context:** Each inbound user message carries a small `<runtime>` block with
+ingress time, channel/chat provenance, and sender/trust classification (per
+SYSTEM_PROMPT.md). Earlier wording left it ambiguous whether this block is part
+of the persisted message or injected fresh per LLM call. Runtime blocks are
+timestamped historical metadata: each old block records when and where that
+message arrived, not current global state.
 **Decision:**
-- The `<runtime>` block is constructed **once**, at user-message ingress time (in the channel adapter or `publish_inbound` path), with then-current time + channel + chat_id.
+- The `<runtime>` block is constructed **once**, at user-message ingress time
+  (in the channel adapter or `publish_inbound` path), using the deterministic
+  server-owned grammar in `SYSTEM_PROMPT.md`.
 - It is prepended to the user's content blocks inside the same `messages.content` JSONB row (per ADR-059), as a text block.
-- It is **immutable** after insert. No later regeneration, no stripping on replay.
+- It is **immutable** after insert. No later regeneration and no stripping from
+  provider replay.
 - On history read, the agent sees a chronologically ordered sequence of user messages, each with its own runtime block labeling when it arrived. The most-recent one describes "now"; older ones describe the past.
+- Public history does not expose server runtime metadata. Projection inspects
+  only the first text block of canonical human/pending content, validates the
+  exact anchored grammar plus matching session `channel`/`chat_id`, and omits
+  only that block. It never applies a loose regex over concatenated user text.
 
 **Consequences:**
 - Agent naturally understands temporal flow: *"user asked at 10:00, now it's 17:00, they're asking a follow-up"*. Old blocks aren't confusion — they're context.
@@ -1657,7 +1680,7 @@ messages, wake runners, or change routing. Users cannot set or rename
 any user-owned session, not a safe-boundary cancel. The handler terminates the
 session's in-memory runner and live/queued POST streams, then deletes the
 `sessions` row. Database cascades remove canonical `messages` and durable
-`pending_messages`. No stop marker or synthetic tool results are inserted
+`pending_messages` plus `turn_runs`. No stop marker or synthetic tool results are inserted
 because the transcript is intentionally removed. Deleting a channel session
 removes that conversation history only; it does not remove Discord/Telegram
 configuration, so a later inbound channel message may create a fresh session.
@@ -1684,6 +1707,9 @@ without duplicates. `before` and `after` cursors apply only to canonical
 history and are mutually exclusive; no cursor returns the latest page in
 chronological order. `pending_messages` is always returned in `(received_at,
 id)` order and is not counted against the history `limit`.
+The same response includes persisted `status`, `active_turn_id`,
+`last_message_id`, `pending_count`, and `has_more_before` per ADR-125; it never
+includes partial token previews.
 
 ---
 
@@ -1841,11 +1867,12 @@ One client process talks to exactly one OpenOctopus server. `OPENOCTOPUS_DEVICE_
 
 **Status:** accepted
 **Python-main clarification:** Anthropic Messages remains the only provider
-wire format. Six `system_config` keys carry forward (`llm_endpoint`,
+wire format. Seven `system_config` keys carry forward (`llm_endpoint`,
 `llm_api_key`, `llm_model`, `llm_max_context_tokens`,
-`llm_compaction_threshold_tokens`, `llm_max_concurrent_requests`). Python
+`llm_compaction_threshold_tokens`, `llm_max_concurrent_requests`,
+`llm_max_output_tokens`). Python
 server implements the provider adapter using the Anthropic Python SDK.
-Provier validation before config write is retained. Tokenizer changes from
+Provider validation before config write is retained. Tokenizer changes from
 `tiktoken-rs` to a Python tokenizer strategy (revalidated per model).
 **Context:** OpenOctopus needs an LLM. The choices: (a) ship a per-provider client trait (Anthropic Messages API, OpenAI Chat Completions, Bedrock, Gemini, etc. — each with its own request/response/tool-call shape), (b) speak one wire format and let the admin put a compatible endpoint or gateway in front for everything else. Option (a) has been the prior-OpenOctopus pattern and produced provider-switching bugs, vision-strip drift, and tool-call-format edge cases. OpenAI chat completions was the M1b-M1d bootstrap format, but M1f needs native `tool_use`, `tool_result`, `thinking`, and image blocks.
 **Decision:** **Anthropic Messages API ONLY.** OpenOctopus speaks one request shape, one response shape, one tool-call format. If an admin wants OpenAI / Bedrock / Gemini / a local model that does not expose an Anthropic-compatible endpoint, they put a gateway in front and configure OpenOctopus to talk to it. Format translation lives in the gateway, not in OpenOctopus.
@@ -1863,7 +1890,7 @@ translate outside OpenOctopus. Public SSE/history responses return normal
 `thinking.thinking` when present so the frontend can decide whether to render
 it, but strip `thinking.signature` and raw `redacted_thinking.data`.
 
-The admin configures the LLM via the admin REST API — **not env vars**. Six keys persist in `system_config`:
+The admin configures the LLM via the admin REST API — **not env vars**. Seven keys persist in `system_config`:
 
 | Key | Type | Purpose |
 |---|---|---|
@@ -1873,11 +1900,16 @@ The admin configures the LLM via the admin REST API — **not env vars**. Six ke
 | `llm_max_context_tokens` | integer | The LLM's hard context-window size in tokens. Counted against the full Anthropic Messages request — system + tools + history + new turn. |
 | `llm_compaction_threshold_tokens` | integer | Headroom that triggers compaction (ADR-028). Missing means compaction is not configured; future compaction code must handle that explicitly. When `llm_max_context_tokens − tiktoken_count(prompt) < llm_compaction_threshold_tokens`, the bus fires stage-1 compaction. The summary's `max_output_tokens` is `threshold − 4000`, reserving 4k headroom for the next user turn. |
 | `llm_max_concurrent_requests` | integer | Optional in-process semaphore applied in the shared Anthropic-compatible provider layer. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls. When set, all LLM calls share the same cap: normal chat, cron, heartbeat, compaction, and future autonomous flows. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
+| `llm_max_output_tokens` | integer | Maximum output-token budget passed to Anthropic Messages. Missing means an effective default of `16384`; the default is computed at read/use time and is not seeded. The budget includes thinking and visible output. Changes apply to the next provider turn, not an already-running call. |
 
 Bootstrap does not seed these rows. Set via `PATCH /api/admin/config`. Read via
-`GET /api/admin/config`; a fresh server may return `{}`. No `LLM_*` env vars;
-the only env vars relevant to LLM behavior are `DATABASE_URL` (so the server can
-read these keys at startup) and the JWT/auth secrets.
+`GET /api/admin/config`; a fresh server returns the effective
+`llm_max_output_tokens=16384` even though no row has been written. Other
+unconfigured LLM keys are omitted. `llm_max_output_tokens` must be in
+`1..1_000_000` and, when `llm_max_context_tokens` is configured, must not
+exceed that context-window value. No `LLM_*` env vars; the only env vars
+relevant to LLM behavior are `DATABASE_URL` (so the server can read these keys
+at startup) and the JWT/auth secrets.
 
 When an admin changes `llm_endpoint`, `llm_api_key`, or `llm_model`, the server validates before writing to `system_config`: `GET {llm_endpoint}/models` must be reachable with the configured bearer credential, return a well-formed models response accepted by OpenOctopus, and include the configured `llm_model`. Failure rejects the admin request and leaves the existing DB config unchanged. Automated tests use a fake Anthropic-compatible HTTP server; real provider credentials are only needed for live smoke testing.
 
@@ -2609,8 +2641,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py-Setup** | Docs (gate) | 4 ADRs (client language, wire protocol as sole shared contract, tool schema ownership, matcher pattern) + fix 3 pseudo-sharing doc residuals | Py-Prep | 4 ADRs accepted; TOOLS.md:245 / DECISIONS.md:593 / ADR-042 audit row updated |
 | **Py0** | Server skeleton | FastAPI app + `/health` + SQLAlchemy/PostgreSQL bootstrap + DB schema apply on empty DB + DTOs (session/message/error) + `ErrorCode` enum + error normalization + truncation helper + Anthropic Messages wire types | Py-Setup | `/health` 200; OpenAPI docs generated; ruff/mypy/pytest green; fake-provider wire shape tests pass |
 | **Py1** | Auth + config | Registration/login + JWT + cookie/bearer + admin `system_config` + admin user management | Py0 | Auth + admin config tests pass; admin can configure fake LLM; no chat yet |
-| **Py2** | Single-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript + Anthropic SDK adapter + `llm_max_concurrent_requests` semaphore | Py1 | Browser can create session, fake provider completes one turn, GET recovers history |
-| **Py3** | Agent loop + first tools | Hand-written ReAct loop + JIT tool-result collapsing + best-effort token preview + cancel/restart + **only** web_fetch and message schemas + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers | Py2 | web_fetch + message work end-to-end; tool_result normalization; cancel/restart; pending drain |
+| **Py2** | Streaming single-provider-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript and `turn_runs` + Anthropic SDK streaming adapter + best-effort text/thinking `token_delta` preview + detached per-session runner + durable `pending_messages` drain/latest-wins subscriber semantics + `llm_max_concurrent_requests` semaphore + admin `llm_max_output_tokens` | Py1 | Browser can create a session; fake provider streams and persists one complete assistant turn; same-session overlap queues and drains durably; disconnect recovers through full GET state |
+| **Py3** | Agent loop + first tools | Hand-written ReAct loop + JIT tool-result collapsing + tool progress + cancel/restart + **only** web_fetch and message schemas + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers | Py2 | web_fetch + message work end-to-end; tool_result normalization; tool progress and cancel/restart work |
 | **Py4a** | Design spike | `workspace_fs` 2–3 page spec: object-client pool size/lifecycle, quota race resolution strategy, temp cleanup triggers, MinIO error normalization checklist | Py3 | Spec doc reviewed; answers the four points explicitly |
 | **Py4** | Workspace files | `workspace_fs` (per Py4a spec) + file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + MinIO integration + quota | Py4a | File API/tool tests pass through workspace_fs; no API touches MinIO directly |
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
@@ -2696,9 +2728,10 @@ unit that can be replayed to providers and users.
 - `POST /api/sessions/{id}/messages` creates the web session if the
   client-generated UUID is missing, durably accepts the user message, creates
   or wakes the session runner, and may stream coalesced token deltas,
-  tool-progress events, persisted-message notifications, and turn-finished
-  events on that HTTP response. The POST stream is a subscriber to the runner,
-  not the runner itself.
+  persisted-message notifications, and turn-finished events on that HTTP
+  response. The POST stream is a subscriber to the runner, not the runner
+  itself. Py2 emits text/thinking token deltas but has no tools and therefore
+  emits no `tool_progress`; that event starts with Py3.
 - If the session is already running, the accepted message is written to
   `pending_messages`. The newest queued POST stream may wait for the next safe
   boundary and become the live subscriber for the whole pending batch. Older
@@ -2710,6 +2743,12 @@ unit that can be replayed to providers and users.
   by polling `GET /api/sessions/{id}/messages` for message-level progress.
   OpenOctopus does not attempt cross-worker per-turn replay of missed token deltas
   in the Python server alpha.
+- Provider retries are allowed only before the first text/thinking delta has
+  been emitted. After any live delta, a provider failure is terminal for that
+  turn: partial preview text is discarded from durable state, a
+  `synthetic_assistant_error` is persisted, and `turn_finished(status="failed")`
+  is emitted. The server never silently starts a different answer behind an
+  already-visible prefix.
 - If a worker/server restarts while an assistant response is incomplete, the
   partial live tokens are discarded. Recovery treats the latest unanswered
   user turn as still pending, abandons the old run/lease, rebuilds context from
@@ -2931,6 +2970,79 @@ writes for files that are only useful while the user's device is online.
 Third-party delivery behaves like native chat apps: users receive an actual
 file in the platform, not a OpenOctopus-authenticated link they cannot open. Durable
 storage stays explicit and quota-accounted through the server workspace.
+
+---
+
+### ADR-125 · Py2 establishes the durable streaming-turn foundation
+
+**Status:** accepted
+
+**Context:** The original Py2 draft treated chat as a request-owned,
+non-token-streaming provider call and deferred pending-message handling and run
+status to Py3. That boundary would require replacing the chat lifecycle just as
+the agent loop arrived. Py2 should instead prove the durable execution and
+recovery foundation while keeping tools themselves out of scope.
+
+**Decision:** Py2 owns the following complete browser-chat contract:
+
+- Anthropic Messages is consumed as a real stream. Text and thinking deltas are
+  forwarded as transient `token_delta` events; complete assistant content is
+  persisted once. `tool_progress` is not emitted until Py3.
+- The runner is detached from the POST response. A disconnect removes only the
+  subscriber. One process-local runner reservation per session is the fast
+  path, while a partial unique index on persisted `turn_runs` is the durable
+  backstop.
+- Every provider call creates a `turn_runs` row before `turn_started`.
+  `turn_runs.id` is the public `turn_id`. Terminal state is persisted as
+  `completed`, `failed`, `cancelled`, or `abandoned`. On startup, rows left
+  `running` by the same boot-independent database state are marked
+  `abandoned`; no partial assistant preview is recovered.
+- `GET /api/sessions/{id}/messages` returns canonical messages, the complete
+  durable pending queue, `status`, `active_turn_id`, `last_message_id`,
+  `pending_count`, and pagination state. It never returns partial token
+  previews.
+- A second POST during an active turn is durably inserted into
+  `pending_messages`, not rejected. Because Py2 has no tool loop, its safe
+  boundary is immediately after the current complete assistant response and
+  terminal run state are persisted. The runner then drains all pending rows in
+  `(received_at, id)` order into canonical human messages, preserving IDs, and
+  begins the next provider turn. ADR-034 latest-wins subscriber replacement
+  applies without changing message durability.
+- If durable pending rows survive a restart or a crash between terminal-state
+  persistence and drain, the next inbound is added to that queue and the full
+  ordered batch is drained before the recovered turn starts. A newer inbound
+  never leapfrogs older pending input.
+- Browser input in Py2 supports Anthropic text blocks, direct inline base64
+  image blocks, and optional `effort`. `attachments` must be an empty array;
+  MinIO/workspace attachment references start in Py4.
+- Server-generated `<runtime>` metadata remains persisted and provider-visible,
+  but is not part of the public history DTO. Projection code examines only the
+  first text block of canonical human and pending messages, accepts only the
+  exact anchored server grammar whose `channel` and `chat_id` match the
+  session, and removes that one block from the response. It does not run a
+  broad regex over concatenated user text.
+- `llm_max_output_tokens` is administered through the existing system-config
+  API, has an unseeded effective default of `16384`, and is read when a new
+  provider turn starts. It includes both thinking and visible output and does
+  not increase the model context window.
+- Transient provider failures may be retried only before the first live delta.
+  A failure after a text/thinking delta persists a
+  `synthetic_assistant_error`, marks the turn failed, and never persists the
+  partial assistant response.
+
+The cacheable system prompt uses one stable section order. It is a
+configuration snapshot, not an immutable artifact: SOUL, MEMORY, configured
+channels, skill catalog/bodies, workspace catalog, or device capabilities may
+change between turns and legitimately invalidate the cached prefix. Volatile
+per-message facts such as time, inbound channel/chat identity, trust, and
+relevant current execution state belong in the server-generated runtime block
+or out-of-band tool execution context.
+
+**Consequences:** Py3 can add the ReAct/tool loop on top of a proven streaming,
+queueing, and recovery lifecycle instead of changing that lifecycle. Py2 is
+larger than a trivial request/response adapter, but it still excludes tools,
+tool progress, workspace attachments, MinIO, compaction, channels, cron,
+heartbeat, and multi-worker coordination.
 
 ---
 

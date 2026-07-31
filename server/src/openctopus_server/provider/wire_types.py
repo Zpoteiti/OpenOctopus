@@ -46,20 +46,15 @@ class ToolResultBlock(BaseModel):
 class ThinkingBlock(BaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str
-    signature: str
+    signature: str | None = None
 
 
 class RedactedThinkingBlock(BaseModel):
     type: Literal["redacted_thinking"] = "redacted_thinking"
-    data: str
+    data: str | None = None
 
 
 ContentBlock = Annotated[
-    TextBlock
-    | ImageBlock
-    | ToolUseBlock
-    | ToolResultBlock
-    | ThinkingBlock
-    | RedactedThinkingBlock,
+    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock,
     Field(discriminator="type"),
 ]
