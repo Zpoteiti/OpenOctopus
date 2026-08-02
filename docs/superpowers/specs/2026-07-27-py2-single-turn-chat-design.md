@@ -717,21 +717,31 @@ Py2 is complete when:
 ### Py3
 
 - ReAct/tool loop;
-- web_fetch and message tools;
+- executable `web_fetch` tool only;
 - `tool_progress`;
 - tool-result pairing and JIT collapse;
 - cancel/restart;
-- Py3's extended safe-boundary rule.
+- Py3's extended safe-boundary rule;
+- two-stage compaction with all inbound rows staged in `pending_messages` before
+  provider-visible promotion;
+- one `turn_id` per normal provider call plus its following tool batch.
 
-### Py4/Py5
+### Py4
 
 - MinIO-backed workspace files;
-- workspace/device attachment refs;
-- server/device file tools and client dispatch.
+- server workspace attachment refs and file tools;
+- initial current-web/server-workspace `message` tool;
+- provider-hidden delivery persistence that does not insert an extra
+  provider-visible assistant row inside a tool batch.
+
+### Py5
+
+- device attachment refs, device file tools, and client dispatch;
+- paired-device media expansion for `message`.
 
 ### Later milestones
 
 - cron/heartbeat;
-- Discord/Telegram/other channel adapters;
+- Discord/Telegram/other channel adapters and cross-channel `message` fields;
 - multi-worker/cross-node coordination;
 - durable stream replay, only if product evidence requires it.

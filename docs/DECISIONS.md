@@ -132,6 +132,13 @@ scans or a cross-worker queue. A process restart discards live stream
 subscribers and in-flight partial tokens. Durable pending rows are recovered by
 the next inbound POST/channel activity for that session, which rebuilds context
 from Postgres and drains at the next safe boundary.
+**Py3 clarification:** ADR-126 supersedes the direct-to-`messages` idle path
+above. Beginning with Py3, every inbound user message is durable in
+`pending_messages` before provider-visible promotion. When Stage 1 compaction
+is unnecessary, an idle runner promotes it immediately. When Stage 1 is
+required, the row remains pending until the replacement summary has been
+inserted, which preserves summary-before-user transcript order without
+backdating timestamps.
 **Consequences:** Per-session serial, cross-session concurrent. Mid-turn follow-ups are durable without corrupting provider-visible chat order. When all workers are idle, `pending_messages` should be empty.
 
 ### ADR-012 · Three external ingress sources + two internal synthesizers
@@ -179,8 +186,11 @@ Python-main uses durable persisted messages plus transient per-connection turn
 events.
 **Decision:**
 - **Durable output:** completed assistant messages, tool results, synthetic rows,
-  and channel-delivery messages are persisted in Postgres and surfaced through
-  authoritative reads such as `GET /api/sessions/{id}/messages`.
+  and channel-delivery state are persisted in Postgres and surfaced through
+  authoritative reads such as `GET /api/sessions/{id}/messages`. Durable
+  delivery does not imply inserting another provider-visible assistant row
+  between an assistant `tool_use` and its required `tool_result`; ADR-127
+  defers that provider-hidden representation to Py4 with the `message` tool.
 - **Live preview:** an active browser `POST /api/sessions/{id}/messages`
   response may receive best-effort `token_delta`, `tool_progress`,
   `message_persisted`, and `turn_finished` events. These events are subscribers
@@ -256,6 +266,11 @@ uses canonical message polling.
 ### ADR-020 · Direct replies route to current session; `message` tool defaults to current session and allows explicit cross-channel override
 
 **Status:** accepted
+**Python-main milestone clarification:** ADR-127 defers the executable
+`message` tool and its delivery-persistence helper from Py3 to Py4. The routing
+contract below remains the eventual surface; Py4 starts with the web/workspace
+subset, while device and third-party channel branches remain gated by their
+owning milestones.
 **Decision:**
 - **Text-only direct reply** (no tool call): `publish_final` uses the session's own `channel` and `chat_id` (carried from the InboundMessage). Most common path.
 - **`message` tool** (nanobot-aligned): `channel` and `chat_id` are OPTIONAL. If omitted, the tool delivers to the current session's channel + chat_id — same target as a direct reply, but gives the agent access to `media` (attachments) and `buttons` (inline keyboards). If specified, the tool delivers to the named channel + chat_id — cross-channel reach.
@@ -291,6 +306,12 @@ uses canonical message polling.
     request or tool call finishes, synthesize `user_cancelled` results for
     unstarted tools in the current batch, persist `[User pressed stop]`, clear
     the flag, and exit without another LLM call.
+
+Each normal agent-loop provider call owns one `turn_runs` row. That row stays
+active through persistence of the complete assistant response and, when tools
+were requested, through the complete following tool-result batch. Continuing
+the ReAct loop at step 3 creates a new row and a new public `turn_id`; one
+external user request can therefore produce several turn IDs (ADR-126).
 
 ### ADR-022 · `context::build_context` is a pure function
 
@@ -329,11 +350,16 @@ inputs are unchanged; volatile execution state does not churn it.
 **Decision:** SkillInfo has `always_on: bool`. Skills marked always-on have their full SKILL.md body inlined in the system prompt. Conditional skills appear as one-line entries (`name: description`) with a pointer to load via `read_file(path="skills/{name}/SKILL.md")`.
 **Consequences:** Progressive disclosure. Large skill libraries don't bloat every prompt. Agent knows what exists and can pull on demand.
 
-### ADR-025 · `tiktoken-rs` for accurate token counts
+### ADR-025 · Tokenizer-based counts, not byte heuristics
 
 **Status:** accepted
-**Decision:** Compaction threshold checks use tiktoken-rs, not byte-count heuristics. Required for correctness across different tokenizers.
-**Consequences:** Adds `tiktoken-rs` dependency. One compile-time cost for a correctness win.
+**Python-main clarification:** ADR-101 replaces the former Rust
+`tiktoken-rs` dependency with a Python tokenizer strategy revalidated for the
+configured model.
+**Decision:** Compaction threshold checks use tokenizer counts, not byte-count
+heuristics. Required for correctness across different tokenizers.
+**Consequences:** Token counting is an explicit provider-prompt concern rather
+than an approximation from serialized byte length.
 
 ### ADR-026 · Vision retry lives in the provider layer
 
@@ -355,26 +381,65 @@ inputs are unchanged; volatile execution state does not churn it.
 ### ADR-028 · Two-stage compaction
 
 **Status:** accepted
+**Python-main milestone clarification:** Py3 implements this workflow. Both
+normal provider replay and compaction input select only message rows where
+`is_compacted=false` (ADR-126).
 **Decision:** Two admin-set keys in `system_config` (ADR-101) drive the trigger:
-- `llm_max_context_tokens` — the LLM's context-window size, counted with tiktoken-rs (ADR-025) against the full provider prompt/request (system + tools + history + new turn).
-- `llm_compaction_threshold_tokens` — the headroom that triggers compaction. Missing means compaction is not configured; the future compaction implementation must handle that explicitly.
+- `llm_max_context_tokens` — the LLM's context-window size, counted with the Python tokenizer strategy (ADR-025, ADR-101) against the full provider prompt/request (system + tools + active history + pending new turn).
+- `llm_compaction_threshold_tokens` — the headroom that triggers compaction. Missing disables compaction.
 
-**Trigger:** when `llm_max_context_tokens − tiktoken_count(prompt) < llm_compaction_threshold_tokens`, fire compaction.
+**Trigger:** when `llm_max_context_tokens − tokenizer_count(prompt) < llm_compaction_threshold_tokens`, fire compaction.
 
 **Stages:**
-- **Stage 1** (user-turn boundary): compact the range `[after system prompt ... before latest user message]` into a single compressed message. The compaction LLM call uses `max_output_tokens = llm_compaction_threshold_tokens − 4000` (= `12000` at the default), leaving 4k headroom for the next user turn.
-- **Stage 2** (mid-turn): if the prompt still trips the trigger after stage 1, compact `[latest user message + accumulated tool/assistant within current turn]` into another summary with the same `max_output_tokens` formula.
+- **Stage 1** (user-turn boundary): keep the incoming user batch durable in
+  `pending_messages` and compact all active prior message rows into one
+  `message_kind='compaction_summary'` row. After summary generation, one
+  transaction marks every source row `is_compacted=true`, inserts the summary
+  with `is_compacted=false`, promotes the pending human rows in receive order,
+  and deletes those pending rows. Canonical active order is therefore
+  `S1, U11`; timestamps are not backdated. The compaction LLM call uses
+  `max_output_tokens = llm_compaction_threshold_tokens − 4000` (= `12000` at
+  the default), leaving 4k headroom for the new user turn.
+- **Stage 2** (mid-turn): preserve the latest active human message/batch and
+  compact only the active assistant/tool rows accumulated after it. Mark those
+  source rows compacted and append one active summary in the same transaction.
+  Active order becomes `S1, U11, T1`. Use the same `max_output_tokens` formula.
 
-**Units clarification:** all the thresholds are **tokens** (tiktoken-rs). Tool result caps (ADR-076) are **characters** — roughly 4× smaller in token terms. A max-size tool output (16k chars ≈ 4k tokens) uses ~¼ of a 16k-token threshold, so ~4 such outputs fit before stage-1 compaction fires. Mid-turn accumulation of many tool results is what stage 2 handles.
+An active summary is intentionally eligible for later compaction. A later Stage
+1 can absorb `S1`, the completed turn after it, and an active Stage 2 summary
+into `S2`; the old summary then becomes `is_compacted=true`. The boolean is the
+sole provider/compaction membership flag, not a permanent "was summarized"
+label.
 
-**Consequences:** Handles both long histories and long agentic runs. Admin tunes `llm_compaction_threshold_tokens` against their model's behavior — smaller threshold = more frequent compaction with more useful tail history; larger = fewer compaction calls but less room for the next turn. Compressed messages are stored in DB with `is_compaction_summary=true` (ADR-089) to prevent re-summarization. Stage 2 is rare in practice (needs 30+ tool calls in one turn) but correct when needed.
+**Units clarification:** all thresholds are **tokens**. Tool result caps
+(ADR-076) are **characters** — roughly 4× smaller in token terms. A max-size
+tool output (16k chars ≈ 4k tokens) uses ~¼ of a 16k-token threshold, so ~4
+such outputs fit before the trigger. Mid-turn accumulation of many tool results
+is what Stage 2 handles.
+
+**Consequences:** Handles both long histories and long agentic runs. Admin
+tunes `llm_compaction_threshold_tokens` against model behavior: a larger
+headroom threshold triggers earlier and more often; a smaller threshold triggers
+later and leaves less emergency headroom. Compacted source rows remain in DB
+for history/audit but are excluded from provider replay and later compaction
+input. Stage 2 is expected to be rarer than Stage 1 but remains correct when a
+single agentic turn grows large.
 
 ### ADR-029 · Serial tool dispatch; DB is mid-turn source of truth
 
 **Status:** accepted
 **Decision:** Tool calls within a single LLM response are dispatched one at a time, not in parallel. Each tool's `tool_result` is inserted into DB immediately on completion. When all tools in that assistant batch have a result, the loop drains pending user messages and then continues; next iteration's context build reloads fresh history from DB. In the Anthropic Messages wire format, consecutive DB tool-result rows are collapsed just-in-time into one `role="user"` message containing all `tool_result` blocks for that assistant batch.
 
-The collapse happens only in provider projection when constructing the next Anthropic Messages request; it never rewrites DB rows. A collapse group is adjacent `role="user"` rows whose `message_kind` is `tool_result` or `synthetic_tool_result` and whose content contains only `tool_result` blocks. Human, assistant, compaction, or synthetic assistant error rows terminate the group. If persisted history somehow interleaves a human/assistant row between results for one assistant batch after crash repair, the provider projection must not cross that boundary or skip over it; treat the transcript as invalid and surface a diagnostic error rather than reordering history.
+The collapse happens only in provider projection when constructing the next
+Anthropic Messages request; it never rewrites DB rows. A collapse group is
+adjacent rows whose `message_kind` is `tool_result` or
+`synthetic_tool_result` and whose content contains only `tool_result` blocks.
+Provider projection assigns the collapsed message `role="user"`. Human,
+assistant, compaction, or synthetic assistant error rows terminate the group.
+If persisted history somehow interleaves a human/assistant row between results
+for one assistant batch after crash repair, the provider projection must not
+cross that boundary or skip over it; treat the transcript as invalid and
+surface a diagnostic error rather than reordering history.
 
 **Consequences:** Order-dependent tool chains (edit file → run file) are safe. No in-memory "current turn" buffer — makes crash recovery straightforward (ADR-014). LLM sees consistent history every iteration while the provider still receives valid Anthropic role alternation.
 
@@ -407,13 +472,17 @@ instructions to re-run skipped work automatically.
 ### ADR-032 · Persist immediately on every state transition
 
 **Status:** accepted
-**Decision:** The following events each trigger an immediate DB insert (no batching):
-- LLM returns an assistant message (with or without tool_use): insert as `role="assistant"`, `message_kind="assistant"`
-- A tool dispatch completes: insert a `tool_result` block as `role="user"`, `message_kind="tool_result"`
-- A user message arrives: insert as `role="user"`, `message_kind="human"`
-- A provider failure becomes user-visible: insert as `role="assistant"`, `message_kind="synthetic_assistant_error"`
-- Compaction produces a summary: insert as `role="assistant"`, `message_kind="compaction_summary"` plus `is_compaction_summary=true`
-**Consequences:** DB state is always within one insert of the truth. Crash recovery is clean (ADR-014). DB latency (low milliseconds) << LLM latency (seconds), so no perf impact.
+**Decision:** Every state transition is persisted immediately. Simple events
+use one insert; compaction and pending promotion use one atomic transaction:
+- LLM returns an assistant message (with or without tool_use): insert with `message_kind="assistant"`.
+- A tool dispatch completes: insert a `tool_result` block with `message_kind="tool_result"`.
+- A user message arrives: durably insert it into `pending_messages`; promotion inserts `message_kind="human"` into canonical messages with the same ID (ADR-011, ADR-126).
+- A provider failure becomes user-visible: insert with `message_kind="synthetic_assistant_error"`.
+- Compaction produces a summary: atomically mark its selected source rows `is_compacted=true` and insert `message_kind="compaction_summary"`, `is_compacted=false`; Stage 1 also promotes the waiting human batch after that summary.
+**Consequences:** Committed DB state always represents a complete durable
+transition; no in-memory transcript buffer must be recovered. Crash recovery is
+clean (ADR-014). DB latency (low milliseconds) is small relative to provider
+and tool latency.
 
 ### ADR-033 · `publish_final` when: no more tool calls, hard cap, or fatal error
 
@@ -471,7 +540,7 @@ safe boundary (ADR-034), the agent loop observes the flag, pairs any unstarted
 `tool_use` blocks with synthetic `tool_result` rows using
 `code="user_cancelled"` and server-authored diagnostic text `[user cancelled:
 tool was not executed because the user pressed stop]` in the normalized
-content-block array, inserts `"[User pressed stop]"` as `role=user`,
+content-block array, inserts `"[User pressed stop]"` with
 `message_kind="human"`, clears `session.cancel_requested`, emits
 `turn_finished(status="cancelled")` on any active POST preview stream, and exits
 the loop for that turn.
@@ -1435,7 +1504,10 @@ Canonical block types:
 - **tool_use / tool_result:** Anthropic native blocks.
 - **thinking / redacted_thinking:** stored full-fidelity for provider replay. Public API sanitizes `thinking.signature` and `redacted_thinking.data`.
 
-User and assistant messages use the same block schema. Tool results are `role="user"` messages containing `tool_result` blocks.
+Every stored row uses the same content-block schema. Provider projection wraps
+tool-result rows as `role="user"` messages containing `tool_result` blocks;
+the wire role is derived from `message_kind` rather than stored in Postgres
+(ADR-126).
 
 **Consequences:**
 - No OpenAI/Anthropic dual storage shape. The DB is the provider-visible transcript.
@@ -1450,18 +1522,31 @@ User and assistant messages use the same block schema. Tool results are `role="u
 **Decision:** SOUL.md and MEMORY.md are files in the user's workspace, not DB columns. Per-user SSRF whitelist doesn't exist server-side (ADR-052); only per-device whitelists.
 **Consequences:** Editable by the agent via file tools without specialty endpoints. Inspectable through workspace APIs/tools. Server-side persistence is object storage, so git-style versioning is a later explicit feature, not an implicit property of the storage backend.
 
-### ADR-089 · Message wire role is `user | assistant`; logical meaning uses `message_kind`
+### ADR-089 · Semantic message kind is stored; provider role is derived
 
-**Status:** accepted
-**Context:** Anthropic Messages has only `user` and `assistant` wire roles. Human prompts and tool results are both `role="user"`, but the agent loop, recovery, SSE, and frontend still need to distinguish them without expensive JSONB inspection.
+**Status:** accepted (revised by ADR-126 for Python-main)
+**Context:** Provider roles and OpenOctopus lifecycle meaning are different.
+Anthropic projects both human prompts and tool results through `role="user"`,
+while recovery, rendering, compaction, and audit must distinguish them without
+inspecting arbitrary JSONB. Storing both a wire role and a semantic kind is
+redundant and permits invalid pairs.
 **Decision:**
-- `messages.role` column is strictly one of `user`, `assistant`. No synthetic role values.
-- `messages.message_kind` is required and uses `human`, `assistant`, `tool_result`, `synthetic_tool_result`, `synthetic_assistant_error`, or `compaction_summary`.
-- Tool results are stored as `role='user'`, `message_kind='tool_result'` or `synthetic_tool_result`.
-- Compaction summaries are inserted with `role='assistant'`, `message_kind='compaction_summary'`, plus `is_compaction_summary=true`.
-- **Context builder:** loads the most recent row where `is_compaction_summary=true` (if any), then every message newer than it. Pre-summary rows are not loaded but remain in DB for audit.
-- **Compaction pass:** skips rows where `is_compaction_summary=true` so a summary never gets re-summarized.
-**Consequences:** Content JSONB is pass-through to the provider — the summary appears as a regular assistant message in the LLM request. The flag is a purely internal marker, never serialized outside DB. No special provider-side handling.
+- `messages.message_kind` is required and uses `human`, `assistant`,
+  `tool_result`, `synthetic_tool_result`, `synthetic_assistant_error`, or
+  `compaction_summary`.
+- No `messages.role` column is stored. Provider projection derives `user` for
+  `human`, `tool_result`, and `synthetic_tool_result`; it derives `assistant`
+  for `assistant`, `synthetic_assistant_error`, and `compaction_summary`.
+- `is_compacted` is the sole context-membership flag. Normal provider replay
+  and compaction input select rows where `is_compacted=false` in canonical
+  transcript order.
+- A summary starts active (`is_compacted=false`) and can later be absorbed into
+  a newer summary, at which point it becomes `is_compacted=true` like any other
+  replaced source row.
+**Consequences:** `content` remains provider-block-shaped while the lightweight
+message wrapper is constructed at projection time. No JSONB inspection is
+needed to determine wire role or application meaning, and invalid role/kind
+pairs cannot be stored.
 
 ### ADR-090 · Per-channel bot configs live in their own tables
 
@@ -1898,7 +1983,7 @@ The admin configures the LLM via the admin REST API — **not env vars**. Seven 
 | `llm_api_key` | string | Bearer credential the server uses on outbound requests. |
 | `llm_model` | string | Model name passed in the request body (for example `claude-sonnet-4-5` or a gateway model alias). |
 | `llm_max_context_tokens` | integer | The LLM's hard context-window size in tokens. Counted against the full Anthropic Messages request — system + tools + history + new turn. |
-| `llm_compaction_threshold_tokens` | integer | Headroom that triggers compaction (ADR-028). Missing means compaction is not configured; future compaction code must handle that explicitly. When `llm_max_context_tokens − tiktoken_count(prompt) < llm_compaction_threshold_tokens`, the bus fires stage-1 compaction. The summary's `max_output_tokens` is `threshold − 4000`, reserving 4k headroom for the next user turn. |
+| `llm_compaction_threshold_tokens` | integer | Headroom that triggers Py3 compaction (ADR-028, ADR-126). Missing disables compaction. When `llm_max_context_tokens − tokenizer_count(prompt) < llm_compaction_threshold_tokens`, the agent loop fires the applicable compaction stage. The summary's `max_output_tokens` is `threshold − 4000`, reserving 4k headroom. |
 | `llm_max_concurrent_requests` | integer | Optional in-process semaphore applied in the shared Anthropic-compatible provider layer. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls. When set, all LLM calls share the same cap: normal chat, cron, heartbeat, compaction, and future autonomous flows. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 | `llm_max_output_tokens` | integer | Maximum output-token budget passed to Anthropic Messages. Missing means an effective default of `16384`; the default is computed at read/use time and is not seeded. The budget includes thinking and visible output. Changes apply to the next provider turn, not an already-running call. |
 
@@ -2507,6 +2592,9 @@ stale `online: true` after its failed push cleaned the registry.
 ### ADR-117 · M1f Anthropic Messages, `message_kind`, and device tool-result blocks
 
 **Status:** accepted
+**Python-main clarification:** ADR-126 removes the stored `messages.role`
+column. `message_kind` remains authoritative and provider projection derives
+the Anthropic wire role.
 **Context:** M1f adds the full agent execution loop, device-routed tool
 execution, and multimodal `read_file`. The OpenAI chat-completions bootstrap
 shape cannot represent Anthropic `thinking` / `redacted_thinking` cleanly and
@@ -2518,9 +2606,9 @@ not have.
 - `POST /api/sessions/{id}/messages` accepts `effort` plus Anthropic user
   blocks (`text`, `image`) and attachment refs.
 - `document` blocks and Anthropic `/v1/files` are excluded.
-- `messages.role` is the provider wire role (`user` or `assistant`).
 - `messages.message_kind` carries internal semantics and is exposed through
-  SSE/history for frontend rendering and audit.
+  live events/history for frontend rendering and audit. Python-main derives
+  the provider wire role from it rather than storing a second column.
 - Assistant tool batches execute in returned order; pending user messages drain
   only after the batch is fully addressed.
 - Stop/cancel is the exception: after the current external action finishes,
@@ -2642,9 +2730,9 @@ does not count as production code. Numbered implementation milestones start at
 | **Py0** | Server skeleton | FastAPI app + `/health` + SQLAlchemy/PostgreSQL bootstrap + DB schema apply on empty DB + DTOs (session/message/error) + `ErrorCode` enum + error normalization + truncation helper + Anthropic Messages wire types | Py-Setup | `/health` 200; OpenAPI docs generated; ruff/mypy/pytest green; fake-provider wire shape tests pass |
 | **Py1** | Auth + config | Registration/login + JWT + cookie/bearer + admin `system_config` + admin user management | Py0 | Auth + admin config tests pass; admin can configure fake LLM; no chat yet |
 | **Py2** | Streaming single-provider-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript and `turn_runs` + Anthropic SDK streaming adapter + best-effort text/thinking `token_delta` preview + detached per-session runner + durable `pending_messages` drain/latest-wins subscriber semantics + `llm_max_concurrent_requests` semaphore + admin `llm_max_output_tokens` | Py1 | Browser can create a session; fake provider streams and persists one complete assistant turn; same-session overlap queues and drains durably; disconnect recovers through full GET state |
-| **Py3** | Agent loop + first tools | Hand-written ReAct loop + JIT tool-result collapsing + tool progress + cancel/restart + **only** web_fetch and message schemas + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers | Py2 | web_fetch + message work end-to-end; tool_result normalization; tool progress and cancel/restart work |
+| **Py3** | Agent loop + first tool + compaction | Hand-written ReAct loop + JIT tool-result collapsing + tool progress + cancel/restart + **only** executable `web_fetch` + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers + two-stage compaction with pending-boundary ordering | Py2 | `web_fetch` works end-to-end; tool-result normalization, tool progress, cancel/restart, multi-`turn_id` ReAct chains, and both compaction stages work |
 | **Py4a** | Design spike | `workspace_fs` 2–3 page spec: object-client pool size/lifecycle, quota race resolution strategy, temp cleanup triggers, MinIO error normalization checklist | Py3 | Spec doc reviewed; answers the four points explicitly |
-| **Py4** | Workspace files | `workspace_fs` (per Py4a spec) + file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + MinIO integration + quota | Py4a | File API/tool tests pass through workspace_fs; no API touches MinIO directly |
+| **Py4** | Workspace files + initial `message` tool | `workspace_fs` (per Py4a spec) + file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + MinIO integration + quota + initial web/workspace `message` tool and provider-hidden delivery persistence | Py4a | File API/tool tests pass through workspace_fs; no API touches MinIO directly; current-web message delivery does not insert an extra provider-visible row inside a tool batch |
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
 | **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
 | **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
@@ -2731,7 +2819,9 @@ unit that can be replayed to providers and users.
   persisted-message notifications, and turn-finished events on that HTTP
   response. The POST stream is a subscriber to the runner, not the runner
   itself. Py2 emits text/thinking token deltas but has no tools and therefore
-  emits no `tool_progress`; that event starts with Py3.
+  emits no `tool_progress`; that event starts with Py3. A Py3 ReAct chain can
+  make several normal agent provider calls, so one connected POST preview can
+  carry several `turn_started`/`turn_finished` pairs with distinct turn IDs.
 - If the session is already running, the accepted message is written to
   `pending_messages`. The newest queued POST stream may wait for the next safe
   boundary and become the live subscriber for the whole pending batch. Older
@@ -2927,7 +3017,9 @@ file refs with `delivery_refs` metadata; the browser downloads later through
 the Workspace Files GET relay. Third-party channel delivery streams
 device/server bytes directly into the platform's native file upload API.
 Server workspace media persists in MinIO; device media does not
-auto-duplicate. Python implementation via FastAPI streaming + httpx.
+auto-duplicate. Python implementation via FastAPI streaming + httpx. ADR-127
+defers the first producer of `delivery_refs` and the delivery-persistence
+helper to Py4; the column remains empty through Py3.
 
 **Context:** The `message` tool can send media whose bytes live either in the
 server workspace or on a paired client device. Python-main also has two very
@@ -2939,10 +3031,11 @@ download endpoint.
 **Decision:** Outbound file delivery is channel-adapter-specific but follows
 one boundary:
 
-- **Web channel:** `message(media=[...], openoctopus_device="<client>")` writes a
-  visible assistant message with `delivery_refs` metadata that names the device
-  and path. It does **not** read the file, upload it to MinIO, or count it
-  toward workspace quota. The frontend renders a file chip/link. When the user
+- **Web channel:** `message(media=[...], openoctopus_device="<client>")` writes
+  user-visible, provider-hidden delivery state with `delivery_refs` metadata
+  that names the device and path. It does **not** read the file, upload it to
+  MinIO, or count it toward workspace quota. The frontend renders a file
+  chip/link. When the user
   clicks it, the browser calls the Workspace Files download route with the
   recorded `openoctopus_device` and `path`; the server relays that HTTP response to
   the device WebSocket stream with bounded buffering/backpressure. The link is
@@ -2964,6 +3057,14 @@ one boundary:
 `messages.content` remains provider-shaped and is not polluted with OpenOctopus-only
 download blocks. Web-facing download chips live in `messages.delivery_refs`, an
 API/DB sidecar that provider replay ignores.
+
+The concrete Py4 delivery record/helper must not insert another
+provider-replayed assistant row between the assistant message containing the
+`message` tool use and the user-role tool-result batch that answers it. The
+persisted assistant `tool_use` remains the provider-visible message content and
+the matching persisted `tool_result` records the delivery outcome. Exact
+ownership/linking of provider-hidden delivery state is finalized with the Py4
+implementation rather than prebuilt in Py3.
 
 **Consequences:** Web delivery is cheap and avoids unnecessary object-storage
 writes for files that are only useful while the user's device is online.
@@ -2997,6 +3098,10 @@ recovery foundation while keeping tools themselves out of scope.
   `completed`, `failed`, `cancelled`, or `abandoned`. On startup, rows left
   `running` by the same boot-independent database state are marked
   `abandoned`; no partial assistant preview is recovered.
+  Beginning with Py3, this statement applies to each normal agent-loop provider
+  call: the row remains running through the complete following tool batch, if
+  any, and then reaches terminal state. A continuing ReAct chain creates a new
+  row and new `turn_id` for its next provider call.
 - `GET /api/sessions/{id}/messages` returns canonical messages, the complete
   durable pending queue, `status`, `active_turn_id`, `last_message_id`,
   `pending_count`, and pagination state. It never returns partial token
@@ -3043,6 +3148,74 @@ queueing, and recovery lifecycle instead of changing that lifecycle. Py2 is
 larger than a trivial request/response adapter, but it still excludes tools,
 tool progress, workspace attachments, MinIO, compaction, channels, cron,
 heartbeat, and multi-worker coordination.
+
+### ADR-126 · Py3 uses semantic message rows, provider-call turn IDs, and active-row compaction
+
+**Status:** accepted
+
+**Context:** Py3 adds a multi-call ReAct loop and implements compaction. The
+Py0/Py2 placeholder schema stored both Anthropic wire `role` and OpenOctopus
+`message_kind`, even though the former is fully derivable from the latter. The
+old compaction marker permanently exempted summaries from later summaries and
+could not represent rolling compaction. Stage 1 also needs its summary to sort
+before the incoming user batch even though summary generation finishes later.
+
+**Decision:**
+
+- `messages` stores `message_kind`, not provider `role`. Projection derives
+  Anthropic `user` for `human`, `tool_result`, and `synthetic_tool_result`, and
+  `assistant` for `assistant`, `synthetic_assistant_error`, and
+  `compaction_summary`.
+- Replace `is_compaction_summary` with `is_compacted`. `false` means the row is
+  active for normal provider replay and eligible as input to a later
+  compaction. `true` means retained for canonical history/audit but excluded
+  from both. Summary identity comes from `message_kind`; summaries begin active
+  and may later be compacted.
+- Beginning with Py3, every inbound user row is first durable in
+  `pending_messages`. Stage 1 summarizes the active transcript before the
+  pending user batch, then atomically marks its sources compacted, inserts the
+  active summary, and promotes the pending rows. This yields canonical active
+  order `S1, U11` without timestamp rewriting. When Stage 1 is unnecessary,
+  an idle runner promotes the pending batch immediately.
+- Stage 2 preserves the latest active human batch and replaces only subsequent
+  active assistant/tool rows with an active summary. A later Stage 1 can absorb
+  both earlier summaries and completed turns.
+- One `turn_runs` row and public `turn_id` cover one normal agent-loop provider
+  call plus the complete serial tool batch returned by that call. A continuing
+  ReAct chain creates a new row for its next provider call, so one external
+  user request may produce several turn IDs.
+
+**Consequences:** The message table has eight columns including the dormant
+`delivery_refs` sidecar. Invalid role/kind pairs disappear. One boolean is
+enough for rolling context membership because Stage 1 promotion preserves
+logical transcript order. Existing Py2 code and DTO projection must be updated
+in Py3 to derive public/provider roles and to stage idle inbound messages before
+promotion.
+
+### ADR-127 · Executable `message` tool and delivery persistence move to Py4
+
+**Status:** accepted
+
+**Context:** A useful `message` tool depends on the workspace/file surface, and
+its former persistence sketch could insert an extra provider-visible assistant
+row inside a tool batch, breaking required tool-use/tool-result adjacency. Py3
+only needs to prove the ReAct loop with one executable tool.
+
+**Decision:** Py3 registers and executes `web_fetch` only. It does not expose a
+`message` schema, execute the tool, or implement its delivery-persistence
+helper. Py4 introduces the initial current-web/server-workspace subset after
+`workspace_fs` exists. Device media and cross-channel/buttons behavior remain
+gated by the client and channel milestones. `messages.delivery_refs` remains a
+separate provider-hidden sidecar and stays empty through Py3; keeping the
+already-created column avoids a remove-and-readd migration. Py4 must persist
+user-visible delivery state without inserting another provider-replayed
+assistant row between the existing assistant `tool_use` and its matching
+tool-result batch.
+
+**Consequences:** Py3 has one end-to-end executable tool and no speculative
+delivery helper. The final `message` schema remains documented in `TOOLS.md` as
+a forward contract, with field availability controlled by the owning
+milestones.
 
 ---
 

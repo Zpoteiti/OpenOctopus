@@ -738,6 +738,13 @@ These three tools have no client-side counterpart. Their implementations live en
 
 **Lives in:** `openoctopus_server/tools/message.py`
 
+**Availability:** Not registered or executable in Py3. Py4 introduces the
+initial current-web/server-workspace subset after `workspace_fs` exists. Paired
+device media begins with the client milestone, and explicit third-party
+`channel`/`chat_id` plus `buttons` activate with the channel milestone. The
+schema below is the final forward contract, not the Py3 registry surface
+(ADR-127).
+
 **Purpose:** Send a message to the user, optionally with file attachments or inline keyboard buttons. `content` is required; `channel` and `chat_id` default to the current session's values. Specify them explicitly for cross-channel reach.
 
 **Source schema (matches nanobot, with `openoctopus_device` added for multi-device media sources):**
@@ -794,15 +801,18 @@ These three tools have no client-side counterpart. Their implementations live en
 - **Routing (ADR-020):**
   - If `channel` + `chat_id` omitted → delivers to the current session's channel + chat_id. Equivalent target as a direct text reply, but with access to `media` / `buttons`.
   - If `channel` + `chat_id` specified → delivers to that target. Cross-channel reach.
-- Looks up the user's config for the target channel (`discord_configs` / `telegram_configs`); if none, returns `ToolError::ChannelNotConfigured`.
+- Once channel adapters exist, looks up the user's config for an explicit target channel (`discord_configs` / `telegram_configs`); if none, returns `ToolError::ChannelNotConfigured`.
 - For each media path:
-  - If `openoctopus_device="server"`: opens via `workspace_fs::read` (validates user authorization, path policy, and quota-lock read behavior). For web delivery, emits a durable workspace file ref in the target message's `delivery_refs`; for third-party channels, streams the workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
-  - If `openoctopus_device="<client_name>"` and the target channel is `web`: does not fetch or stage the file at send time. It writes a visible assistant message with an online-only `device_file` entry in `delivery_refs` containing the device name and path. The frontend later downloads through `GET /api/workspace/files/{path}?openoctopus_device=<client_name>`, which relays the browser response to the live device WebSocket. Download fails at click time with `device_unreachable`, `not_found`, or policy errors if the device/path is unavailable.
+  - If `openoctopus_device="server"`: opens via `workspace_fs::read` (validates user authorization, path policy, and quota-lock read behavior). Beginning in Py4, web delivery emits a durable workspace file ref in provider-hidden delivery state/`delivery_refs`; for later third-party channels, the adapter streams workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
+  - If `openoctopus_device="<client_name>"` and the target channel is `web`: does not fetch or stage the file at send time. It writes user-visible, provider-hidden delivery state with an online-only `device_file` entry in `delivery_refs` containing the device name and path. The frontend later downloads through `GET /api/workspace/files/{path}?openoctopus_device=<client_name>`, which relays the browser response to the live device WebSocket. Download fails at click time with `device_unreachable`, `not_found`, or policy errors if the device/path is unavailable.
   - If `openoctopus_device="<client_name>"` and the target channel is a third-party platform (`telegram`, `discord`, `feishu`, `weixin`, ...): server streams bytes from the device over `/ws/device` and forwards them directly into the platform's upload API. The bytes are not staged into MinIO or the server workspace. The platform owns the delivered copy after success.
 - `buttons` renders as inline keyboard rows on channels that support it (Telegram, Discord's button components); plain text channels ignore the param with no error.
-- Persists and delivers a durable channel message with `channel`/`chat_id` set
-  to the resolved target. Active browser streams may observe the resulting
-  `message_persisted` event, but delivery does not depend on a live stream.
+- The provider-visible transcript remains the assistant message containing the
+  `message` tool use plus its matching persisted `tool_result`, which records
+  delivery success/failure. The Py4 delivery helper persists user-visible
+  delivery state outside provider replay; it must not insert another
+  provider-visible assistant row between that tool use and result. Exact
+  ownership/linking of the provider-hidden state is finalized with Py4.
 
 **Timeout:** 30s internal.
 **Result cap:** 16,000 characters.

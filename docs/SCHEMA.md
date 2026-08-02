@@ -35,9 +35,9 @@ unsupported keys return `400 Bad Request`):
 | `llm_endpoint` | string | ADR-101 | Anthropic-compatible Messages API base URL. |
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
-| `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with tiktoken-rs (ADR-025). |
+| `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with the configured-model Python tokenizer strategy (ADR-025, ADR-101). |
 | `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
-| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101 | Accepted/reserved config for later compaction decisions. Missing means not configured; future compaction code must handle that explicitly. Python-main may store the value before compaction is implemented. |
+| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, Py3 applies ADR-028's two-stage workflow. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 
 Reserved/future known keys (not PATCH-editable until their milestone):
@@ -175,13 +175,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
 
 ---
 
-## 6. `messages` — every assistant/user/tool turn
+## 6. `messages` — persisted transcript rows
 
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
     id                       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id               UUID         NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role                     TEXT         NOT NULL CHECK (role IN ('user', 'assistant')),
     message_kind             TEXT         NOT NULL CHECK (message_kind IN (
                                  'human',
                                  'assistant',
@@ -193,7 +192,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content                  JSONB        NOT NULL,
     delivery_refs            JSONB        NOT NULL DEFAULT '[]'::jsonb,
     llm_fingerprint          TEXT,
-    is_compaction_summary    BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_compacted             BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
@@ -202,11 +201,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
 ```
 
 - `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) live only in workspaces; the DB carries path-text markers and the agent reaches bytes via `read_file`. Remote attachment runtime failures are also persisted as server-authored text marker blocks so the user message is not lost.
-- `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. Web `message(media=...)` uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Server workspace refs are durable and point at `openoctopus_device="server"` paths. Device refs are online-only pointers to `(device name, path)`; the browser resolves them later through the Workspace Files `GET` route and may receive `device_unreachable`, `not_found`, or policy errors at click time. Third-party channel native uploads do not need a OpenOctopus download ref unless a later UI wants to render platform receipts.
+- `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. It remains `[]` through Py3; the first producer arrives with the initial Py4 `message` tool (ADR-127). Web `message(media=...)` uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Server workspace refs are durable and point at `openoctopus_device="server"` paths. Device refs are online-only pointers to `(device name, path)`; the browser resolves them later through the Workspace Files `GET` route and may receive `device_unreachable`, `not_found`, or policy errors at click time. Third-party channel native uploads do not need a OpenOctopus download ref unless a later UI wants to render platform receipts.
 - `llm_fingerprint` — nullable model/provider fingerprint for assistant rows that contain opaque thinking state. Provider replay may use raw `thinking` / `redacted_thinking` blocks only when this matches the current compatible model segment.
-- `role` — strictly `user` or `assistant` (ADR-089). Tool results are `role='user'` rows containing `tool_result` blocks.
-- `message_kind` — OpenOctopus semantic discriminator exposed through SSE/history: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. It avoids JSONB inspection for latest-human detection, JIT collapsing, frontend rendering, and audit.
-- `is_compaction_summary` — retained as the fast compaction marker. Compaction summary rows also use `message_kind='compaction_summary'`.
+- `message_kind` — stored OpenOctopus semantic discriminator: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. Provider projection derives `role='user'` for `human`, `tool_result`, and `synthetic_tool_result`; it derives `role='assistant'` for the other three kinds. This avoids JSONB inspection and prevents invalid stored role/kind pairs (ADR-089, ADR-126).
+- `is_compacted` — provider/compaction context membership. `FALSE` means the row participates in normal provider replay and may be input to a later compaction. `TRUE` means the row remains available for canonical history/audit but is excluded from both. A `compaction_summary` begins `FALSE` and may later become `TRUE` when absorbed into a newer summary.
 - The `idx_messages_session_created` index powers the `GET /api/sessions/{id}/messages` cursor scan.
 - Runtime block (ADR-094) is prepended into the user-row's `content` JSONB at
   ingress time; not a separate column. Public history projection inspects only
@@ -238,7 +236,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
     ON pending_messages(session_key, received_at, id);
 ```
 
-- `pending_messages` stores inbound user messages that arrive while a session worker is active. These rows are durable but not provider-visible history yet. Browser HTTP stream ownership is not stored here: an older queued POST can close with `stream_replaced` while its row remains durable, and the newest queued POST is only an in-memory live preview subscriber. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Py2 uses it for messages arriving while a worker is active. Beginning with Py3, every inbound user message is staged here first so Stage 1 compaction can place its replacement summary before the new user batch (ADR-126). Browser HTTP stream ownership is not stored here: an older queued POST can close with `stream_replaced` while its row remains durable, and the newest queued POST is only an in-memory live preview subscriber. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
 - `session_key` is stored alongside `session_id` so channel/session routing can recover pending work without recomputing the key.
 - At the safe boundary, the worker drains all rows for the session in one DB
   transaction: select pending rows in `(received_at, id)` order, insert them
@@ -251,11 +249,17 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
   tool-less Py2, the boundary follows persistence of the current complete
   assistant response and terminal run state. From Py3 onward, the current
   assistant tool batch must also be fully addressed (ADR-034, ADR-125).
+  When an idle Py3 runner finds no Stage 1 work, it performs this promotion
+  immediately. When Stage 1 triggers, summary generation runs while the new
+  user batch remains pending; the commit marks all selected active source rows
+  `is_compacted=TRUE`, inserts the new active summary, and only then promotes
+  the pending rows. Canonical active order is `S1, U11` without backdating.
   `GET /api/sessions/{id}/messages` returns these rows separately as
   `pending_messages` until they drain; its public projection removes a valid
   server-generated first runtime block without mutating the row. The stable
   `id` lets the frontend reconcile the pending item with the eventual canonical
-  message. When no session is in flight, this table should normally be empty.
+  message. When neither a session run nor boundary compaction is in flight,
+  this table should normally be empty.
 - A process restart drops live token previews and in-memory stream subscribers.
   Startup reconciles only stale `turn_runs` lifecycle rows; it does not drain or
   reorder `pending_messages`. The next inbound POST/channel activity rebuilds
@@ -266,7 +270,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
 
 ---
 
-## 8. `turn_runs` — durable provider-turn lifecycle
+## 8. `turn_runs` — durable agent provider-call/tool-batch lifecycle
 
 ```sql
 CREATE TABLE IF NOT EXISTS turn_runs (
@@ -296,11 +300,17 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_session_started
 
 - `id` is the `turn_id` emitted by `turn_started`, `token_delta`,
   `message_persisted`, and `turn_finished`.
-- A runner inserts `status='running'` before `turn_started`. Normal completion
-  updates the row to `completed`; exhausted provider failure updates it to
-  `failed`; safe-boundary cancellation updates it to `cancelled`.
-- The partial unique index is the durable backstop for one active turn per
-  session. The in-memory reservation remains the fast scheduler path.
+- A runner inserts `status='running'` before each normal agent-loop provider
+  call and `turn_started`. The same row covers persistence of that call's
+  complete assistant response and, when it contains `tool_use`, the complete
+  following serial tool-result batch. It reaches `completed` only after that
+  batch is fully addressed; exhausted provider failure updates it to `failed`;
+  safe-boundary cancellation updates it to `cancelled`. The next provider call
+  in the same ReAct chain creates another row and public `turn_id`, so one
+  external user request can produce several run rows (ADR-126).
+- The partial unique index is the durable backstop for one active
+  provider-call/tool-batch run per session. The in-memory reservation remains
+  the fast scheduler path.
 - The server process creates one boot-scoped `runner_instance_id`. During
   startup, before accepting traffic, it performs one indexed reconciliation
   update that marks leftover `status='running'` rows from the prior process as
@@ -443,7 +453,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 | `idx_messages_session_created` | messages (`session_id, created_at`) | History replay + cursor scan. |
 | `idx_pending_messages_session_received` | pending_messages (`session_id, received_at, id`) | Safe-boundary drain order. |
 | `idx_pending_messages_session_key_received` | pending_messages (`session_key, received_at, id`) | Recovery and channel-key lookup for queued inbound. |
-| `idx_turn_runs_one_running_per_session` | turn_runs (partial UNIQUE on `session_id WHERE status='running'`) | Durable one-active-turn invariant. |
+| `idx_turn_runs_one_running_per_session` | turn_runs (partial UNIQUE on `session_id WHERE status='running'`) | Durable one-active provider-call/tool-batch invariant. |
 | `idx_turn_runs_session_started` | turn_runs (`session_id, started_at DESC, id DESC`) | Latest run status for GET recovery. |
 | `idx_devices_user_id` | devices | List user's devices. |
 | `devices_user_id_name_key` | devices (UNIQUE on `(user_id, name)`) | URL resolution `/api/devices/{name}`. |
