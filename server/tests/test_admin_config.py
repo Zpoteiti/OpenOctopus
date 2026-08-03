@@ -103,6 +103,36 @@ async def test_patch_output_above_context_rejected(admin_client):
     assert response.json()["code"] == "config_validation_failed"
 
 
+async def test_patch_compaction_threshold_requires_larger_context(admin_client):
+    without_context = await admin_client.patch(
+        "/api/admin/config",
+        json={"llm_compaction_threshold_tokens": 16000},
+    )
+    assert without_context.status_code == 400
+    assert without_context.json()["code"] == "config_validation_failed"
+
+    equal_to_context = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "llm_max_output_tokens": 4000,
+            "llm_max_context_tokens": 16000,
+            "llm_compaction_threshold_tokens": 16000,
+        },
+    )
+    assert equal_to_context.status_code == 400
+    assert equal_to_context.json()["code"] == "config_validation_failed"
+
+    valid = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "llm_max_output_tokens": 4000,
+            "llm_max_context_tokens": 16001,
+            "llm_compaction_threshold_tokens": 16000,
+        },
+    )
+    assert valid.status_code == 200
+
+
 async def test_concurrent_token_limit_updates_keep_pair_valid(admin_client, monkeypatch):
     initial = await admin_client.patch(
         "/api/admin/config",

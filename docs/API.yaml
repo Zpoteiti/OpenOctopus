@@ -453,8 +453,10 @@ paths:
         runner promotes it immediately when Stage 1 compaction is unnecessary.
         When Stage 1 triggers, the incoming batch remains pending while active
         prior history is summarized; one commit marks the selected source rows
-        compacted, inserts the active summary, then promotes the pending human
-        rows. This preserves active order `S1, U11` without backdating. During
+        compacted, inserts the active summary, then promotes the captured
+        pending-human prefix. This preserves active order `S1, U11` without
+        backdating. Messages accepted after preflight captures its ordered
+        the preflight boundary remain pending for the next provider call. During
         an existing tool run, pending rows drain only after the current
         assistant tool batch is fully addressed.
         If pending rows survived a restart but no turn is running, the new
@@ -465,9 +467,11 @@ paths:
         POST response may stay open as the live preview subscriber for the next
         pending batch. Older queued POST responses receive `stream_replaced`
         and close after their own message has been durably accepted. At the
-        safe boundary, all pending rows for the session are drained in order and
-        become one provider-visible batch; the latest still-connected queued
-        stream receives that batch's live preview. Reconnect/recovery uses
+        safe boundary, the runner captures the current pending rows in order;
+        only that fixed prefix becomes the next provider-visible batch. Later
+        arrivals remain pending for the following call. The latest
+        still-connected queued stream for the captured batch receives its live
+        preview. Reconnect/recovery uses
         `GET /api/sessions/{id}/messages`; missed token deltas are not replayed.
 
         Py2 retries a transient provider failure only before the first
@@ -567,13 +571,15 @@ paths:
         a stale cancel flag. If a runner is active, the server sets
         `cancel_requested=true`. The agent loop lets the current LLM request or
         tool call finish. If the current external action is an LLM request, the
-        assistant response is persisted first and `cancel_requested` is checked
-        before dispatching any returned `tool_use`. The loop then inserts
-        synthetic `tool_result` blocks with `code="user_cancelled"` for
-        unstarted tools in the current assistant batch, inserts
-        `"[User pressed stop]"` as a `message_kind="human"` message, clears the
-        flag, emits `turn_finished` with `status="cancelled"` on any active
-        POST preview stream, and exits without another LLM call for that turn.
+        assistant response is persisted first. A response with no `tool_use`
+        completes normally, clears the flag, and does not add a stop marker. A
+        response containing tools is checked before dispatch; the loop inserts
+        synthetic `tool_result` blocks with `code="user_cancelled"` for every
+        unstarted tool in that assistant batch, inserts `"[User pressed stop]"`
+        as a `message_kind="human"` message, clears the flag, emits
+        `turn_finished` with `status="cancelled"` on any active POST preview
+        stream, and exits without another LLM call. If a tool is already in
+        flight, it finishes normally and only the remaining tools are skipped.
       responses:
         '202':
           description: Cancellation requested.
@@ -1661,13 +1667,18 @@ paths:
           - `llm_model` (string) — model name passed in the Anthropic Messages
             request body. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
-            (e.g. `128000`). Counted with the Python tokenizer strategy
-            selected for ADR-025. ADR-101.
+            (e.g. `128000`). Counted for the configured model through the
+            Anthropic-compatible `POST /messages/count_tokens` route selected
+            for ADR-025. ADR-101.
           - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
-            trigger. Missing disables compaction. The trigger compares
+            trigger. Missing disables compaction. When configured,
+            `llm_max_context_tokens` is required and the threshold must be
+            strictly smaller than that context window. The trigger compares
             `llm_max_context_tokens − tokenizer_count(prompt)` with
             `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-            = `threshold − 4000`. ADR-028, ADR-101, ADR-126.
+            = `threshold − 4000`. The configured endpoint must implement the
+            count route; there is no byte/tokenizer fallback. ADR-028, ADR-101,
+            ADR-126.
           - `llm_max_concurrent_requests` (int) — optional
             in-process semaphore in the shared LLM provider layer. A configured
             `0` means unlimited and creates no semaphore. A positive integer
@@ -1738,7 +1749,8 @@ paths:
         `llm_max_context_tokens` is configured, the merged config must also
         satisfy `llm_max_output_tokens <= llm_max_context_tokens`. A successful
         change is read by the next provider turn and does not mutate an
-        already-running call.
+        already-running call. `llm_compaction_threshold_tokens`, when present,
+        must be in `4001..(llm_max_context_tokens - 1)`.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -2216,7 +2228,7 @@ components:
             channel: { type: string, enum: [text, thinking] }
             text: { type: string, description: Coalesced best-effort token text. Not persisted and not replayed. }
         - type: object
-          required: [type, turn_id, kind]
+          required: [type, turn_id, kind, tool_call_id, tool_name]
           description: Introduced by Py3; Py2 never emits this event.
           properties:
             type: { type: string, enum: [tool_progress] }
@@ -2308,13 +2320,17 @@ components:
             content:
               type: array
               description: |
-                Provider-facing and public history shape. Raw device WebSocket
-                frames may submit a string or safe block array, but OpenOctopus
+                Persisted and public history shape. Raw device WebSocket frames
+                may submit a string or safe block array, but OpenOctopus
                 normalizes persisted `tool_result.content` to safe blocks
-                before DB storage, SSE, history, or provider replay.
+                before DB storage, streaming, history, or provider replay.
               items: { $ref: '#/components/schemas/ToolResultContentBlock' }
             is_error: { type: boolean, default: false }
-            code: { type: string }
+            code:
+              type: string
+              description: |
+                OpenOctopus diagnostic metadata retained in storage and public
+                history, then omitted from the strict Anthropic provider block.
         - type: object
           required: [type, thinking]
           properties:

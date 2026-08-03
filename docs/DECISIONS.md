@@ -358,6 +358,13 @@ inputs are unchanged; volatile execution state does not churn it.
 configured model.
 **Decision:** Compaction threshold checks use tokenizer counts, not byte-count
 heuristics. Required for correctness across different tokenizers.
+Python-main obtains the configured model's exact input count through the
+Anthropic-compatible `messages/count_tokens` endpoint. An endpoint must support
+that route when compaction is enabled; OpenOctopus does not silently fall back
+to a byte or unrelated-model estimate. The count request mirrors the normal
+request's system, tools, messages, cache control, and thinking controls. It uses
+the shared provider limiter, transient retry policy, and image-compatibility
+fallback.
 **Consequences:** Token counting is an explicit provider-prompt concern rather
 than an approximation from serialized byte length.
 
@@ -388,28 +395,60 @@ normal provider replay and compaction input select only message rows where
 - `llm_max_context_tokens` — the LLM's context-window size, counted with the Python tokenizer strategy (ADR-025, ADR-101) against the full provider prompt/request (system + tools + active history + pending new turn).
 - `llm_compaction_threshold_tokens` — the headroom that triggers compaction. Missing disables compaction.
 
+When a threshold is configured, `llm_max_context_tokens` is required and the
+merged configuration must satisfy
+`4001 <= llm_compaction_threshold_tokens < llm_max_context_tokens`.
+
 **Trigger:** when `llm_max_context_tokens − tokenizer_count(prompt) < llm_compaction_threshold_tokens`, fire compaction.
+
+An empty continuation `TurnStart` captures the current ordered pending-message
+IDs and latest effort under the session lock before preflight. Token counting
+and promotion use only that captured prefix; once captured, the boundary never
+expands. Messages accepted later remain pending for the next provider-call
+boundary.
 
 **Stages:**
 - **Stage 1** (user-turn boundary): keep the incoming user batch durable in
   `pending_messages` and compact all active prior message rows into one
   `message_kind='compaction_summary'` row. After summary generation, one
   transaction marks every source row `is_compacted=true`, inserts the summary
-  with `is_compacted=false`, promotes the pending human rows in receive order,
-  and deletes those pending rows. Canonical active order is therefore
-  `S1, U11`; timestamps are not backdated. The compaction LLM call uses
+  with `is_compacted=false`, promotes the captured pending prefix in receive
+  order, and deletes those captured pending rows. Messages that arrive while
+  summary generation is running remain pending for the next boundary.
+  Canonical active order is therefore `S1, U11`; timestamps are not backdated.
+  The compaction LLM call uses
   `max_output_tokens = llm_compaction_threshold_tokens − 4000` (= `12000` at
   the default), leaving 4k headroom for the new user turn.
-- **Stage 2** (mid-turn): preserve the latest active human message/batch and
-  compact only the active assistant/tool rows accumulated after it. Mark those
-  source rows compacted and append one active summary in the same transaction.
-  Active order becomes `S1, U11, T1`. Use the same `max_output_tokens` formula.
+- **Stage 2** (mid-turn): preserve the latest active external human boundary,
+  identified by the exact server-generated runtime first block, and compact all
+  active rows accumulated after it. Server-authored `human` markers such as the
+  repeated-tool warning are part of that compactable tail rather than new
+  external boundaries. Transcripts with no runtime-bearing human fall back to
+  the latest active human for legacy compatibility. Mark the selected source
+  rows compacted and append one active summary in the same transaction. Active
+  order becomes `S1, U11, T1`. Use the same `max_output_tokens` formula.
+
+Every summary request ends with a synthetic user instruction to produce the
+summary. When a Stage 2 summary would otherwise be the final active assistant
+row in a normal provider request, projection appends a provider-only user
+instruction to continue the preserved task; neither instruction is persisted.
 
 An active summary is intentionally eligible for later compaction. A later Stage
 1 can absorb `S1`, the completed turn after it, and an active Stage 2 summary
 into `S2`; the old summary then becomes `is_compacted=true`. The boolean is the
 sole provider/compaction membership flag, not a permanent "was summarized"
 label.
+
+Token counting and summary generation happen outside database transactions. A
+counting or summary failure commits no compaction state. After a successful
+compaction commit, the runner recounts the exact rebuilt normal request once.
+If it still crosses the trigger, the compacted state remains durable but the
+runner does not issue the oversized normal request; it fails the turn visibly.
+At a Stage 1 boundary,
+the runner promotes the captured human batch, persists a synthetic assistant
+error, and fails the turn; at Stage 2 it persists the same terminal error after
+the preserved human turn. There is no heuristic fallback or automatic
+compaction retry loop.
 
 **Units clarification:** all thresholds are **tokens**. Tool result caps
 (ADR-076) are **characters** — roughly 4× smaller in token terms. A max-size
@@ -506,8 +545,8 @@ The active turn never interrupts an in-flight LLM request or an in-flight tool c
 
 Pending messages are not allowed to split a set of `tool_result` blocks. The next provider request sees the assistant tool request, one collapsed `user` tool-result message, and then the drained human messages in chronological order.
 
-The drain is atomic per session: select pending rows in `(received_at, id)`
-order, insert matching `messages` rows with the same IDs and
+The drain is atomic per session: capture a fixed pending prefix in
+`(received_at, id)` order before preflight, insert matching `messages` rows with the same IDs and
 `message_kind="human"`, delete the selected pending rows, commit, then
 make the visible user rows available to canonical `GET messages` history and
 the current live POST preview stream.
@@ -515,16 +554,23 @@ The promoted rows receive canonical `messages.created_at` values at drain time
 in pending order. `pending_messages.received_at` is the queue-order timestamp,
 not the eventual transcript position; copying it would place a queued follow-up
 before the assistant response it waited behind.
+Messages accepted after the prefix is captured remain pending for the following
+provider call and cannot enter the current request without being token-counted.
 
 For browser `POST /api/sessions/{id}/messages`, pending stream delivery is
 latest-wins. If multiple browser POSTs arrive while the session is running, all
 accepted messages remain durable pending rows, but only the newest still-open
 queued POST response is kept as the live preview subscriber for the next drained
 batch. Older queued POST responses receive `stream_replaced` and close. The next
-provider request sees the full pending batch in receive order, not one request
-per queued browser message.
+provider request sees the full captured pending batch in receive order. Rows
+accepted after capture form a later batch.
 
-`POST /api/sessions/{id}/cancel` is the only user-facing exception. It does not kill the current LLM request or tool call, but after the current external action finishes the loop inserts synthetic `user_cancelled` results for unstarted tool IDs, persists the stop marker, clears `cancel_requested`, and exits.
+`POST /api/sessions/{id}/cancel` is the only user-facing exception. It does not
+kill the current LLM request or tool call. If an in-flight provider response is
+a final response with no tools, normal completion wins (ADR-129). Otherwise,
+after the current external action finishes the loop inserts synthetic
+`user_cancelled` results for unstarted tool IDs, persists the stop marker,
+clears `cancel_requested`, and exits.
 
 **Consequences:** Normal follow-ups wait for the current tool batch, preserving Anthropic role alternation without synthetic skipped results. Stop remains useful for long batches. ADR-014 remains the crash-recovery backstop for process death before pairing rows can be inserted.
 
@@ -545,7 +591,15 @@ content-block array, inserts `"[User pressed stop]"` with
 `turn_finished(status="cancelled")` on any active POST preview stream, and exits
 the loop for that turn.
 
-If cancellation arrives while an LLM request or tool call is already in flight, that external action is not force-killed by this ADR. For an in-flight LLM request, the loop waits for the provider response, persists the assistant message, then observes `cancel_requested` before dispatching any returned `tool_use`. For an in-flight tool call, the current tool is allowed to finish, then unstarted tools are skipped. If the process crashes before synthetic pairing rows can be written, ADR-014 repairs any remaining unpaired `tool_use` blocks on the next inbound message.
+If cancellation arrives while an LLM request or tool call is already in
+flight, that external action is not force-killed by this ADR. For an in-flight
+LLM request, the loop waits for and persists the provider response. A response
+with no `tool_use` completes normally under ADR-129. A response with tools is
+checked before dispatch, so every returned tool is paired with a synthetic
+`user_cancelled` result. For an in-flight tool call, the current tool is allowed
+to finish, then unstarted tools are skipped. If the process crashes before
+synthetic pairing rows can be written, ADR-014 repairs any remaining unpaired
+`tool_use` blocks on the next inbound message.
 
 **Consequences:** No separate cancel pipeline. The stop marker is a normal user-turn row. Next inbound for this session loads history from DB, sees the stop marker, and the agent picks up the interruption context cleanly — no in-memory state needed to "remember" that the user stopped. In normal non-crash cancellation, DB history remains valid for Anthropic Messages because skipped tools are paired with synthetic error results before the worker exits.
 
@@ -1710,6 +1764,11 @@ message arrived, not current global state.
 
 Raw string output becomes the following text block. Raw safe block arrays are appended after the warning in their original order. Base64 image bytes are never modified. A helper in `openoctopus_server/tools/result.py` performs this normalization uniformly across shared, server-only, client-only, and MCP-wrapped tools.
 
+The optional top-level `tool_result.code` is OpenOctopus diagnostic metadata.
+It is retained in PostgreSQL and public history but removed just-in-time from
+the strict Anthropic provider request; `is_error` and the server-authored text
+remain provider-visible.
+
 The wrapped shape the LLM sees:
 
 ```
@@ -1983,7 +2042,7 @@ The admin configures the LLM via the admin REST API — **not env vars**. Seven 
 | `llm_api_key` | string | Bearer credential the server uses on outbound requests. |
 | `llm_model` | string | Model name passed in the request body (for example `claude-sonnet-4-5` or a gateway model alias). |
 | `llm_max_context_tokens` | integer | The LLM's hard context-window size in tokens. Counted against the full Anthropic Messages request — system + tools + history + new turn. |
-| `llm_compaction_threshold_tokens` | integer | Headroom that triggers Py3 compaction (ADR-028, ADR-126). Missing disables compaction. When `llm_max_context_tokens − tokenizer_count(prompt) < llm_compaction_threshold_tokens`, the agent loop fires the applicable compaction stage. The summary's `max_output_tokens` is `threshold − 4000`, reserving 4k headroom. |
+| `llm_compaction_threshold_tokens` | integer | Headroom that triggers Py3 compaction (ADR-028, ADR-126). Missing disables compaction. When configured, `llm_max_context_tokens` is required and the threshold must be in `4001..(max_context_tokens − 1)`. When `llm_max_context_tokens − tokenizer_count(prompt) < llm_compaction_threshold_tokens`, the agent loop fires the applicable compaction stage. The summary's `max_output_tokens` is `threshold − 4000`, reserving 4k headroom. |
 | `llm_max_concurrent_requests` | integer | Optional in-process semaphore applied in the shared Anthropic-compatible provider layer. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls. When set, all LLM calls share the same cap: normal chat, cron, heartbeat, compaction, and future autonomous flows. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 | `llm_max_output_tokens` | integer | Maximum output-token budget passed to Anthropic Messages. Missing means an effective default of `16384`; the default is computed at read/use time and is not seeded. The budget includes thinking and visible output. Changes apply to the next provider turn, not an already-running call. |
 
@@ -3216,6 +3275,57 @@ tool-result batch.
 delivery helper. The final `message` schema remains documented in `TOOLS.md` as
 a forward contract, with field availability controlled by the owning
 milestones.
+
+### ADR-128 · Py3 has one authoritative runtime-block codec
+
+**Status:** accepted
+
+**Context:** ADR-094 requires a deterministic runtime block to be generated
+once at ingress, persisted with the human message, replayed to the provider,
+and removed only from the public projection. Py2 placed construction and
+parsing beside the public DTO projection, which makes later ingress adapters
+likely to duplicate the grammar.
+
+**Decision:** Py3 moves the runtime grammar, builder, and exact parser into one
+small authoritative module. Ingress constructs the block through that module;
+public projection removes the first block only when the same module parses it
+and its `channel` and `chat_id` match the owning session. Py3's grammar has only
+the fields it already needs: ingress time, channel, chat ID, partner sender ID,
+and trust. Later milestones may extend the codec when a concrete ingress field
+is required; Py3 does not add a generic metadata registry or speculative
+fields.
+
+Authenticated tool execution state is not model-visible runtime text. A small
+typed `ToolContext` carries authoritative user/session identity and live
+services directly to tool handlers.
+
+**Consequences:** All ingress paths and public reads share one format without
+turning runtime metadata into a general context framework. ReAct iterations
+replay the immutable ingress block, while tool authorization never trusts IDs
+from prompt text.
+
+### ADR-129 · A completed final provider response wins a late cancellation
+
+**Status:** accepted
+
+**Context:** A stop request can arrive while a provider request is already in
+flight. Once that request returns a complete assistant response with no tools,
+there is no remaining external action to prevent and replacing the response
+with a cancellation marker would discard completed work.
+
+**Decision:** The agent loop always persists the completed assistant response
+first. If it contains no `tool_use`, the turn completes normally even when
+`cancel_requested` became true during the request: clear the flag, mark the
+turn completed, emit normal completion, and do not insert a stop marker. If the
+response contains tools, cancellation wins before dispatch: pair every
+unstarted tool ID with a synthetic `user_cancelled` result, insert the stop
+marker, clear the flag, and finish the turn as cancelled. A tool already in
+flight is allowed to finish; only the remaining tools in that batch are
+synthetically cancelled.
+
+**Consequences:** The stop button prevents future work without erasing a final
+answer that already completed. Every persisted assistant tool-use batch remains
+fully paired, and idle sessions never retain a stale cancel flag.
 
 ---
 

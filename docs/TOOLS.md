@@ -700,7 +700,8 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
       },
       "maxChars": {
         "type": "integer",
-        "minimum": 100
+        "minimum": 100,
+        "maximum": 50000
       }
     },
     "required": ["url"]
@@ -720,7 +721,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
   - IPv6 ULA `fc00::/7` and link-local `fe80::/10`
 - **Client site:** if `sandbox_mode=true`, rejects targets matching `device.ssrf_denylist` (CIDR, host, or `host:port`). The default sandbox-device denylist contains private/reserved ranges and common metadata-service addresses. Users remove entries from the denylist to allow known internal services. If `sandbox_mode=false`, private/internal access is allowed by default; trusted devices created without an explicit list store `[]`, while any explicit deny entries the user keeps still reject matching targets.
 - **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command can still make its own network calls subject only to command-denylist/env policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
-- Fetches via `httpx`, 10s connect + 30s total timeout. Uses a readability extractor (jina/readability-style) to convert HTML → `extractMode` output. Output capped at `maxChars` (default 50,000, agent-overridable).
+- Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity encoding, rejects compressed responses, and raw-streams at most 5 MB before extraction. Uses a readability extractor (jina/readability-style) to convert HTML → `extractMode` output. Output is capped at `maxChars` (`100..50000`, default 50,000).
 - Tool result content is normalized per ADR-095 before the LLM sees it: warning text block first, fetched page content after it.
 
 **Timeout:** 30s total, 10s connect.

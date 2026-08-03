@@ -56,7 +56,7 @@ class MessageResponse(BaseModel):
     message_kind: str
     content: list[ContentBlock]
     delivery_refs: list[dict[str, Any]]
-    is_compaction_summary: bool
+    is_compacted: bool
     created_at: datetime
 
 

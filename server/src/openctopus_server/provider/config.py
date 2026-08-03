@@ -18,6 +18,7 @@ class ProviderConfig:
     max_output_tokens: int
     max_concurrent_requests: int
     max_context_tokens: int | None
+    compaction_threshold_tokens: int | None = None
 
 
 async def load_provider_config(db: AsyncSession) -> ProviderConfig:
@@ -31,6 +32,7 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
                     "llm_max_output_tokens",
                     "llm_max_concurrent_requests",
                     "llm_max_context_tokens",
+                    "llm_compaction_threshold_tokens",
                 }
             )
         )
@@ -55,6 +57,7 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
     max_output_tokens = rows.get("llm_max_output_tokens", LLM_MAX_OUTPUT_TOKENS_DEFAULT)
     max_concurrent_requests = rows.get("llm_max_concurrent_requests", 0)
     max_context_tokens = rows.get("llm_max_context_tokens")
+    compaction_threshold_tokens = rows.get("llm_compaction_threshold_tokens")
     if not isinstance(max_output_tokens, int) or not 1 <= max_output_tokens <= 1_000_000:
         raise ChatError(
             ErrorCode.PROVIDER_NOT_CONFIGURED,
@@ -76,6 +79,17 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
             ErrorCode.PROVIDER_NOT_CONFIGURED,
             "LLM context/output token configuration is invalid",
         )
+    if compaction_threshold_tokens is not None:
+        if (
+            not isinstance(compaction_threshold_tokens, int)
+            or compaction_threshold_tokens < 4001
+            or max_context_tokens is None
+            or compaction_threshold_tokens >= max_context_tokens
+        ):
+            raise ChatError(
+                ErrorCode.PROVIDER_NOT_CONFIGURED,
+                "llm_compaction_threshold_tokens is invalid",
+            )
 
     return ProviderConfig(
         endpoint=endpoint,
@@ -84,4 +98,5 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
         max_output_tokens=max_output_tokens,
         max_concurrent_requests=max_concurrent_requests,
         max_context_tokens=max_context_tokens,
+        compaction_threshold_tokens=compaction_threshold_tokens,
     )

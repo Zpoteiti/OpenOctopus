@@ -228,10 +228,11 @@ trust: partner
 </runtime>
 ```
 
-Later ingress adapters may add versioned fields, such as a selected active
-workspace or channel-specific sender ID, but must keep a deterministic
-server-owned grammar. Volatile global catalogs do not belong here: include
-only state relevant to this inbound message.
+Py3 keeps exactly these five values: time, channel, chat ID, partner sender ID,
+and trust. Later ingress adapters may extend the authoritative codec when a
+concrete field, such as a selected workspace or channel-specific sender ID, is
+required. Volatile global catalogs do not belong here: include only state
+relevant to this inbound message (ADR-128).
 
 The wire shape of a turn makes the separation explicit. Chronology goes **system → all prior history (oldest → newest) → current user turn (with runtime block prepended)**:
 
@@ -269,7 +270,8 @@ moment. Public `GET /api/sessions/{id}/messages` responses omit it. Projection
 code examines only the first text block, parses the exact anchored
 server-generated grammar, verifies `channel` and `chat_id` against the session,
 and removes only that block. It never applies a loose regex to concatenated
-user text.
+user text. ADR-128 places construction and parsing in one authoritative codec;
+the public DTO layer does not own a second grammar.
 
 ### Prompt placement summary
 

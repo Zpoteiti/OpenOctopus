@@ -22,7 +22,7 @@ def test_message_response():
         message_kind="human",
         content=[{"type": "text", "text": "hi"}],
         delivery_refs=[],
-        is_compaction_summary=False,
+        is_compacted=False,
         created_at=datetime.now(UTC),
     )
     assert msg.role == "user"

@@ -10,7 +10,7 @@ EXPECTED_COLUMNS = {
     "discord_configs": 5,
     "telegram_configs": 5,
     "sessions": 10,
-    "messages": 9,
+    "messages": 8,
     "pending_messages": 7,
     "turn_runs": 6,
     "devices": 11,

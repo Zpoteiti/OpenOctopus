@@ -37,7 +37,7 @@ unsupported keys return `400 Bad Request`):
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with the configured-model Python tokenizer strategy (ADR-025, ADR-101). |
 | `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
-| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, Py3 applies ADR-028's two-stage workflow. |
+| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, `llm_max_context_tokens` is required and the value must be `4001 <= threshold < max_context_tokens`. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 
 Reserved/future known keys (not PATCH-editable until their milestone):
@@ -170,7 +170,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
 - `title` is the human-facing mutable session name. It defaults to `"New chat"` and never affects `id`, `chat_id`, or `session_key`.
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
-- `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true.
+- `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true. If an in-flight provider request returns a final response with no tools, normal completion wins and clears the flag without a stop marker (ADR-129).
 - `DELETE /api/sessions/{id}` removes session rows after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes that session's `turn_runs`, `messages`, and `pending_messages`; channel configuration rows are not tied to session deletion. Active cron sessions are rejected by the FK from `cron_jobs.session_id`; delete the cron job through `/api/cron/{id}` so the job row and its dedicated history stay consistent. Completed one-shot cron sessions with no remaining `cron_jobs` row can be deleted as normal history.
 
 ---
@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
     ON messages(session_id, created_at);
 ```
 
-- `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) live only in workspaces; the DB carries path-text markers and the agent reaches bytes via `read_file`. Remote attachment runtime failures are also persisted as server-authored text marker blocks so the user message is not lost.
+- `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection, except optional OpenOctopus `tool_result.code` metadata is retained for storage/public diagnostics and stripped from the strict provider request. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) live only in workspaces; the DB carries path-text markers and the agent reaches bytes via `read_file`. Remote attachment runtime failures are also persisted as server-authored text marker blocks so the user message is not lost.
 - `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. It remains `[]` through Py3; the first producer arrives with the initial Py4 `message` tool (ADR-127). Web `message(media=...)` uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Server workspace refs are durable and point at `openoctopus_device="server"` paths. Device refs are online-only pointers to `(device name, path)`; the browser resolves them later through the Workspace Files `GET` route and may receive `device_unreachable`, `not_found`, or policy errors at click time. Third-party channel native uploads do not need a OpenOctopus download ref unless a later UI wants to render platform receipts.
 - `llm_fingerprint` — nullable model/provider fingerprint for assistant rows that contain opaque thinking state. Provider replay may use raw `thinking` / `redacted_thinking` blocks only when this matches the current compatible model segment.
 - `message_kind` — stored OpenOctopus semantic discriminator: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. Provider projection derives `role='user'` for `human`, `tool_result`, and `synthetic_tool_result`; it derives `role='assistant'` for the other three kinds. This avoids JSONB inspection and prevents invalid stored role/kind pairs (ADR-089, ADR-126).
@@ -236,13 +236,15 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
     ON pending_messages(session_key, received_at, id);
 ```
 
-- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Py2 uses it for messages arriving while a worker is active. Beginning with Py3, every inbound user message is staged here first so Stage 1 compaction can place its replacement summary before the new user batch (ADR-126). Browser HTTP stream ownership is not stored here: an older queued POST can close with `stream_replaced` while its row remains durable, and the newest queued POST is only an in-memory live preview subscriber. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Py2 uses it for messages arriving while a worker is active. Beginning with Py3, every inbound user message is staged here first so Stage 1 compaction can place its replacement summary before the new user batch (ADR-126). Before preflight, a continuation with no captured input fixes the current ordered pending IDs as its boundary; token counting and promotion consume only that prefix, while later arrivals remain pending for the following provider call. Browser HTTP stream ownership is not stored here: an older queued POST can close with `stream_replaced` while its row remains durable, and the newest queued POST is only an in-memory live preview subscriber. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
 - `session_key` is stored alongside `session_id` so channel/session routing can recover pending work without recomputing the key.
-- At the safe boundary, the worker drains all rows for the session in one DB
-  transaction: select pending rows in `(received_at, id)` order, insert them
+- At the safe boundary, the worker captures the current rows for the session
+  and drains that fixed prefix in one DB transaction: select them in
+  `(received_at, id)` order, insert them
   into `messages` with the same `id` and `message_kind='human'`, delete the
   selected pending rows, commit, then the resulting user messages become
   visible to canonical history and the latest live POST preview stream.
+  Messages accepted after capture remain pending for the following call.
   Canonical `messages.created_at` values are assigned at drain time in that
   same order; copying the earlier `received_at` would incorrectly place queued
   input before the assistant response whose safe boundary it waited for. In
@@ -439,7 +441,9 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 
 - Every user-referencing FK has `ON DELETE CASCADE` (ADR-058) → account deletion is one statement. **Sole exception:** `workspaces.created_by` uses `ON DELETE SET NULL` per ADR-108 so a workspace persists for its remaining members when its creator's account is removed.
 - No surrogate "is_active" / "deleted_at" columns — deletes are hard, undo lives in admin's backup strategy.
-- No migration framework in v1 (ADR-069). Schema changes during rebuild require dev-DB reset (`scripts/reset-db.sh`). Real-user deployments add `sqlx::migrate!` later.
+- No migration framework before production launch (ADR-069). Schema changes
+  during the development rebuild require resetting the development database;
+  real-user deployments add a versioned migration framework later.
 
 ---
 

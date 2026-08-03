@@ -12,7 +12,11 @@ from openctopus_server.errors.exceptions import ConfigError
 _QUOTA_DEFAULT = 524288000  # 500 MiB
 LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
 _REDACTED = "<redacted>"
-_TOKEN_LIMIT_KEYS = {"llm_max_context_tokens", "llm_max_output_tokens"}
+_TOKEN_LIMIT_KEYS = {
+    "llm_max_context_tokens",
+    "llm_compaction_threshold_tokens",
+    "llm_max_output_tokens",
+}
 
 _CONFIG_KEYS = {
     "quota_bytes",
@@ -89,6 +93,17 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
         raise ConfigError(
             ErrorCode.CONFIG_VALIDATION_FAILED,
             "llm_max_output_tokens must not exceed llm_max_context_tokens",
+        )
+    raw_compaction_threshold = data.get(
+        "llm_compaction_threshold_tokens",
+        existing.get("llm_compaction_threshold_tokens"),
+    )
+    if raw_compaction_threshold is not None and (
+        raw_context_tokens is None or int(raw_compaction_threshold) >= int(raw_context_tokens)
+    ):
+        raise ConfigError(
+            ErrorCode.CONFIG_VALIDATION_FAILED,
+            "llm_compaction_threshold_tokens must be less than llm_max_context_tokens",
         )
 
     # Upsert rows after validation succeeds.

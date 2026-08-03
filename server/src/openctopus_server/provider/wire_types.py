@@ -41,6 +41,7 @@ class ToolResultBlock(BaseModel):
     tool_use_id: str
     content: str | list[TextBlock | ImageBlock]
     is_error: bool = False
+    code: str | None = None
 
 
 class ThinkingBlock(BaseModel):

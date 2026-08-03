@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.chat.public_projection import build_runtime_block
 from openctopus_server.chat.runner import ChatRuntime
-from openctopus_server.chat.types import AcceptedMessage
+from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.db.models import (
     Message,
     PendingMessage,
@@ -31,8 +31,10 @@ from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services.messages import (
+    capture_pending_for_turn,
     drain_pending_and_create_turn,
     get_messages_response,
+    promote_pending_for_turn,
 )
 from openctopus_server.services.turn_runs import abandon_running_turns
 
@@ -60,6 +62,7 @@ class FakeProvider:
         effort: Effort | None,
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResult:
         step = self.steps.popleft()
         self.calls.append(
@@ -68,6 +71,7 @@ class FakeProvider:
                 "system": system,
                 "messages": messages,
                 "effort": effort,
+                "tools": tools,
             }
         )
         if step.started is not None:
@@ -82,6 +86,19 @@ class FakeProvider:
             content=step.content,
             fingerprint=provider_fingerprint(config),
         )
+
+    async def count_tokens(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: Effort | None,
+        limiter: ProviderLimiter,
+    ) -> int:
+        del config, system, tools, effort, limiter
+        return sum(len(json.dumps(message)) for message in messages)
 
     async def close(self) -> None:
         return None
@@ -338,7 +355,6 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
             Message(
                 id=uuid4(),
                 session_id=session_id,
-                role="user",
                 message_kind="human",
                 content=[{"type": "text", "text": "first"}],
                 delivery_refs=[],
@@ -409,6 +425,183 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
     visible_ids = [message.id for message in response.messages]
     visible_ids.extend(message.id for message in response.pending_messages)
     assert visible_ids.count(pending_id) == 1
+
+
+async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
+    user_client,
+    pg_engine,
+) -> None:
+    del user_client
+    now = datetime.now(UTC)
+    session_id = uuid4()
+    turn_id = uuid4()
+    first_id = uuid4()
+    second_id = uuid4()
+    late_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                TurnRun(
+                    id=turn_id,
+                    session_id=session_id,
+                    runner_instance_id=uuid4(),
+                    status="running",
+                    started_at=now,
+                ),
+                PendingMessage(
+                    id=first_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "captured"}],
+                    effort="low",
+                    received_at=now,
+                ),
+                PendingMessage(
+                    id=second_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "also captured"}],
+                    effort="medium",
+                    received_at=now + timedelta(microseconds=1),
+                ),
+            ]
+        )
+        await db.commit()
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(),
+            effort=None,
+        )
+
+        captured = await capture_pending_for_turn(db, turn=turn)
+        db.add(
+            PendingMessage(
+                id=late_id,
+                session_id=session_id,
+                user_id=user.id,
+                session_key=session.session_key,
+                content=[{"type": "text", "text": "late"}],
+                effort="high",
+                received_at=now + timedelta(microseconds=2),
+            )
+        )
+        await db.commit()
+        captured_again = await capture_pending_for_turn(db, turn=captured)
+        promoted = await promote_pending_for_turn(db, turn=captured)
+        promoted_again = await promote_pending_for_turn(db, turn=captured)
+        canonical_ids = tuple(
+            (
+                await db.execute(
+                    select(Message.id)
+                    .where(Message.session_id == session_id)
+                    .order_by(Message.created_at, Message.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending_ids = tuple(
+            (
+                await db.execute(
+                    select(PendingMessage.id)
+                    .where(PendingMessage.session_id == session_id)
+                    .order_by(PendingMessage.received_at, PendingMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert captured.message_ids == (first_id, second_id)
+    assert captured.effort == Effort.MEDIUM
+    assert captured_again == promoted == promoted_again == captured
+    assert canonical_ids == (first_id, second_id)
+    assert pending_ids == (late_id,)
+
+
+async def test_pending_promotion_with_an_empty_capture_leaves_the_queue_untouched(
+    user_client,
+    pg_engine,
+) -> None:
+    del user_client
+    now = datetime.now(UTC)
+    session_id = uuid4()
+    turn_id = uuid4()
+    pending_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                TurnRun(
+                    id=turn_id,
+                    session_id=session_id,
+                    runner_instance_id=uuid4(),
+                    status="running",
+                    started_at=now,
+                ),
+                PendingMessage(
+                    id=pending_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "late"}],
+                    received_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(),
+            effort=None,
+        )
+
+        unchanged = await promote_pending_for_turn(db, turn=turn)
+        canonical_count = len(
+            (await db.execute(select(Message.id).where(Message.session_id == session_id)))
+            .scalars()
+            .all()
+        )
+        pending_ids = tuple(
+            (
+                await db.execute(
+                    select(PendingMessage.id).where(PendingMessage.session_id == session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert unchanged == turn
+    assert canonical_count == 0
+    assert pending_ids == (pending_id,)
 
 
 async def test_latest_queued_post_replaces_older_stream(
@@ -506,6 +699,60 @@ async def test_latest_late_registration_replaces_older_running_preview(
             disposition="queued",
             created_session=False,
             turn=None,
+        )
+    )
+
+    older_events = [json.loads(chunk) async for chunk in older.ndjson()]
+    assert [event["type"] for event in older_events] == [
+        "message_accepted",
+        "stream_replaced",
+    ]
+    assert older.closed is True
+    assert newer.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=newer)
+    await runtime.close()
+
+
+async def test_delayed_initial_registration_does_not_replace_newer_queued_preview(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    accepted_at = datetime.now(UTC)
+
+    async def pending_location(accepted: AcceptedMessage) -> tuple[str, Any]:
+        return "pending", None
+
+    async def turn_is_running(candidate: Any) -> bool:
+        return candidate == turn_id
+
+    monkeypatch.setattr(runtime, "_queued_location", pending_location)
+    monkeypatch.setattr(runtime, "_turn_is_running", turn_is_running)
+    newer = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=uuid4(),
+            accepted_at=accepted_at + timedelta(microseconds=1),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+    older = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=uuid4(),
+            accepted_at=accepted_at,
+            disposition="started",
+            created_session=False,
+            turn=TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(),
+                effort=None,
+            ),
         )
     )
 
@@ -757,7 +1004,6 @@ async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
             Message(
                 id=uuid4(),
                 session_id=session_id,
-                role="user",
                 message_kind="human",
                 content=[
                     build_runtime_block(
