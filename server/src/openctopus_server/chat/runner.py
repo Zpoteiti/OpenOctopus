@@ -67,7 +67,7 @@ class _SessionState:
     starts: deque[TurnStart] = field(default_factory=deque)
     runner_task: asyncio.Task[None] | None = None
     turn_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
-    queued_subscriber: StreamSubscriber | None = None
+    queued_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,27 +141,22 @@ class ChatRuntime:
                 if location == "done":
                     subscriber.close()
                     return subscriber
-                if state.queued_subscriber is not None:
-                    state.queued_subscriber = self._replace_older(
-                        state.queued_subscriber,
-                        subscriber,
-                    )
-                else:
-                    state.queued_subscriber = subscriber
+                self._queue_subscriber(state, subscriber)
                 return subscriber
 
             if not await self._turn_is_running(accepted.turn.turn_id):
                 subscriber.close()
                 return subscriber
-            candidate = subscriber
-            if state.queued_subscriber is not None:
-                candidate = self._replace_older(state.queued_subscriber, subscriber)
-                state.queued_subscriber = None
-            self._install_newest_subscriber(
-                state,
-                turn_id=accepted.turn.turn_id,
-                subscriber=candidate,
-            )
+            candidates = [
+                subscriber,
+                *self._take_queued_subscribers(state, accepted.turn.message_ids),
+            ]
+            for candidate in candidates:
+                self._install_newest_subscriber(
+                    state,
+                    turn_id=accepted.turn.turn_id,
+                    subscriber=candidate,
+                )
         return subscriber
 
     async def unregister(
@@ -172,8 +167,8 @@ class ChatRuntime:
     ) -> None:
         state = await self._state_for(session_id)
         async with state.lock:
-            if state.queued_subscriber is subscriber:
-                state.queued_subscriber = None
+            if state.queued_subscribers.get(subscriber.message_id) is subscriber:
+                state.queued_subscribers.pop(subscriber.message_id, None)
             for turn_id, candidate in tuple(state.turn_subscribers.items()):
                 if candidate is subscriber:
                     state.turn_subscribers.pop(turn_id, None)
@@ -278,7 +273,7 @@ class ChatRuntime:
                         runner_instance_id=self.runner_instance_id,
                     )
                 if current is not None:
-                    await self._assign_queued_subscriber(state, current)
+                    await self._assign_queued_subscribers(state, current)
         finally:
             async with state.lock:
                 current_task = asyncio.current_task()
@@ -297,19 +292,18 @@ class ChatRuntime:
                 return state.starts.popleft()
             return None
 
-    async def _assign_queued_subscriber(
+    async def _assign_queued_subscribers(
         self,
         state: _SessionState,
         turn: TurnStart,
     ) -> None:
         async with state.lock:
-            if state.queued_subscriber is not None:
+            for subscriber in self._take_queued_subscribers(state, turn.message_ids):
                 self._install_newest_subscriber(
                     state,
                     turn_id=turn.turn_id,
-                    subscriber=state.queued_subscriber,
+                    subscriber=subscriber,
                 )
-                state.queued_subscriber = None
 
     async def _execute_chain(self, state: _SessionState, initial_turn: TurnStart) -> None:
         turn = initial_turn
@@ -503,7 +497,7 @@ class ChatRuntime:
                 status="completed",
                 final_message_id=last_result_id,
             )
-            await self._transfer_turn_subscriber(state, turn.turn_id, next_turn.turn_id)
+            await self._transfer_turn_subscriber(state, turn.turn_id, next_turn)
             turn = next_turn
 
     async def _prepare_turn(self, turn: TurnStart) -> _PreparedTurn:
@@ -970,19 +964,18 @@ class ChatRuntime:
         self,
         state: _SessionState,
         old_turn_id: UUID,
-        new_turn_id: UUID,
+        new_turn: TurnStart,
     ) -> None:
         async with state.lock:
             candidates = [
                 candidate
-                for candidate in (
+                for candidate in [
                     state.turn_subscribers.pop(old_turn_id, None),
-                    state.turn_subscribers.pop(new_turn_id, None),
-                    state.queued_subscriber,
-                )
+                    state.turn_subscribers.pop(new_turn.turn_id, None),
+                    *self._take_queued_subscribers(state, new_turn.message_ids),
+                ]
                 if candidate is not None and not candidate.closed
             ]
-            state.queued_subscriber = None
             if not candidates:
                 return
             winner = max(candidates, key=lambda candidate: candidate.accepted_at)
@@ -997,7 +990,7 @@ class ChatRuntime:
                     }
                 )
                 candidate.close()
-            state.turn_subscribers[new_turn_id] = winner
+            state.turn_subscribers[new_turn.turn_id] = winner
 
     async def _close_turn_subscriber(
         self,
@@ -1039,15 +1032,38 @@ class ChatRuntime:
         turn: TurnStart,
     ) -> None:
         async with state.lock:
-            subscriber = state.queued_subscriber
-            if subscriber is None or subscriber.message_id not in turn.message_ids:
-                return
-            state.queued_subscriber = None
-            self._install_newest_subscriber(
-                state,
-                turn_id=turn.turn_id,
-                subscriber=subscriber,
-            )
+            for subscriber in self._take_queued_subscribers(state, turn.message_ids):
+                self._install_newest_subscriber(
+                    state,
+                    turn_id=turn.turn_id,
+                    subscriber=subscriber,
+                )
+
+    def _queue_subscriber(
+        self,
+        state: _SessionState,
+        subscriber: StreamSubscriber,
+    ) -> None:
+        current = state.queued_subscribers.get(subscriber.message_id)
+        if current is None:
+            state.queued_subscribers[subscriber.message_id] = subscriber
+            return
+        state.queued_subscribers[subscriber.message_id] = self._replace_older(
+            current,
+            subscriber,
+        )
+
+    @staticmethod
+    def _take_queued_subscribers(
+        state: _SessionState,
+        message_ids: tuple[UUID, ...],
+    ) -> list[StreamSubscriber]:
+        return [
+            subscriber
+            for message_id in message_ids
+            if (subscriber := state.queued_subscribers.pop(message_id, None)) is not None
+            and not subscriber.closed
+        ]
 
     def _install_newest_subscriber(
         self,

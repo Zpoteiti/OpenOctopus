@@ -650,16 +650,21 @@ async def test_latest_queued_post_replaces_older_stream(
     )
     await _wait_for_pending(user_client, session_id, 2)
 
-    second_response = await asyncio.wait_for(second_task, timeout=2)
+    await asyncio.sleep(0)
+    assert second_task.done() is False
+
+    release.set()
+    first_response, second_response, third_response = await asyncio.gather(
+        first_task,
+        second_task,
+        third_task,
+    )
+    assert first_response.status_code == 200
     second_events = _events(second_response)
     assert [event["type"] for event in second_events] == [
         "message_accepted",
         "stream_replaced",
     ]
-
-    release.set()
-    first_response, third_response = await asyncio.gather(first_task, third_task)
-    assert first_response.status_code == 200
     third_events = _events(third_response)
     assert third_events[0]["disposition"] == "queued"
     assert len(third_events[1]["message_ids"]) == 2
@@ -713,13 +718,71 @@ async def test_latest_late_registration_replaces_older_running_preview(
     await runtime.close()
 
 
-async def test_delayed_initial_registration_does_not_replace_newer_queued_preview(
+async def test_idle_assignment_keeps_post_boundary_subscriber_queued(
     pg_engine,
     monkeypatch,
 ):
     runtime = ChatRuntime(pg_engine)
     session_id = uuid4()
     turn_id = uuid4()
+    captured_id = uuid4()
+    later_id = uuid4()
+    accepted_at = datetime.now(UTC)
+
+    async def pending_location(accepted: AcceptedMessage) -> tuple[str, Any]:
+        return "pending", None
+
+    monkeypatch.setattr(runtime, "_queued_location", pending_location)
+    captured = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=captured_id,
+            accepted_at=accepted_at,
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+    later = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=later_id,
+            accepted_at=accepted_at + timedelta(microseconds=1),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+
+    state = await runtime._state_for(session_id)
+    await runtime._assign_queued_subscribers(
+        state,
+        TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(captured_id,),
+            effort=None,
+        ),
+    )
+
+    assert state.turn_subscribers[turn_id] is captured
+    assert state.queued_subscribers[later_id] is later
+    assert captured.closed is False
+    assert later.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=captured)
+    await runtime.unregister(session_id=session_id, subscriber=later)
+    await runtime.close()
+
+
+async def test_delayed_initial_registration_keeps_post_boundary_subscriber_queued(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    older_id = uuid4()
+    newer_id = uuid4()
     accepted_at = datetime.now(UTC)
 
     async def pending_location(accepted: AcceptedMessage) -> tuple[str, Any]:
@@ -733,7 +796,7 @@ async def test_delayed_initial_registration_does_not_replace_newer_queued_previe
     newer = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=newer_id,
             accepted_at=accepted_at + timedelta(microseconds=1),
             disposition="queued",
             created_session=False,
@@ -743,26 +806,25 @@ async def test_delayed_initial_registration_does_not_replace_newer_queued_previe
     older = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=older_id,
             accepted_at=accepted_at,
             disposition="started",
             created_session=False,
             turn=TurnStart(
                 session_id=session_id,
                 turn_id=turn_id,
-                message_ids=(),
+                message_ids=(older_id,),
                 effort=None,
             ),
         )
     )
 
-    older_events = [json.loads(chunk) async for chunk in older.ndjson()]
-    assert [event["type"] for event in older_events] == [
-        "message_accepted",
-        "stream_replaced",
-    ]
-    assert older.closed is True
+    state = await runtime._state_for(session_id)
+    assert state.turn_subscribers[turn_id] is older
+    assert state.queued_subscribers[newer_id] is newer
+    assert older.closed is False
     assert newer.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=older)
     await runtime.unregister(session_id=session_id, subscriber=newer)
     await runtime.close()
 

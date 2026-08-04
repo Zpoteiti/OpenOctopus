@@ -585,14 +585,16 @@ The registry tracks:
 
 - whether a runner task exists;
 - the active-turn subscriber;
-- at most one newest queued subscriber;
+- queued subscribers by durable message ID;
 - runner wake-up state.
 
-When a newer queued POST arrives:
+When a safe boundary captures a pending batch:
 
-- the older queued subscriber receives `stream_replaced`;
-- the older message remains in `pending_messages`;
-- the new response becomes the preview candidate for the next drained batch.
+- the newest subscriber from that captured batch becomes its preview owner;
+- older subscribers from the same batch receive `stream_replaced` while their
+  messages remain durable;
+- subscribers for messages accepted after the boundary remain queued for the
+  following batch.
 
 The registry is not a durable queue and is intentionally empty after restart.
 

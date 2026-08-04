@@ -2882,12 +2882,13 @@ unit that can be replayed to providers and users.
   make several normal agent provider calls, so one connected POST preview can
   carry several `turn_started`/`turn_finished` pairs with distinct turn IDs.
 - If the session is already running, the accepted message is written to
-  `pending_messages`. The newest queued POST stream may wait for the next safe
-  boundary and become the live subscriber for the whole pending batch. Older
-  queued POST streams receive `stream_replaced` and close after their own
-  message is durable. If the newest queued stream disconnects before the batch
-  starts or finishes, the runner still proceeds and the frontend recovers by
-  polling `GET messages`.
+  `pending_messages`. Queued POST streams remain bound to their message IDs
+  until the next safe boundary captures a fixed pending batch. The newest
+  stream within that captured batch becomes its live subscriber; older streams
+  from the same batch receive `stream_replaced`, while streams for messages
+  accepted after the boundary remain queued for the following turn. If the
+  selected stream disconnects, the runner still proceeds and the frontend
+  recovers by polling `GET messages`.
 - If the POST response disconnects, the runner continues. The frontend recovers
   by polling `GET /api/sessions/{id}/messages` for message-level progress.
   OpenOctopus does not attempt cross-worker per-turn replay of missed token deltas

@@ -13,6 +13,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import openctopus_server.chat.runner as chat_runner
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Session, SystemConfig, TurnRun, User
 from openctopus_server.errors.codes import ErrorCode
@@ -509,6 +510,93 @@ async def test_pending_during_tool_waits_for_complete_pairing(
         "tool-2",
     ]
     assert messages[-1]["content"][-1] == {"type": "text", "text": "follow up"}
+
+
+async def test_post_boundary_subscriber_waits_for_its_captured_turn(
+    user_client,
+    pg_engine,
+    install_runtime,
+    monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    boundary_committed = asyncio.Event()
+    release_handoff = asyncio.Event()
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(content=[_tool_use("tool-1", "one")]),
+            _ProviderStep(content=[{"type": "text", "text": "second done"}]),
+            _ProviderStep(content=[{"type": "text", "text": "third done"}]),
+        ]
+    )
+    runtime = install_runtime(
+        provider,
+        _ScriptedTool(
+            [
+                _ToolStep(
+                    result=ToolResult(content="result"),
+                    started=tool_started,
+                    release=release_tool,
+                )
+            ]
+        ),
+    )
+    registered: asyncio.Queue[UUID] = asyncio.Queue()
+    original_register = runtime.register
+
+    async def track_queued_registration(accepted):
+        subscriber = await original_register(accepted)
+        if accepted.turn is None:
+            registered.put_nowait(accepted.message_id)
+        return subscriber
+
+    monkeypatch.setattr(runtime, "register", track_queued_registration)
+    original_finish = chat_runner.finish_tool_batch_and_continue
+
+    async def pause_after_boundary(*args: Any, **kwargs: Any):
+        next_turn = await original_finish(*args, **kwargs)
+        boundary_committed.set()
+        await release_handoff.wait()
+        return next_turn
+
+    monkeypatch.setattr(chat_runner, "finish_tool_batch_and_continue", pause_after_boundary)
+    session_id = uuid4()
+
+    first_task = asyncio.create_task(_post(user_client, session_id, "first"))
+    await asyncio.wait_for(tool_started.wait(), timeout=2)
+    second_task = asyncio.create_task(_post(user_client, session_id, "second"))
+    pending = await _wait_for_pending(user_client, session_id, 1)
+    second_id = pending["pending_messages"][0]["id"]
+    assert str(await asyncio.wait_for(registered.get(), timeout=2)) == second_id
+
+    release_tool.set()
+    await asyncio.wait_for(boundary_committed.wait(), timeout=2)
+    third_task = asyncio.create_task(_post(user_client, session_id, "third"))
+    pending = await _wait_for_pending(user_client, session_id, 2)
+    third_id = next(
+        row["id"]
+        for row in pending["pending_messages"]
+        if row["content"][-1] == {"type": "text", "text": "third"}
+    )
+    assert str(await asyncio.wait_for(registered.get(), timeout=2)) == third_id
+    release_handoff.set()
+
+    first_response, second_response, third_response = await asyncio.wait_for(
+        asyncio.gather(first_task, second_task, third_task),
+        timeout=2,
+    )
+
+    assert first_response.status_code == second_response.status_code == 200
+    assert third_response.status_code == 200
+    second_started = next(
+        event for event in _events(second_response) if event["type"] == "turn_started"
+    )
+    third_started = next(
+        event for event in _events(third_response) if event["type"] == "turn_started"
+    )
+    assert second_started["message_ids"] == [second_id]
+    assert third_started["message_ids"] == [third_id]
 
 
 async def test_pending_promoted_during_preflight_claims_newest_stream(
