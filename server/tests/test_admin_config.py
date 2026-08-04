@@ -6,8 +6,14 @@ from openctopus_server.services import system_config
 from openctopus_server.services.system_config import validate_llm_identity
 
 
-def _mock_models_response(model: str, status: int = 200) -> httpx.MockTransport:
+def _mock_models_response(
+    model: str,
+    status: int = 200,
+    captured: dict[str, str] | None = None,
+) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
+        if captured is not None:
+            captured["path"] = request.url.path
         return httpx.Response(
             status,
             json={"object": "list", "data": [{"id": model, "object": "model"}]},
@@ -40,9 +46,10 @@ async def test_get_config_defaults(admin_client):
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):
     original = validate_llm_identity
+    captured: dict[str, str] = {}
 
     async def mock_validate(endpoint, api_key, model, *, client=None):
-        mock_transport = _mock_models_response(model)
+        mock_transport = _mock_models_response(model, captured=captured)
         mock_client = httpx.AsyncClient(transport=mock_transport)
         await original(endpoint, api_key, model, client=mock_client)
         await mock_client.aclose()
@@ -54,16 +61,17 @@ async def test_patch_config_llm_success(admin_client, monkeypatch):
     response = await admin_client.patch(
         "/api/admin/config",
         json={
-            "llm_endpoint": "http://fake-llm/v1",
+            "llm_endpoint": "http://fake-llm",
             "llm_api_key": "fake-key",
             "llm_model": "fake-model",
         },
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["llm_endpoint"] == "http://fake-llm/v1"
+    assert body["llm_endpoint"] == "http://fake-llm"
     assert body["llm_api_key"] == "<redacted>"
     assert body["llm_model"] == "fake-model"
+    assert captured["path"] == "/v1/models"
 
 
 async def test_patch_config_unknown_key_returns_422(admin_client):
@@ -197,7 +205,7 @@ async def test_patch_config_llm_non_200_returns_400(admin_client, monkeypatch):
     response = await admin_client.patch(
         "/api/admin/config",
         json={
-            "llm_endpoint": "http://fake-llm/v1",
+            "llm_endpoint": "http://fake-llm",
             "llm_api_key": "fake-key",
             "llm_model": "fake-model",
         },
@@ -222,7 +230,7 @@ async def test_patch_config_llm_model_absent_returns_400(admin_client, monkeypat
     response = await admin_client.patch(
         "/api/admin/config",
         json={
-            "llm_endpoint": "http://fake-llm/v1",
+            "llm_endpoint": "http://fake-llm",
             "llm_api_key": "fake-key",
             "llm_model": "fake-model",
         },

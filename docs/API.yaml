@@ -1658,8 +1658,9 @@ paths:
           - `shared_workspace_quota_bytes` (int) — quota ceiling that any
             single shared workspace may request. If no row is configured, the
             effective default is 500 MiB (`524288000`). ADR-108.
-          - `llm_endpoint` (string) — base URL of the Anthropic-compatible
-            Messages API or gateway endpoint. ADR-101.
+          - `llm_endpoint` (string) — unversioned base URL of the
+            Anthropic-compatible Messages API or gateway (for example,
+            `https://api.anthropic.com`). Do not include `/v1`. ADR-101.
           - `llm_api_key` (string) — bearer credential the server uses on
             outbound LLM requests. Write-only in admin API responses: once
             configured, GET/PATCH responses return `"<redacted>"` instead of
@@ -1668,7 +1669,7 @@ paths:
             request body. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
             (e.g. `128000`). Counted for the configured model through the
-            Anthropic-compatible `POST /messages/count_tokens` route selected
+            Anthropic-compatible `POST /v1/messages/count_tokens` route selected
             for ADR-025. ADR-101.
           - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
             trigger. Missing disables compaction. When configured,
@@ -1701,7 +1702,7 @@ paths:
 
         Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` on PATCH
         after validating the merged provider identity with `GET
-        {llm_endpoint}/models`. `GET /api/admin/config` redacts configured
+        {llm_endpoint}/v1/models`. `GET /api/admin/config` redacts configured
         `llm_api_key` as `"<redacted>"`; callers rotate the key by sending a new
         value and keep the existing key by omitting it. Sending `"<redacted>"` as
         a new secret value is rejected.
@@ -1726,7 +1727,7 @@ paths:
 
         When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
         the server validates the provider before writing: `GET
-        {llm_endpoint}/models` must be reachable with the configured bearer
+        {llm_endpoint}/v1/models` must be reachable with the configured bearer
         credential, return a well-formed models response accepted by OpenOctopus,
         and include the configured `llm_model`. Validation failure returns
         `400 Bad Request` and leaves the existing DB config unchanged.

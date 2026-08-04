@@ -133,7 +133,7 @@ async def validate_llm_identity(
         client = httpx.AsyncClient(timeout=10.0)
     try:
         response = await client.get(
-            f"{endpoint}/models",
+            f"{endpoint.rstrip('/')}/v1/models",
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",

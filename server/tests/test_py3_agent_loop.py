@@ -165,7 +165,7 @@ async def _configure_provider(pg_engine) -> None:
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         db.add_all(
             [
-                SystemConfig(key="llm_endpoint", value="http://fake.test/v1"),
+                SystemConfig(key="llm_endpoint", value="http://fake.test"),
                 SystemConfig(key="llm_api_key", value="fake-key"),
                 SystemConfig(key="llm_model", value="fake-model"),
             ]

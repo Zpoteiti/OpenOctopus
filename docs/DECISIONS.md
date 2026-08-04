@@ -2038,7 +2038,7 @@ The admin configures the LLM via the admin REST API — **not env vars**. Seven 
 
 | Key | Type | Purpose |
 |---|---|---|
-| `llm_endpoint` | string | Base URL of the Anthropic-compatible API (for example an Anthropic Messages endpoint or a gateway exposing that shape). |
+| `llm_endpoint` | string | Unversioned base URL of the Anthropic-compatible API (for example `https://api.anthropic.com`); do not include `/v1`. |
 | `llm_api_key` | string | Bearer credential the server uses on outbound requests. |
 | `llm_model` | string | Model name passed in the request body (for example `claude-sonnet-4-5` or a gateway model alias). |
 | `llm_max_context_tokens` | integer | The LLM's hard context-window size in tokens. Counted against the full Anthropic Messages request — system + tools + history + new turn. |
@@ -2055,13 +2055,13 @@ exceed that context-window value. No `LLM_*` env vars; the only env vars
 relevant to LLM behavior are `DATABASE_URL` (so the server can read these keys
 at startup) and the JWT/auth secrets.
 
-When an admin changes `llm_endpoint`, `llm_api_key`, or `llm_model`, the server validates before writing to `system_config`: `GET {llm_endpoint}/models` must be reachable with the configured bearer credential, return a well-formed models response accepted by OpenOctopus, and include the configured `llm_model`. Failure rejects the admin request and leaves the existing DB config unchanged. Automated tests use a fake Anthropic-compatible HTTP server; real provider credentials are only needed for live smoke testing.
+When an admin changes `llm_endpoint`, `llm_api_key`, or `llm_model`, the server validates before writing to `system_config`: `GET {llm_endpoint}/v1/models` must be reachable with the configured bearer credential, return a well-formed models response accepted by OpenOctopus, and include the configured `llm_model`. `llm_endpoint` is the unversioned base URL; the provider SDK adds `/v1` to Messages requests. Failure rejects the admin request and leaves the existing DB config unchanged. Automated tests use a fake Anthropic-compatible HTTP server; real provider credentials are only needed for live smoke testing.
 
 Implementation sequencing: M1a exposed only the admin config keys that could be
 validated without the provider runtime, so `llm_endpoint`, `llm_api_key`, and
 `llm_model` were deliberately rejected in that slice. M1b implements the
 provider validation described above; those keys are now accepted only after the
-`/models` check succeeds.
+`/v1/models` check succeeds.
 
 **Consequences:** No provider abstraction trait, no per-provider modules, no vision-format adapters per provider — vision retry (ADR-026) targets a single request shape. Switching the model is a `PATCH` away. Switching to a non-Anthropic provider is "stand up a compatible gateway, change `llm_endpoint` and `llm_api_key`" — handled outside OpenOctopus. Admin operating overhead is the trade we're willing to make for codebase simplicity. The optional concurrency cap is deliberately provider-wide rather than heartbeat-specific, so weaker deployments can protect their LLM backend without changing individual subsystems.
 

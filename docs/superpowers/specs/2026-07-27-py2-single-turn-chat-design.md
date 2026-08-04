@@ -460,6 +460,9 @@ The adapter reads raw values from `system_config`, never the redacted admin DTO:
 - `llm_max_concurrent_requests` (missing/zero means unlimited);
 - context/compaction values reserved for later enforcement.
 
+`llm_endpoint` is the unversioned API base URL; admins do not include `/v1`.
+The Anthropic SDK appends `/v1` for Messages requests.
+
 Missing provider identity fails before user-message persistence with
 `503 provider_not_configured`.
 

@@ -442,7 +442,7 @@ async def test_provider_config_loads_and_validates_compaction_threshold(pg_engin
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         db.add_all(
             [
-                SystemConfig(key="llm_endpoint", value="http://fake.test/v1"),
+                SystemConfig(key="llm_endpoint", value="http://fake.test"),
                 SystemConfig(key="llm_api_key", value="fake-key"),
                 SystemConfig(key="llm_model", value="fake-model"),
                 SystemConfig(key="llm_max_context_tokens", value=128_000),

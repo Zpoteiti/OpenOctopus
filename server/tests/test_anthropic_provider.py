@@ -102,12 +102,12 @@ async def test_real_sdk_streaming_wire_and_max_tokens():
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncAnthropic(
         api_key="fake-key",
-        base_url="http://fake.test/v1",
+        base_url="http://fake.test",
         max_retries=0,
         http_client=http_client,
     )
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,
@@ -139,7 +139,7 @@ async def test_real_sdk_streaming_wire_and_max_tokens():
         tools=[tool_schema],
     )
 
-    assert captured["path"].endswith("/messages")
+    assert captured["path"] == "/v1/messages"
     assert captured["body"]["max_tokens"] == 16384
     assert captured["body"]["thinking"] == {"type": "disabled"}
     assert captured["body"]["tools"] == [tool_schema]
@@ -167,12 +167,12 @@ async def test_real_sdk_count_tokens_wire():
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncAnthropic(
         api_key="fake-key",
-        base_url="http://fake.test/v1",
+        base_url="http://fake.test",
         max_retries=0,
         http_client=http_client,
     )
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,
@@ -204,7 +204,7 @@ async def test_real_sdk_count_tokens_wire():
     )
 
     assert count == 42
-    assert captured["path"].endswith("/messages/count_tokens")
+    assert captured["path"] == "/v1/messages/count_tokens"
     assert captured["body"] == {
         "model": "fake-model",
         "system": "system",
@@ -219,7 +219,7 @@ async def test_real_sdk_count_tokens_wire():
 
 async def test_count_tokens_retries_and_image_fallback_gets_a_fresh_budget(monkeypatch):
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,
@@ -300,7 +300,7 @@ async def test_count_tokens_retries_and_image_fallback_gets_a_fresh_budget(monke
 
 async def test_transient_retry_stops_after_first_delta(monkeypatch):
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,
@@ -345,7 +345,7 @@ async def test_transient_retry_stops_after_first_delta(monkeypatch):
 
 async def test_transient_failure_retries_before_first_delta(monkeypatch):
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,
@@ -398,7 +398,7 @@ async def test_transient_failure_retries_before_first_delta(monkeypatch):
 
 async def test_image_fallback_starts_a_fresh_retry_budget(monkeypatch):
     config = ProviderConfig(
-        endpoint="http://fake.test/v1",
+        endpoint="http://fake.test",
         api_key="fake-key",
         model="fake-model",
         max_output_tokens=16384,

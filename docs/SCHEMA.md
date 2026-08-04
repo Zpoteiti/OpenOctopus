@@ -32,7 +32,7 @@ unsupported keys return `400 Bad Request`):
 |---|---|---|---|
 | `quota_bytes` | int | ADR-046 | Per-user workspace quota. Missing means the effective default is 500 MiB (`524288000`). |
 | `shared_workspace_quota_bytes` | int | ADR-108 | Quota ceiling that any single shared workspace may request at create or rename time. Missing means the effective default is 500 MiB (`524288000`). |
-| `llm_endpoint` | string | ADR-101 | Anthropic-compatible Messages API base URL. |
+| `llm_endpoint` | string | ADR-101 | Unversioned base URL of an Anthropic-compatible Messages API; do not include `/v1`. |
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with the configured-model Python tokenizer strategy (ADR-025, ADR-101). |
@@ -58,7 +58,7 @@ outside the admin-editable table above, including `server_mcp` and
 Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` only after provider
 validation succeeds. First setup must provide all three identity values; later
 PATCHes may reuse stored values by omitting unchanged identity keys. Validation
-uses `GET {llm_endpoint}/models` before any DB write, so failed identity
+uses `GET {llm_endpoint}/v1/models` before any DB write, so failed identity
 changes do not persist paired config updates. `llm_api_key` is stored in
 `system_config` for outbound calls but redacted as `"<redacted>"` in admin
 config read and patch responses. Sending the literal redaction marker as a new

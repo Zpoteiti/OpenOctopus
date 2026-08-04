@@ -134,7 +134,7 @@ async def test_provider_context_filters_compacted_rows(pg_engine) -> None:
             db,
             session_id=session.id,
             config=ProviderConfig(
-                endpoint="http://fake.test/v1",
+                endpoint="http://fake.test",
                 api_key="key",
                 model="model",
                 max_output_tokens=1024,
