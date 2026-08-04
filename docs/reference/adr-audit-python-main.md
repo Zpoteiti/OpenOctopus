@@ -195,7 +195,9 @@ canonical message polling plus best-effort current-turn POST streaming.
 - Mid-turn browser follow-ups are durable `pending_messages`. The newest queued
   POST response within a captured batch may become that batch's live subscriber;
   older responses from the same batch close with `stream_replaced`, while later
-  arrivals wait for the following batch.
+  arrivals wait for the following batch. Delayed registrations attach only when
+  their message IDs remain in the active preview batch; otherwise they close and
+  recover through the canonical GET surface.
 - Browser progress events use `PostMessageStreamEvent` (`token_delta`,
   `tool_progress`, `message_persisted`, `turn_finished`, `stream_replaced`, and
   keepalive). Channel adapters may aggregate or drop equivalent transient

@@ -596,6 +596,10 @@ When a safe boundary captures a pending batch:
 - subscribers for messages accepted after the boundary remain queued for the
   following batch.
 
+A delayed subscriber registration may attach to a running turn only while its
+message ID belongs to that turn's active preview batch. Otherwise it closes and
+the frontend recovers through `GET messages`.
+
 The registry is not a durable queue and is intentionally empty after restart.
 
 ### Race handling

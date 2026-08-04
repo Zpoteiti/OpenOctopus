@@ -68,6 +68,8 @@ class _SessionState:
     runner_task: asyncio.Task[None] | None = None
     turn_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
     queued_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
+    active_turn_id: UUID | None = None
+    active_preview_message_ids: frozenset[UUID] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +134,12 @@ class ChatRuntime:
             if accepted.turn is None:
                 location, running_turn_id = await self._queued_location(accepted)
                 if location == "running" and running_turn_id is not None:
+                    if (
+                        state.active_turn_id != running_turn_id
+                        or accepted.message_id not in state.active_preview_message_ids
+                    ):
+                        subscriber.close()
+                        return subscriber
                     self._install_newest_subscriber(
                         state,
                         turn_id=running_turn_id,
@@ -147,6 +155,7 @@ class ChatRuntime:
             if not await self._turn_is_running(accepted.turn.turn_id):
                 subscriber.close()
                 return subscriber
+            self._set_active_turn(state, accepted.turn, inherit_preview=False)
             candidates = [
                 subscriber,
                 *self._take_queued_subscribers(state, accepted.turn.message_ids),
@@ -198,6 +207,7 @@ class ChatRuntime:
     async def _schedule_turn(self, turn: TurnStart) -> None:
         state = await self._state_for(turn.session_id)
         async with state.lock:
+            self._set_active_turn(state, turn, inherit_preview=False)
             state.starts.append(turn)
             self._ensure_runner_locked(state)
 
@@ -298,6 +308,7 @@ class ChatRuntime:
         turn: TurnStart,
     ) -> None:
         async with state.lock:
+            self._set_active_turn(state, turn, inherit_preview=False)
             for subscriber in self._take_queued_subscribers(state, turn.message_ids):
                 self._install_newest_subscriber(
                     state,
@@ -316,6 +327,8 @@ class ChatRuntime:
                 for attempt in range(2):
                     async with AsyncSession(self.engine, expire_on_commit=False) as db:
                         turn = await capture_pending_for_turn(db, turn=turn)
+                    async with state.lock:
+                        self._set_active_turn(state, turn, inherit_preview=True)
                     try:
                         prepared = await self._prepare_turn(turn)
                         turn = prepared.turn
@@ -967,6 +980,7 @@ class ChatRuntime:
         new_turn: TurnStart,
     ) -> None:
         async with state.lock:
+            self._set_active_turn(state, new_turn, inherit_preview=True)
             candidates = [
                 candidate
                 for candidate in [
@@ -1001,11 +1015,14 @@ class ChatRuntime:
             subscriber = state.turn_subscribers.pop(turn_id, None)
             if subscriber is not None:
                 subscriber.close()
+            self._clear_active_turn(state, turn_id)
 
     async def _close_chain_subscribers(self, state: _SessionState) -> None:
         async with state.lock:
             subscribers = list(state.turn_subscribers.values())
             state.turn_subscribers.clear()
+            state.active_turn_id = None
+            state.active_preview_message_ids = frozenset()
             for subscriber in subscribers:
                 subscriber.close()
 
@@ -1019,6 +1036,7 @@ class ChatRuntime:
                 candidate for candidate in state.turn_subscribers.values() if not candidate.closed
             ]
             state.turn_subscribers.clear()
+            state.active_turn_id = turn_id
             if not candidates:
                 return
             winner = candidates[0]
@@ -1052,6 +1070,26 @@ class ChatRuntime:
             current,
             subscriber,
         )
+
+    @staticmethod
+    def _set_active_turn(
+        state: _SessionState,
+        turn: TurnStart,
+        *,
+        inherit_preview: bool,
+    ) -> None:
+        state.active_turn_id = turn.turn_id
+        if turn.message_ids:
+            state.active_preview_message_ids = frozenset(turn.message_ids)
+        elif not inherit_preview:
+            state.active_preview_message_ids = frozenset()
+
+    @staticmethod
+    def _clear_active_turn(state: _SessionState, turn_id: UUID) -> None:
+        if state.active_turn_id != turn_id:
+            return
+        state.active_turn_id = None
+        state.active_preview_message_ids = frozenset()
 
     @staticmethod
     def _take_queued_subscribers(

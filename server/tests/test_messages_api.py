@@ -671,35 +671,49 @@ async def test_latest_queued_post_replaces_older_stream(
     await runtime.close()
 
 
-async def test_latest_late_registration_replaces_older_running_preview(
+async def test_late_registration_does_not_replace_unrelated_running_preview(
     pg_engine,
     monkeypatch,
 ):
     runtime = ChatRuntime(pg_engine)
     session_id = uuid4()
     turn_id = uuid4()
+    active_message_id = uuid4()
+    late_message_id = uuid4()
     accepted_at = datetime.now(UTC)
+    location = "pending"
 
-    async def running_location(
+    async def queued_location(
         accepted: AcceptedMessage,
     ) -> tuple[str, Any]:
-        return "running", turn_id
+        return location, turn_id if location == "running" else None
 
-    monkeypatch.setattr(runtime, "_queued_location", running_location)
-    older = await runtime.register(
+    monkeypatch.setattr(runtime, "_queued_location", queued_location)
+    active = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=active_message_id,
             accepted_at=accepted_at,
             disposition="queued",
             created_session=False,
             turn=None,
         )
     )
-    newer = await runtime.register(
+    state = await runtime._state_for(session_id)
+    await runtime._assign_queued_subscribers(
+        state,
+        TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(active_message_id,),
+            effort=None,
+        ),
+    )
+    location = "running"
+    late = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=late_message_id,
             accepted_at=accepted_at + timedelta(microseconds=1),
             disposition="queued",
             created_session=False,
@@ -707,14 +721,65 @@ async def test_latest_late_registration_replaces_older_running_preview(
         )
     )
 
-    older_events = [json.loads(chunk) async for chunk in older.ndjson()]
-    assert [event["type"] for event in older_events] == [
-        "message_accepted",
-        "stream_replaced",
-    ]
-    assert older.closed is True
-    assert newer.closed is False
-    await runtime.unregister(session_id=session_id, subscriber=newer)
+    assert active.closed is False
+    assert late.closed is True
+    late_events = [json.loads(chunk) async for chunk in late.ndjson()]
+    assert [event["type"] for event in late_events] == ["message_accepted"]
+    await runtime.unregister(session_id=session_id, subscriber=active)
+    await runtime.close()
+
+
+async def test_late_registration_joins_its_matching_running_continuation(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    initial_turn_id = uuid4()
+    continuation_turn_id = uuid4()
+    message_id = uuid4()
+
+    async def running_location(
+        accepted: AcceptedMessage,
+    ) -> tuple[str, Any]:
+        return "running", continuation_turn_id
+
+    monkeypatch.setattr(runtime, "_queued_location", running_location)
+    state = await runtime._state_for(session_id)
+    await runtime._assign_queued_subscribers(
+        state,
+        TurnStart(
+            session_id=session_id,
+            turn_id=initial_turn_id,
+            message_ids=(message_id,),
+            effort=None,
+        ),
+    )
+    await runtime._transfer_turn_subscriber(
+        state,
+        initial_turn_id,
+        TurnStart(
+            session_id=session_id,
+            turn_id=continuation_turn_id,
+            message_ids=(),
+            effort=None,
+        ),
+    )
+
+    subscriber = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=message_id,
+            accepted_at=datetime.now(UTC),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+
+    assert subscriber.closed is False
+    assert state.turn_subscribers[continuation_turn_id] is subscriber
+    await runtime.unregister(session_id=session_id, subscriber=subscriber)
     await runtime.close()
 
 

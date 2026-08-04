@@ -2887,8 +2887,10 @@ unit that can be replayed to providers and users.
   stream within that captured batch becomes its live subscriber; older streams
   from the same batch receive `stream_replaced`, while streams for messages
   accepted after the boundary remain queued for the following turn. If the
-  selected stream disconnects, the runner still proceeds and the frontend
-  recovers by polling `GET messages`.
+  selected stream disconnects, the runner still proceeds. A delayed subscriber
+  registration may join only while its message ID still belongs to the active
+  preview batch; otherwise it closes and the frontend recovers by polling
+  `GET messages`.
 - If the POST response disconnects, the runner continues. The frontend recovers
   by polling `GET /api/sessions/{id}/messages` for message-level progress.
   OpenOctopus does not attempt cross-worker per-turn replay of missed token deltas
