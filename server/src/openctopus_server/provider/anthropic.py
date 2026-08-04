@@ -37,7 +37,19 @@ class Provider(Protocol):
         effort: Effort | None,
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResult: ...
+
+    async def count_tokens(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: Effort | None,
+        limiter: ProviderLimiter,
+    ) -> int: ...
 
     async def close(self) -> None: ...
 
@@ -67,6 +79,7 @@ class AnthropicProvider:
         effort: Effort | None,
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResult:
         await limiter.configure(config.max_concurrent_requests)
         projected_messages = messages
@@ -88,6 +101,7 @@ class AnthropicProvider:
                             config=config,
                             system=system,
                             messages=projected_messages,
+                            tools=tools or [],
                             effort=effort,
                             on_delta=emit,
                         )
@@ -121,12 +135,82 @@ class AnthropicProvider:
                 continue
             raise ProviderInvocationError("Provider request failed")
 
+    async def count_tokens(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: Effort | None,
+        limiter: ProviderLimiter,
+    ) -> int:
+        await limiter.configure(config.max_concurrent_requests)
+        projected_messages = messages
+        stripped_images = False
+
+        while True:
+            switch_to_text_only = False
+            for projection_attempt in range(3):
+                try:
+                    async with limiter.slot():
+                        return await self._count_attempt(
+                            config=config,
+                            system=system,
+                            messages=projected_messages,
+                            tools=tools,
+                            effort=effort,
+                        )
+                except ProviderInvocationError:
+                    raise
+                except Exception as exc:
+                    if (
+                        not stripped_images
+                        and _contains_images(projected_messages)
+                        and _is_image_compatibility_error(exc)
+                    ):
+                        switch_to_text_only = True
+                        break
+                    if projection_attempt < 2 and _is_retryable(exc):
+                        await asyncio.sleep(0.25 * (2**projection_attempt))
+                        continue
+                    raise ProviderInvocationError(f"Provider token count failed: {exc}") from exc
+
+            if switch_to_text_only:
+                projected_messages = _strip_images(projected_messages)
+                stripped_images = True
+                continue
+            raise ProviderInvocationError("Provider token count failed")
+
+    async def _count_attempt(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: Effort | None,
+    ) -> int:
+        request: dict[str, Any] = {
+            "model": config.model,
+            "system": system,
+            "messages": messages,
+            "cache_control": {"type": "ephemeral"},
+        }
+        if tools:
+            request["tools"] = tools
+        request.update(_thinking_controls(effort))
+        count_method: Any = self._client.messages.count_tokens
+        result = await count_method(**request)
+        return int(result.input_tokens)
+
     async def _stream_attempt(
         self,
         *,
         config: ProviderConfig,
         system: str,
         messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
         effort: Effort | None,
         on_delta: DeltaCallback,
     ) -> list[dict[str, Any]]:
@@ -137,11 +221,9 @@ class AnthropicProvider:
             "messages": messages,
             "cache_control": {"type": "ephemeral"},
         }
-        if effort is None or effort == Effort.OFF:
-            request["thinking"] = {"type": "disabled"}
-        else:
-            request["thinking"] = {"type": "adaptive"}
-            request["output_config"] = {"effort": effort.value}
+        if tools:
+            request["tools"] = tools
+        request.update(_thinking_controls(effort))
 
         stream_method: Any = self._client.messages.stream
         async with stream_method(**request) as stream:
@@ -170,9 +252,13 @@ class AnthropicProvider:
             elif block_type == "redacted_thinking":
                 content.append({"type": "redacted_thinking", "data": block.data})
             elif block_type == "tool_use":
-                raise ProviderInvocationError(
-                    "Provider returned tool_use during tool-less Py2",
-                    protocol=True,
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    }
                 )
             else:
                 raise ProviderInvocationError(
@@ -190,6 +276,15 @@ class AnthropicProvider:
 def provider_fingerprint(config: ProviderConfig) -> str:
     source = f"{config.endpoint.rstrip('/')}\0{config.model}".encode()
     return hashlib.sha256(source).hexdigest()
+
+
+def _thinking_controls(effort: Effort | None) -> dict[str, Any]:
+    if effort is None or effort == Effort.OFF:
+        return {"thinking": {"type": "disabled"}}
+    return {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort.value},
+    }
 
 
 def _contains_images(messages: list[dict[str, Any]]) -> bool:

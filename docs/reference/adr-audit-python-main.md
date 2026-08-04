@@ -53,9 +53,10 @@ classified before implementation depends on it.
   disconnects or process restarts.
 - Pending browser messages drain as a batch at the next safe boundary. If
   multiple browser POSTs arrive while a session is running, every accepted
-  message remains durable in `pending_messages`, but only the newest queued POST
-  response is kept as the live subscriber for the upcoming batch. Older queued
-  responses receive `stream_replaced` and close.
+  message remains durable in `pending_messages`. Queued responses remain bound
+  to their message IDs until capture; the newest response within the captured
+  batch becomes its live subscriber, and older responses from that batch
+  receive `stream_replaced` and close.
 - `GET /api/sessions/{id}/messages` returns a DB-only snapshot with canonical
   `messages` and durable `pending_messages` separated. Pending rows keep the
   same UUID they will use after safe-boundary drain, allowing frontend
@@ -192,8 +193,11 @@ canonical message polling plus best-effort current-turn POST streaming.
   surface. It returns persisted complete messages, durable pending messages, and
   run status, but never in-flight token deltas.
 - Mid-turn browser follow-ups are durable `pending_messages`. The newest queued
-  POST response may become the live subscriber for the next drained batch; older
-  queued responses close with `stream_replaced` after their own input is durable.
+  POST response within a captured batch may become that batch's live subscriber;
+  older responses from the same batch close with `stream_replaced`, while later
+  arrivals wait for the following batch. Delayed registrations attach only when
+  their message IDs remain in the active preview batch; otherwise they close and
+  recover through the canonical GET surface.
 - Browser progress events use `PostMessageStreamEvent` (`token_delta`,
   `tool_progress`, `message_persisted`, `turn_finished`, `stream_replaced`, and
   keepalive). Channel adapters may aggregate or drop equivalent transient

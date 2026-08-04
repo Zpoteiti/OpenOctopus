@@ -19,6 +19,11 @@ router = APIRouter(
     tags=["Sessions"],
 )
 
+control_router = APIRouter(
+    prefix="/api/sessions/{session_id}",
+    tags=["Sessions"],
+)
+
 
 def get_chat_runtime(request: Request) -> ChatRuntime:
     runtime = getattr(request.app.state, "chat_runtime", None)
@@ -83,3 +88,17 @@ async def post_message(
         event_stream(),
         media_type="application/x-ndjson",
     )
+
+
+@control_router.post("/cancel", status_code=202)
+async def cancel_session(
+    session_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, bool]:
+    cancel_requested = await messages.request_cancel(
+        db,
+        user_id=user.id,
+        session_id=session_id,
+    )
+    return {"cancel_requested": cancel_requested}

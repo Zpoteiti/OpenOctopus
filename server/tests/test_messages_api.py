@@ -5,14 +5,14 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.chat.public_projection import build_runtime_block
 from openctopus_server.chat.runner import ChatRuntime
-from openctopus_server.chat.types import AcceptedMessage
+from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.db.models import (
     Message,
     PendingMessage,
@@ -31,8 +31,10 @@ from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services.messages import (
+    capture_pending_for_turn,
     drain_pending_and_create_turn,
     get_messages_response,
+    promote_pending_for_turn,
 )
 from openctopus_server.services.turn_runs import abandon_running_turns
 
@@ -60,6 +62,7 @@ class FakeProvider:
         effort: Effort | None,
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResult:
         step = self.steps.popleft()
         self.calls.append(
@@ -68,6 +71,7 @@ class FakeProvider:
                 "system": system,
                 "messages": messages,
                 "effort": effort,
+                "tools": tools,
             }
         )
         if step.started is not None:
@@ -83,6 +87,19 @@ class FakeProvider:
             fingerprint=provider_fingerprint(config),
         )
 
+    async def count_tokens(
+        self,
+        *,
+        config: ProviderConfig,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: Effort | None,
+        limiter: ProviderLimiter,
+    ) -> int:
+        del config, system, tools, effort, limiter
+        return sum(len(json.dumps(message)) for message in messages)
+
     async def close(self) -> None:
         return None
 
@@ -91,7 +108,7 @@ async def _configure_provider(pg_engine) -> None:
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         db.add_all(
             [
-                SystemConfig(key="llm_endpoint", value="http://fake.test/v1"),
+                SystemConfig(key="llm_endpoint", value="http://fake.test"),
                 SystemConfig(key="llm_api_key", value="fake-key"),
                 SystemConfig(key="llm_model", value="fake-model"),
             ]
@@ -119,6 +136,15 @@ async def _wait_for_pending(client, session_id: str, expected: int) -> dict[str,
             return response.json()
         await asyncio.sleep(0.01)
     raise AssertionError(f"pending_count never reached {expected}")
+
+
+async def _wait_for_state_eviction(runtime: ChatRuntime, session_id: UUID) -> None:
+    for _ in range(100):
+        async with runtime._states_lock:
+            if session_id not in runtime._states:
+                return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"runtime state was not evicted for {session_id}")
 
 
 async def test_get_empty_session_keeps_required_nullable_fields(
@@ -244,6 +270,51 @@ async def test_post_streams_and_get_recovers_canonical_history(
     await runtime.close()
 
 
+async def test_completed_session_state_is_evicted_and_reactivated(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider(
+        [
+            FakeStep(content=[{"type": "text", "text": "first"}]),
+            FakeStep(content=[{"type": "text", "text": "second"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = UUID("1cd4a7e8-4010-4dc3-b2e4-021a8fac60a7")
+
+    first = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "one"}], "attachments": []},
+    )
+    assert first.status_code == 200
+    await _wait_for_state_eviction(runtime, session_id)
+
+    second = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "two"}], "attachments": []},
+    )
+    assert second.status_code == 200
+    await _wait_for_state_eviction(runtime, session_id)
+    assert len(provider.calls) == 2
+    await runtime.close()
+
+
+async def test_active_state_lease_blocks_idle_eviction(pg_engine):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._evict_state_if_idle(state)
+        assert runtime._states[session_id] is state
+
+    assert session_id not in runtime._states
+    await runtime.close()
+
+
 async def test_same_session_overlap_is_durable_and_drains(
     user_client,
     test_app,
@@ -338,7 +409,6 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
             Message(
                 id=uuid4(),
                 session_id=session_id,
-                role="user",
                 message_kind="human",
                 content=[{"type": "text", "text": "first"}],
                 delivery_refs=[],
@@ -411,6 +481,183 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
     assert visible_ids.count(pending_id) == 1
 
 
+async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
+    user_client,
+    pg_engine,
+) -> None:
+    del user_client
+    now = datetime.now(UTC)
+    session_id = uuid4()
+    turn_id = uuid4()
+    first_id = uuid4()
+    second_id = uuid4()
+    late_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                TurnRun(
+                    id=turn_id,
+                    session_id=session_id,
+                    runner_instance_id=uuid4(),
+                    status="running",
+                    started_at=now,
+                ),
+                PendingMessage(
+                    id=first_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "captured"}],
+                    effort="low",
+                    received_at=now,
+                ),
+                PendingMessage(
+                    id=second_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "also captured"}],
+                    effort="medium",
+                    received_at=now + timedelta(microseconds=1),
+                ),
+            ]
+        )
+        await db.commit()
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(),
+            effort=None,
+        )
+
+        captured = await capture_pending_for_turn(db, turn=turn)
+        db.add(
+            PendingMessage(
+                id=late_id,
+                session_id=session_id,
+                user_id=user.id,
+                session_key=session.session_key,
+                content=[{"type": "text", "text": "late"}],
+                effort="high",
+                received_at=now + timedelta(microseconds=2),
+            )
+        )
+        await db.commit()
+        captured_again = await capture_pending_for_turn(db, turn=captured)
+        promoted = await promote_pending_for_turn(db, turn=captured)
+        promoted_again = await promote_pending_for_turn(db, turn=captured)
+        canonical_ids = tuple(
+            (
+                await db.execute(
+                    select(Message.id)
+                    .where(Message.session_id == session_id)
+                    .order_by(Message.created_at, Message.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending_ids = tuple(
+            (
+                await db.execute(
+                    select(PendingMessage.id)
+                    .where(PendingMessage.session_id == session_id)
+                    .order_by(PendingMessage.received_at, PendingMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert captured.message_ids == (first_id, second_id)
+    assert captured.effort == Effort.MEDIUM
+    assert captured_again == promoted == promoted_again == captured
+    assert canonical_ids == (first_id, second_id)
+    assert pending_ids == (late_id,)
+
+
+async def test_pending_promotion_with_an_empty_capture_leaves_the_queue_untouched(
+    user_client,
+    pg_engine,
+) -> None:
+    del user_client
+    now = datetime.now(UTC)
+    session_id = uuid4()
+    turn_id = uuid4()
+    pending_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                TurnRun(
+                    id=turn_id,
+                    session_id=session_id,
+                    runner_instance_id=uuid4(),
+                    status="running",
+                    started_at=now,
+                ),
+                PendingMessage(
+                    id=pending_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "late"}],
+                    received_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(),
+            effort=None,
+        )
+
+        unchanged = await promote_pending_for_turn(db, turn=turn)
+        canonical_count = len(
+            (await db.execute(select(Message.id).where(Message.session_id == session_id)))
+            .scalars()
+            .all()
+        )
+        pending_ids = tuple(
+            (
+                await db.execute(
+                    select(PendingMessage.id).where(PendingMessage.session_id == session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert unchanged == turn
+    assert canonical_count == 0
+    assert pending_ids == (pending_id,)
+
+
 async def test_latest_queued_post_replaces_older_stream(
     user_client,
     test_app,
@@ -457,51 +704,71 @@ async def test_latest_queued_post_replaces_older_stream(
     )
     await _wait_for_pending(user_client, session_id, 2)
 
-    second_response = await asyncio.wait_for(second_task, timeout=2)
+    await asyncio.sleep(0)
+    assert second_task.done() is False
+
+    release.set()
+    first_response, second_response, third_response = await asyncio.gather(
+        first_task,
+        second_task,
+        third_task,
+    )
+    assert first_response.status_code == 200
     second_events = _events(second_response)
     assert [event["type"] for event in second_events] == [
         "message_accepted",
         "stream_replaced",
     ]
-
-    release.set()
-    first_response, third_response = await asyncio.gather(first_task, third_task)
-    assert first_response.status_code == 200
     third_events = _events(third_response)
     assert third_events[0]["disposition"] == "queued"
     assert len(third_events[1]["message_ids"]) == 2
     await runtime.close()
 
 
-async def test_latest_late_registration_replaces_older_running_preview(
+async def test_late_registration_does_not_replace_unrelated_running_preview(
     pg_engine,
     monkeypatch,
 ):
     runtime = ChatRuntime(pg_engine)
     session_id = uuid4()
     turn_id = uuid4()
+    active_message_id = uuid4()
+    late_message_id = uuid4()
     accepted_at = datetime.now(UTC)
+    location = "pending"
 
-    async def running_location(
+    async def queued_location(
         accepted: AcceptedMessage,
     ) -> tuple[str, Any]:
-        return "running", turn_id
+        return location, turn_id if location == "running" else None
 
-    monkeypatch.setattr(runtime, "_queued_location", running_location)
-    older = await runtime.register(
+    monkeypatch.setattr(runtime, "_queued_location", queued_location)
+    active = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=active_message_id,
             accepted_at=accepted_at,
             disposition="queued",
             created_session=False,
             turn=None,
         )
     )
-    newer = await runtime.register(
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(active_message_id,),
+                effort=None,
+            ),
+        )
+    location = "running"
+    late = await runtime.register(
         AcceptedMessage(
             session_id=session_id,
-            message_id=uuid4(),
+            message_id=late_message_id,
             accepted_at=accepted_at + timedelta(microseconds=1),
             disposition="queued",
             created_session=False,
@@ -509,13 +776,178 @@ async def test_latest_late_registration_replaces_older_running_preview(
         )
     )
 
-    older_events = [json.loads(chunk) async for chunk in older.ndjson()]
-    assert [event["type"] for event in older_events] == [
-        "message_accepted",
-        "stream_replaced",
-    ]
-    assert older.closed is True
-    assert newer.closed is False
+    assert active.closed is False
+    assert late.closed is True
+    late_events = [json.loads(chunk) async for chunk in late.ndjson()]
+    assert [event["type"] for event in late_events] == ["message_accepted"]
+    await runtime.unregister(session_id=session_id, subscriber=active)
+    await runtime.close()
+
+
+async def test_late_registration_joins_its_matching_running_continuation(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    initial_turn_id = uuid4()
+    continuation_turn_id = uuid4()
+    message_id = uuid4()
+
+    async def running_location(
+        accepted: AcceptedMessage,
+    ) -> tuple[str, Any]:
+        return "running", continuation_turn_id
+
+    monkeypatch.setattr(runtime, "_queued_location", running_location)
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=initial_turn_id,
+                message_ids=(message_id,),
+                effort=None,
+            ),
+        )
+        await runtime._transfer_turn_subscriber(
+            state,
+            initial_turn_id,
+            TurnStart(
+                session_id=session_id,
+                turn_id=continuation_turn_id,
+                message_ids=(),
+                effort=None,
+            ),
+        )
+
+        subscriber = await runtime.register(
+            AcceptedMessage(
+                session_id=session_id,
+                message_id=message_id,
+                accepted_at=datetime.now(UTC),
+                disposition="queued",
+                created_session=False,
+                turn=None,
+            )
+        )
+
+        assert subscriber.closed is False
+        assert state.turn_subscribers[continuation_turn_id] is subscriber
+        await runtime.unregister(session_id=session_id, subscriber=subscriber)
+    await runtime.close()
+
+
+async def test_idle_assignment_keeps_post_boundary_subscriber_queued(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    captured_id = uuid4()
+    later_id = uuid4()
+    accepted_at = datetime.now(UTC)
+
+    async def pending_location(accepted: AcceptedMessage) -> tuple[str, Any]:
+        return "pending", None
+
+    monkeypatch.setattr(runtime, "_queued_location", pending_location)
+    captured = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=captured_id,
+            accepted_at=accepted_at,
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+    later = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=later_id,
+            accepted_at=accepted_at + timedelta(microseconds=1),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(captured_id,),
+                effort=None,
+            ),
+        )
+
+        assert state.turn_subscribers[turn_id] is captured
+        assert state.queued_subscribers[later_id] is later
+        assert captured.closed is False
+        assert later.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=captured)
+    await runtime.unregister(session_id=session_id, subscriber=later)
+    await runtime.close()
+
+
+async def test_delayed_initial_registration_keeps_post_boundary_subscriber_queued(
+    pg_engine,
+    monkeypatch,
+):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    older_id = uuid4()
+    newer_id = uuid4()
+    accepted_at = datetime.now(UTC)
+
+    async def pending_location(accepted: AcceptedMessage) -> tuple[str, Any]:
+        return "pending", None
+
+    async def turn_is_running(candidate: Any) -> bool:
+        return candidate == turn_id
+
+    monkeypatch.setattr(runtime, "_queued_location", pending_location)
+    monkeypatch.setattr(runtime, "_turn_is_running", turn_is_running)
+    newer = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=newer_id,
+            accepted_at=accepted_at + timedelta(microseconds=1),
+            disposition="queued",
+            created_session=False,
+            turn=None,
+        )
+    )
+    older = await runtime.register(
+        AcceptedMessage(
+            session_id=session_id,
+            message_id=older_id,
+            accepted_at=accepted_at,
+            disposition="started",
+            created_session=False,
+            turn=TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(older_id,),
+                effort=None,
+            ),
+        )
+    )
+
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        assert state.turn_subscribers[turn_id] is older
+        assert state.queued_subscribers[newer_id] is newer
+        assert older.closed is False
+        assert newer.closed is False
+    await runtime.unregister(session_id=session_id, subscriber=older)
     await runtime.unregister(session_id=session_id, subscriber=newer)
     await runtime.close()
 
@@ -757,7 +1189,6 @@ async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
             Message(
                 id=uuid4(),
                 session_id=session_id,
-                role="user",
                 message_kind="human",
                 content=[
                     build_runtime_block(

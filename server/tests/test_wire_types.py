@@ -26,9 +26,7 @@ def test_text_block_round_trip():
 
 
 def test_image_block_round_trip():
-    block = ImageBlock(
-        source={"type": "base64", "media_type": "image/png", "data": "abc123"}
-    )
+    block = ImageBlock(source={"type": "base64", "media_type": "image/png", "data": "abc123"})
     data = json.loads(block.model_dump_json())
     parsed = pydantic.TypeAdapter(ContentBlock).validate_python(data)
     assert isinstance(parsed, ImageBlock)
@@ -36,10 +34,12 @@ def test_image_block_round_trip():
 
 
 def test_tool_result_block_accepts_string_or_list():
-    block_str = ToolResultBlock(tool_use_id="1", content="plain text")
+    block_str = ToolResultBlock(tool_use_id="1", content="plain text", code="network_error")
     assert block_str.content == "plain text"
+    assert block_str.code == "network_error"
     block_list = ToolResultBlock(tool_use_id="1", content=[{"type": "text", "text": "hi"}])
     assert block_list.content[0].text == "hi"
+    assert block_list.code is None
 
 
 def test_content_block_discriminator_rejects_unknown_type():

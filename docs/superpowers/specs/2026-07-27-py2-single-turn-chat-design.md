@@ -460,6 +460,9 @@ The adapter reads raw values from `system_config`, never the redacted admin DTO:
 - `llm_max_concurrent_requests` (missing/zero means unlimited);
 - context/compaction values reserved for later enforcement.
 
+`llm_endpoint` is the unversioned API base URL; admins do not include `/v1`.
+The Anthropic SDK appends `/v1` for Messages requests.
+
 Missing provider identity fails before user-message persistence with
 `503 provider_not_configured`.
 
@@ -582,14 +585,20 @@ The registry tracks:
 
 - whether a runner task exists;
 - the active-turn subscriber;
-- at most one newest queued subscriber;
+- queued subscribers by durable message ID;
 - runner wake-up state.
 
-When a newer queued POST arrives:
+When a safe boundary captures a pending batch:
 
-- the older queued subscriber receives `stream_replaced`;
-- the older message remains in `pending_messages`;
-- the new response becomes the preview candidate for the next drained batch.
+- the newest subscriber from that captured batch becomes its preview owner;
+- older subscribers from the same batch receive `stream_replaced` while their
+  messages remain durable;
+- subscribers for messages accepted after the boundary remain queued for the
+  following batch.
+
+A delayed subscriber registration may attach to a running turn only while its
+message ID belongs to that turn's active preview batch. Otherwise it closes and
+the frontend recovers through `GET messages`.
 
 The registry is not a durable queue and is intentionally empty after restart.
 
@@ -717,21 +726,31 @@ Py2 is complete when:
 ### Py3
 
 - ReAct/tool loop;
-- web_fetch and message tools;
+- executable `web_fetch` tool only;
 - `tool_progress`;
 - tool-result pairing and JIT collapse;
 - cancel/restart;
-- Py3's extended safe-boundary rule.
+- Py3's extended safe-boundary rule;
+- two-stage compaction with all inbound rows staged in `pending_messages` before
+  provider-visible promotion;
+- one `turn_id` per normal provider call plus its following tool batch.
 
-### Py4/Py5
+### Py4
 
 - MinIO-backed workspace files;
-- workspace/device attachment refs;
-- server/device file tools and client dispatch.
+- server workspace attachment refs and file tools;
+- initial current-web/server-workspace `message` tool;
+- provider-hidden delivery persistence that does not insert an extra
+  provider-visible assistant row inside a tool batch.
+
+### Py5
+
+- device attachment refs, device file tools, and client dispatch;
+- paired-device media expansion for `message`.
 
 ### Later milestones
 
 - cron/heartbeat;
-- Discord/Telegram/other channel adapters;
+- Discord/Telegram/other channel adapters and cross-channel `message` fields;
 - multi-worker/cross-node coordination;
 - durable stream replay, only if product evidence requires it.

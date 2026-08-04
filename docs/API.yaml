@@ -71,6 +71,9 @@ info:
     for that HTTP connection. `GET /api/sessions/{id}/messages` reads only
     PostgreSQL-backed canonical messages and run status. Reconnect falls back to
     polling `GET messages`; missed token deltas are not replayed.
+    Each POST subscriber has bounded buffering. A client that cannot consume
+    events before its buffer fills is disconnected without blocking the runner
+    and recovers through `GET messages`.
 
     **Python-main deployment/concurrency boundary (ADR-122):**
     The Python server alpha runs one ASGI worker and uses asyncio tasks for
@@ -428,13 +431,16 @@ paths:
       summary: Send a user message, wake runner, stream best-effort preview
       description: |
         Durably accepts the user message and wakes or reserves the session
-        runner. A `turn_id` is created when its provider-visible batch starts;
-        queued input does not invent one early. The response is a best-effort
-        streaming body for this HTTP connection only. Disconnecting the
+        runner. A `turn_id` identifies one normal agent-loop provider call plus
+        the complete following tool batch returned by that call. A ReAct chain
+        can therefore emit several `turn_started`/`turn_finished` pairs with
+        different IDs on the same best-effort POST stream. Pending input does
+        not invent an ID before its provider call begins. Disconnecting the
         response does not cancel the runner or roll back the message. Py2
         streams text/thinking token deltas from one provider call and has no
         tool progress; Py3 adds tool execution and `tool_progress` events
-        without changing this detached-runner contract.
+        without changing this detached-runner contract. Internal compaction
+        call lifecycle is outside this public `turn_id` definition.
 
         If `{id}` does not exist, the server atomically creates a browser web
         session owned by the authenticated user: `id={id}`,
@@ -443,13 +449,19 @@ paths:
         the message. Existing sessions owned by another user return `404`
         without revealing whether the id exists.
 
-        If no runner is active and no durable pending rows remain, the message
-        is written directly to provider-visible `messages` and a runner is
-        started. If a runner is active, the message is written to
-        `pending_messages` and is drained into `messages` only at the next safe
-        boundary. In tool-less Py2, that boundary is after the current complete
-        assistant response and terminal run state are persisted. From Py3
-        onward, the current assistant tool batch must also be fully addressed.
+        In Py2, if no runner is active and no durable pending rows remain, the
+        message is written directly to provider-visible `messages`; active-run
+        overlap is written to `pending_messages`. Beginning with Py3, every
+        accepted user message is first durable in `pending_messages`. An idle
+        runner promotes it immediately when Stage 1 compaction is unnecessary.
+        When Stage 1 triggers, the incoming batch remains pending while active
+        prior history is summarized; one commit marks the selected source rows
+        compacted, inserts the active summary, then promotes the captured
+        pending-human prefix. This preserves active order `S1, U11` without
+        backdating. Messages accepted after preflight captures its ordered
+        the preflight boundary remain pending for the next provider call. During
+        an existing tool run, pending rows drain only after the current
+        assistant tool batch is fully addressed.
         If pending rows survived a restart but no turn is running, the new
         input joins them and the entire ordered queue drains before the
         recovered turn starts.
@@ -458,9 +470,11 @@ paths:
         POST response may stay open as the live preview subscriber for the next
         pending batch. Older queued POST responses receive `stream_replaced`
         and close after their own message has been durably accepted. At the
-        safe boundary, all pending rows for the session are drained in order and
-        become one provider-visible batch; the latest still-connected queued
-        stream receives that batch's live preview. Reconnect/recovery uses
+        safe boundary, the runner captures the current pending rows in order;
+        only that fixed prefix becomes the next provider-visible batch. Later
+        arrivals remain pending for the following call. The latest
+        still-connected queued stream for the captured batch receives its live
+        preview. Reconnect/recovery uses
         `GET /api/sessions/{id}/messages`; missed token deltas are not replayed.
 
         Py2 retries a transient provider failure only before the first
@@ -505,9 +519,9 @@ paths:
                   type: array
                   maxItems: 0
                   description: |
-                    Required for the stable request shape, but Py2 requires this
-                    array to be empty. Py2 accepts text and direct inline base64
-                    images through `content`; workspace/device attachment
+                    Required for the stable request shape, but Py2 and Py3
+                    require this array to be empty. They accept text and direct
+                    inline base64 images through `content`; workspace/device attachment
                     references begin with the Py4 workspace-files milestone.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
@@ -560,13 +574,15 @@ paths:
         a stale cancel flag. If a runner is active, the server sets
         `cancel_requested=true`. The agent loop lets the current LLM request or
         tool call finish. If the current external action is an LLM request, the
-        assistant response is persisted first and `cancel_requested` is checked
-        before dispatching any returned `tool_use`. The loop then inserts
-        synthetic `tool_result` blocks with `code="user_cancelled"` for
-        unstarted tools in the current assistant batch, inserts
-        `"[User pressed stop]"` as a `message_kind="human"` message, clears the
-        flag, emits `turn_finished` with `status="cancelled"` on any active
-        POST preview stream, and exits without another LLM call for that turn.
+        assistant response is persisted first. A response with no `tool_use`
+        completes normally, clears the flag, and does not add a stop marker. A
+        response containing tools is checked before dispatch; the loop inserts
+        synthetic `tool_result` blocks with `code="user_cancelled"` for every
+        unstarted tool in that assistant batch, inserts `"[User pressed stop]"`
+        as a `message_kind="human"` message, clears the flag, emits
+        `turn_finished` with `status="cancelled"` on any active POST preview
+        stream, and exits without another LLM call. If a tool is already in
+        flight, it finishes normally and only the remaining tools are skipped.
       responses:
         '202':
           description: Cancellation requested.
@@ -1645,8 +1661,9 @@ paths:
           - `shared_workspace_quota_bytes` (int) — quota ceiling that any
             single shared workspace may request. If no row is configured, the
             effective default is 500 MiB (`524288000`). ADR-108.
-          - `llm_endpoint` (string) — base URL of the Anthropic-compatible
-            Messages API or gateway endpoint. ADR-101.
+          - `llm_endpoint` (string) — unversioned base URL of the
+            Anthropic-compatible Messages API or gateway (for example,
+            `https://api.anthropic.com`). Do not include `/v1`. ADR-101.
           - `llm_api_key` (string) — bearer credential the server uses on
             outbound LLM requests. Write-only in admin API responses: once
             configured, GET/PATCH responses return `"<redacted>"` instead of
@@ -1654,16 +1671,18 @@ paths:
           - `llm_model` (string) — model name passed in the Anthropic Messages
             request body. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
-            (e.g. `128000`). Counted with the Python tokenizer strategy
-            selected for ADR-025. ADR-101.
-          - `llm_compaction_threshold_tokens` (int) — accepted/reserved
-            config for later compaction decisions. Missing means not
-            configured; future compaction code must handle that explicitly.
-            The intended future trigger compares
+            (e.g. `128000`). Counted for the configured model through the
+            Anthropic-compatible `POST /v1/messages/count_tokens` route selected
+            for ADR-025. ADR-101.
+          - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
+            trigger. Missing disables compaction. When configured,
+            `llm_max_context_tokens` is required and the threshold must be
+            strictly smaller than that context window. The trigger compares
             `llm_max_context_tokens − tokenizer_count(prompt)` with
             `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-            = `threshold − 4000`. The Python server alpha may store the value
-            before compaction is implemented. ADR-028, ADR-101.
+            = `threshold − 4000`. The configured endpoint must implement the
+            count route; there is no byte/tokenizer fallback. ADR-028, ADR-101,
+            ADR-126.
           - `llm_max_concurrent_requests` (int) — optional
             in-process semaphore in the shared LLM provider layer. A configured
             `0` means unlimited and creates no semaphore. A positive integer
@@ -1686,7 +1705,7 @@ paths:
 
         Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` on PATCH
         after validating the merged provider identity with `GET
-        {llm_endpoint}/models`. `GET /api/admin/config` redacts configured
+        {llm_endpoint}/v1/models`. `GET /api/admin/config` redacts configured
         `llm_api_key` as `"<redacted>"`; callers rotate the key by sending a new
         value and keep the existing key by omitting it. Sending `"<redacted>"` as
         a new secret value is rejected.
@@ -1711,7 +1730,7 @@ paths:
 
         When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
         the server validates the provider before writing: `GET
-        {llm_endpoint}/models` must be reachable with the configured bearer
+        {llm_endpoint}/v1/models` must be reachable with the configured bearer
         credential, return a well-formed models response accepted by OpenOctopus,
         and include the configured `llm_model`. Validation failure returns
         `400 Bad Request` and leaves the existing DB config unchanged.
@@ -1734,7 +1753,8 @@ paths:
         `llm_max_context_tokens` is configured, the merged config must also
         satisfy `llm_max_output_tokens <= llm_max_context_tokens`. A successful
         change is read by the next provider turn and does not mutate an
-        already-running call.
+        already-running call. `llm_compaction_threshold_tokens`, when present,
+        must be in `4001..(llm_max_context_tokens - 1)`.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -2062,18 +2082,31 @@ components:
 
     Message:
       type: object
-      required: [id, session_id, role, message_kind, content, delivery_refs, created_at]
+      required: [id, session_id, role, message_kind, is_compacted, content, delivery_refs, created_at]
       properties:
         id: { type: string }
         session_id: { type: string }
-        role: { type: string, enum: [user, assistant] }
+        role:
+          type: string
+          enum: [user, assistant]
+          description: |
+            Provider-wire role derived from `message_kind`; this is a public
+            projection convenience, not a stored `messages` database column.
         message_kind:
           type: string
           enum: [human, assistant, tool_result, synthetic_tool_result, synthetic_assistant_error, compaction_summary]
-          description: OpenOctopus semantic discriminator for rendering, audit, recovery, and provider request folding.
-        is_compaction_summary:
+          description: |
+            Stored OpenOctopus semantic discriminator for rendering, audit,
+            recovery, and provider request folding. `human`, `tool_result`,
+            and `synthetic_tool_result` derive provider role `user`; the other
+            three kinds derive `assistant`.
+        is_compacted:
           type: boolean
-          description: If true, this assistant row is a compaction summary (ADR-089), not a regular assistant turn.
+          description: |
+            If true, the row remains in canonical history/audit but is excluded
+            from provider replay and future compaction input. Summary identity
+            is represented by `message_kind=compaction_summary`; an active
+            summary is false and can later become true when absorbed.
         content:
           type: array
           items: { $ref: '#/components/schemas/ContentBlock' }
@@ -2089,9 +2122,9 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
           description: |
-            API-only user-visible delivery references, usually file chips
-            created by the `message` tool for web delivery. These refs are not
-            part of provider replay. Device refs are online-only and are
+            API-only user-visible delivery references. This array remains empty
+            through Py3; its first producer is the initial Py4 `message` tool.
+            These refs are not part of provider replay. Device refs are online-only and are
             resolved by calling the Workspace Files `GET` route with the
             recorded `openoctopus_device` and `path`.
         created_at: { type: string, format: date-time }
@@ -2128,7 +2161,9 @@ components:
       description: |
         Canonical PostgreSQL-backed chat state. This response never includes
         in-flight token deltas from a running assistant response. The
-        `messages` array is cursor-paginated canonical history; the
+        `messages` array is cursor-paginated canonical history, including rows
+        retained with `is_compacted=true`; provider replay independently
+        selects only active rows. The
         `pending_messages` array is the full durable pending queue for this
         session and is not counted against `limit`.
       properties:
@@ -2152,7 +2187,7 @@ components:
         active_turn_id:
           type: string
           nullable: true
-          description: Running turn id when a runner currently owns the session.
+          description: Running provider-call/tool-batch id when one currently owns the session.
         last_message_id:
           type: string
           nullable: true
@@ -2176,13 +2211,19 @@ components:
             created_session: { type: boolean, description: Whether this POST implicitly created the web session. }
         - type: object
           required: [type, turn_id, message_ids]
+          description: |
+            Starts one normal agent-loop provider call. The ID remains active
+            through that call's following tool batch, if any. A later call in
+            the same ReAct chain emits another event and ID.
           properties:
             type: { type: string, enum: [turn_started] }
             turn_id: { type: string }
             message_ids:
               type: array
               items: { type: string }
-              description: User message ids included in this provider-visible turn after direct insert or pending batch drain.
+              description: |
+                Newly promoted user message ids included in this provider call.
+                May be empty for a continuation call in the same ReAct chain.
         - type: object
           required: [type, turn_id, channel, text]
           properties:
@@ -2191,7 +2232,7 @@ components:
             channel: { type: string, enum: [text, thinking] }
             text: { type: string, description: Coalesced best-effort token text. Not persisted and not replayed. }
         - type: object
-          required: [type, turn_id, kind]
+          required: [type, turn_id, kind, tool_call_id, tool_name]
           description: Introduced by Py3; Py2 never emits this event.
           properties:
             type: { type: string, enum: [tool_progress] }
@@ -2207,11 +2248,21 @@ components:
             message: { $ref: '#/components/schemas/Message' }
         - type: object
           required: [type, turn_id, status]
+          description: |
+            Finishes one provider-call/tool-batch run. This does not necessarily
+            close the POST stream: if the ReAct loop continues, a new
+            `turn_started` event with a new ID follows.
           properties:
             type: { type: string, enum: [turn_finished] }
             turn_id: { type: string }
             status: { type: string, enum: [completed, failed, cancelled, abandoned] }
-            final_message_id: { type: string, nullable: true }
+            final_message_id:
+              type: string
+              nullable: true
+              description: |
+                Last durable message produced by this run: the assistant row
+                for a no-tool response, or the final tool-result row after a
+                completed tool batch. Null when no durable message was produced.
         - type: object
           required: [type]
           properties:
@@ -2273,13 +2324,17 @@ components:
             content:
               type: array
               description: |
-                Provider-facing and public history shape. Raw device WebSocket
-                frames may submit a string or safe block array, but OpenOctopus
+                Persisted and public history shape. Raw device WebSocket frames
+                may submit a string or safe block array, but OpenOctopus
                 normalizes persisted `tool_result.content` to safe blocks
-                before DB storage, SSE, history, or provider replay.
+                before DB storage, streaming, history, or provider replay.
               items: { $ref: '#/components/schemas/ToolResultContentBlock' }
             is_error: { type: boolean, default: false }
-            code: { type: string }
+            code:
+              type: string
+              description: |
+                OpenOctopus diagnostic metadata retained in storage and public
+                history, then omitted from the strict Anthropic provider block.
         - type: object
           required: [type, thinking]
           properties:
@@ -2342,6 +2397,10 @@ components:
 
     MessageDeliveryRef:
       type: object
+      description: |
+        Provider-hidden user delivery metadata. `delivery_refs` arrays remain
+        empty through Py3; the initial Py4 `message` tool begins producing
+        these refs.
       required: [type, openoctopus_device, path, filename, online_only]
       additionalProperties: false
       properties:

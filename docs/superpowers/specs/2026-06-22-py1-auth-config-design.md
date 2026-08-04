@@ -24,7 +24,7 @@ This spec builds on the Py0 skeleton (`server/src/openoctopus_server/`) and reus
 - argon2id password hashing
 - `ADMIN_TOKEN` gating at register → `is_admin`
 - Last-admin protection on user deletion
-- `system_config` admin-editable keys with LLM identity validation (`GET {llm_endpoint}/models`) and `llm_api_key` redaction
+- `system_config` admin-editable keys with LLM identity validation (`GET {llm_endpoint}/v1/models`) and `llm_api_key` redaction
 
 **Out of scope (later milestones):**
 - Personal workspace creation on register / `workspace_fs` / quota enforcement — Py4
@@ -255,7 +255,7 @@ Allowed config keys (per `SCHEMA.md` admin-editable table):
      exists.
   5. Upsert rows for non-None fields, commit, return `get_config_view(db)`.
 
-- `validate_llm_identity(endpoint, api_key, model, *, client: httpx.AsyncClient | None = None)` — `GET {endpoint}/models` with `Authorization: Bearer {api_key}`; per ADR-101, the response must be HTTP 200 **and** include the configured `llm_model` in the models list. The expected response shape is OpenAI-compatible: `{"object": "list", "data": [{"id": "<model_name>", "object": "model"}, ...]}`. The check looks for `llm_model` in `data[].id`. Non-200 or model absent → `CONFIG_VALIDATION_FAILED`. The optional `client` enables test injection via `MockTransport`. Real provider credentials are only needed for live smoke testing, not automated tests (ADR-101).
+- `validate_llm_identity(endpoint, api_key, model, *, client: httpx.AsyncClient | None = None)` — `endpoint` is the unversioned API base URL; `GET {endpoint}/v1/models` with `Authorization: Bearer {api_key}` must return HTTP 200 **and** include the configured `llm_model` in the models list. The expected response shape is OpenAI-compatible: `{"object": "list", "data": [{"id": "<model_name>", "object": "model"}, ...]}`. The check looks for `llm_model` in `data[].id`. Non-200 or model absent → `CONFIG_VALIDATION_FAILED`. The optional `client` enables test injection via `MockTransport`. Real provider credentials are only needed for live smoke testing, not automated tests (ADR-101).
 
 - `llm_max_concurrent_requests` runtime behavior: Py1 only stores/retrieves the value. The actual semaphore is Py2 (provider runtime). Per ADR-101, if the key is missing at startup, the runtime limiter treats it as `0` (unlimited); no default row is persisted. Py1's `get_config_view` returns `None` for this key when no row exists.
 - `llm_max_output_tokens` runtime behavior: the config service exposes the

@@ -114,14 +114,13 @@ class Message(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
-    role: Mapped[str] = mapped_column(Text, nullable=False)
     message_kind: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     delivery_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     llm_fingerprint: Mapped[str | None] = mapped_column(Text)
-    is_compaction_summary: Mapped[bool] = mapped_column(
+    is_compacted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("FALSE")
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -129,7 +128,6 @@ class Message(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("role IN ('user','assistant')", name="check_message_role"),
         CheckConstraint(
             "message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary')",
             name="check_message_kind",
