@@ -2969,7 +2969,10 @@ simple. A single process can still handle hundreds of I/O-bound sessions if
 implementation code stays async and provider/file concurrency is bounded. The
 trade-off is that a single blocking bug can stall all sessions and device
 heartbeats, so tests and code review should treat event-loop blocking as a
-correctness issue. Horizontal scale is intentionally deferred.
+correctness issue. The Py3 regression suite holds 500 sessions concurrently at
+the provider boundary and verifies isolated streams, durable results, and idle
+state eviction against PostgreSQL. This is a correctness/capacity floor, not a
+production latency benchmark. Horizontal scale is intentionally deferred.
 
 ---
 
