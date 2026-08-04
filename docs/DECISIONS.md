@@ -2956,6 +2956,9 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
 - Live POST subscribers use bounded event queues. If a browser cannot consume
   preview events before its queue fills, only that transient stream is closed;
   the runner continues and the browser recovers through canonical `GET messages`.
+- Per-session scheduler state is evicted once it has no runner, queued start, or
+  subscriber. A later message recreates it from PostgreSQL-backed session state;
+  active users of a state hold a short lease so eviction cannot split a session.
 - Server workspace operations will need their own Py4 implementation boundary:
   MinIO/S3 client lifecycle, object-client connection pool sizing, workspace IO
   concurrency limits, and backpressure are not part of the public API, but must

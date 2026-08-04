@@ -2,7 +2,8 @@ import asyncio
 import json
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
@@ -64,6 +65,7 @@ _COMPACTION_REQUEST = "Write the compacted summary now."
 class _SessionState:
     session_id: UUID
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    leases: int = 0
     starts: deque[TurnStart] = field(default_factory=deque)
     runner_task: asyncio.Task[None] | None = None
     turn_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
@@ -129,43 +131,44 @@ class ChatRuntime:
                 "created_session": accepted.created_session,
             }
         )
-        state = await self._state_for(accepted.session_id)
-        async with state.lock:
-            if accepted.turn is None:
-                location, running_turn_id = await self._queued_location(accepted)
-                if location == "running" and running_turn_id is not None:
-                    if (
-                        state.active_turn_id != running_turn_id
-                        or accepted.message_id not in state.active_preview_message_ids
-                    ):
+        async with self._lease_state(accepted.session_id) as state:
+            assert state is not None
+            async with state.lock:
+                if accepted.turn is None:
+                    location, running_turn_id = await self._queued_location(accepted)
+                    if location == "running" and running_turn_id is not None:
+                        if (
+                            state.active_turn_id != running_turn_id
+                            or accepted.message_id not in state.active_preview_message_ids
+                        ):
+                            subscriber.close()
+                            return subscriber
+                        self._install_newest_subscriber(
+                            state,
+                            turn_id=running_turn_id,
+                            subscriber=subscriber,
+                        )
+                        return subscriber
+                    if location == "done":
                         subscriber.close()
                         return subscriber
-                    self._install_newest_subscriber(
-                        state,
-                        turn_id=running_turn_id,
-                        subscriber=subscriber,
-                    )
+                    self._queue_subscriber(state, subscriber)
                     return subscriber
-                if location == "done":
+
+                if not await self._turn_is_running(accepted.turn.turn_id):
                     subscriber.close()
                     return subscriber
-                self._queue_subscriber(state, subscriber)
-                return subscriber
-
-            if not await self._turn_is_running(accepted.turn.turn_id):
-                subscriber.close()
-                return subscriber
-            self._set_active_turn(state, accepted.turn, inherit_preview=False)
-            candidates = [
-                subscriber,
-                *self._take_queued_subscribers(state, accepted.turn.message_ids),
-            ]
-            for candidate in candidates:
-                self._install_newest_subscriber(
-                    state,
-                    turn_id=accepted.turn.turn_id,
-                    subscriber=candidate,
-                )
+                self._set_active_turn(state, accepted.turn, inherit_preview=False)
+                candidates = [
+                    subscriber,
+                    *self._take_queued_subscribers(state, accepted.turn.message_ids),
+                ]
+                for candidate in candidates:
+                    self._install_newest_subscriber(
+                        state,
+                        turn_id=accepted.turn.turn_id,
+                        subscriber=candidate,
+                    )
         return subscriber
 
     async def unregister(
@@ -174,13 +177,14 @@ class ChatRuntime:
         session_id: UUID,
         subscriber: StreamSubscriber,
     ) -> None:
-        state = await self._state_for(session_id)
-        async with state.lock:
-            if state.queued_subscribers.get(subscriber.message_id) is subscriber:
-                state.queued_subscribers.pop(subscriber.message_id, None)
-            for turn_id, candidate in tuple(state.turn_subscribers.items()):
-                if candidate is subscriber:
-                    state.turn_subscribers.pop(turn_id, None)
+        async with self._lease_state(session_id, create=False) as state:
+            if state is not None:
+                async with state.lock:
+                    if state.queued_subscribers.get(subscriber.message_id) is subscriber:
+                        state.queued_subscribers.pop(subscriber.message_id, None)
+                    for turn_id, candidate in tuple(state.turn_subscribers.items()):
+                        if candidate is subscriber:
+                            state.turn_subscribers.pop(turn_id, None)
             subscriber.close()
 
     async def close(self) -> None:
@@ -205,19 +209,50 @@ class ChatRuntime:
         await asyncio.gather(*(provider.close() for provider in providers), return_exceptions=True)
 
     async def _schedule_turn(self, turn: TurnStart) -> None:
-        state = await self._state_for(turn.session_id)
-        async with state.lock:
-            self._set_active_turn(state, turn, inherit_preview=False)
-            state.starts.append(turn)
-            self._ensure_runner_locked(state)
+        async with self._lease_state(turn.session_id) as state:
+            assert state is not None
+            async with state.lock:
+                self._set_active_turn(state, turn, inherit_preview=False)
+                state.starts.append(turn)
+                self._ensure_runner_locked(state)
 
-    async def _state_for(self, session_id: UUID) -> _SessionState:
+    @asynccontextmanager
+    async def _lease_state(
+        self,
+        session_id: UUID,
+        *,
+        create: bool = True,
+    ) -> AsyncIterator[_SessionState | None]:
         async with self._states_lock:
             state = self._states.get(session_id)
-            if state is None:
+            if state is None and create:
                 state = _SessionState(session_id=session_id)
                 self._states[session_id] = state
-            return state
+            if state is not None:
+                state.leases += 1
+        try:
+            yield state
+        finally:
+            if state is not None:
+                async with self._states_lock:
+                    state.leases -= 1
+                    self._evict_state_locked(state)
+
+    async def _evict_state_if_idle(self, state: _SessionState) -> None:
+        async with self._states_lock:
+            self._evict_state_locked(state)
+
+    def _evict_state_locked(self, state: _SessionState) -> None:
+        if self._states.get(state.session_id) is not state:
+            return
+        if (
+            state.leases == 0
+            and state.runner_task is None
+            and not state.starts
+            and not state.turn_subscribers
+            and not state.queued_subscribers
+        ):
+            self._states.pop(state.session_id)
 
     async def _queued_location(
         self,
@@ -295,6 +330,7 @@ class ChatRuntime:
                         )
                     else:
                         state.runner_task = None
+            await self._evict_state_if_idle(state)
 
     async def _take_start_or_stop(self, state: _SessionState) -> TurnStart | None:
         async with state.lock:

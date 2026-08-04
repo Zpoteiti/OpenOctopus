@@ -5,7 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -138,6 +138,15 @@ async def _wait_for_pending(client, session_id: str, expected: int) -> dict[str,
     raise AssertionError(f"pending_count never reached {expected}")
 
 
+async def _wait_for_state_eviction(runtime: ChatRuntime, session_id: UUID) -> None:
+    for _ in range(100):
+        async with runtime._states_lock:
+            if session_id not in runtime._states:
+                return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"runtime state was not evicted for {session_id}")
+
+
 async def test_get_empty_session_keeps_required_nullable_fields(
     user_client,
     pg_engine,
@@ -258,6 +267,51 @@ async def test_post_streams_and_get_recovers_canonical_history(
     assert call["effort"] == Effort.HIGH
     assert call["messages"][0]["content"][0]["text"].startswith("<runtime>\n")
     assert call["messages"][0]["content"][1] == {"type": "text", "text": "Hi"}
+    await runtime.close()
+
+
+async def test_completed_session_state_is_evicted_and_reactivated(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider(
+        [
+            FakeStep(content=[{"type": "text", "text": "first"}]),
+            FakeStep(content=[{"type": "text", "text": "second"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = UUID("1cd4a7e8-4010-4dc3-b2e4-021a8fac60a7")
+
+    first = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "one"}], "attachments": []},
+    )
+    assert first.status_code == 200
+    await _wait_for_state_eviction(runtime, session_id)
+
+    second = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": "two"}], "attachments": []},
+    )
+    assert second.status_code == 200
+    await _wait_for_state_eviction(runtime, session_id)
+    assert len(provider.calls) == 2
+    await runtime.close()
+
+
+async def test_active_state_lease_blocks_idle_eviction(pg_engine):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._evict_state_if_idle(state)
+        assert runtime._states[session_id] is state
+
+    assert session_id not in runtime._states
     await runtime.close()
 
 
@@ -699,16 +753,17 @@ async def test_late_registration_does_not_replace_unrelated_running_preview(
             turn=None,
         )
     )
-    state = await runtime._state_for(session_id)
-    await runtime._assign_queued_subscribers(
-        state,
-        TurnStart(
-            session_id=session_id,
-            turn_id=turn_id,
-            message_ids=(active_message_id,),
-            effort=None,
-        ),
-    )
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(active_message_id,),
+                effort=None,
+            ),
+        )
     location = "running"
     late = await runtime.register(
         AcceptedMessage(
@@ -745,41 +800,42 @@ async def test_late_registration_joins_its_matching_running_continuation(
         return "running", continuation_turn_id
 
     monkeypatch.setattr(runtime, "_queued_location", running_location)
-    state = await runtime._state_for(session_id)
-    await runtime._assign_queued_subscribers(
-        state,
-        TurnStart(
-            session_id=session_id,
-            turn_id=initial_turn_id,
-            message_ids=(message_id,),
-            effort=None,
-        ),
-    )
-    await runtime._transfer_turn_subscriber(
-        state,
-        initial_turn_id,
-        TurnStart(
-            session_id=session_id,
-            turn_id=continuation_turn_id,
-            message_ids=(),
-            effort=None,
-        ),
-    )
-
-    subscriber = await runtime.register(
-        AcceptedMessage(
-            session_id=session_id,
-            message_id=message_id,
-            accepted_at=datetime.now(UTC),
-            disposition="queued",
-            created_session=False,
-            turn=None,
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=initial_turn_id,
+                message_ids=(message_id,),
+                effort=None,
+            ),
         )
-    )
+        await runtime._transfer_turn_subscriber(
+            state,
+            initial_turn_id,
+            TurnStart(
+                session_id=session_id,
+                turn_id=continuation_turn_id,
+                message_ids=(),
+                effort=None,
+            ),
+        )
 
-    assert subscriber.closed is False
-    assert state.turn_subscribers[continuation_turn_id] is subscriber
-    await runtime.unregister(session_id=session_id, subscriber=subscriber)
+        subscriber = await runtime.register(
+            AcceptedMessage(
+                session_id=session_id,
+                message_id=message_id,
+                accepted_at=datetime.now(UTC),
+                disposition="queued",
+                created_session=False,
+                turn=None,
+            )
+        )
+
+        assert subscriber.closed is False
+        assert state.turn_subscribers[continuation_turn_id] is subscriber
+        await runtime.unregister(session_id=session_id, subscriber=subscriber)
     await runtime.close()
 
 
@@ -819,21 +875,22 @@ async def test_idle_assignment_keeps_post_boundary_subscriber_queued(
         )
     )
 
-    state = await runtime._state_for(session_id)
-    await runtime._assign_queued_subscribers(
-        state,
-        TurnStart(
-            session_id=session_id,
-            turn_id=turn_id,
-            message_ids=(captured_id,),
-            effort=None,
-        ),
-    )
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        await runtime._assign_queued_subscribers(
+            state,
+            TurnStart(
+                session_id=session_id,
+                turn_id=turn_id,
+                message_ids=(captured_id,),
+                effort=None,
+            ),
+        )
 
-    assert state.turn_subscribers[turn_id] is captured
-    assert state.queued_subscribers[later_id] is later
-    assert captured.closed is False
-    assert later.closed is False
+        assert state.turn_subscribers[turn_id] is captured
+        assert state.queued_subscribers[later_id] is later
+        assert captured.closed is False
+        assert later.closed is False
     await runtime.unregister(session_id=session_id, subscriber=captured)
     await runtime.unregister(session_id=session_id, subscriber=later)
     await runtime.close()
@@ -884,11 +941,12 @@ async def test_delayed_initial_registration_keeps_post_boundary_subscriber_queue
         )
     )
 
-    state = await runtime._state_for(session_id)
-    assert state.turn_subscribers[turn_id] is older
-    assert state.queued_subscribers[newer_id] is newer
-    assert older.closed is False
-    assert newer.closed is False
+    async with runtime._lease_state(session_id) as state:
+        assert state is not None
+        assert state.turn_subscribers[turn_id] is older
+        assert state.queued_subscribers[newer_id] is newer
+        assert older.closed is False
+        assert newer.closed is False
     await runtime.unregister(session_id=session_id, subscriber=older)
     await runtime.unregister(session_id=session_id, subscriber=newer)
     await runtime.close()
