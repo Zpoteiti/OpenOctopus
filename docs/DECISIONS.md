@@ -2953,6 +2953,9 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
 - Blocking work must not run on the event loop. Workspace file IO, hashing,
   recursive find_files/grep, copy/move, and other CPU/blocking filesystem work must
   use an explicit background/thread boundary with bounded concurrency.
+- Live POST subscribers use bounded event queues. If a browser cannot consume
+  preview events before its queue fills, only that transient stream is closed;
+  the runner continues and the browser recovers through canonical `GET messages`.
 - Server workspace operations will need their own Py4 implementation boundary:
   MinIO/S3 client lifecycle, object-client connection pool sizing, workspace IO
   concurrency limits, and backpressure are not part of the public API, but must

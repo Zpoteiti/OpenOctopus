@@ -71,6 +71,9 @@ info:
     for that HTTP connection. `GET /api/sessions/{id}/messages` reads only
     PostgreSQL-backed canonical messages and run status. Reconnect falls back to
     polling `GET messages`; missed token deltas are not replayed.
+    Each POST subscriber has bounded buffering. A client that cannot consume
+    events before its buffer fills is disconnected without blocking the runner
+    and recovers through `GET messages`.
 
     **Python-main deployment/concurrency boundary (ADR-122):**
     The Python server alpha runs one ASGI worker and uses asyncio tasks for
