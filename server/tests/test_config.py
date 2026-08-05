@@ -13,11 +13,13 @@ REQUIRED_ENV_VARS = {
     "OPENOCTOPUS_PORT": "8080",
     "OPENOCTOPUS_JWT_SECRET": "secret",
     "OPENOCTOPUS_COOKIE_SECURE": "false",
-    "OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT": "localhost:9000",
+    "OPENOCTOPUS_ADMIN_TOKEN": "dev-admin-token",
+    "OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT": "http://localhost:9000",
     "OPENOCTOPUS_OBJECT_STORAGE_BUCKET": "bucket",
     "OPENOCTOPUS_OBJECT_STORAGE_REGION": "us-east-1",
     "OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY": "key",
     "OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY": "secret",
+    "OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS": "32",
 }
 
 
@@ -46,3 +48,35 @@ def test_settings_loads_with_openoctopus_prefix(monkeypatch, valid_env):
     cached = get_settings()
     assert cached.host == "0.0.0.0"
     assert cached.port == 9000
+
+
+@pytest.mark.parametrize("required_var", REQUIRED_ENV_VARS)
+def test_settings_requires_every_documented_variable(monkeypatch, valid_env, required_var):
+    monkeypatch.delenv(required_var)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_settings_rejects_empty_admin_token(monkeypatch, valid_env):
+    monkeypatch.setenv("OPENOCTOPUS_ADMIN_TOKEN", "")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", ["0", "257", "not-an-integer"])
+def test_settings_rejects_invalid_object_storage_max_connections(monkeypatch, valid_env, value):
+    monkeypatch.setenv("OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS", value)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", ["1", "256"])
+def test_settings_accepts_object_storage_connection_boundaries(monkeypatch, valid_env, value):
+    monkeypatch.setenv("OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS", value)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.object_storage_max_connections == int(value)

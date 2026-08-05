@@ -6,7 +6,12 @@ semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
 `create_all()`; Alembic or equivalent migration framework is deferred until
 production launch after frontend completion (ADR-057, ADR-069).
 
-**Twelve tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
+**Thirteen tables.** Account deletion fences affected workspaces, then commits
+the user deletion and durable object-cleanup intents together. RustFS purge is
+idempotent and may finish after that logical deletion. Every user-referencing
+FK has `ON DELETE CASCADE` defined inline (ADR-058), with one explicit exception
+in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace
+persists for its remaining members when the creator's account is removed.
 
 This doc is the canonical reference for the schema's *shape*. When Python
 implementation SQL or ORM metadata exists, it must be kept in sync with this
@@ -88,10 +93,10 @@ CREATE TABLE IF NOT EXISTS users (
 ```
 
 - `password_hash` — argon2 (or bcrypt — implementer's choice within reason). Never returned by any API.
-- `is_admin` — true for any user who registered with the `ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
+- `is_admin` — true for any user who registered with the `OPENOCTOPUS_ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
 - **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
 - **No inline channel fields** — Discord/Telegram live in their own tables (ADR-090).
-- **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing MinIO object sizes under the workspace prefix (or maintained via a denormalized counter/index hidden inside `workspace_fs`; not part of the API contract).
+- **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing paged RustFS object metadata under the workspace prefix.
 
 ---
 
@@ -369,18 +374,24 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 CREATE TABLE IF NOT EXISTS workspaces (
     id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     name         TEXT         NOT NULL,
+    suffix       TEXT         NOT NULL,
     quota_bytes  BIGINT       NOT NULL,
     created_by   UUID         REFERENCES users(id) ON DELETE SET NULL,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 ```
 
-- `id` — UUID primary key. Drives the MinIO object prefix `workspaces/{id}/` and the public-facing `name@suffix` addressing form (ADR-108, ADR-123) where `suffix` is the first 8 hex chars of `id` (auto-extended on collision per ADR-108).
+- `id` — UUID primary key. Drives the RustFS object prefix `workspaces/{id}/`.
 - `name` — display label. **Not unique.** Two unrelated teams may both create a workspace called "Xmas gift". The validator in ADR-109 enforces character rules (no `/`, `\`, `@`, `:`, control chars, etc.), NFC-normalizes, and length-caps at 64 chars.
+- `suffix` — persisted 8+ hex-character addressing suffix. It starts with the
+  shortest collision-free prefix of `id` allowed by ADR-108 and remains stable
+  across renames and membership changes.
 - `quota_bytes` — capped at `system_config.shared_workspace_quota_bytes` at create and rename time.
 - Quota state for both personal and shared workspaces is exposed through `Workspace` API responses (`quota_bytes`, `bytes_used`, `locked`) from `GET /api/workspaces` and `GET /api/workspaces/{workspace_ref}`; there is no separate personal-only quota route.
 - `created_by` — author. **Exception to ADR-058**: uses `ON DELETE SET NULL`, not `CASCADE`. Removing the creator's user account does not delete a workspace that still has other members; `created_by` becomes NULL and the membership rows survive.
-- Last-member-leaves auto-deletion (per `DELETE FROM workspace_members WHERE workspace_id = $1`) is enforced in application code (`workspace_fs`), not SQL — when no `workspace_members` rows remain for a `workspaces.id`, the row is deleted and the corresponding MinIO object prefix is deleted.
+- Last-member-leaves auto-deletion is enforced in application code under a
+  PostgreSQL workspace-row lock. The workspace row and a durable cleanup intent
+  commit together; RustFS prefix deletion then runs idempotently.
 
 ---
 
@@ -403,7 +414,29 @@ CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_
 
 ---
 
-## 12. `cron_jobs` — scheduled agent invocations
+## 12. `workspace_deletions` — durable RustFS cleanup intents
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_deletions (
+    kind        TEXT        NOT NULL CHECK (kind IN ('personal', 'shared')),
+    target_id   UUID        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (kind, target_id)
+);
+```
+
+- The composite key identifies `users/{target_id}/` or
+  `workspaces/{target_id}/`; there is intentionally no FK because the metadata
+  row is deleted in the same transaction that creates this cleanup intent.
+- Lifecycle order is: retire the in-process target, commit metadata deletion
+  plus this row, purge the RustFS prefix, then delete this row.
+- Post-commit purge failure does not undo or misreport the logical deletion.
+  The running process retries pending rows periodically, and startup recovery
+  drains them after the RustFS capability probe.
+
+---
+
+## 13. `cron_jobs` — scheduled agent invocations
 
 ```sql
 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -439,7 +472,10 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 
 ## Constraints summary
 
-- Every user-referencing FK has `ON DELETE CASCADE` (ADR-058) → account deletion is one statement. **Sole exception:** `workspaces.created_by` uses `ON DELETE SET NULL` per ADR-108 so a workspace persists for its remaining members when its creator's account is removed.
+- Every user-referencing FK has `ON DELETE CASCADE` (ADR-058). Account deletion
+  is an application transaction because it also records durable RustFS cleanup
+  intents. **Sole FK exception:** `workspaces.created_by` uses `ON DELETE SET
+  NULL` per ADR-108 so a workspace persists for its remaining members.
 - No surrogate "is_active" / "deleted_at" columns — deletes are hard, undo lives in admin's backup strategy.
 - No migration framework before production launch (ADR-069). Schema changes
   during the development rebuild require resetting the development database;

@@ -1,8 +1,9 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
@@ -30,7 +31,7 @@ class Settings(BaseSettings):
     # Auth (Py1 — read, Py0 placeholder)
     jwt_secret: str
     cookie_secure: bool
-    admin_token: str | None = None
+    admin_token: Annotated[str, Field(min_length=1)]
 
     # Object Storage (Py4 — read, Py0 placeholder)
     object_storage_endpoint: str
@@ -38,6 +39,7 @@ class Settings(BaseSettings):
     object_storage_region: str
     object_storage_access_key: str
     object_storage_secret_key: str
+    object_storage_max_connections: Annotated[int, Field(ge=1, le=256)]
 
     @model_validator(mode="after")
     def _reject_unknown_prefixed_env_vars(self) -> "Settings":

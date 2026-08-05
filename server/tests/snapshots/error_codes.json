@@ -50,10 +50,16 @@
   "USER_CANCELLED": "user_cancelled",
   "USER_NOT_FOUND": "user_not_found",
   "WORKSPACE_BLOCKED_PATH": "workspace_blocked_path",
+  "WORKSPACE_DIRECTORY_TOO_LARGE": "workspace_directory_too_large",
+  "WORKSPACE_FILE_CHANGED": "workspace_file_changed",
+  "WORKSPACE_FILE_TOO_LARGE_TO_EDIT": "workspace_file_too_large_to_edit",
   "WORKSPACE_INVALID_SKILL_FORMAT": "workspace_invalid_skill_format",
   "WORKSPACE_NOT_FOUND": "workspace_not_found",
   "WORKSPACE_PERMISSION_DENIED": "workspace_permission_denied",
+  "WORKSPACE_QUOTA_EXCEEDED": "workspace_quota_exceeded",
   "WORKSPACE_SOFT_LOCKED": "workspace_soft_locked",
+  "WORKSPACE_STORAGE_ERROR": "workspace_storage_error",
+  "WORKSPACE_STORAGE_UNAVAILABLE": "workspace_storage_unavailable",
   "WORKSPACE_SYMLINK_ESCAPE": "workspace_symlink_escape",
   "WORKSPACE_UPLOAD_TOO_LARGE": "workspace_upload_too_large"
 }

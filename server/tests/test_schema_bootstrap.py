@@ -14,8 +14,9 @@ EXPECTED_COLUMNS = {
     "pending_messages": 7,
     "turn_runs": 6,
     "devices": 11,
-    "workspaces": 5,
+    "workspaces": 6,
     "workspace_members": 3,
+    "workspace_deletions": 3,
     "cron_jobs": 11,
 }
 

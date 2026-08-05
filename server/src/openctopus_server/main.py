@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,6 +13,14 @@ from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
 from openctopus_server.errors.http import register_error_handler
 from openctopus_server.services.turn_runs import abandon_running_turns
+from openctopus_server.services.workspace_deletions import (
+    WorkspaceDeletionWorker,
+    recover_workspace_deletions,
+)
+from openctopus_server.workspace.fs import _workspace_fs_for_storage
+from openctopus_server.workspace.storage import get_object_storage
+
+STARTUP_PROBE_TIMEOUT_SECONDS = 60.0
 
 
 @asynccontextmanager
@@ -32,19 +41,76 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         print(f"Database bootstrap failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    object_storage = None
+    try:
+        object_storage = get_object_storage()
+        await asyncio.wait_for(
+            object_storage.probe_startup(),
+            timeout=STARTUP_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        print(f"Object storage probe failed: {exc}", file=sys.stderr)
+        if object_storage is not None:
+            try:
+                await object_storage.close()
+            except Exception:
+                pass
+        await engine.dispose()
+        sys.exit(1)
+
+    workspace_fs = _workspace_fs_for_storage(object_storage)
+    try:
+        await recover_workspace_deletions(
+            engine,
+            workspace_fs,
+        )
+    except Exception as exc:
+        print(f"Workspace deletion recovery failed: {exc}", file=sys.stderr)
+        try:
+            await object_storage.close()
+        except Exception:
+            pass
+        await engine.dispose()
+        sys.exit(1)
+
+    deletion_worker = WorkspaceDeletionWorker(engine, workspace_fs)
+    deletion_worker.start()
+
     runtime = getattr(app.state, "chat_runtime", None)
     if runtime is None:
         runtime = ChatRuntime(engine)
         app.state.chat_runtime = runtime
-    await abandon_running_turns(
-        engine,
-        runner_instance_id=runtime.runner_instance_id,
-    )
+    try:
+        await abandon_running_turns(
+            engine,
+            runner_instance_id=runtime.runner_instance_id,
+        )
+    except BaseException:
+        try:
+            await runtime.close()
+        finally:
+            try:
+                await deletion_worker.close()
+            finally:
+                try:
+                    await object_storage.close()
+                finally:
+                    await engine.dispose()
+        raise
 
-    yield
-
-    await runtime.close()
-    await engine.dispose()
+    try:
+        yield
+    finally:
+        try:
+            await runtime.close()
+        finally:
+            try:
+                await deletion_worker.close()
+            finally:
+                try:
+                    await object_storage.close()
+                finally:
+                    await engine.dispose()
 
 
 def create_app() -> FastAPI:

@@ -46,7 +46,7 @@ info:
 
     **Auth model:**
 
-    - `ADMIN_TOKEN` env var: permanent secret. Anyone who presents it during
+    - `OPENOCTOPUS_ADMIN_TOKEN` env var: required permanent secret. Anyone who presents it during
       registration becomes admin. Multiple admins are supported — share the
       token with teammates who should have admin rights.
     - All other endpoints use JWT, delivered either via `HttpOnly` cookie
@@ -121,6 +121,26 @@ security:
   - bearerAuth: []
 
 paths:
+  /health:
+    get:
+      summary: Check required server dependencies
+      security: []
+      description: |
+        Checks PostgreSQL and RustFS concurrently. RustFS health is a
+        non-mutating bucket-existence check; the stronger read/write/stat/delete
+        capability probe runs only at startup.
+      responses:
+        '200':
+          description: Both dependencies are connected.
+          content:
+            application/json:
+              example: {status: ok, db: connected, object_storage: connected}
+        '503':
+          description: One or both dependencies are disconnected.
+          content:
+            application/json:
+              example: {status: error, db: connected, object_storage: disconnected}
+
   #
   # --- Auth ---
   #
@@ -130,7 +150,7 @@ paths:
       summary: Register a new account
       description: |
         Creates a new user and their auto-created personal workspace.
-        If `admin_token` in the body matches `ADMIN_TOKEN` env var, the
+        If `admin_token` in the body matches `OPENOCTOPUS_ADMIN_TOKEN`, the
         new user is created with `is_admin=true`. Otherwise a regular
         user. On success, returns the JWT and sets the auth cookie.
       security: []
@@ -252,8 +272,12 @@ paths:
       tags: [Me]
       summary: Delete own account (cascades to all user data)
       description: |
-        Cascades to devices, sessions, messages, cron_jobs, discord_configs,
-        telegram_configs, and personal workspace files (ADR-058).
+        Commits the account deletion and a durable workspace-cleanup intent in
+        PostgreSQL, then purges personal RustFS objects. A post-commit storage
+        failure does not turn the logical deletion into an error: cleanup is
+        retried by the running process and during startup (ADR-058, ADR-123).
+        Database cascades remove devices, sessions, messages, cron_jobs,
+        discord_configs, and telegram_configs.
         Shared workspace memberships are removed; shared workspaces the user
         was in persist for other members.
       responses:
@@ -686,7 +710,7 @@ paths:
       description: |
         Any member of the allow-list can rename or change the quota cap
         (ADR-flat-permissions). Rename only mutates `workspaces.name` —
-        the MinIO object prefix and `workspaces.id` are unchanged, so no
+        the RustFS object prefix and `workspaces.id` are unchanged, so no
         object moves happen. The `suffix` portion of the addressing form is
         also unchanged (it is derived from `id`). However, since strict
         mode (ADR-108) requires both `name` and `suffix` to match in
@@ -774,8 +798,8 @@ paths:
       summary: Remove a user from the allow-list
       description: |
         Any member can remove anyone (including themselves). Removing
-        the last member triggers automatic workspace deletion (files
-        purged, quota released).
+        the last member commits workspace deletion plus a durable cleanup
+        intent. RustFS purge is idempotent and retried after transient failure.
       responses:
         '204': { description: Removed. }
 
@@ -810,11 +834,11 @@ paths:
       tags: [Workspace Files]
       summary: Read workspace file contents
       description: |
-        For `openoctopus_device=server`, reads from `workspace_fs` and streams the
+        For `openoctopus_device=server`, authorizes through `WorkspaceService` and streams the
         server workspace object bytes. For a paired device target, the server
         relays the authenticated HTTP response to the device WebSocket file
         stream with bounded buffering/backpressure; it does not stage the file
-        into MinIO. This route is also how the browser resolves online-only web
+        into RustFS. This route is also how the browser resolves online-only web
         `MessageDeliveryRef` device-file chips.
       responses:
         '200':
@@ -831,7 +855,7 @@ paths:
       description: |
         Full-content replace. Accepts raw `application/octet-stream` bytes.
         For `openoctopus_device=server`, implicit `mkdir -p` on the parent path
-        (ADR-088) and workspace_fs quota checks apply. Device targets route the
+        (ADR-088) and `WorkspaceService` quota checks apply. Device targets route the
         write over `/ws/device` and the client applies its local fs policy.
         Server-side writes, hashes, and recursive operations must use the
         workspace service's background/thread boundary rather than blocking the
@@ -1790,7 +1814,7 @@ paths:
       description: |
         Lists user identity rows plus personal server workspace quota state.
         `quota_bytes`, `bytes_used`, and `locked` are flat response fields for
-        the user's personal server workspace, derived through `workspace_fs`;
+        the user's personal server workspace, derived through `WorkspaceService`;
         they are not columns on `users` and do not aggregate shared workspaces.
       security:
         - cookieAuth: [admin]
@@ -1818,10 +1842,11 @@ paths:
       tags: [Admin]
       summary: Delete a user (admin only)
       description: |
-        Deletes a user and relies on DB cascades plus subsystem cleanup for their
-        resources. Admins may delete themselves unless doing so would delete the
-        last admin. If the target is the only remaining admin, the server returns
-        `409 Conflict` with code `last_admin_required`.
+        Deletes a user through the same durable cleanup-outbox flow as
+        `DELETE /api/me`; a post-commit RustFS purge failure is retried and does
+        not change the 204 result. Admins may delete themselves unless doing so
+        would delete the last admin. If the target is the only remaining admin,
+        the server returns `409 Conflict` with code `last_admin_required`.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -2047,11 +2072,11 @@ components:
         quota_bytes:
           type: integer
           format: int64
-          description: Personal server workspace quota from `workspace_fs`.
+          description: Personal server workspace quota from `WorkspaceService`.
         bytes_used:
           type: integer
           format: int64
-          description: Personal server workspace usage from `workspace_fs`; not a `users` table column.
+          description: Personal server workspace usage from `WorkspaceService`; not a `users` table column.
         locked:
           type: boolean
           description: Personal server workspace is over quota (`bytes_used > quota_bytes`).
@@ -2449,7 +2474,7 @@ components:
           description: |
             UUID. For personal workspaces, equals the owner's `users.id`.
             For shared workspaces, the `workspaces.id` row PK (ADR-108).
-            Drives the MinIO object prefix: `users/{id}/` for personal
+            Drives the RustFS object prefix: `users/{id}/` for personal
             workspaces and `workspaces/{id}/` for shared workspaces
             (ADR-123).
         name:
@@ -2461,9 +2486,10 @@ components:
         suffix:
           type: string
           description: |
-            Present for shared workspaces. First 8 hex chars of `id` (auto-extended
-            on collision per ADR-108). The agent and the REST API both address the
-            workspace via the `name@suffix` form derived from these two fields.
+            Present for shared workspaces. Persisted 8+ hex-character prefix of
+            `id`, auto-extended on collision per ADR-108 and stable across
+            renames. The agent and REST API address the workspace via the
+            `name@suffix` form.
         ref:
           type: string
           description: |

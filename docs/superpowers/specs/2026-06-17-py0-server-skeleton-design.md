@@ -5,6 +5,10 @@
 **Date:** 2026-06-17
 **Depends on:** Py-Setup (complete)
 
+> Historical milestone record. Its environment, health, table-count, and
+> MinIO examples are superseded by the current schema and the Py4a RustFS
+> workspace design; do not use those snippets as a deployment template.
+
 ## Purpose
 
 Produce a minimal but working FastAPI server skeleton: connect to PostgreSQL, apply the full 11-table schema on an empty database, and serve `/health`. No auth, no chat, no agent loop. The output is a single `pyproject.toml` + `src/openoctopus_server/` tree that passes lint, type-check, and test gate on every push.

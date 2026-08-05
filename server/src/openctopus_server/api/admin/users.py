@@ -11,6 +11,7 @@ from openctopus_server.dto.user import AdminUserResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import AuthError
 from openctopus_server.services import users
+from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
 
 router = APIRouter(prefix="/api/admin/users", tags=["Admin"])
 
@@ -31,10 +32,10 @@ async def delete_user(
     user_id: UUID,
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
+    workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
 ) -> Response:
     target = await users.get_user_by_id(db, user_id)
     if target is None:
         raise AuthError(ErrorCode.USER_NOT_FOUND, "User not found")
-    await users.assert_not_last_admin(db, target)
-    await users.delete_user(db, target)
+    await users.delete_user(db, target, workspace_fs=workspace_fs)
     return Response(status_code=204)

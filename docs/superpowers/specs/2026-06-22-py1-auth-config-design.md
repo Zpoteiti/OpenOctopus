@@ -22,7 +22,7 @@ This spec builds on the Py0 skeleton (`server/src/openoctopus_server/`) and reus
 - JWT issue/verify (HS256, `OPENOCTOPUS_JWT_SECRET`, 30-day exp, claims `{sub, exp}`)
 - Cookie (`openoctopus_session`) + bearer delivery; `OPENOCTOPUS_COOKIE_SECURE` controls `Secure`
 - argon2id password hashing
-- `ADMIN_TOKEN` gating at register → `is_admin`
+- `OPENOCTOPUS_ADMIN_TOKEN` gating at register → `is_admin`
 - Last-admin protection on user deletion
 - `system_config` admin-editable keys with LLM identity validation (`GET {llm_endpoint}/v1/models`) and `llm_api_key` redaction
 
@@ -73,7 +73,7 @@ server/src/openctopus_server/
   dto/
     user.py              UserResponse, AdminUserResponse
     config.py            ConfigPatch (request body), AdminConfig (response)
-  config.py             +admin_token: str | None = None
+  config.py             +admin_token: required non-empty str (Py4a revision)
   main.py               register OpenOctopusError handler in create_app()
 ```
 
@@ -100,7 +100,10 @@ server/src/openctopus_server/
 
 ## Config additions (`config.py`)
 
-- `admin_token: str | None = None` (env var `OPENOCTOPUS_ADMIN_TOKEN`) — optional. When unset, an `admin_token` in the register body is ignored (the user is created as a regular user). When set, a register request whose `admin_token` equals it creates `is_admin=true`.
+- Py1 originally allowed `admin_token: str | None = None`. Py4a supersedes that
+  deployment contract: `OPENOCTOPUS_ADMIN_TOKEN` is required and must be
+  non-empty. A register request whose `admin_token` equals it creates
+  `is_admin=true`.
 - Existing `jwt_secret` and `cookie_secure` are reused.
 
 ## JWT & cookie (`auth/jwt.py`, `auth/cookies.py`)
@@ -163,7 +166,7 @@ Services receive the session as an argument; they commit their own transactions.
 ### Auth (`api/auth.py`)
 
 `POST /api/auth/register` — body `{email: EmailStr, password: str (min 8), name: str, admin_token?: str}`.
-→ `users.create_user(...)` (email unique check → `AUTH_EMAIL_TAKEN`; `admin_token` matches `OPENOCTOPUS_ADMIN_TOKEN` when set → `is_admin=true`) → `create_jwt` → `set_auth_cookie` → `201 {jwt, user: UserResponse}`.
+→ `users.create_user(...)` (email unique check → `AUTH_EMAIL_TAKEN`; `admin_token` matches the required non-empty `OPENOCTOPUS_ADMIN_TOKEN` → `is_admin=true`) → `create_jwt` → `set_auth_cookie` → `201 {jwt, user: UserResponse}`.
 
 `POST /api/auth/login` — body `{email: EmailStr, password: str}`.
 → `get_user_by_email` + `verify_password`; mismatch → `AUTH_INVALID_CREDENTIALS` → `200 {jwt, user}` + cookie.

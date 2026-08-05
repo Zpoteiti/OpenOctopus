@@ -50,6 +50,26 @@ jobs:
       - name: Create environment file
         run: cp .env.example .env
 
+      - name: Start RustFS and create workspace bucket
+        run: |
+          docker run -d --name openoctopus-rustfs \
+            -p 9000:9000 -p 9001:9001 \
+            -e RUSTFS_ACCESS_KEY=openoctopus \
+            -e RUSTFS_SECRET_KEY=change-me-object-storage-secret \
+            rustfs/rustfs@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21 \
+            /data
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker logs openoctopus-rustfs
+              exit 1
+            fi
+            sleep 1
+          done
+          python -c "from minio import Minio; Minio('localhost:9000', access_key='openoctopus', secret_key='change-me-object-storage-secret', secure=False).make_bucket('openoctopus')"
+
       - name: Lint with ruff
         run: ruff check .
 
@@ -57,4 +77,6 @@ jobs:
         run: mypy src
 
       - name: Run tests
+        env:
+          RUN_RUSTFS_INTEGRATION: "1"
         run: pytest -v
