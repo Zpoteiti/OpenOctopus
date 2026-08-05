@@ -20,6 +20,8 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE: 413,
     ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE: 503,
     ErrorCode.WORKSPACE_STORAGE_ERROR: 503,
+    ErrorCode.WORKSPACE_INVALID_REQUEST: 400,
+    ErrorCode.WORKSPACE_REF_CONFLICT: 409,
     ErrorCode.TOOL_NO_MATCH: 409,
     ErrorCode.TOOL_AMBIGUOUS_EDIT: 409,
     ErrorCode.TOOL_IS_DIRECTORY: 409,
@@ -65,6 +67,14 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    if request.url.path.startswith("/api/workspace"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": ErrorCode.WORKSPACE_INVALID_REQUEST.value,
+                "message": "Workspace request is invalid",
+            },
+        )
     is_messages_route = request.url.path.startswith("/api/sessions/") and request.url.path.endswith(
         "/messages"
     )

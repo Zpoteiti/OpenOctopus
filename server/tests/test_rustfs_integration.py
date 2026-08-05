@@ -84,6 +84,7 @@ async def test_real_rustfs_personal_and_shared_file_lifecycle(
             entries = await fs.list_dir(target, "integration")
 
             assert written.etag
+            assert written.created is True
             assert stored.data == content
             assert stored.etag == written.etag
             assert metadata.size == len(content)
@@ -100,7 +101,18 @@ async def test_real_rustfs_personal_and_shared_file_lifecycle(
                 if_match=written.etag,
             )
             assert replacement.etag != written.etag
+            assert replacement.created is False
             assert await fs.read(target, path) == content + b" replaced"
+
+            with pytest.raises(WorkspaceError) as caught:
+                await fs.write(
+                    target,
+                    path,
+                    b"must not replace",
+                    quota_bytes=1024 * 1024,
+                    if_none_match=True,
+                )
+            assert caught.value.code == ErrorCode.WORKSPACE_FILE_CHANGED
 
         for target, _ in cases:
             await fs.delete_file(target, path)
@@ -113,3 +125,28 @@ async def test_real_rustfs_personal_and_shared_file_lifecycle(
                 await _delete_prefix(rustfs_storage, prefix)
             except WorkspaceError:
                 pass
+
+
+async def test_real_rustfs_streams_bounded_chunks_and_releases_response(
+    rustfs_storage: ObjectStorage,
+) -> None:
+    fs = WorkspaceFS(rustfs_storage)
+    target = WorkspaceTarget.personal(uuid4())
+    content = b"x" * (64 * 1024 + 17)
+    path = "integration/stream.bin"
+    try:
+        written = await fs.write(target, path, content, quota_bytes=1024 * 1024)
+        stream = await fs.open_stream(target, path)
+        try:
+            chunks = []
+            while chunk := await stream.read():
+                chunks.append(chunk)
+        finally:
+            await stream.aclose()
+
+        assert stream.size == len(content)
+        assert stream.etag == written.etag
+        assert [len(chunk) for chunk in chunks] == [64 * 1024, 17]
+        assert b"".join(chunks) == content
+    finally:
+        await _delete_prefix(rustfs_storage, f"users/{target.id}/")

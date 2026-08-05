@@ -16,6 +16,8 @@ class ErrorCode(StrEnum):
     WORKSPACE_FILE_CHANGED = "workspace_file_changed"
     WORKSPACE_STORAGE_UNAVAILABLE = "workspace_storage_unavailable"
     WORKSPACE_STORAGE_ERROR = "workspace_storage_error"
+    WORKSPACE_INVALID_REQUEST = "workspace_invalid_request"
+    WORKSPACE_REF_CONFLICT = "workspace_ref_conflict"
     # Tool
     TOOL_AMBIGUOUS_EDIT = "tool_ambiguous_edit"
     TOOL_NO_MATCH = "tool_no_match"

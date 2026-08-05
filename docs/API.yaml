@@ -32,10 +32,10 @@ info:
     | `apply_patch` | `POST /api/workspace/patch` | Query: required `openoctopus_device`; body mirrors nanobot apply_patch args |
     | `delete_file` | `DELETE /api/workspace/files/{path}` | Query: required `openoctopus_device`; always allowed for quota release |
     | `delete_folder` | `DELETE /api/workspace/folders/{path}` | Query: required `openoctopus_device`; recursive, no flag |
-    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, max_entries |
-    | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/head_limit/offset |
-    | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, etc. |
-    | `notebook_edit` | — | REST equivalent not specified |
+    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, limit, offset |
+    | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
+    | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
+    | `notebook_edit` | — | Agent-only in Py4; no REST equivalent |
     | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args |
     | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
@@ -60,6 +60,12 @@ info:
     - JSON bodies everywhere except file reads, which return raw file bytes
       with an appropriate `Content-Type`, and streaming message POST responses,
       which return newline-delimited JSON events.
+    - Py4 workspace collection routes return
+      `{items, limit, offset, next_offset, truncated}`. `next_offset=null`
+      means no ordinary next page; `truncated=true` means an internal safety
+      ceiling stopped a complete scan. Other historical route families keep
+      their documented response shapes until their owning milestone revisits
+      them.
     - Errors always return a JSON body: `{code, message}`. `code` values come
       from the `ErrorCode` enum in `openoctopus_server/errors/`.
     - Timestamps are ISO 8601 with timezone offset.
@@ -631,14 +637,15 @@ paths:
         workspaces they can access. Each `Workspace` includes quota state
         (`quota_bytes`, `bytes_used`, `locked`), so there is no separate
         personal quota endpoint.
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 } }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/Workspace' }
+              schema: { $ref: '#/components/schemas/WorkspacePage' }
     post:
       tags: [Workspaces]
       summary: Create a shared workspace (caller auto-added to allow-list)
@@ -655,6 +662,7 @@ paths:
             schema:
               type: object
               required: [name, quota_bytes]
+              additionalProperties: false
               properties:
                 name:
                   type: string
@@ -723,6 +731,8 @@ paths:
           application/json:
             schema:
               type: object
+              minProperties: 1
+              additionalProperties: false
               properties:
                 name: { type: string }
                 quota_bytes: { type: integer, format: int64 }
@@ -746,14 +756,15 @@ paths:
     get:
       tags: [Workspaces]
       summary: List allow-list for a shared workspace
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 } }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/WorkspaceMember' }
+              schema: { $ref: '#/components/schemas/WorkspaceMemberPage' }
     post:
       tags: [Workspaces]
       summary: Add a user to the allow-list
@@ -770,9 +781,13 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               oneOf:
-                - { required: [user_id], properties: { user_id: { type: string } } }
-                - { required: [email], properties: { email: { type: string, format: email } } }
+                - { required: [user_id] }
+                - { required: [email] }
+              properties:
+                user_id: { type: string, format: uuid }
+                email: { type: string, format: email }
       responses:
         '201':
           description: Member added.
@@ -842,7 +857,20 @@ paths:
         `MessageDeliveryRef` device-file chips.
       responses:
         '200':
-          description: OK — returns raw file bytes as `application/octet-stream`.
+          description: OK — returns a backpressured raw file stream.
+          headers:
+            ETag:
+              description: Quoted opaque file revision for a later `If-Match`.
+              schema: { type: string }
+            Content-Length:
+              description: File size in bytes.
+              schema: { type: integer, format: int64 }
+            Content-Disposition:
+              description: Safe attachment filename.
+              schema: { type: string }
+            X-Content-Type-Options:
+              description: Always `nosniff` for user-controlled files.
+              schema: { type: string, enum: [nosniff] }
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
@@ -860,13 +888,34 @@ paths:
         Server-side writes, hashes, and recursive operations must use the
         workspace service's background/thread boundary rather than blocking the
         FastAPI or agent event loop.
+        Missing precondition headers mean an intentional unconditional full
+        replacement. `If-None-Match: *` provides race-safe creation.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Stale revisions return `workspace_file_changed`.
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string, enum: ['*'] }
+          description: Optional `*` for create-only semantics. Cannot be combined with `If-Match`.
       requestBody:
         required: true
         content:
           application/octet-stream:
             schema: { type: string, format: binary }
       responses:
-        '204': { description: Written. }
+        '200':
+          description: Written. Returns the new metadata and ETag.
+          headers:
+            ETag:
+              description: Quoted opaque revision after the write.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMutation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409':
@@ -881,6 +930,12 @@ paths:
         `line_hint`, and `expected_replacements`. `old_text=""` keeps
         nanobot's create-file shortcut when the target does not exist; ordinary
         create/replace remains available through `PUT`.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Missing means edit the latest locked content.
       requestBody:
         required: true
         content:
@@ -908,13 +963,13 @@ paths:
       responses:
         '200':
           description: Edit applied.
+          headers:
+            ETag:
+              description: Quoted opaque revision after the edit.
+              schema: { type: string }
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  replacements: { type: integer }
-                  created: { type: boolean, default: false }
+              schema: { $ref: '#/components/schemas/FileMutation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -930,6 +985,12 @@ paths:
       description: |
         Deletes a file from the selected install site. Server deletes are
         always allowed regardless of quota lock state.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Missing means unconditional delete.
       responses:
         '204': { description: Deleted. }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1034,7 +1095,8 @@ paths:
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
       - { name: recursive, in: query, required: false, schema: { type: boolean, default: false }, description: 'Recursively list all files (default false).' }
-      - { name: max_entries, in: query, required: false, schema: { type: integer, minimum: 1, default: 200 }, description: 'Maximum entries to return (default 200).' }
+      - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum entries to return.' }
+      - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N matching entries.' }
     get:
       tags: [Workspace Files]
       summary: List workspace directory contents
@@ -1043,9 +1105,7 @@ paths:
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/ListDirEntry' }
+              schema: { $ref: '#/components/schemas/ListDirEntryPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1063,16 +1123,14 @@ paths:
         - { name: type, in: query, required: false, schema: { type: string }, description: 'Optional file type shorthand, e.g. `py`, `ts`, `md`, or `json`.' }
         - { name: include_dirs, in: query, required: false, schema: { type: boolean, default: false }, description: 'Include matching directories as well as files.' }
         - { name: sort, in: query, required: false, schema: { type: string, enum: [path, modified], default: path }, description: 'Sort by path or most recently modified first.' }
-        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 200 }, description: 'Maximum number of paths to return. 0 means all matches up to internal safety limits.' }
-        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N matching entries.' }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum number of paths to return.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N matching entries.' }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { type: string }
+              schema: { $ref: '#/components/schemas/StringPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
 
   /api/workspace/grep:
@@ -1091,16 +1149,14 @@ paths:
         - { name: output_mode, in: query, required: false, schema: { type: string, enum: [content, files_with_matches, count], default: files_with_matches }, description: 'Shape of grep results.' }
         - { name: context_before, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context before a match in content mode.' }
         - { name: context_after, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context after a match in content mode.' }
-        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 250 }, description: 'Maximum number of file entries or content match blocks.' }
-        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N results before applying `head_limit`.' }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum number of file entries or content match blocks.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N results before applying `limit`.' }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { type: string }
+              schema: { $ref: '#/components/schemas/StringPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1978,7 +2034,8 @@ components:
       required: true
       description: |
         Install site for file operations. `server` names OpenOctopus's built-in
-        server workspace. Paired device names route over `/ws/device`; the
+        server workspace. Py4 accepts only `server`. Beginning with Py5,
+        paired device names route over `/ws/device`; the
         client applies its `workspace_path` and `sandbox_mode`. Paired-but-offline
         devices remain valid names and return an error with code
         `device_unreachable` at dispatch.
@@ -2267,6 +2324,10 @@ components:
             tool_name: { type: string }
         - type: object
           required: [type, turn_id, message]
+          description: |
+            Idempotent durable message snapshot. The same message ID may appear
+            again after the Py4 `message` tool attaches provider-hidden
+            `delivery_refs`; consumers upsert by message ID.
           properties:
             type: { type: string, enum: [message_persisted] }
             turn_id: { type: string }
@@ -2425,10 +2486,16 @@ components:
       description: |
         Provider-hidden user delivery metadata. `delivery_refs` arrays remain
         empty through Py3; the initial Py4 `message` tool begins producing
-        these refs.
-      required: [type, openoctopus_device, path, filename, online_only]
+        these refs. The agent/provider never supplies or receives this shape.
+      required: [tool_use_id, type, openoctopus_device, path, filename, online_only]
       additionalProperties: false
       properties:
+        tool_use_id:
+          type: string
+          description: |
+            Provider tool-use ID that generated this ref. A frontend uses it to
+            associate files with the correct `message` call when one assistant
+            response contains multiple calls.
         type:
           type: string
           enum: [workspace_file, device_file]
@@ -2445,6 +2512,18 @@ components:
         path:
           type: string
           description: Existing file path on the selected install site.
+        workspace_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Immutable personal/shared workspace ID for `workspace_file` refs;
+            null for device refs. A frontend can match this against
+            `GET /api/workspaces` after a shared-workspace rename.
+        workspace_relative_path:
+          type: [string, "null"]
+          description: |
+            Stable path relative to the identified server workspace for
+            `workspace_file` refs; null for device refs.
         filename:
           type: string
           description: Display filename. Defaults to the final path segment if the adapter cannot infer anything better.
@@ -2466,7 +2545,7 @@ components:
 
     Workspace:
       type: object
-      required: [id, name, type, quota_bytes, bytes_used]
+      required: [id, name, type, quota_bytes, bytes_used, locked]
       properties:
         id:
           type: string
@@ -2510,8 +2589,21 @@ components:
             exception to ADR-058's cascade rule).
         members:
           type: array
-          description: Present for shared workspaces.
+          description: Present for shared-workspace create/get/patch responses; omitted from workspace collection summaries. Use the paginated members route for full lists.
           items: { $ref: '#/components/schemas/WorkspaceMember' }
+
+    WorkspacePage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Workspace' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True only when a hard internal safety ceiling stopped the collection. }
 
     WorkspaceMember:
       type: object
@@ -2520,6 +2612,19 @@ components:
         user_id: { type: string }
         email: { type: string, format: email }
         name: { type: string }
+
+    WorkspaceMemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/WorkspaceMember' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True only when a hard internal safety ceiling stopped the collection. }
 
     Device:
       type: object
@@ -2718,6 +2823,20 @@ components:
         dst_path: { type: string }
         mode: { type: string, enum: [copy, move] }
 
+    FileMutation:
+      type: object
+      additionalProperties: false
+      required: [path, size, etag, created]
+      properties:
+        path: { type: string, description: Authorized virtual workspace path. }
+        size: { type: integer, format: int64, minimum: 0 }
+        etag: { type: string, description: Opaque unquoted revision value. }
+        created: { type: boolean }
+        replacements:
+          type: integer
+          minimum: 0
+          description: Present only for text-edit responses.
+
     ListDirEntry:
       type: object
       required: [name, path, kind, size]
@@ -2726,6 +2845,32 @@ components:
         path: { type: string, description: Relative path from the personal server workspace root. }
         kind: { type: string, enum: [file, directory, symlink, other] }
         size: { type: integer, format: int64, description: File byte length; zero for non-files. }
+
+    ListDirEntryPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ListDirEntry' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True when the 10,000-object scan ceiling stopped the search. }
+
+    StringPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True when the 10,000-object scan ceiling stopped the search. }
 
     McpServerConfig:
       type: object

@@ -1,0 +1,670 @@
+"""HTTP contract tests for the Py4 server-workspace file API."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from collections.abc import AsyncIterator, Iterator
+from io import BytesIO
+from types import SimpleNamespace
+from typing import Any
+from urllib.parse import quote
+from uuid import UUID
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from openctopus_server.db.engine import get_engine
+from openctopus_server.db.models import User, Workspace, WorkspaceMember
+from openctopus_server.workspace.fs import _workspace_fs_for_storage
+from openctopus_server.workspace.storage import ObjectStorage, get_object_storage
+
+_MIB = 1024 * 1024
+_REST_UPLOAD_LIMIT = 64 * _MIB
+
+
+class _NoSuchKeyError(Exception):
+    code = "NoSuchKey"
+
+
+class _ObjectBody(BytesIO):
+    def __init__(self, data: bytes, etag: str) -> None:
+        super().__init__(data)
+        self.headers = {
+            "Content-Length": str(len(data)),
+            "ETag": f'"{etag}"',
+        }
+
+    def release_conn(self) -> None:
+        return None
+
+
+class _MemoryMinio:
+    """Small synchronous MinIO stand-in behind the real ObjectStorage adapter."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, tuple[bytes, str]] = {}
+        self._revision = 0
+
+    def seed(self, user_id: UUID, path: str, data: bytes) -> str:
+        return self._store(f"users/{user_id}/{path}", data)
+
+    def data_for(self, user_id: UUID, path: str) -> bytes | None:
+        stored = self.objects.get(f"users/{user_id}/{path}")
+        return None if stored is None else stored[0]
+
+    def stat_object(self, bucket: str, object_name: str) -> SimpleNamespace:
+        del bucket
+        try:
+            data, etag = self.objects[object_name]
+        except KeyError as exc:
+            raise _NoSuchKeyError from exc
+        return SimpleNamespace(object_name=object_name, size=len(data), etag=etag)
+
+    def get_object(
+        self,
+        bucket: str,
+        object_name: str,
+        *,
+        offset: int = 0,
+        length: int = 0,
+    ) -> _ObjectBody:
+        del bucket
+        try:
+            data, etag = self.objects[object_name]
+        except KeyError as exc:
+            raise _NoSuchKeyError from exc
+        end = None if length == 0 else offset + length
+        return _ObjectBody(data[offset:end], etag)
+
+    def put_object(
+        self,
+        bucket: str,
+        object_name: str,
+        stream: Any,
+        length: int,
+    ) -> SimpleNamespace:
+        del bucket
+        data = stream.read(length)
+        assert len(data) == length
+        return SimpleNamespace(etag=self._store(object_name, data))
+
+    def remove_object(self, bucket: str, object_name: str) -> None:
+        del bucket
+        if object_name not in self.objects:
+            raise _NoSuchKeyError
+        del self.objects[object_name]
+
+    def list_objects(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        start_after: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[SimpleNamespace]:
+        del bucket, kwargs
+        for object_name in sorted(self.objects):
+            if object_name.startswith(prefix) and (
+                start_after is None or object_name > start_after
+            ):
+                data, etag = self.objects[object_name]
+                yield SimpleNamespace(
+                    object_name=object_name,
+                    size=len(data),
+                    etag=etag,
+                )
+
+    def _store(self, object_name: str, data: bytes) -> str:
+        self._revision += 1
+        etag = f"revision-{self._revision}"
+        self.objects[object_name] = (data, etag)
+        return etag
+
+
+@pytest_asyncio.fixture
+async def workspace_storage(test_app) -> AsyncIterator[_MemoryMinio]:
+    client = _MemoryMinio()
+    storage = ObjectStorage(client, "test", max_connections=1)
+    test_app.dependency_overrides[get_object_storage] = lambda: storage
+    _workspace_fs_for_storage.cache_clear()
+    try:
+        yield client
+    finally:
+        _workspace_fs_for_storage.cache_clear()
+        await storage.close()
+
+
+@pytest_asyncio.fixture
+async def workspace_api(
+    user_client,
+    workspace_storage: _MemoryMinio,
+    pg_engine,
+) -> tuple[Any, _MemoryMinio, UUID]:
+    async with AsyncSession(pg_engine) as db:
+        user_id = await db.scalar(select(User.id).where(User.email == "user@test.com"))
+    assert user_id is not None
+    return user_client, workspace_storage, user_id
+
+
+def _assert_standard_error(response, status: int, code: str | None = None) -> None:
+    assert response.status_code == status
+    body = response.json()
+    assert set(body) == {"code", "message"}
+    assert isinstance(body["message"], str) and body["message"]
+    if code is not None:
+        assert body["code"] == code
+
+
+async def test_runtime_openapi_describes_raw_download_and_upload(async_client) -> None:
+    schema = (await async_client.get("/openapi.json")).json()
+    operations = schema["paths"]["/api/workspace/files/{path}"]
+
+    download = operations["get"]["responses"]["200"]
+    assert set(download["headers"]) == {
+        "ETag",
+        "Content-Length",
+        "Content-Disposition",
+        "X-Content-Type-Options",
+    }
+    assert download["content"]["application/octet-stream"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+    upload = operations["put"]["requestBody"]
+    assert upload["required"] is True
+    assert upload["content"]["application/octet-stream"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        ("GET", "/api/workspace/files/a.txt", {}),
+        ("PUT", "/api/workspace/files/a.txt", {"content": b"a"}),
+        (
+            "PATCH",
+            "/api/workspace/files/a.txt",
+            {"json": {"old_text": "a", "new_text": "b"}},
+        ),
+        ("DELETE", "/api/workspace/files/a.txt", {}),
+        ("DELETE", "/api/workspace/folders/docs", {}),
+        ("GET", "/api/workspace/list/docs", {}),
+    ],
+)
+async def test_every_file_route_requires_explicit_server_device(
+    user_client,
+    workspace_storage,
+    method: str,
+    path: str,
+    kwargs: dict[str, Any],
+) -> None:
+    response = await user_client.request(method, path, **kwargs)
+    _assert_standard_error(response, 400)
+
+
+async def test_file_routes_reject_non_server_device(user_client, workspace_storage) -> None:
+    response = await user_client.get(
+        "/api/workspace/files/a.txt",
+        params={"openoctopus_device": "laptop"},
+    )
+    _assert_standard_error(response, 400)
+
+
+async def test_file_routes_require_authentication(async_client, workspace_storage) -> None:
+    response = await async_client.get(
+        "/api/workspace/files/a.txt",
+        params={"openoctopus_device": "server"},
+    )
+    _assert_standard_error(response, 401, "auth_unauthorized")
+
+
+async def test_get_file_streams_raw_bytes_and_download_headers(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    etag = storage.seed(user_id, "reports/report.bin", b"\x00report\xff")
+
+    response = await client.get(
+        "/api/workspace/files/reports/report.bin",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"\x00report\xff"
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers["content-length"] == "8"
+    assert response.headers["etag"] == f'"{etag}"'
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert 'filename="report.bin"' in response.headers["content-disposition"]
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_get_file_uses_ascii_safe_and_utf8_download_filenames(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "reports/\u62a5\u544a.txt", b"report")
+
+    response = await client.get(
+        f"/api/workspace/files/{quote('reports/\u62a5\u544a.txt')}",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert 'filename="__.txt"' in disposition
+    assert "filename*=UTF-8''%E6%8A%A5%E5%91%8A.txt" in disposition
+
+
+async def test_invalid_download_etag_closes_stream_before_returning_error(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.objects[f"users/{user_id}/bad.bin"] = (b"bad", "invalid-\u2603")
+    storage.seed(user_id, "good.bin", b"good")
+
+    invalid = await client.get(
+        "/api/workspace/files/bad.bin",
+        params={"openoctopus_device": "server"},
+    )
+    assert invalid.status_code == 503
+    assert invalid.json()["code"] == "workspace_storage_error"
+
+    unblocked = await client.get(
+        "/api/workspace/files/good.bin",
+        params={"openoctopus_device": "server"},
+    )
+    assert unblocked.status_code == 200
+    assert unblocked.content == b"good"
+
+
+async def test_download_waiting_for_object_storage_does_not_hold_database_connection(
+    workspace_api,
+) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "slow.bin", b"slow")
+    entered = threading.Event()
+    release = threading.Event()
+    original_get = storage.get_object
+
+    def blocking_get(*args: Any, **kwargs: Any) -> _ObjectBody:
+        entered.set()
+        release.wait(timeout=2)
+        return original_get(*args, **kwargs)
+
+    storage.get_object = blocking_get  # type: ignore[method-assign]
+    downloading = asyncio.create_task(
+        client.get(
+            "/api/workspace/files/slow.bin",
+            params={"openoctopus_device": "server"},
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    try:
+        assert get_engine().pool.checkedout() == 0
+    finally:
+        release.set()
+    response = await downloading
+    assert response.status_code == 200
+
+
+async def test_slow_upload_body_does_not_hold_database_connection(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    body_requested = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_body() -> AsyncIterator[bytes]:
+        yield b"first"
+        body_requested.set()
+        await release.wait()
+        yield b"second"
+
+    uploading = asyncio.create_task(
+        client.put(
+            "/api/workspace/files/slow-upload.bin",
+            params={"openoctopus_device": "server"},
+            headers={"Content-Type": "application/octet-stream"},
+            content=slow_body(),
+        )
+    )
+    await asyncio.wait_for(body_requested.wait(), timeout=1)
+    try:
+        assert get_engine().pool.checkedout() == 0
+    finally:
+        release.set()
+    response = await uploading
+    assert response.status_code == 200
+    assert storage.data_for(user_id, "slow-upload.bin") == b"firstsecond"
+
+
+async def test_put_file_returns_uniform_json_mutation_shape(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    url = "/api/workspace/files/notes/today.md"
+    params = {"openoctopus_device": "server"}
+
+    created = await client.put(
+        url,
+        params=params,
+        headers={"Content-Type": "application/octet-stream"},
+        content=b"first",
+    )
+    assert created.status_code == 200
+    assert created.json() == {
+        "path": "notes/today.md",
+        "size": 5,
+        "etag": created.json()["etag"],
+        "created": True,
+    }
+    assert created.headers["etag"] == f'"{created.json()["etag"]}"'
+
+    replaced = await client.put(
+        url,
+        params=params,
+        headers={"Content-Type": "application/octet-stream"},
+        content=b"replacement",
+    )
+    assert replaced.status_code == 200
+    assert replaced.json() == {
+        "path": "notes/today.md",
+        "size": 11,
+        "etag": replaced.json()["etag"],
+        "created": False,
+    }
+    assert storage.data_for(user_id, "notes/today.md") == b"replacement"
+
+
+async def test_put_rejects_oversized_content_length_before_reading_body(
+    workspace_api,
+) -> None:
+    client, storage, user_id = workspace_api
+    response = await client.put(
+        "/api/workspace/files/large.bin",
+        params={"openoctopus_device": "server"},
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(_REST_UPLOAD_LIMIT + 1),
+        },
+        content=b"small",
+    )
+
+    _assert_standard_error(response, 409, "workspace_upload_too_large")
+    assert storage.data_for(user_id, "large.bin") is None
+
+
+async def test_put_counts_streamed_chunks_when_content_length_is_absent(
+    workspace_api,
+) -> None:
+    client, storage, user_id = workspace_api
+    chunk = b"x" * _MIB
+
+    async def oversized_body() -> AsyncIterator[bytes]:
+        for _ in range(65):
+            yield chunk
+
+    response = await client.put(
+        "/api/workspace/files/chunked.bin",
+        params={"openoctopus_device": "server"},
+        headers={"Content-Type": "application/octet-stream"},
+        content=oversized_body(),
+    )
+
+    _assert_standard_error(response, 409, "workspace_upload_too_large")
+    assert storage.data_for(user_id, "chunked.bin") is None
+
+
+async def test_put_supports_optional_if_match(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    etag = storage.seed(user_id, "draft.txt", b"version one")
+    url = "/api/workspace/files/draft.txt"
+    params = {"openoctopus_device": "server"}
+
+    matched = await client.put(
+        url,
+        params=params,
+        headers={"Content-Type": "application/octet-stream", "If-Match": f'"{etag}"'},
+        content=b"version two",
+    )
+    assert matched.status_code == 200
+
+    stale = await client.put(
+        url,
+        params=params,
+        headers={"Content-Type": "application/octet-stream", "If-Match": f'"{etag}"'},
+        content=b"stale overwrite",
+    )
+    _assert_standard_error(stale, 409, "workspace_file_changed")
+    assert storage.data_for(user_id, "draft.txt") == b"version two"
+
+
+async def test_put_supports_if_none_match_star_for_create_only(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    url = "/api/workspace/files/new.txt"
+    params = {"openoctopus_device": "server"}
+    headers = {"Content-Type": "application/octet-stream", "If-None-Match": "*"}
+
+    created = await client.put(url, params=params, headers=headers, content=b"new")
+    assert created.status_code == 200
+    assert created.json()["created"] is True
+
+    conflict = await client.put(url, params=params, headers=headers, content=b"replace")
+    _assert_standard_error(conflict, 409, "workspace_file_changed")
+    assert storage.data_for(user_id, "new.txt") == b"new"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"If-Match": 'W/"revision-1"'},
+        {"If-Match": '"revision-1", "revision-2"'},
+        {"If-None-Match": '"revision-1"'},
+        {"If-Match": '"revision-1"', "If-None-Match": "*"},
+    ],
+)
+async def test_put_rejects_malformed_or_conflicting_etag_conditions(
+    workspace_api,
+    headers: dict[str, str],
+) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "guarded.txt", b"original")
+    response = await client.put(
+        "/api/workspace/files/guarded.txt",
+        params={"openoctopus_device": "server"},
+        headers={"Content-Type": "application/octet-stream", **headers},
+        content=b"changed",
+    )
+
+    _assert_standard_error(response, 400)
+    assert storage.data_for(user_id, "guarded.txt") == b"original"
+
+
+async def test_patch_file_returns_edit_mutation_result(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    etag = storage.seed(user_id, "notes/edit.txt", b"hello world world")
+
+    response = await client.patch(
+        "/api/workspace/files/notes/edit.txt",
+        params={"openoctopus_device": "server"},
+        headers={"If-Match": f'"{etag}"'},
+        json={
+            "old_text": "world",
+            "new_text": "octopus",
+            "occurrence": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": "notes/edit.txt",
+        "size": 19,
+        "etag": response.json()["etag"],
+        "created": False,
+        "replacements": 1,
+    }
+    assert response.headers["etag"] == f'"{response.json()["etag"]}"'
+    assert storage.data_for(user_id, "notes/edit.txt") == b"hello world octopus"
+
+
+async def test_delete_file_honors_if_match_and_returns_no_content(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    etag = storage.seed(user_id, "delete-me.txt", b"content")
+    url = "/api/workspace/files/delete-me.txt"
+    params = {"openoctopus_device": "server"}
+
+    stale = await client.delete(
+        url,
+        params=params,
+        headers={"If-Match": '"stale"'},
+    )
+    _assert_standard_error(stale, 409, "workspace_file_changed")
+
+    deleted = await client.delete(
+        url,
+        params=params,
+        headers={"If-Match": f'"{etag}"'},
+    )
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert storage.data_for(user_id, "delete-me.txt") is None
+
+
+async def test_delete_folder_is_recursive_and_does_not_delete_siblings(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "docs/a.txt", b"a")
+    storage.seed(user_id, "docs/nested/b.txt", b"b")
+    storage.seed(user_id, "docs-sibling.txt", b"keep")
+
+    response = await client.delete(
+        "/api/workspace/folders/docs",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert storage.data_for(user_id, "docs/a.txt") is None
+    assert storage.data_for(user_id, "docs/nested/b.txt") is None
+    assert storage.data_for(user_id, "docs-sibling.txt") == b"keep"
+
+
+async def test_list_directory_uses_standard_page_envelope(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "docs/a.txt", b"a")
+    storage.seed(user_id, "docs/sub/b.txt", b"bb")
+
+    first = await client.get(
+        "/api/workspace/list/docs",
+        params={"openoctopus_device": "server", "limit": 1, "offset": 0},
+    )
+    assert first.status_code == 200
+    assert first.json() == {
+        "items": [{"name": "a.txt", "path": "docs/a.txt", "kind": "file", "size": 1}],
+        "limit": 1,
+        "offset": 0,
+        "next_offset": 1,
+        "truncated": False,
+    }
+
+    second = await client.get(
+        "/api/workspace/list/docs",
+        params={"openoctopus_device": "server", "limit": 1, "offset": 1},
+    )
+    assert second.status_code == 200
+    assert second.json() == {
+        "items": [{"name": "sub", "path": "docs/sub", "kind": "directory", "size": 0}],
+        "limit": 1,
+        "offset": 1,
+        "next_offset": None,
+        "truncated": False,
+    }
+
+
+async def test_list_directory_paginates_more_than_one_thousand_entries(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    for index in range(1_001):
+        storage.seed(user_id, f"large/{index:04d}.txt", b"x")
+
+    response = await client.get(
+        "/api/workspace/list/large",
+        params={"openoctopus_device": "server", "limit": 1, "offset": 1_000},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "name": "1000.txt",
+                "path": "large/1000.txt",
+                "kind": "file",
+                "size": 1,
+            }
+        ],
+        "limit": 1,
+        "offset": 1_000,
+        "next_offset": None,
+        "truncated": False,
+    }
+
+
+async def test_shared_directory_entries_preserve_reusable_virtual_paths(
+    workspace_api,
+    pg_engine,
+) -> None:
+    client, storage, user_id = workspace_api
+    workspace_id = UUID("a4f7e2d1-0000-4000-8000-000000000001")
+    async with AsyncSession(pg_engine) as db:
+        db.add(
+            Workspace(
+                id=workspace_id,
+                name="Team",
+                suffix="a4f7e2d1",
+                quota_bytes=1_000_000,
+                created_by=user_id,
+            )
+        )
+        db.add(WorkspaceMember(workspace_id=workspace_id, user_id=user_id))
+        await db.commit()
+    storage._store(f"workspaces/{workspace_id}/docs/a.txt", b"a")
+
+    response = await client.get(
+        "/api/workspace/list//Team@a4f7e2d1/docs",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {
+            "name": "a.txt",
+            "path": "/Team@a4f7e2d1/docs/a.txt",
+            "kind": "file",
+            "size": 1,
+        }
+    ]
+
+
+async def test_file_routes_return_standard_domain_and_validation_errors(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    missing = await client.get(
+        "/api/workspace/files/missing.txt",
+        params={"openoctopus_device": "server"},
+    )
+    _assert_standard_error(missing, 404, "workspace_not_found")
+
+    storage.seed(user_id, "file.txt", b"content")
+    file_as_folder = await client.delete(
+        "/api/workspace/folders/file.txt",
+        params={"openoctopus_device": "server"},
+    )
+    _assert_standard_error(file_as_folder, 409, "tool_is_file")
+
+    invalid_json = await client.patch(
+        "/api/workspace/files/file.txt",
+        params={"openoctopus_device": "server"},
+        json={"old_text": "content", "new_text": "new", "unexpected": True},
+    )
+    _assert_standard_error(invalid_json, 400)
+
+    wrong_media_type = await client.put(
+        "/api/workspace/files/file.txt",
+        params={"openoctopus_device": "server"},
+        headers={"Content-Type": "text/plain"},
+        content=b"new",
+    )
+    _assert_standard_error(wrong_media_type, 400)

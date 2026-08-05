@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import AsyncMock
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -8,14 +9,26 @@ from openctopus_server.db.models import User, Workspace, WorkspaceMember
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.services import users
-from openctopus_server.workspace.fs import WorkspaceTarget
+from openctopus_server.workspace.fs import WorkspaceFS, WorkspaceTarget
 from openctopus_server.workspace.service import WorkspaceService
+
+
+@asynccontextmanager
+async def _slot():
+    yield
+
+
+def _workspace_fs_mock() -> AsyncMock:
+    workspace_fs = AsyncMock(spec=WorkspaceFS)
+    workspace_fs.materialization_slot = Mock(side_effect=_slot)
+    workspace_fs.file_operation_slot = Mock(side_effect=_slot)
+    return workspace_fs
 
 
 async def test_service_rejects_inaccessible_shared_path_before_file_call(
     pg_engine: AsyncEngine,
 ) -> None:
-    workspace_fs = AsyncMock()
+    workspace_fs = _workspace_fs_mock()
     service = WorkspaceService(workspace_fs)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         owner = User(email="owner-service@test.com", password_hash="x", name="Owner")
@@ -47,12 +60,13 @@ async def test_service_rejects_inaccessible_shared_path_before_file_call(
 
     assert caught.value.code is ErrorCode.WORKSPACE_NOT_FOUND
     workspace_fs.write.assert_not_awaited()
+    workspace_fs.write_collected_upload.assert_not_awaited()
 
 
 async def test_service_supplies_resolved_target_and_database_quota(
     pg_engine: AsyncEngine,
 ) -> None:
-    workspace_fs = AsyncMock()
+    workspace_fs = _workspace_fs_mock()
     service = WorkspaceService(workspace_fs)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         member = User(email="member-service@test.com", password_hash="x", name="Member")
@@ -76,12 +90,13 @@ async def test_service_supplies_resolved_target_and_database_quota(
             data=b"contents",
         )
 
-    workspace_fs.write.assert_awaited_once_with(
+    workspace_fs.write_collected_upload.assert_awaited_once_with(
         WorkspaceTarget.shared(workspace.id),
         "file.txt",
         b"contents",
         quota_bytes=4321,
         if_match=None,
+        if_none_match=False,
     )
 
 
@@ -96,8 +111,8 @@ async def test_authorized_operation_holds_account_deletion_until_it_finishes(
         entered_file_call.set()
         await release_file_call.wait()
 
-    workspace_fs = AsyncMock()
-    workspace_fs.write.side_effect = blocking_write
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.write_collected_upload.side_effect = blocking_write
     service = WorkspaceService(workspace_fs)
     async with AsyncSession(pg_engine, expire_on_commit=False) as setup_db:
         user = User(email="locked-service@test.com", password_hash="x", name="Locked")

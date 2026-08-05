@@ -4,6 +4,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -14,6 +15,64 @@ from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import MAX_EDIT_BYTES, WorkspaceFS, WorkspaceTarget
 from openctopus_server.workspace.locks import KeyedLockManager
 from openctopus_server.workspace.storage import ObjectStorage, normalize_storage_error
+
+
+async def test_download_waiting_for_storage_capacity_does_not_block_workspace_retirement() -> None:
+    target = WorkspaceTarget.personal(uuid4())
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stream = object()
+    storage = AsyncMock()
+
+    async def blocked_open(object_name: str) -> object:
+        assert object_name.endswith("/report.bin")
+        entered.set()
+        await release.wait()
+        return stream
+
+    storage.open_stream.side_effect = blocked_open
+    workspace_fs = WorkspaceFS(storage)
+    opening = asyncio.create_task(workspace_fs.open_stream(target, "report.bin"))
+    await entered.wait()
+
+    retiring = asyncio.create_task(workspace_fs.retire_workspace(target))
+    await asyncio.wait_for(asyncio.shield(retiring), timeout=0.2)
+    release.set()
+
+    assert await opening is stream
+
+
+async def test_upload_collection_holds_materialization_slot_until_caller_finishes() -> None:
+    storage = AsyncMock()
+    workspace_fs = WorkspaceFS(storage, materialization_concurrency=1)
+    first_ready = asyncio.Event()
+    release_first = asyncio.Event()
+    second_consumed = asyncio.Event()
+
+    async def first_chunks():
+        yield b"first"
+
+    async def second_chunks():
+        second_consumed.set()
+        yield b"second"
+
+    async def first_upload() -> None:
+        async with workspace_fs.collect_upload(first_chunks(), max_bytes=10) as data:
+            assert data == b"first"
+            first_ready.set()
+            await release_first.wait()
+
+    async def second_upload() -> None:
+        async with workspace_fs.collect_upload(second_chunks(), max_bytes=10) as data:
+            assert data == b"second"
+
+    first = asyncio.create_task(first_upload())
+    await first_ready.wait()
+    second = asyncio.create_task(second_upload())
+    await asyncio.sleep(0)
+    assert not second_consumed.is_set()
+    release_first.set()
+    await asyncio.gather(first, second)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -301,11 +360,13 @@ def _fs(
     *,
     max_connections: int = 8,
     materialization_concurrency: int = 4,
+    heavy_operation_concurrency: int = 4,
 ) -> WorkspaceFS:
     storage = ObjectStorage(client, "openoctopus", max_connections=max_connections)
     return WorkspaceFS(
         storage,
         materialization_concurrency=materialization_concurrency,
+        heavy_operation_concurrency=heavy_operation_concurrency,
     )
 
 
@@ -534,6 +595,19 @@ async def test_materialization_concurrency_is_bounded() -> None:
     assert client.max_active_gets == limit
     client.release.set()
     await asyncio.gather(*tasks)
+
+
+async def test_usage_scan_concurrency_is_bounded_process_wide() -> None:
+    limit = 2
+    client = _CapacityMinio(limit)
+    fs = _fs(client, max_connections=8, heavy_operation_concurrency=limit)
+    targets = [WorkspaceTarget.personal(uuid4()) for _ in range(5)]
+    tasks = [asyncio.create_task(fs.usage(target)) for target in targets]
+    await _wait_for(client.started.is_set)
+
+    assert client.max_active_operations == limit
+    client.release.set()
+    assert await asyncio.gather(*tasks) == [0] * len(targets)
 
 
 async def test_write_materialization_concurrency_is_bounded() -> None:

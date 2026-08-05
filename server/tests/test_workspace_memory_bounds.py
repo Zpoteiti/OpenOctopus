@@ -127,6 +127,40 @@ class _PagedClient:
         del self.objects[object_name]
 
 
+class _DelimiterClient:
+    def __init__(self) -> None:
+        self.recursive_values: list[bool] = []
+
+    def list_objects(
+        self,
+        bucket: str,
+        *,
+        prefix: str,
+        recursive: bool,
+        start_after: str | None = None,
+    ) -> Iterator[SimpleNamespace]:
+        del bucket, start_after
+        self.recursive_values.append(recursive)
+        if recursive:
+            raise AssertionError("non-recursive list must use object-store delimiter mode")
+        return iter(
+            (
+                SimpleNamespace(
+                    object_name=f"{prefix}huge/",
+                    size=0,
+                    etag=None,
+                    is_dir=True,
+                ),
+                SimpleNamespace(
+                    object_name=f"{prefix}sibling.txt",
+                    size=1,
+                    etag="sibling-etag",
+                    is_dir=False,
+                ),
+            )
+        )
+
+
 async def test_read_uses_limit_plus_one_and_never_unbounded_response_read() -> None:
     client = _ReadClient(b"0123456789")
     storage = ObjectStorage(client, "openoctopus", max_connections=1)
@@ -222,3 +256,20 @@ async def test_directory_listing_refuses_an_unbounded_result() -> None:
 
     assert caught.value.code == ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE
     assert client.max_items_consumed_per_call <= _PAGE_SIZE + 1
+
+
+async def test_non_recursive_directory_listing_uses_object_store_delimiter() -> None:
+    client = _DelimiterClient()
+    target = WorkspaceTarget.personal(uuid4())
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    fs = WorkspaceFS(storage)
+    try:
+        entries = await fs.list_dir(target, "docs")
+    finally:
+        await storage.close()
+
+    assert [(entry.path, entry.is_directory, entry.size) for entry in entries] == [
+        ("docs/huge", True, None),
+        ("docs/sibling.txt", False, 1),
+    ]
+    assert client.recursive_values == [False]

@@ -10,6 +10,7 @@ from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.services import users
 from openctopus_server.services.workspace_deletions import (
     WorkspaceDeletionWorker,
+    finalize_workspace_deletions,
     recover_workspace_deletions,
 )
 from openctopus_server.workspace.fs import WorkspaceTarget
@@ -90,6 +91,34 @@ async def test_startup_recovery_purges_and_removes_durable_cleanup(
         assert await db.scalar(select(WorkspaceDeletion)) is None
     assert workspace_fs.purged == [target]
     assert workspace_fs.forgotten == [target]
+
+
+async def test_slow_workspace_purge_does_not_hold_database_connection(
+    pg_engine: AsyncEngine,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingLifecycle(_LifecycleFS):
+        async def purge_workspace(self, target: WorkspaceTarget) -> None:
+            entered.set()
+            await release.wait()
+            await super().purge_workspace(target)
+
+    workspace_fs = BlockingLifecycle()
+    target = WorkspaceTarget.shared(uuid4())
+    async with AsyncSession(pg_engine) as setup_db:
+        setup_db.add(WorkspaceDeletion(kind=target.kind, target_id=target.id))
+        await setup_db.commit()
+
+    async with AsyncSession(pg_engine) as db:
+        finalizing = asyncio.create_task(finalize_workspace_deletions(db, [target], workspace_fs))
+        await entered.wait()
+        try:
+            assert pg_engine.pool.checkedout() == 0
+        finally:
+            release.set()
+        await finalizing
 
 
 async def test_ambiguous_commit_keeps_a_deleted_target_retired(

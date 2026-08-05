@@ -21,6 +21,7 @@ from openctopus_server.errors.exceptions import WorkspaceError
 STARTUP_PROBE_KEY = "_openoctopus/startup-probe"
 _PROBE_BYTES = 32
 MAX_LIST_PAGE_SIZE = 1000
+STREAM_CHUNK_SIZE = 64 * 1024
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,82 @@ class ObjectMetadata:
 class ObjectPage:
     items: tuple[ObjectMetadata, ...]
     next_start_after: str | None
+
+
+@dataclass(frozen=True)
+class DirectoryObject:
+    object_name: str
+    size: int | None
+    is_directory: bool
+
+
+@dataclass(frozen=True)
+class DirectoryObjectPage:
+    items: tuple[DirectoryObject, ...]
+    next_start_after: str | None
+
+
+class ObjectStream:
+    """One bounded object response that owns a storage slot until closed."""
+
+    def __init__(
+        self,
+        storage: ObjectStorage,
+        response: Any,
+        *,
+        size: int,
+        etag: str,
+    ) -> None:
+        self.size = size
+        self.etag = etag
+        self._storage = storage
+        self._response = response
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    async def read(self) -> bytes:
+        try:
+            async with self._lock:
+                if self._closed:
+                    return b""
+                chunk = await self._storage._run_stream_operation(
+                    self._response.read,
+                    STREAM_CHUNK_SIZE,
+                )
+                if not isinstance(chunk, bytes):
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_STORAGE_ERROR,
+                        "Object storage request failed",
+                    )
+                if not chunk:
+                    await self._close_locked()
+                return chunk
+        except asyncio.CancelledError:
+            close_task = asyncio.create_task(self.aclose())
+            await _wait_for_worker(close_task)
+            raise
+        except Exception:
+            try:
+                await self.aclose()
+            except WorkspaceError:
+                pass
+            raise
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            await self._close_locked()
+
+    async def _close_locked(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._storage._run_stream_operation(
+                _close_response,
+                self._response,
+            )
+        finally:
+            self._storage._semaphore.release()
 
 
 class ObjectStorage:
@@ -142,6 +219,63 @@ class ObjectStorage:
 
         return await self.execute(stat_and_validate)
 
+    async def open_stream(self, object_name: str) -> ObjectStream:
+        await self._semaphore.acquire()
+        try:
+            worker = asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                partial(self._open_stream_response, object_name),
+            )
+        except Exception as exc:
+            self._semaphore.release()
+            raise normalize_storage_error(exc) from exc
+        try:
+            response, size, etag = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await _wait_for_worker(worker)
+                if not worker.cancelled() and worker.exception() is None:
+                    response, _, _ = worker.result()
+                    close_worker = asyncio.get_running_loop().run_in_executor(
+                        self._executor,
+                        _close_response,
+                        response,
+                    )
+                    await _wait_for_worker(close_worker)
+            finally:
+                self._semaphore.release()
+            raise
+        except Exception as exc:
+            self._semaphore.release()
+            raise normalize_storage_error(exc) from exc
+        return ObjectStream(self, response, size=size, etag=etag)
+
+    def _open_stream_response(self, object_name: str) -> tuple[Any, int, str]:
+        response = self.client.get_object(self.bucket, object_name)
+        try:
+            size, etag = _stream_metadata(response)
+        except Exception:
+            _close_response(response)
+            raise
+        return response, size, etag
+
+    async def _run_stream_operation(
+        self,
+        operation: Callable[..., _T],
+        *args: Any,
+    ) -> _T:
+        worker = asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            partial(operation, *args),
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await _wait_for_worker(worker)
+            raise
+        except Exception as exc:
+            raise normalize_storage_error(exc) from exc
+
     async def list_page(
         self,
         prefix: str,
@@ -166,6 +300,56 @@ class ObjectStorage:
                     break
                 items.append(_metadata(item))
             return ObjectPage(
+                items=tuple(items),
+                next_start_after=items[-1].object_name if has_more else None,
+            )
+
+        return await self.execute(collect_page)
+
+    async def list_directory_page(
+        self,
+        prefix: str,
+        *,
+        start_after: str | None = None,
+        limit: int = MAX_LIST_PAGE_SIZE,
+    ) -> DirectoryObjectPage:
+        if not 1 <= limit <= MAX_LIST_PAGE_SIZE:
+            raise ValueError(f"list limit must be between 1 and {MAX_LIST_PAGE_SIZE}")
+
+        def collect_page() -> DirectoryObjectPage:
+            items: list[DirectoryObject] = []
+            has_more = False
+            for item in self.client.list_objects(
+                self.bucket,
+                prefix=prefix,
+                recursive=False,
+                start_after=start_after,
+            ):
+                if len(items) == limit:
+                    has_more = True
+                    break
+                object_name = getattr(item, "object_name", None)
+                if not isinstance(object_name, str) or not object_name:
+                    raise ValueError("object listing entry is malformed")
+                is_directory = bool(getattr(item, "is_dir", False)) or object_name.endswith("/")
+                if is_directory:
+                    items.append(
+                        DirectoryObject(
+                            object_name=object_name,
+                            size=None,
+                            is_directory=True,
+                        )
+                    )
+                else:
+                    metadata = _metadata(item)
+                    items.append(
+                        DirectoryObject(
+                            object_name=metadata.object_name,
+                            size=metadata.size,
+                            is_directory=False,
+                        )
+                    )
+            return DirectoryObjectPage(
                 items=tuple(items),
                 next_start_after=items[-1].object_name if has_more else None,
             )
@@ -374,6 +558,40 @@ def normalize_storage_error(exc: Exception) -> WorkspaceError:
             "Object storage is unavailable",
         )
     return WorkspaceError(ErrorCode.WORKSPACE_STORAGE_ERROR, "Object storage request failed")
+
+
+def _stream_metadata(response: Any) -> tuple[int, str]:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        raise ValueError("object response is missing headers")
+    raw_size = headers.get("Content-Length")
+    etag = headers.get("ETag")
+    if not isinstance(raw_size, str):
+        raise ValueError("object response is missing a Content-Length")
+    try:
+        size = int(raw_size)
+    except ValueError as exc:
+        raise ValueError("object response has an invalid Content-Length") from exc
+    if size < 0:
+        raise ValueError("object response has an invalid Content-Length")
+    if not isinstance(etag, str) or not etag.strip('"'):
+        raise ValueError("object response is missing an ETag")
+    return size, etag.strip('"')
+
+
+def _close_response(response: Any) -> None:
+    close_error: Exception | None = None
+    try:
+        response.close()
+    except Exception as exc:
+        close_error = exc
+    try:
+        response.release_conn()
+    except Exception as exc:
+        if close_error is None:
+            close_error = exc
+    if close_error is not None:
+        raise close_error
 
 
 def _metadata(item: Any, *, expected_name: str | None = None) -> ObjectMetadata:

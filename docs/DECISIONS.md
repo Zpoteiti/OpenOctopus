@@ -347,6 +347,12 @@ inputs are unchanged; volatile execution state does not churn it.
 ### ADR-024 · Skills: always-on full body; conditional name + description
 
 **Status:** accepted
+**Python-main clarification:** Py4 keeps prompt construction memory-bounded.
+`SKILL.md` bodies are capped at 64,000 characters, discovery at 200 skills, and
+aggregate always-on bodies at 128,000 characters. Once the aggregate cap is
+reached, remaining always-on skills fall back to the conditional
+name/description/read-path entry rather than growing the system prompt without
+bound. The skills cache is a weighted process LRU, not an unbounded per-user map.
 **Decision:** SkillInfo has `always_on: bool`. Skills marked always-on have their full SKILL.md body inlined in the system prompt. Conditional skills appear as one-line entries (`name: description`) with a pointer to load via `read_file(path="skills/{name}/SKILL.md")`.
 **Consequences:** Progressive disclosure. Large skill libraries don't bloat every prompt. Agent knows what exists and can pull on demand.
 
@@ -2388,7 +2394,7 @@ Always `<name>@<suffix>` where `suffix` is the first 8 hex characters of `worksp
 #### Suffix length and collision handling
 
 - **Default 8 hex chars** (32 bits). Collision probability inside a single user's accessible workspaces is ~1e-8 even with hundreds of memberships.
-- **Auto-extend on collision** at workspace-create or member-add time: if the new suffix would collide with an existing workspace already accessible to any prospective member, extend the suffix length by one hex char (then two, etc.) until unique. Same convention as `git`'s short-hash extension. The assigned suffix is persisted in `workspaces.suffix`; its length is stable for the workspace lifetime and it is never recomputed or re-shortened.
+- **Auto-extend on collision at workspace creation:** if the new suffix would collide with an existing workspace already accessible to the creator, extend the suffix length by one hex char (then two, etc.) until unique. Same convention as `git`'s short-hash extension. The assigned suffix is persisted in `workspaces.suffix`; its length is stable for the workspace lifetime and it is never recomputed or re-shortened. A later member addition that would collide in the prospective member's accessible set is rejected with `workspace_ref_conflict` instead of changing an existing workspace's stable ref.
 - The `@` separator is a reserved character in workspace names (rejected by the validator in ADR-109) so name+suffix parsing is unambiguous.
 
 #### Resolution (strict mode)
@@ -2799,7 +2805,7 @@ does not count as production code. Numbered implementation milestones start at
 | **Py2** | Streaming single-provider-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript and `turn_runs` + Anthropic SDK streaming adapter + best-effort text/thinking `token_delta` preview + detached per-session runner + durable `pending_messages` drain/latest-wins subscriber semantics + `llm_max_concurrent_requests` semaphore + admin `llm_max_output_tokens` | Py1 | Browser can create a session; fake provider streams and persists one complete assistant turn; same-session overlap queues and drains durably; disconnect recovers through full GET state |
 | **Py3** | Agent loop + first tool + compaction | Hand-written ReAct loop + JIT tool-result collapsing + tool progress + cancel/restart + **only** executable `web_fetch` + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers + two-stage compaction with pending-boundary ordering | Py2 | `web_fetch` works end-to-end; tool-result normalization, tool progress, cancel/restart, multi-`turn_id` ReAct chains, and both compaction stages work |
 | **Py4a** | Workspace foundation | `WorkspaceService`/internal `WorkspaceFS`, bounded RustFS client lifecycle, quota and lifecycle race handling, deletion outbox, error normalization | Py3 | Foundation tests, live RustFS tests, lint, formatting, and strict typing pass |
-| **Py4** | Workspace files + initial `message` tool | file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + quota + initial web/workspace `message` tool and provider-hidden delivery persistence | Py4a | File API/tool tests pass through `WorkspaceService`; no API touches RustFS directly; current-web message delivery does not insert an extra provider-visible row inside a tool batch |
+| **Py4** | Workspace files + initial `message` tool | workspace-management REST + file REST API (read/write/edit/list/find/grep/delete/apply_patch) + server-side shared file tools (including agent-only `notebook_edit`) + quota + workspace-backed prompt inputs + initial web/workspace `message` tool and provider-hidden delivery persistence | Py4a | File API/tool tests pass through `WorkspaceService`; no API touches RustFS directly; current-web message delivery attaches provider-hidden refs to the existing assistant tool-use row and does not insert an extra provider-visible row inside a tool batch |
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
 | **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
 | **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
@@ -3012,7 +3018,12 @@ request/job completes or fails.
 
 `WorkspaceService` is the authenticated virtual-path boundary for REST handlers
 and agent tools. It resolves personal/shared access in PostgreSQL and retains
-the authorization row lock through the file operation. `WorkspaceFS` accepts
+the authorization row lock through bounded materialized operations. Streaming
+REST downloads are the exception: authorization produces a private immutable
+target ticket, the DB transaction ends before waiting/yielding bytes, and an
+already-authorized open download may finish after membership revocation. REST
+uploads likewise use a short preflight before body collection and re-resolve
+authorization/quota in a fresh transaction at the write boundary. `WorkspaceFS` accepts
 only already-authorized immutable targets and owns object-key mapping, quota,
 mutation locks, and MinIO/S3 error normalization. Trusted account/workspace
 lifecycle code may call its retire/purge operations directly; other handlers,
@@ -3159,9 +3170,10 @@ The concrete Py4 delivery record/helper must not insert another
 provider-replayed assistant row between the assistant message containing the
 `message` tool use and the user-role tool-result batch that answers it. The
 persisted assistant `tool_use` remains the provider-visible message content and
-the matching persisted `tool_result` records the delivery outcome. Exact
-ownership/linking of provider-hidden delivery state is finalized with the Py4
-implementation rather than prebuilt in Py3.
+the matching persisted `tool_result` records the delivery outcome. Py4 appends
+server-generated refs, each linked by `tool_use_id`, to that existing assistant
+row's provider-hidden `delivery_refs` sidecar and commits the sidecar update with
+the matching tool result.
 
 **Consequences:** Web delivery is cheap and avoids unnecessary object-storage
 writes for files that are only useful while the user's device is online.
@@ -3307,7 +3319,13 @@ separate provider-hidden sidecar and stays empty through Py3; keeping the
 already-created column avoids a remove-and-readd migration. Py4 must persist
 user-visible delivery state without inserting another provider-replayed
 assistant row between the existing assistant `tool_use` and its matching
-tool-result batch.
+tool-result batch. The agent supplies ordinary workspace paths; it never supplies
+`delivery_refs`. On successful current-web delivery, the server generates refs,
+links each ref to the generating `tool_use_id`, and appends them to the already
+persisted assistant row containing that tool use. Updating this provider-hidden
+sidecar does not change provider replay. The matching tool result is committed in
+the same transaction, and a live `message_persisted` event may republish the same
+assistant message ID as an idempotent updated snapshot for frontend upsert.
 
 **Consequences:** Py3 has one end-to-end executable tool and no speculative
 delivery helper. The final `message` schema remains documented in `TOOLS.md` as

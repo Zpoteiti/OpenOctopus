@@ -47,8 +47,21 @@ async def finalize_workspace_deletions(
     targets: list[WorkspaceTarget],
     workspace_fs: WorkspaceLifecycle,
 ) -> None:
-    pending: list[tuple[WorkspaceTarget, WorkspaceDeletion]] = []
+    pending: list[WorkspaceTarget] = []
     for target in sorted(targets, key=lambda item: (item.kind, item.id)):
+        exists = await db.scalar(
+            select(WorkspaceDeletion).where(
+                WorkspaceDeletion.kind == target.kind,
+                WorkspaceDeletion.target_id == target.id,
+            )
+        )
+        if exists is not None:
+            pending.append(target)
+    await db.commit()
+
+    for target in pending:
+        await workspace_fs.purge_workspace(target)
+    for target in pending:
         row = await db.scalar(
             select(WorkspaceDeletion)
             .where(
@@ -58,13 +71,9 @@ async def finalize_workspace_deletions(
             .with_for_update()
         )
         if row is not None:
-            pending.append((target, row))
-    for target, _ in pending:
-        await workspace_fs.purge_workspace(target)
-    for _, row in pending:
-        await db.delete(row)
+            await db.delete(row)
     await db.commit()
-    for target, _ in pending:
+    for target in pending:
         await workspace_fs.forget_workspace(target)
 
 

@@ -144,7 +144,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - **Office docs** (`.docx`/`.xlsx`/`.pptx`): text extraction via built-in parsers.
 - **Images** (detected by mime/magic bytes): returned as `text + image` content blocks, not plain text. The image block shape is Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
 - **Detection fallback:** if image magic-byte detection is inconclusive, try the normal text path. If the file is not readable text and not a supported document type, return an error instead of embedding arbitrary binary bytes into text.
-- **Dedup:** if the file's `mtime` + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads.
+- **Dedup:** if the file's revision + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads. Server RustFS files use their opaque ETag as the revision; clients may use `mtime` plus size.
 - Tool results are normalized by the shared helper per ADR-095 before reaching the LLM: the first `tool_result.content` block is the server warning text block, followed by the raw text/image result blocks.
 
 **Timeout:** 30s internal, no agent override (ADR-075).
@@ -429,7 +429,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
     "properties": {
       "path": { "type": "string", "description": "The directory path to list" },
       "recursive": { "type": "boolean", "description": "Recursively list all files (default false)" },
-      "max_entries": { "type": "integer", "description": "Maximum entries to return (default 200)", "minimum": 1 }
+      "max_entries": { "type": "integer", "description": "Maximum entries to return (default 200, max 1000)", "minimum": 1, "maximum": 1000 }
     },
     "required": ["path"]
   }
@@ -441,7 +441,9 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - **Auto-ignored noise dirs** (mirror of nanobot's list): `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.coverage`, `htmlcov`.
 - **Non-recursive output:** entries with a `📁 ` / `📄 ` prefix per entry (visual, LLM-friendly).
 - **Recursive output:** flat list of relative paths, with trailing `/` for directories.
-- **`max_entries` cap:** if exceeded, output truncated with `(truncated, showing first X of Y entries)` note.
+- **`max_entries` cap:** if a one-entry look-ahead proves more results exist,
+  output is truncated with `(truncated, showing first X entries)`; the server
+  does not scan the remaining RustFS prefix only to calculate a total.
 - **Reject** if path doesn't exist or is a file (`ToolError::NotADirectory`).
 
 **Timeout:** 10s internal.
@@ -617,7 +619,10 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 ```
 
 **Mechanism:**
-- Wraps ripgrep (via subprocess call to `rg`, or Python regex fallback if rg is not installed).
+- **Server RustFS site:** streams bounded object bodies and uses a
+  timeout-capable regex engine; it never stages a workspace tree or invokes
+  `rg` against server disk. **Client sites:** may invoke local `rg` with a
+  contract-compatible fallback.
 - Skips binary files and files >2 MB automatically.
 - Respects `.gitignore` and the noise-dir ignore list.
 - `output_mode=files_with_matches` is the default — favor it for broad searches to stay scoped.
@@ -639,6 +644,10 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - Client impl: `openoctopus_client/tools/notebook_edit.py`
 
 **Purpose:** Edit a Jupyter notebook (`.ipynb`) cell — replace source, insert a new cell after an index, or delete an existing cell.
+
+**REST availability:** Agent tool only. Py4 intentionally defines no dedicated
+REST equivalent; frontend callers can still download or replace the raw
+`.ipynb` file through the normal Workspace Files API.
 
 **Source schema (matches nanobot):**
 ```json
@@ -746,6 +755,10 @@ device media begins with the client milestone, and explicit third-party
 schema below is the final forward contract, not the Py3 registry surface
 (ADR-127).
 
+The initial Py4 provider-visible schema exposes only `content`, optional
+`media`, and `openoctopus_device` fixed to `server`. It does not advertise
+`channel`, `chat_id`, or `buttons` before their owning channel milestone.
+
 **Purpose:** Send a message to the user, optionally with file attachments or inline keyboard buttons. `content` is required; `channel` and `chat_id` default to the current session's values. Specify them explicitly for cross-channel reach.
 
 **Source schema (matches nanobot, with `openoctopus_device` added for multi-device media sources):**
@@ -810,10 +823,14 @@ schema below is the final forward contract, not the Py3 registry surface
 - `buttons` renders as inline keyboard rows on channels that support it (Telegram, Discord's button components); plain text channels ignore the param with no error.
 - The provider-visible transcript remains the assistant message containing the
   `message` tool use plus its matching persisted `tool_result`, which records
-  delivery success/failure. The Py4 delivery helper persists user-visible
-  delivery state outside provider replay; it must not insert another
-  provider-visible assistant row between that tool use and result. Exact
-  ownership/linking of the provider-hidden state is finalized with Py4.
+  delivery success/failure. The agent supplies workspace paths, never
+  `delivery_refs`. For current-web delivery, the Py4 helper generates refs,
+  links them to the matching `tool_use_id`, and appends them to the existing
+  assistant row containing that tool use. Server-workspace refs also retain the
+  immutable workspace ID and workspace-relative path so a future frontend can
+  recover from a shared-workspace rename. The helper commits this sidecar update
+  with the matching tool result and does not insert another provider-visible
+  assistant row. Provider replay ignores `delivery_refs`.
 
 **Timeout:** 30s internal.
 **Result cap:** 16,000 characters.
