@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import PurePosixPath
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -18,10 +18,14 @@ from openctopus_server.dto.workspace_file import (
     DirectoryEntryPage,
     FileEditRequest,
     FileMutationResponse,
+    GrepResultPage,
+    StructuredPatchRequest,
+    StructuredPatchResponse,
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.workspace.service import WorkspaceService, get_workspace_service
+from openctopus_server.workspace.search import GrepContentMatch, GrepCount
+from openctopus_server.workspace.service import PatchEdit, WorkspaceService, get_workspace_service
 
 router = APIRouter(prefix="/api/workspace", tags=["Workspace Files"])
 _STRONG_ETAG = re.compile(r'^"([\x21\x23-\x7e]+)"$')
@@ -177,7 +181,10 @@ async def edit_file(
         path=path,
         old_text=body.old_text,
         new_text=body.new_text,
+        replace_all=body.replace_all,
         occurrence=body.occurrence,
+        line_hint=body.line_hint,
+        expected_replacements=body.expected_replacements,
         if_match=if_match,
     )
     await db.commit()
@@ -221,6 +228,47 @@ async def delete_folder(
     return Response(status_code=204)
 
 
+@router.post("/patch", response_model=StructuredPatchResponse)
+async def apply_workspace_patch(
+    body: StructuredPatchRequest,
+    _: None = Depends(require_server_device),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> dict[str, Any]:
+    edits = tuple(
+        PatchEdit(
+            path=edit.path,
+            action=edit.action,
+            old_text=edit.old_text,
+            new_text=edit.new_text or "",
+        )
+        for edit in body.edits
+    )
+    results = await service.apply_patch(
+        db,
+        user_id=user.id,
+        edits=edits,
+        dry_run=body.dry_run,
+    )
+    await db.commit()
+    return {
+        "items": [
+            {
+                "path": item.path,
+                "action": item.action,
+                "size": item.size,
+                "etag": item.etag,
+                "created": item.created,
+                "replacements": item.replacements,
+            }
+            for item in results
+        ],
+        "dry_run": body.dry_run,
+        "committed": 0 if body.dry_run else len(results),
+    }
+
+
 @router.get("/list/{path:path}", response_model=DirectoryEntryPage)
 async def list_directory(
     path: str,
@@ -233,21 +281,107 @@ async def list_directory(
     service: WorkspaceService = Depends(get_workspace_service),
 ) -> dict[str, Any]:
     if recursive:
-        raise _invalid("Recursive directory listing is implemented in Py4 slice 2")
-    ticket = await service.authorize_download(db, user_id=user.id, path=path)
-    await db.commit()
-    page = await service.list_authorized_page(ticket, limit=limit, offset=offset)
-    items = [
-        {
-            "name": PurePosixPath(entry.path).name,
-            "path": _virtual_entry_path(path, entry.path),
-            "kind": "directory" if entry.is_directory else "file",
-            "size": 0 if entry.size is None else entry.size,
-        }
-        for entry in page.items
-    ]
+        recursive_page = await service.list_recursive(
+            db,
+            user_id=user.id,
+            path=path,
+            limit=limit,
+            offset=offset,
+        )
+        rendered_items = [_search_entry(path, entry) for entry in recursive_page.items]
+        next_offset = recursive_page.next_offset
+        truncated = recursive_page.truncated
+    else:
+        directory_page = await service.list_dir_page(
+            db,
+            user_id=user.id,
+            path=path,
+            limit=limit,
+            offset=offset,
+        )
+        rendered_items = [_search_entry(path, entry) for entry in directory_page.items]
+        next_offset = directory_page.next_offset
+        truncated = directory_page.truncated
     return {
-        "items": items,
+        "items": rendered_items,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "truncated": truncated,
+    }
+
+
+@router.get("/find-files", response_model=DirectoryEntryPage)
+async def find_workspace_files(
+    path: str = ".",
+    query: str = "",
+    glob: str | None = None,
+    file_type: Annotated[str | None, Query(alias="type")] = None,
+    include_dirs: bool = False,
+    sort: Literal["path", "modified"] = "path",
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    _: None = Depends(require_server_device),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> dict[str, Any]:
+    page = await service.find_files(
+        db,
+        user_id=user.id,
+        path=path,
+        query=query,
+        glob=glob,
+        file_type=file_type,
+        include_dirs=include_dirs,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "items": [_search_entry(path, item) for item in page.items],
+        "limit": limit,
+        "offset": offset,
+        "next_offset": page.next_offset,
+        "truncated": page.truncated,
+    }
+
+
+@router.get("/grep", response_model=GrepResultPage, response_model_exclude_none=True)
+async def grep_workspace_files(
+    pattern: Annotated[str, Query(min_length=1)],
+    path: str = ".",
+    glob: str | None = None,
+    file_type: Annotated[str | None, Query(alias="type")] = None,
+    case_insensitive: bool = False,
+    fixed_strings: bool = False,
+    output_mode: Literal["content", "files_with_matches", "count"] = "files_with_matches",
+    context_before: Annotated[int, Query(ge=0, le=20)] = 0,
+    context_after: Annotated[int, Query(ge=0, le=20)] = 0,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    _: None = Depends(require_server_device),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> dict[str, Any]:
+    page = await service.grep(
+        db,
+        user_id=user.id,
+        pattern=pattern,
+        path=path,
+        glob=glob,
+        file_type=file_type,
+        case_insensitive=case_insensitive,
+        fixed_strings=fixed_strings,
+        output_mode=output_mode,
+        context_before=context_before,
+        context_after=context_after,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "items": [_grep_item(path, item) for item in page.items],
         "limit": limit,
         "offset": offset,
         "next_offset": page.next_offset,
@@ -311,6 +445,33 @@ def _virtual_entry_path(request_path: str, relative_path: str) -> str:
         return relative_path
     workspace_ref = request_path[1:].partition("/")[0]
     return f"/{workspace_ref}/{relative_path}"
+
+
+def _search_entry(request_path: str, entry: Any) -> dict[str, Any]:
+    return {
+        "name": PurePosixPath(entry.path).name,
+        "path": _virtual_entry_path(request_path, entry.path),
+        "kind": "directory" if entry.is_directory else "file",
+        "size": 0 if entry.size is None else entry.size,
+    }
+
+
+def _grep_item(request_path: str, item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        return {"path": _virtual_entry_path(request_path, item)}
+    if isinstance(item, GrepCount):
+        return {
+            "path": _virtual_entry_path(request_path, item.path),
+            "count": item.count,
+        }
+    assert isinstance(item, GrepContentMatch)
+    return {
+        "path": _virtual_entry_path(request_path, item.path),
+        "line_number": item.line_number,
+        "line": item.line,
+        "before": [{"line_number": line_number, "line": line} for line_number, line in item.before],
+        "after": [{"line_number": line_number, "line": line} for line_number, line in item.after],
+    }
 
 
 def _mutation_response(

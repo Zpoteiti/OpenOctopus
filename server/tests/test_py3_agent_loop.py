@@ -17,6 +17,7 @@ import openctopus_server.chat.runner as chat_runner
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Session, SystemConfig, TurnRun, User
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.anthropic import (
     DeltaCallback,
     ProviderResult,
@@ -27,8 +28,9 @@ from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
-from openctopus_server.tools.registry import ToolRegistry, build_py3_registry
+from openctopus_server.tools.registry import ToolRegistry, build_py3_registry, build_py4_registry
 from openctopus_server.tools.result import UNTRUSTED_TOOL_RESULT_WARNING
+from openctopus_server.workspace.fs import DirectoryPage, FileMetadata
 
 
 @dataclass(slots=True)
@@ -143,15 +145,56 @@ class _ScriptedTool(Tool):
             self.active -= 1
 
 
+class _CountingPromptWorkspace:
+    def __init__(self) -> None:
+        self.read_paths: list[str] = []
+        self.list_calls = 0
+
+    async def read(self, db, *, user_id, path, offset=0, length=0) -> bytes:
+        del db, user_id, offset, length
+        self.read_paths.append(path)
+        raise WorkspaceError(ErrorCode.WORKSPACE_NOT_FOUND, "missing")
+
+    async def list_dir_page(
+        self,
+        db,
+        *,
+        user_id,
+        path,
+        limit,
+        offset=0,
+        include_noise_directories=False,
+    ) -> DirectoryPage:
+        del db, user_id, path, limit, offset, include_noise_directories
+        self.list_calls += 1
+        raise WorkspaceError(ErrorCode.WORKSPACE_NOT_FOUND, "missing")
+
+
+class _Py4Workspace(_CountingPromptWorkspace):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[tuple[UUID, str, bytes]] = []
+
+    async def write(self, db, *, user_id, path, data) -> FileMetadata:
+        del db
+        self.writes.append((user_id, path, data))
+        return FileMetadata(size=len(data), etag="written", created=True)
+
+
 @pytest_asyncio.fixture
 async def install_runtime(test_app, pg_engine):
     runtimes: list[ChatRuntime] = []
 
-    def install(provider: _ScriptedProvider, tool: _ScriptedTool) -> ChatRuntime:
+    def install(
+        provider: _ScriptedProvider,
+        tool: _ScriptedTool,
+        workspace_service=None,
+    ) -> ChatRuntime:
         runtime = ChatRuntime(
             pg_engine,
             provider_factory=lambda config: provider,
             tool_registry=ToolRegistry((tool,)),
+            workspace_service=workspace_service,
         )
         test_app.state.chat_runtime = runtime
         runtimes.append(runtime)
@@ -284,6 +327,23 @@ async def test_two_turn_react_uses_distinct_turn_ids_on_one_stream(
     assert [run.status for run in runs] == ["completed", "completed"]
 
 
+async def test_normal_agent_turn_builds_workspace_prompt_once(
+    user_client,
+    pg_engine,
+    install_runtime,
+) -> None:
+    await _configure_provider(pg_engine)
+    provider = _ScriptedProvider([_ProviderStep(content=[{"type": "text", "text": "done"}])])
+    workspace = _CountingPromptWorkspace()
+    install_runtime(provider, _ScriptedTool([]), workspace)
+
+    response = await _post(user_client, uuid4(), "start")
+
+    assert response.status_code == 200
+    assert workspace.read_paths == ["SOUL.md", "MEMORY.md"]
+    assert workspace.list_calls == 1
+
+
 async def test_web_fetch_runs_end_to_end_through_the_agent_loop(
     user_client,
     test_app,
@@ -347,6 +407,66 @@ async def test_web_fetch_runs_end_to_end_through_the_agent_loop(
             "tool_result",
             "assistant",
         ]
+    finally:
+        await runtime.close()
+
+
+async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "write-1",
+                        "name": "write_file",
+                        "input": {
+                            "path": "notes/a.txt",
+                            "content": "hello",
+                            DEVICE_FIELD_NAME: "server",
+                        },
+                    }
+                ]
+            ),
+            _ProviderStep(content=[{"type": "text", "text": "Saved."}]),
+        ]
+    )
+    workspace = _Py4Workspace()
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=build_py4_registry(pg_engine, workspace),  # type: ignore[arg-type]
+        workspace_service=workspace,  # type: ignore[arg-type]
+    )
+    test_app.state.chat_runtime = runtime
+    try:
+        response = await _post(user_client, uuid4(), "save a note")
+
+        assert response.status_code == 200
+        assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
+            "web_fetch",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "delete_file",
+            "delete_folder",
+            "list_dir",
+            "find_files",
+            "grep",
+            "notebook_edit",
+        ]
+        assert workspace.writes and workspace.writes[0][1:] == ("notes/a.txt", b"hello")
+        provider_result = provider.calls[1]["messages"][-1]["content"][0]
+        assert provider_result["tool_use_id"] == "write-1"
+        assert "Wrote notes/a.txt (5 bytes)." in str(provider_result["content"])
+        assert workspace.read_paths == ["SOUL.md", "MEMORY.md"] * 2
+        assert workspace.list_calls == 1
     finally:
         await runtime.close()
 

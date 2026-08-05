@@ -12,7 +12,12 @@ import pytest_asyncio
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.workspace.fs import MAX_EDIT_BYTES, WorkspaceFS, WorkspaceTarget
+from openctopus_server.workspace.fs import (
+    MAX_EDIT_BYTES,
+    FileTransform,
+    WorkspaceFS,
+    WorkspaceTarget,
+)
 from openctopus_server.workspace.locks import KeyedLockManager
 from openctopus_server.workspace.storage import ObjectStorage, normalize_storage_error
 
@@ -188,6 +193,19 @@ class _MemoryMinio:
                 raise _S3Error("NoSuchKey")
             del self._objects[object_name]
             self.removed_names.append(object_name)
+
+
+class _FailingSecondPutMinio(_MemoryMinio):
+    def put_object(
+        self,
+        bucket: str,
+        object_name: str,
+        data: io.BytesIO,
+        length: int,
+    ) -> SimpleNamespace:
+        if self.put_calls == 1:
+            raise _S3Error("InternalError")
+        return super().put_object(bucket, object_name, data, length)
 
 
 class _BlockingStatMinio(_MemoryMinio):
@@ -405,6 +423,85 @@ async def test_same_workspace_mutations_serialize_and_idle_lock_is_evicted() -> 
 
     assert client.max_active_puts == 1
     assert fs.mutation_lock_count == 0
+
+
+async def test_multi_file_transform_validates_every_edit_before_first_write() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "a.txt", b"old-a", quota_bytes=100)
+    await fs.write(target, "b.txt", b"old-b", quota_bytes=100)
+    writes_before = client.put_calls
+
+    def reject(_: bytes | None) -> bytes:
+        raise WorkspaceError(ErrorCode.TOOL_NO_MATCH, "missing")
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.apply_transforms(
+            (
+                FileTransform(target, "a.txt", 100, lambda _: b"new-a"),
+                FileTransform(target, "b.txt", 100, reject),
+            ),
+            dry_run=False,
+        )
+
+    assert caught.value.code is ErrorCode.TOOL_NO_MATCH
+    assert client.put_calls == writes_before
+    assert client._objects[f"users/{target.id}/a.txt"][0] == b"old-a"
+
+
+async def test_multi_file_transform_dry_run_returns_sizes_without_writing() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "a.txt", b"old", quota_bytes=100)
+    writes_before = client.put_calls
+
+    results = await fs.apply_transforms(
+        (FileTransform(target, "a.txt", 100, lambda _: b"updated"),),
+        dry_run=True,
+    )
+
+    assert results[0].size == 7
+    assert client.put_calls == writes_before
+
+
+async def test_multi_file_transform_reports_partial_storage_commit_count() -> None:
+    client = _FailingSecondPutMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.apply_transforms(
+            (
+                FileTransform(target, "a.txt", 100, lambda _: b"first"),
+                FileTransform(target, "b.txt", 100, lambda _: b"second"),
+            ),
+            dry_run=False,
+        )
+
+    assert "after 1 edits committed" in caught.value.message
+    assert client._objects[f"users/{target.id}/a.txt"][0] == b"first"
+    assert f"users/{target.id}/b.txt" not in client._objects
+
+
+async def test_multi_file_transform_has_an_aggregate_materialization_limit() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    writes_before = client.put_calls
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.apply_transforms(
+            (
+                FileTransform(target, "a.txt", 100 * 1024 * 1024, lambda _: b"a" * (5 << 20)),
+                FileTransform(target, "b.txt", 100 * 1024 * 1024, lambda _: b"b" * (5 << 20)),
+            ),
+            dry_run=False,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT
+    assert client.put_calls == writes_before
 
 
 async def test_waiter_lease_prevents_lock_eviction_during_handoff() -> None:
@@ -822,6 +919,58 @@ async def test_list_dir_returns_public_metadata_without_reading_file_contents() 
     assert client.get_calls == get_calls_before
 
 
+async def test_non_recursive_list_skips_noise_directories() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, ".git/config", b"hidden", quota_bytes=100)
+    await fs.write(target, "node_modules/pkg/index.js", b"hidden", quota_bytes=100)
+    await fs.write(target, "src/app.py", b"visible", quota_bytes=100)
+
+    page = await fs.list_dir_page(target, "", limit=20, offset=0)
+
+    assert [(entry.path, entry.is_directory) for entry in page.items] == [("src", True)]
+
+
+async def test_folder_with_only_noise_children_lists_as_empty() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "project/node_modules/pkg/index.js", b"hidden", quota_bytes=100)
+
+    page = await fs.list_dir_page(target, "project", limit=20, offset=0)
+
+    assert page.items == ()
+
+
+async def test_non_recursive_list_keeps_files_named_like_noise_directories() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "build", b"file", quota_bytes=100)
+
+    page = await fs.list_dir_page(target, "", limit=20, offset=0)
+
+    assert [(entry.path, entry.is_directory) for entry in page.items] == [("build", False)]
+
+
+async def test_skill_discovery_can_include_noise_named_directories() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "skills/build/SKILL.md", b"manifest", quota_bytes=100)
+
+    page = await fs.list_dir_page(
+        target,
+        "skills",
+        limit=20,
+        offset=0,
+        include_noise_directories=True,
+    )
+
+    assert [(entry.path, entry.is_directory) for entry in page.items] == [("skills/build", True)]
+
+
 async def test_usage_sums_workspace_metadata_without_downloading_objects() -> None:
     client = _MemoryMinio()
     fs = _fs(client)
@@ -1006,6 +1155,18 @@ async def test_delete_folder_rejects_workspace_root() -> None:
     assert caught.value.code == ErrorCode.WORKSPACE_BLOCKED_PATH
     assert await fs.read(target, "keep.txt") == b"data"
     assert client.removed_names == []
+
+
+@pytest.mark.parametrize("path", [".", "a/./b", "a//b", "a/../b"])
+async def test_file_operations_reject_noncanonical_paths(path: str) -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.write(target, path, b"data", quota_bytes=100)
+
+    assert caught.value.code is ErrorCode.WORKSPACE_BLOCKED_PATH
 
 
 async def test_file_and_folder_names_cannot_overlap() -> None:

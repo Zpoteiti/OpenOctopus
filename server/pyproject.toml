@@ -16,6 +16,13 @@ dependencies = [
     "anthropic>=0.104.1",
     "minio>=7.2",
     "urllib3>=2.2",
+    "PyYAML>=6.0",
+    "pathspec>=1.0",
+    "regex>=2024.0",
+    "pypdf>=5.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +31,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "mypy>=1.13",
+    "types-PyYAML>=6.0",
+    "types-openpyxl>=3.1",
 ]
 
 [tool.ruff]

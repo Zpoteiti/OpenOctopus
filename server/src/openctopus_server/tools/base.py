@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -8,6 +9,12 @@ from openctopus_server.tools.truncate import DEFAULT_MAX_TOOL_RESULT_CHARS
 
 type ToolResultContentBlock = dict[str, Any]
 type RawToolResultContent = str | list[ToolResultContentBlock]
+
+
+class ToolRoutingMode(StrEnum):
+    ROUTING_ONLY = "routing_only"
+    INTRINSIC_DEVICE = "intrinsic_device"
+    PURE_SERVER = "pure_server"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,9 +28,12 @@ class ToolResult:
 class ToolContext:
     user_id: UUID
     session_id: UUID
+    openoctopus_device: str | None = None
 
 
 class Tool(ABC):
+    routing_mode = ToolRoutingMode.ROUTING_ONLY
+
     @abstractmethod
     def name(self) -> str:
         """Return the provider-visible tool name."""

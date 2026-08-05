@@ -1,7 +1,10 @@
 import asyncio
 import json
 from collections import defaultdict
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
@@ -17,6 +20,7 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
+from openctopus_server.workspace.fs import WorkspaceFS
 
 _SESSION_COUNT = 500
 
@@ -102,6 +106,31 @@ async def test_500_concurrent_sessions_complete_without_cross_talk(
         provider_factory=lambda config: provider,
     )
     test_app.state.chat_runtime = runtime
+    workspace_fs = WorkspaceFS(AsyncMock())
+    workspace_slots_entered = 0
+    all_workspace_slots_entered = asyncio.Event()
+    release_workspace_slots = asyncio.Event()
+
+    async def hold_workspace_slot(
+        slot: Callable[[], AbstractAsyncContextManager[None]],
+    ) -> None:
+        nonlocal workspace_slots_entered
+        async with slot():
+            workspace_slots_entered += 1
+            if workspace_slots_entered == 12:
+                all_workspace_slots_entered.set()
+            await release_workspace_slots.wait()
+
+    workspace_holders = [
+        asyncio.create_task(hold_workspace_slot(slot))
+        for slot in (
+            workspace_fs.materialization_slot,
+            workspace_fs.file_operation_slot,
+            workspace_fs.heavy_operation_slot,
+        )
+        for _ in range(4)
+    ]
+    await asyncio.wait_for(all_workspace_slots_entered.wait(), timeout=1)
     session_ids = [
         uuid5(NAMESPACE_URL, f"openoctopus-capacity-{index}") for index in range(_SESSION_COUNT)
     ]
@@ -124,11 +153,15 @@ async def test_500_concurrent_sessions_complete_without_cross_talk(
             assert len(runtime._states) == _SESSION_COUNT
     except BaseException:
         provider.release.set()
+        release_workspace_slots.set()
         await asyncio.gather(*requests, return_exceptions=True)
+        await asyncio.gather(*workspace_holders)
         await runtime.close()
         raise
 
     provider.release.set()
+    release_workspace_slots.set()
+    await asyncio.gather(*workspace_holders)
     responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=60)
     for index, response in enumerate(responses):
         assert response.status_code == 200

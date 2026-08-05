@@ -1,12 +1,14 @@
 from collections.abc import Iterable
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError
-from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
 from openctopus_server.tools.device_field import (
     DEVICE_FIELD_MARKER,
     DEVICE_FIELD_NAME,
@@ -14,6 +16,9 @@ from openctopus_server.tools.device_field import (
 )
 from openctopus_server.tools.result import normalize_tool_result
 from openctopus_server.tools.web_fetch import Resolver, WebFetchTool
+from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
+from openctopus_server.tools.workspace_files import build_workspace_file_tools
+from openctopus_server.workspace.service import WorkspaceService
 
 
 def inject_device_routing(
@@ -68,9 +73,16 @@ class ToolRegistry:
             self._tools[name] = tool
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [
-            inject_device_routing(tool.schema(), sites=("server",)) for tool in self._tools.values()
-        ]
+        schemas: list[dict[str, Any]] = []
+        for tool in self._tools.values():
+            if tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
+                schema = inject_device_routing(tool.schema(), sites=("server",))
+            elif tool.routing_mode is ToolRoutingMode.INTRINSIC_DEVICE:
+                schema = extend_openoctopus_device_enums(tool.schema(), extra=())
+            else:
+                schema = deepcopy(tool.schema())
+            schemas.append(schema)
+        return schemas
 
     async def execute(
         self,
@@ -87,20 +99,23 @@ class ToolRegistry:
             )
 
         routed_args = dict(args)
-        device = routed_args.pop(DEVICE_FIELD_NAME, None)
-        if device is None:
-            return _normalized_error(
-                ErrorCode.TOOL_MISSING_REQUIRED_FIELD,
-                f"Missing required field: {DEVICE_FIELD_NAME}",
-            )
-        if device != "server":
-            return _normalized_error(
-                ErrorCode.TOOL_DEVICE_UNREACHABLE,
-                f"Tool install site is unavailable: {device}",
-            )
+        routed_ctx = ctx
+        if tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
+            device = routed_args.pop(DEVICE_FIELD_NAME, None)
+            if device is None:
+                return _normalized_error(
+                    ErrorCode.TOOL_MISSING_REQUIRED_FIELD,
+                    f"Missing required field: {DEVICE_FIELD_NAME}",
+                )
+            if device != "server":
+                return _normalized_error(
+                    ErrorCode.TOOL_DEVICE_UNREACHABLE,
+                    f"Tool install site is unavailable: {device}",
+                )
+            routed_ctx = replace(ctx, openoctopus_device=device)
 
         try:
-            result = await tool.execute(routed_args, ctx)
+            result = await tool.execute(routed_args, routed_ctx)
         except OpenOctopusError as exc:
             result = ToolResult(
                 content=_error_text(exc.code, exc.message),
@@ -130,6 +145,22 @@ def build_py3_registry(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ToolRegistry:
     return ToolRegistry((WebFetchTool(resolver=resolver, transport=transport),))
+
+
+def build_py4_registry(
+    engine: AsyncEngine,
+    workspace_service: WorkspaceService,
+    *,
+    resolver: Resolver | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ToolRegistry:
+    backend = WorkspaceToolDispatcher(engine, workspace_service)
+    return ToolRegistry(
+        (
+            WebFetchTool(resolver=resolver, transport=transport),
+            *build_workspace_file_tools(backend),
+        )
+    )
 
 
 def _normalized_error(code: ErrorCode, message: str) -> ToolResult:

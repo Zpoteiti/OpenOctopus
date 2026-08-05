@@ -194,6 +194,13 @@ async def test_runtime_openapi_describes_raw_download_and_upload(async_client) -
         ("DELETE", "/api/workspace/files/a.txt", {}),
         ("DELETE", "/api/workspace/folders/docs", {}),
         ("GET", "/api/workspace/list/docs", {}),
+        ("GET", "/api/workspace/find-files", {}),
+        ("GET", "/api/workspace/grep", {"params": {"pattern": "x"}}),
+        (
+            "POST",
+            "/api/workspace/patch",
+            {"json": {"edits": [{"path": "a.txt", "action": "add", "new_text": "x"}]}},
+        ),
     ],
 )
 async def test_every_file_route_requires_explicit_server_device(
@@ -637,6 +644,153 @@ async def test_shared_directory_entries_preserve_reusable_virtual_paths(
             "size": 1,
         }
     ]
+
+
+async def test_recursive_list_synthesizes_directories_and_skips_noise(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "docs/a.txt", b"a")
+    storage.seed(user_id, "docs/sub/b.txt", b"b")
+    storage.seed(user_id, "docs/node_modules/ignored.js", b"ignored")
+
+    response = await client.get(
+        "/api/workspace/list/docs",
+        params={"openoctopus_device": "server", "recursive": True},
+    )
+
+    assert response.status_code == 200
+    assert [(item["path"], item["kind"]) for item in response.json()["items"]] == [
+        ("docs/a.txt", "file"),
+        ("docs/sub", "directory"),
+        ("docs/sub/b.txt", "file"),
+    ]
+
+
+async def test_find_files_uses_the_standard_page_envelope(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "src/api.py", b"python")
+    storage.seed(user_id, "src/api.ts", b"typescript")
+    storage.seed(user_id, "src/worker.py", b"python")
+
+    response = await client.get(
+        "/api/workspace/find-files",
+        params={
+            "openoctopus_device": "server",
+            "path": "src",
+            "query": "api",
+            "type": "py",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [{"name": "api.py", "path": "src/api.py", "kind": "file", "size": 6}],
+        "limit": 200,
+        "offset": 0,
+        "next_offset": None,
+        "truncated": False,
+    }
+
+
+async def test_grep_returns_structured_files_counts_and_content(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, ".gitignore", b"ignored.txt\n")
+    storage.seed(user_id, "a.txt", b"before\nneedle\nafter\nneedle\n")
+    storage.seed(user_id, "ignored.txt", b"needle\n")
+
+    files = await client.get(
+        "/api/workspace/grep",
+        params={"openoctopus_device": "server", "pattern": "needle"},
+    )
+    counts = await client.get(
+        "/api/workspace/grep",
+        params={
+            "openoctopus_device": "server",
+            "pattern": "needle",
+            "output_mode": "count",
+        },
+    )
+    content = await client.get(
+        "/api/workspace/grep",
+        params={
+            "openoctopus_device": "server",
+            "pattern": "needle",
+            "output_mode": "content",
+            "context_before": 1,
+            "context_after": 1,
+        },
+    )
+
+    assert files.status_code == counts.status_code == content.status_code == 200
+    assert files.json()["items"] == [{"path": "a.txt"}]
+    assert counts.json()["items"] == [{"path": "a.txt", "count": 2}]
+    assert content.json()["items"][0] == {
+        "path": "a.txt",
+        "line_number": 2,
+        "line": "needle",
+        "before": [{"line_number": 1, "line": "before"}],
+        "after": [{"line_number": 3, "line": "after"}],
+    }
+
+
+async def test_structured_patch_dry_run_and_commit_share_one_shape(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "a.txt", b"old")
+    body = {
+        "edits": [
+            {"path": "a.txt", "action": "replace", "old_text": "old", "new_text": "new"},
+            {"path": "b.txt", "action": "add", "new_text": "created"},
+        ]
+    }
+
+    dry_run = await client.post(
+        "/api/workspace/patch",
+        params={"openoctopus_device": "server"},
+        json={**body, "dry_run": True},
+    )
+    committed = await client.post(
+        "/api/workspace/patch",
+        params={"openoctopus_device": "server"},
+        json=body,
+    )
+
+    assert dry_run.status_code == committed.status_code == 200
+    assert dry_run.json()["dry_run"] is True
+    assert dry_run.json()["committed"] == 0
+    assert committed.json()["dry_run"] is False
+    assert committed.json()["committed"] == 2
+    assert storage.data_for(user_id, "a.txt") == b"new"
+    assert storage.data_for(user_id, "b.txt") == b"created"
+
+
+async def test_structured_patch_validation_is_atomic_before_storage_write(workspace_api) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "a.txt", b"old-a")
+    storage.seed(user_id, "b.txt", b"old-b")
+
+    response = await client.post(
+        "/api/workspace/patch",
+        params={"openoctopus_device": "server"},
+        json={
+            "edits": [
+                {
+                    "path": "a.txt",
+                    "action": "replace",
+                    "old_text": "old-a",
+                    "new_text": "new-a",
+                },
+                {
+                    "path": "b.txt",
+                    "action": "replace",
+                    "old_text": "missing",
+                    "new_text": "new-b",
+                },
+            ]
+        },
+    )
+
+    _assert_standard_error(response, 409, "tool_no_match")
+    assert storage.data_for(user_id, "a.txt") == b"old-a"
+    assert storage.data_for(user_id, "b.txt") == b"old-b"
 
 
 async def test_file_routes_return_standard_domain_and_validation_errors(workspace_api) -> None:

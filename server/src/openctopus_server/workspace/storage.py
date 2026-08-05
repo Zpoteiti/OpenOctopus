@@ -6,6 +6,7 @@ import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache, partial
 from io import BytesIO
 from typing import Any, TypeVar
@@ -38,6 +39,7 @@ class ObjectMetadata:
     object_name: str
     size: int
     etag: str
+    modified: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -411,6 +413,7 @@ class ObjectStorage:
                 object_name=object_name,
                 size=len(data),
                 etag=etag,
+                modified=None,
             )
 
         return await self.execute(put_and_validate)
@@ -598,6 +601,7 @@ def _metadata(item: Any, *, expected_name: str | None = None) -> ObjectMetadata:
     object_name = getattr(item, "object_name", expected_name)
     size = getattr(item, "size", None)
     etag = getattr(item, "etag", None)
+    modified = getattr(item, "last_modified", None)
     if (
         not isinstance(object_name, str)
         or not object_name
@@ -608,7 +612,12 @@ def _metadata(item: Any, *, expected_name: str | None = None) -> ObjectMetadata:
         or not etag
     ):
         raise ValueError("object metadata is malformed")
-    return ObjectMetadata(object_name=object_name, size=size, etag=etag)
+    return ObjectMetadata(
+        object_name=object_name,
+        size=size,
+        etag=etag,
+        modified=modified if isinstance(modified, datetime) else None,
+    )
 
 
 def _parse_endpoint(endpoint: str) -> tuple[str, bool]:

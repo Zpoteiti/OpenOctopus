@@ -20,7 +20,11 @@ from openctopus_server.chat.compaction import (
     stage_one_source_ids,
     stage_two_source_ids,
 )
-from openctopus_server.chat.context import build_provider_context, project_message_rows
+from openctopus_server.chat.context import (
+    build_provider_context,
+    project_message_rows,
+    project_provider_messages,
+)
 from openctopus_server.chat.public_projection import message_response
 from openctopus_server.chat.repair import repair_unpaired_tool_uses
 from openctopus_server.chat.stream import StreamSubscriber
@@ -49,6 +53,8 @@ from openctopus_server.services.messages import (
 )
 from openctopus_server.tools.base import ToolContext
 from openctopus_server.tools.registry import ToolRegistry, build_py3_registry
+from openctopus_server.workspace.service import WorkspaceService
+from openctopus_server.workspace.skills import get_skills_cache
 
 ProviderFactory = Callable[[ProviderConfig], Provider]
 
@@ -91,11 +97,14 @@ class ChatRuntime:
         *,
         provider_factory: ProviderFactory | None = None,
         tool_registry: ToolRegistry | None = None,
+        workspace_service: WorkspaceService | None = None,
     ) -> None:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
         self.limiter = ProviderLimiter()
         self.tool_registry = tool_registry or build_py3_registry()
+        self.workspace_service = workspace_service
+        self.skills_cache = get_skills_cache()
         self._provider_factory = provider_factory or AnthropicProvider
         self._providers: dict[tuple[str, str], Provider] = {}
         self._provider_lock = asyncio.Lock()
@@ -596,6 +605,8 @@ class ChatRuntime:
                 session_id=turn.session_id,
                 config=config,
                 add_compaction_continuation=not pending_rows,
+                workspace_service=self.workspace_service,
+                skills_cache=self.skills_cache,
             )
             prospective_messages.extend(
                 {
@@ -604,10 +615,9 @@ class ChatRuntime:
                 }
                 for row in pending_rows
             )
-            _, active_messages = await build_provider_context(
-                db,
-                session_id=turn.session_id,
-                config=config,
+            active_messages = project_provider_messages(
+                active_rows,
+                current_fingerprint=provider_fingerprint(config),
                 add_compaction_continuation=False,
             )
 
@@ -685,10 +695,23 @@ class ChatRuntime:
             session = await db.get(Session, turn.session_id)
             if session is None:
                 raise RuntimeError("Session disappeared while preparing a turn")
-            system, provider_messages = await build_provider_context(
-                db,
-                session_id=turn.session_id,
-                config=config,
+            final_rows = list(
+                (
+                    await db.execute(
+                        select(Message)
+                        .where(
+                            Message.session_id == turn.session_id,
+                            Message.is_compacted.is_(False),
+                        )
+                        .order_by(Message.created_at, Message.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            provider_messages = project_provider_messages(
+                final_rows,
+                current_fingerprint=provider_fingerprint(config),
             )
         if (
             compacted

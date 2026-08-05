@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Hashable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 
 
@@ -40,3 +40,11 @@ class KeyedLockManager:
                 entry.leases -= 1
                 if entry.leases == 0 and not entry.lock.locked():
                     self._entries.pop(key, None)
+
+    @asynccontextmanager
+    async def hold_many(self, keys: tuple[Hashable, ...]) -> AsyncIterator[None]:
+        ordered = sorted(set(keys), key=lambda key: (type(key).__qualname__, repr(key)))
+        async with AsyncExitStack() as stack:
+            for key in ordered:
+                await stack.enter_async_context(self.hold(key))
+            yield

@@ -8,7 +8,7 @@ import pytest_asyncio
 from openctopus_server.config import get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.workspace.fs import WorkspaceFS, WorkspaceTarget
+from openctopus_server.workspace.fs import FileTransform, WorkspaceFS, WorkspaceTarget
 from openctopus_server.workspace.storage import (
     STARTUP_PROBE_KEY,
     ObjectStorage,
@@ -148,5 +148,46 @@ async def test_real_rustfs_streams_bounded_chunks_and_releases_response(
         assert stream.etag == written.etag
         assert [len(chunk) for chunk in chunks] == [64 * 1024, 17]
         assert b"".join(chunks) == content
+    finally:
+        await _delete_prefix(rustfs_storage, f"users/{target.id}/")
+
+
+async def test_real_rustfs_recursive_scan_and_validated_patch(
+    rustfs_storage: ObjectStorage,
+) -> None:
+    fs = WorkspaceFS(rustfs_storage)
+    target = WorkspaceTarget.personal(uuid4())
+    try:
+        await fs.write(target, "docs/a.txt", b"old", quota_bytes=1024 * 1024)
+        await fs.write(target, "docs/sub/b.txt", b"second", quota_bytes=1024 * 1024)
+
+        objects, truncated = await fs.scan_objects(target, "docs")
+        assert [(item.path, item.size) for item in objects] == [
+            ("docs/a.txt", 3),
+            ("docs/sub/b.txt", 6),
+        ]
+        assert truncated is False
+
+        results = await fs.apply_transforms(
+            (
+                FileTransform(
+                    target,
+                    "docs/a.txt",
+                    1024 * 1024,
+                    lambda current: (current or b"") + b" updated",
+                ),
+                FileTransform(
+                    target,
+                    "docs/new.txt",
+                    1024 * 1024,
+                    lambda current: b"created" if current is None else current,
+                ),
+            ),
+            dry_run=False,
+        )
+
+        assert [result.created for result in results] == [False, True]
+        assert await fs.read(target, "docs/a.txt") == b"old updated"
+        assert await fs.read(target, "docs/new.txt") == b"created"
     finally:
         await _delete_prefix(rustfs_storage, f"users/{target.id}/")

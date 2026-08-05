@@ -17,7 +17,9 @@ from openctopus_server.services.workspace_deletions import (
     WorkspaceDeletionWorker,
     recover_workspace_deletions,
 )
+from openctopus_server.tools.registry import build_py4_registry
 from openctopus_server.workspace.fs import _workspace_fs_for_storage
+from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.storage import get_object_storage
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 60.0
@@ -78,7 +80,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     runtime = getattr(app.state, "chat_runtime", None)
     if runtime is None:
-        runtime = ChatRuntime(engine)
+        workspace_service = WorkspaceService(workspace_fs)
+        runtime = ChatRuntime(
+            engine,
+            workspace_service=workspace_service,
+            tool_registry=build_py4_registry(engine, workspace_service),
+        )
         app.state.chat_runtime = runtime
     try:
         await abandon_running_turns(

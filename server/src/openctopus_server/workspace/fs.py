@@ -14,6 +14,7 @@ from fastapi import Depends
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.locks import KeyedLockManager
+from openctopus_server.workspace.search import MAX_SCAN_OBJECTS, NOISE_DIRECTORIES, SearchObject
 from openctopus_server.workspace.storage import (
     DirectoryObject,
     ObjectMetadata,
@@ -47,6 +48,14 @@ class DirectoryPage:
     items: tuple[DirectoryEntry, ...]
     next_offset: int | None
     truncated: bool
+
+
+@dataclass(frozen=True)
+class FileTransform:
+    target: WorkspaceTarget
+    relative_path: str
+    quota_bytes: int
+    transform: Callable[[bytes | None], bytes]
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,79 @@ class WorkspaceFS:
     async def file_operation_slot(self) -> AsyncIterator[None]:
         async with self._file_operations:
             yield
+
+    @asynccontextmanager
+    async def heavy_operation_slot(self) -> AsyncIterator[None]:
+        async with self._heavy_operations:
+            yield
+
+    async def scan_objects(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str = "",
+        *,
+        scan_limit: int = MAX_SCAN_OBJECTS,
+    ) -> tuple[tuple[SearchObject, ...], bool]:
+        self._ensure_active(target)
+        workspace_prefix = _workspace_prefix(target)
+        normalized = relative_path.strip("/")
+        prefix = f"{workspace_prefix}{normalized}/" if normalized else workspace_prefix
+        items: list[SearchObject] = []
+        start_after: str | None = None
+        while len(items) <= scan_limit:
+            page = await self._storage.list_page(prefix, start_after=start_after)
+            for item in page.items:
+                if len(items) > scan_limit:
+                    break
+                items.append(
+                    SearchObject(
+                        path=item.object_name.removeprefix(workspace_prefix),
+                        size=item.size,
+                        modified=item.modified,
+                    )
+                )
+            if len(items) > scan_limit or page.next_start_after is None:
+                break
+            start_after = page.next_start_after
+        if not items and normalized:
+            object_name = f"{workspace_prefix}{normalized}"
+            try:
+                item = await self._storage.stat(object_name)
+            except WorkspaceError as exc:
+                if exc.code is ErrorCode.WORKSPACE_NOT_FOUND:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_NOT_FOUND,
+                        "Workspace path was not found",
+                    ) from exc
+                raise
+            items.append(
+                SearchObject(
+                    path=normalized,
+                    size=item.size,
+                    modified=item.modified,
+                )
+            )
+        return tuple(items[:scan_limit]), len(items) > scan_limit
+
+    async def read_search_object(
+        self,
+        target: WorkspaceTarget,
+        item: SearchObject,
+        *,
+        max_bytes: int,
+    ) -> SearchObject:
+        stored = await self._storage.read(
+            _object_key(target, item.path),
+            max_bytes=max_bytes,
+        )
+        if stored.truncated:
+            return item
+        return SearchObject(
+            path=item.path,
+            size=item.size,
+            modified=item.modified,
+            content=stored.data,
+        )
 
     async def open_stream(
         self,
@@ -194,6 +276,7 @@ class WorkspaceFS:
         limit: int,
         offset: int,
         scan_limit: int = 10_000,
+        include_noise_directories: bool = False,
     ) -> DirectoryPage:
         workspace_prefix = _workspace_prefix(target)
         if relative_path:
@@ -208,6 +291,7 @@ class WorkspaceFS:
         scanned = 0
         start_after: str | None = None
         truncated = False
+        has_raw_child = False
         while True:
             page = await self._storage.list_directory_page(
                 directory_prefix,
@@ -223,12 +307,16 @@ class WorkspaceFS:
                 remainder = item.object_name.removeprefix(directory_prefix)
                 if not remainder:
                     continue
+                has_raw_child = True
                 name, separator, _ = remainder.rstrip("/").partition("/")
+                is_directory = item.is_directory or bool(separator)
+                if is_directory and name in NOISE_DIRECTORIES and not include_noise_directories:
+                    continue
                 public_path = f"{relative_path.rstrip('/')}/{name}" if relative_path else name
                 if public_path in seen:
                     continue
                 seen.add(public_path)
-                if item.is_directory or separator:
+                if is_directory:
                     entry = DirectoryEntry(
                         path=public_path,
                         is_directory=True,
@@ -256,7 +344,7 @@ class WorkspaceFS:
                 break
             start_after = page.next_start_after
 
-        if relative_path and not seen:
+        if relative_path and not has_raw_child:
             try:
                 await self._storage.stat(object_name)
             except WorkspaceError as exc:
@@ -403,6 +491,51 @@ class WorkspaceFS:
                 single_operation_bytes=max(0, len(updated) - metadata.size),
             )
 
+    async def edit_optional_materialized(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        transform: Callable[[bytes | None], bytes],
+        *,
+        quota_bytes: int,
+        if_match: str | None = None,
+    ) -> FileMetadata:
+        object_name = _object_key(target, relative_path)
+        async with self._mutation_locks.hold(target):
+            self._ensure_active(target)
+            metadata = None
+            current_data = None
+            try:
+                metadata = await self._storage.stat(object_name)
+            except WorkspaceError as exc:
+                if exc.code is not ErrorCode.WORKSPACE_NOT_FOUND:
+                    raise
+            if if_match is not None and (metadata is None or metadata.etag != if_match):
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_FILE_CHANGED,
+                    "Workspace file changed after it was read",
+                )
+            if metadata is not None:
+                if metadata.size > MAX_EDIT_BYTES:
+                    raise _too_large_to_edit()
+                current = await self._storage.read(object_name, max_bytes=MAX_EDIT_BYTES)
+                if current.truncated:
+                    raise _too_large_to_edit()
+                current_data = current.data
+            updated = await _run_optional_transform(transform, current_data)
+            if len(updated) > MAX_EDIT_BYTES:
+                raise _too_large_to_edit()
+            existing_size = 0 if metadata is None else metadata.size
+            return await self._write_locked(
+                target,
+                object_name,
+                updated,
+                quota_bytes=quota_bytes,
+                if_match=if_match,
+                if_none_match=False,
+                single_operation_bytes=max(0, len(updated) - existing_size),
+            )
+
     async def _write_locked(
         self,
         target: WorkspaceTarget,
@@ -530,6 +663,172 @@ class WorkspaceFS:
                     "Workspace folder was not found",
                 )
 
+    async def apply_transforms(
+        self,
+        edits: tuple[FileTransform, ...],
+        *,
+        dry_run: bool,
+    ) -> tuple[FileMetadata, ...]:
+        if not 1 <= len(edits) <= 20:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Workspace patch must contain between 1 and 20 edits",
+            )
+        async with self.materialization_slot():
+            return await self.apply_transforms_admitted(edits, dry_run=dry_run)
+
+    async def apply_transforms_admitted(
+        self,
+        edits: tuple[FileTransform, ...],
+        *,
+        dry_run: bool,
+    ) -> tuple[FileMetadata, ...]:
+        if not 1 <= len(edits) <= 20:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Workspace patch must contain between 1 and 20 edits",
+            )
+        targets = tuple(edit.target for edit in edits)
+        async with self._mutation_locks.hold_many(targets):
+            return await self._apply_transforms_locked(edits, dry_run=dry_run)
+
+    async def _apply_transforms_locked(
+        self,
+        edits: tuple[FileTransform, ...],
+        *,
+        dry_run: bool,
+    ) -> tuple[FileMetadata, ...]:
+        object_names = tuple(_object_key(edit.target, edit.relative_path) for edit in edits)
+        edit_keys = tuple(
+            (edit.target, object_name)
+            for edit, object_name in zip(edits, object_names, strict=True)
+        )
+        if len(set(edit_keys)) != len(edit_keys):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Workspace patch cannot edit the same path more than once",
+            )
+        relevant_names_by_target: dict[WorkspaceTarget, tuple[str, ...]] = {}
+        for edit, object_name in zip(edits, object_names, strict=True):
+            relevant_names_by_target.setdefault(edit.target, ())
+            relevant_names_by_target[edit.target] += (object_name,)
+
+        metadata_by_target: dict[WorkspaceTarget, dict[str, ObjectMetadata]] = {}
+        directory_keys: set[tuple[WorkspaceTarget, str]] = set()
+        usage_by_target: dict[WorkspaceTarget, int] = {}
+        quota_by_target: dict[WorkspaceTarget, int] = {}
+        for edit in edits:
+            self._ensure_active(edit.target)
+            previous_quota = quota_by_target.setdefault(edit.target, edit.quota_bytes)
+            if previous_quota != edit.quota_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_INVALID_REQUEST,
+                    "Workspace quota changed while preparing patch",
+                )
+        for target, quota_bytes in quota_by_target.items():
+            metadata: dict[str, ObjectMetadata] = {}
+            relevant_names = relevant_names_by_target[target]
+            relevant_parents = {
+                parent
+                for object_name in relevant_names
+                for parent in _parent_object_names(_workspace_prefix(target), object_name)
+            }
+            usage = 0
+            async for page in _metadata_pages(self._storage, _workspace_prefix(target)):
+                for item in page:
+                    usage += item.size
+                    if item.object_name in relevant_names or item.object_name in relevant_parents:
+                        metadata[item.object_name] = item
+                    for object_name in relevant_names:
+                        if item.object_name.startswith(f"{object_name}/"):
+                            directory_keys.add((target, object_name))
+            if usage > quota_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_SOFT_LOCKED,
+                    "Workspace is over quota; delete files before writing",
+                )
+            metadata_by_target[target] = metadata
+            usage_by_target[target] = usage
+
+        staged: dict[tuple[WorkspaceTarget, str], bytes | None] = {}
+        prepared: list[tuple[FileTransform, str, bytes, FileMetadata]] = []
+        prepared_bytes = 0
+        for edit, object_name in zip(edits, object_names, strict=True):
+            key = (edit.target, object_name)
+            target_metadata = metadata_by_target[edit.target]
+            if key not in staged:
+                current_metadata = target_metadata.get(object_name)
+                if current_metadata is None:
+                    current_data = None
+                else:
+                    if current_metadata.size > MAX_EDIT_BYTES:
+                        raise _too_large_to_edit()
+                    current = await self._storage.read(object_name, max_bytes=MAX_EDIT_BYTES)
+                    if current.truncated:
+                        raise _too_large_to_edit()
+                    current_data = current.data
+                staged[key] = current_data
+            current_data = staged[key]
+            _validate_patch_object_shape(
+                edit.target,
+                object_name,
+                metadata_by_target[edit.target],
+                staged,
+                directory_keys,
+            )
+            updated = await _run_optional_transform(edit.transform, current_data)
+            if len(updated) > MAX_EDIT_BYTES:
+                raise _too_large_to_edit()
+            prepared_bytes += len(updated)
+            if prepared_bytes > MAX_EDIT_BYTES:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT,
+                    "Workspace patch exceeds the 8 MiB aggregate materialization limit",
+                )
+            previous_size = 0 if current_data is None else len(current_data)
+            growth = max(0, len(updated) - previous_size)
+            if growth * 5 > edit.quota_bytes * 4:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                    "Workspace operation exceeds the single-operation size limit",
+                )
+            usage = usage_by_target[edit.target] - previous_size + len(updated)
+            if usage > edit.quota_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+                    "Workspace quota would be exceeded",
+                )
+            usage_by_target[edit.target] = usage
+            preview = FileMetadata(
+                size=len(updated),
+                etag="dry-run",
+                created=current_data is None,
+            )
+            prepared.append((edit, object_name, updated, preview))
+            staged[key] = updated
+
+        if dry_run:
+            return tuple(item[3] for item in prepared)
+        committed = 0
+        results: list[FileMetadata] = []
+        try:
+            for _, object_name, data, preview in prepared:
+                uploaded = await self._storage.write(object_name, data)
+                committed += 1
+                results.append(
+                    FileMetadata(
+                        size=len(data),
+                        etag=uploaded.etag,
+                        created=preview.created,
+                    )
+                )
+        except WorkspaceError as exc:
+            raise WorkspaceError(
+                exc.code,
+                f"Workspace patch storage failure after {committed} edits committed",
+            ) from exc
+        return tuple(results)
+
     async def purge_workspace(self, target: WorkspaceTarget) -> None:
         """Idempotently remove every object for an already-authorized lifecycle event."""
         async with self._mutation_locks.hold(target):
@@ -560,6 +859,21 @@ class WorkspaceFS:
 
 
 async def _run_transform(transform: Callable[[bytes], bytes], current: bytes) -> bytes:
+    worker = asyncio.create_task(asyncio.to_thread(transform, current))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            pass
+        raise
+
+
+async def _run_optional_transform(
+    transform: Callable[[bytes | None], bytes],
+    current: bytes | None,
+) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
     try:
         return await asyncio.shield(worker)
@@ -617,11 +931,13 @@ def _workspace_prefix(target: WorkspaceTarget) -> str:
 
 def _object_key(target: WorkspaceTarget, relative_path: str) -> str:
     path = PurePosixPath(relative_path)
+    raw_parts = relative_path.split("/")
     if (
         not relative_path
+        or not path.parts
         or relative_path.startswith("/")
         or "\x00" in relative_path
-        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(part in {"", ".", ".."} for part in raw_parts)
     ):
         raise WorkspaceError(
             ErrorCode.WORKSPACE_BLOCKED_PATH,
@@ -635,6 +951,29 @@ def _parent_object_names(prefix: str, object_name: str) -> list[str]:
     return [
         f"{prefix}{'/'.join(relative_parts[:index])}" for index in range(1, len(relative_parts))
     ]
+
+
+def _validate_patch_object_shape(
+    target: WorkspaceTarget,
+    object_name: str,
+    metadata: dict[str, ObjectMetadata],
+    staged: dict[tuple[WorkspaceTarget, str], bytes | None],
+    directory_keys: set[tuple[WorkspaceTarget, str]],
+) -> None:
+    prefix = _workspace_prefix(target)
+    parents = set(_parent_object_names(prefix, object_name))
+    staged_names = {
+        name
+        for (staged_target, name), data in staged.items()
+        if staged_target == target and data is not None
+    }
+    if parents.intersection(metadata) or parents.intersection(staged_names):
+        raise WorkspaceError(ErrorCode.TOOL_NOT_A_DIRECTORY, "A workspace path parent is a file")
+    folder_prefix = f"{object_name}/"
+    if (target, object_name) in directory_keys or any(
+        name.startswith(folder_prefix) for name in staged_names
+    ):
+        raise WorkspaceError(ErrorCode.TOOL_IS_DIRECTORY, "Workspace path is a directory")
 
 
 def _too_large_to_edit() -> WorkspaceError:
