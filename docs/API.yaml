@@ -853,8 +853,8 @@ paths:
         server workspace object bytes. For a paired device target, the server
         relays the authenticated HTTP response to the device WebSocket file
         stream with bounded buffering/backpressure; it does not stage the file
-        into RustFS. This route is also how the browser resolves online-only web
-        `MessageDeliveryRef` device-file chips.
+        into RustFS. This route is also how the browser downloads current-web
+        `MessageDeliveryRef` workspace files.
       responses:
         '200':
           description: OK — returns a backpressured raw file stream.
@@ -2195,11 +2195,8 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
           description: |
-            API-only user-visible delivery references. This array remains empty
-            through Py3; its first producer is the initial Py4 `message` tool.
-            These refs are not part of provider replay. Device refs are online-only and are
-            resolved by calling the Workspace Files `GET` route with the
-            recorded `openoctopus_device` and `path`.
+            API-only user-visible delivery references produced by the Py4
+            `message` tool. These refs are not part of provider replay.
         created_at: { type: string, format: date-time }
 
     PendingMessage:
@@ -2470,15 +2467,27 @@ components:
             in the persisted user content.
         path:
           type: string
-          description: Existing file path on the selected install site.
+          description: |
+            Original virtual path supplied to `message`. A shared-workspace
+            rename can make it stale; recover through `workspace_id` and
+            `workspace_relative_path`.
 
     MessageDeliveryRef:
       type: object
       description: |
-        Provider-hidden user delivery metadata. `delivery_refs` arrays remain
-        empty through Py3; the initial Py4 `message` tool begins producing
-        these refs. The agent/provider never supplies or receives this shape.
-      required: [tool_use_id, type, openoctopus_device, path, filename, online_only]
+        Provider-hidden user delivery metadata for a durable server-workspace
+        file. The agent/provider never supplies or receives this shape.
+      required:
+        - tool_use_id
+        - type
+        - openoctopus_device
+        - path
+        - workspace_id
+        - workspace_relative_path
+        - filename
+        - mime
+        - size
+        - online_only
       additionalProperties: false
       properties:
         tool_use_id:
@@ -2489,50 +2498,40 @@ components:
             response contains multiple calls.
         type:
           type: string
-          enum: [workspace_file, device_file]
-          description: |
-            `workspace_file` points at durable server workspace bytes.
-            `device_file` points at a paired device path and is resolved only
-            when the user clicks/downloads it.
+          enum: [workspace_file]
+          description: Points at durable server workspace bytes.
         openoctopus_device:
           type: string
-          description: |
-            `server` for durable workspace refs, or a paired device name for
-            online-only device refs. Frontends pass this value back as the
-            Workspace Files `openoctopus_device` query parameter.
+          enum: [server]
+          description: Frontends pass this value to the Workspace Files GET route.
         path:
           type: string
           description: Existing file path on the selected install site.
         workspace_id:
-          type: [string, "null"]
+          type: string
           format: uuid
           description: |
-            Immutable personal/shared workspace ID for `workspace_file` refs;
-            null for device refs. A frontend can match this against
-            `GET /api/workspaces` after a shared-workspace rename.
+            Immutable personal/shared workspace ID. A frontend can match this
+            against `GET /api/workspaces` after a shared-workspace rename.
         workspace_relative_path:
-          type: [string, "null"]
+          type: string
           description: |
-            Stable path relative to the identified server workspace for
-            `workspace_file` refs; null for device refs.
+            Stable path relative to the identified server workspace.
         filename:
           type: string
           description: Display filename. Defaults to the final path segment if the adapter cannot infer anything better.
         mime:
           type: string
-          nullable: true
-          description: Optional media type hint for rendering.
+          description: Conservative media type hint for rendering.
         size:
           type: integer
           format: int64
-          nullable: true
-          description: Optional size hint. Device refs may omit it because the file is not read until click time.
+          minimum: 0
+          description: File size at delivery-ref creation time.
         online_only:
           type: boolean
-          description: |
-            True for device refs. False for durable server workspace refs.
-            Online-only refs may fail later with `device_unreachable`,
-            `not_found`, or device policy errors.
+          enum: [false]
+          description: Always false for durable server-workspace refs.
 
     Workspace:
       type: object

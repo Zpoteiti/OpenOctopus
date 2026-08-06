@@ -344,14 +344,17 @@ Py4 exposes only this provider-visible input:
 }
 ```
 
-`content` is required. `media` is optional and capped at ten paths. The Py4 schema
-does not expose `channel`, `chat_id`, buttons, or paired-device names. The tool is
-valid only for the current web session.
+`content` is required, must contain non-whitespace text, and is capped at 16,000
+characters. `media` is optional, capped at ten unique paths, and may reference any
+regular workspace file regardless of the 8 MiB editing limit. The Py4 schema does
+not expose `channel`, `chat_id`, buttons, or paired-device names. The tool is valid
+only for the current web session.
 
 For every media path, the tool calls `WorkspaceService.stat`, verifies that it is a
 file accessible to the session owner, and produces filename, size, and a conservative
-MIME hint without reading the file bytes. Validation is all-or-nothing: any invalid
-path returns an error and produces no delivery refs.
+MIME hint without reading the file bytes. Unknown types use
+`application/octet-stream`. Validation is all-or-nothing: any invalid path returns an
+error and produces no delivery refs.
 
 `delivery_refs` are never tool inputs and are never projected to the LLM provider.
 On success the tool returns internal side-effect metadata with its normal tool

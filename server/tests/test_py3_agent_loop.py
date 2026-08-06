@@ -450,6 +450,7 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
         assert response.status_code == 200
         assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
             "web_fetch",
+            "message",
             "read_file",
             "write_file",
             "edit_file",

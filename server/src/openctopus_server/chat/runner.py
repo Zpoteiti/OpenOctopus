@@ -51,7 +51,7 @@ from openctopus_server.services.messages import (
     promote_pending_for_turn,
     reserve_pending_turn,
 )
-from openctopus_server.tools.base import ToolContext
+from openctopus_server.tools.base import MessageDeliveryEffect, ToolContext
 from openctopus_server.tools.registry import ToolRegistry, build_py3_registry
 from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.skills import get_skills_cache
@@ -489,13 +489,37 @@ class ChatRuntime:
                 }
                 if tool_result.code is not None:
                     result_block["code"] = tool_result.code.value
+                delivery_effect = tool_result.side_effect
+                delivery_refs: list[dict[str, Any]] | None = None
+                assistant_message_id: UUID | None = None
+                if isinstance(delivery_effect, MessageDeliveryEffect):
+                    assistant_message_id = assistant.id
+                    delivery_refs = [
+                        {
+                            "tool_use_id": tool_id,
+                            "type": ref.type,
+                            "openoctopus_device": ref.openoctopus_device,
+                            "path": ref.path,
+                            "workspace_id": str(ref.workspace_id),
+                            "workspace_relative_path": ref.workspace_relative_path,
+                            "filename": ref.filename,
+                            "mime": ref.mime,
+                            "size": ref.size,
+                            "online_only": ref.online_only,
+                        }
+                        for ref in delivery_effect.delivery_refs
+                    ]
                 async with AsyncSession(self.engine, expire_on_commit=False) as db:
-                    result_message = await persist_tool_result(
+                    updated_assistant, result_message = await persist_tool_result(
                         db,
                         turn=turn,
                         block=result_block,
+                        assistant_message_id=assistant_message_id,
+                        delivery_refs=delivery_refs,
                     )
                 last_result_id = result_message.id
+                if updated_assistant is not None:
+                    await self._publish_message(state, turn, updated_assistant)
                 await self._publish_message(state, turn, result_message)
                 await self._publish_tool_progress(
                     state,

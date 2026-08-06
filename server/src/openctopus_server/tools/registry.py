@@ -14,6 +14,7 @@ from openctopus_server.tools.device_field import (
     DEVICE_FIELD_NAME,
     openoctopus_device_field,
 )
+from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.result import normalize_tool_result
 from openctopus_server.tools.web_fetch import Resolver, WebFetchTool
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
@@ -136,6 +137,7 @@ class ToolRegistry:
             ),
             is_error=result.is_error,
             code=result.code,
+            side_effect=result.side_effect if not result.is_error else None,
         )
 
 
@@ -158,6 +160,7 @@ def build_py4_registry(
     return ToolRegistry(
         (
             WebFetchTool(resolver=resolver, transport=transport),
+            MessageTool(engine, workspace_service),
             *build_workspace_file_tools(backend),
         )
     )

@@ -287,10 +287,11 @@ async def test_notebook_edit_rejects_non_notebook_paths() -> None:
     assert dispatcher.calls == []
 
 
-def test_py4_registry_includes_web_fetch_and_ten_workspace_tools(pg_engine) -> None:
+def test_py4_registry_includes_message_and_ten_workspace_tools(pg_engine) -> None:
     registry = build_py4_registry(pg_engine, Mock(spec=WorkspaceService))
 
     assert [schema["name"] for schema in registry.get_tool_schemas()] == [
         "web_fetch",
+        "message",
         *EXPECTED_TOOL_NAMES,
     ]

@@ -90,6 +90,13 @@ class ToolFileRead:
     size: int
 
 
+@dataclass(frozen=True, slots=True)
+class AuthorizedWorkspaceFile:
+    target: WorkspaceTarget
+    relative_path: str
+    metadata: FileMetadata
+
+
 class WorkspaceService:
     """Authorized virtual-path façade for REST handlers and agent tools."""
 
@@ -105,6 +112,23 @@ class WorkspaceService:
         async with self._fs.file_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
             return await self._fs.stat(resolved.target, resolved.relative_path)
+
+    async def resolve_delivery_file(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        path: str,
+    ) -> AuthorizedWorkspaceFile:
+        await self._preflight(db, user_id=user_id, path=path)
+        async with self._fs.file_operation_slot():
+            resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            metadata = await self._fs.stat(resolved.target, resolved.relative_path)
+            return AuthorizedWorkspaceFile(
+                target=resolved.target,
+                relative_path=resolved.relative_path,
+                metadata=metadata,
+            )
 
     async def read(
         self,

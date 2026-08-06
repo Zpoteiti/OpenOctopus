@@ -758,6 +758,10 @@ schema below is the final forward contract, not the Py3 registry surface
 The initial Py4 provider-visible schema exposes only `content`, optional
 `media`, and `openoctopus_device` fixed to `server`. It does not advertise
 `channel`, `chat_id`, or `buttons` before their owning channel milestone.
+`content` must contain non-whitespace text and is capped at 16,000 characters;
+`media` accepts at most ten unique server-workspace paths. Py4 only stats those
+files, so the 8 MiB editing limit does not apply; unknown MIME types use
+`application/octet-stream`.
 
 **Purpose:** Send a message to the user, optionally with file attachments or inline keyboard buttons. `content` is required; `channel` and `chat_id` default to the current session's values. Specify them explicitly for cross-channel reach.
 
@@ -817,7 +821,7 @@ The initial Py4 provider-visible schema exposes only `content`, optional
   - If `channel` + `chat_id` specified → delivers to that target. Cross-channel reach.
 - Once channel adapters exist, looks up the user's config for an explicit target channel (`discord_configs` / `telegram_configs`); if none, returns `ToolError::ChannelNotConfigured`.
 - For each media path:
-  - If `openoctopus_device="server"`: opens via `WorkspaceService.read`, which validates user authorization and path policy before bounded RustFS access. Beginning in Py4, web delivery emits a durable workspace file ref in provider-hidden delivery state/`delivery_refs`; for later third-party channels, the adapter streams workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
+  - If `openoctopus_device="server"`: Py4 current-web delivery uses `WorkspaceService` to authorize and stat the file without reading its bytes, then emits a durable workspace file ref in provider-hidden delivery state/`delivery_refs`. Later third-party channel adapters will stream authorized workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
   - If `openoctopus_device="<client_name>"` and the target channel is `web`: does not fetch or stage the file at send time. It writes user-visible, provider-hidden delivery state with an online-only `device_file` entry in `delivery_refs` containing the device name and path. The frontend later downloads through `GET /api/workspace/files/{path}?openoctopus_device=<client_name>`, which relays the browser response to the live device WebSocket. Download fails at click time with `device_unreachable`, `not_found`, or policy errors if the device/path is unavailable.
   - If `openoctopus_device="<client_name>"` and the target channel is a third-party platform (`telegram`, `discord`, `feishu`, `weixin`, ...): server streams bytes from the device over `/ws/device` and forwards them directly into the platform's upload API. The bytes are not written to RustFS or the server workspace. The platform owns the delivered copy after success.
 - `buttons` renders as inline keyboard rows on channels that support it (Telegram, Discord's button components); plain text channels ignore the param with no error.

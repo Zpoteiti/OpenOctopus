@@ -1,7 +1,7 @@
 import base64
 import binascii
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -49,13 +49,28 @@ class PostMessageRequest(BaseModel):
         return self
 
 
+class WorkspaceFileDeliveryRefResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_use_id: str = Field(min_length=1)
+    type: Literal["workspace_file"]
+    openoctopus_device: Literal["server"]
+    path: str = Field(min_length=1)
+    workspace_id: UUID
+    workspace_relative_path: str = Field(min_length=1)
+    filename: str = Field(min_length=1)
+    mime: str = Field(min_length=1)
+    size: int = Field(ge=0)
+    online_only: Literal[False]
+
+
 class MessageResponse(BaseModel):
     id: UUID
     session_id: UUID
     role: str
     message_kind: str
     content: list[ContentBlock]
-    delivery_refs: list[dict[str, Any]]
+    delivery_refs: list[WorkspaceFileDeliveryRefResponse]
     is_compacted: bool
     created_at: datetime
 

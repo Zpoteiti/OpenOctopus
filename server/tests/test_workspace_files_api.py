@@ -9,7 +9,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -17,8 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.engine import get_engine
-from openctopus_server.db.models import User, Workspace, WorkspaceMember
-from openctopus_server.workspace.fs import _workspace_fs_for_storage
+from openctopus_server.db.models import Session, User, Workspace, WorkspaceMember
+from openctopus_server.tools.base import MessageDeliveryEffect, ToolContext
+from openctopus_server.tools.message import MessageTool
+from openctopus_server.tools.registry import ToolRegistry
+from openctopus_server.workspace.fs import WorkspaceFS, _workspace_fs_for_storage
+from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.storage import ObjectStorage, get_object_storage
 
 _MIB = 1024 * 1024
@@ -644,6 +648,76 @@ async def test_shared_directory_entries_preserve_reusable_virtual_paths(
             "size": 1,
         }
     ]
+
+
+async def test_message_ref_recovers_shared_download_after_workspace_rename(
+    workspace_api,
+    test_app,
+    pg_engine,
+) -> None:
+    client, storage_client, user_id = workspace_api
+    created_response = await client.post(
+        "/api/workspaces",
+        json={"name": "Before", "quota_bytes": 1_000_000},
+    )
+    assert created_response.status_code == 201
+    created = created_response.json()
+    workspace_id = UUID(created["id"])
+    relative_path = "reports/report.pdf"
+    storage_client._store(
+        f"workspaces/{workspace_id}/{relative_path}",
+        b"shared report",
+    )
+    session_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Session(
+                id=session_id,
+                user_id=user_id,
+                session_key=f"web:{session_id}",
+                channel="web",
+                chat_id=str(session_id),
+                title="Shared delivery",
+            )
+        )
+        await db.commit()
+
+    object_storage: ObjectStorage = test_app.dependency_overrides[get_object_storage]()
+    service = WorkspaceService(WorkspaceFS(object_storage))
+    registry = ToolRegistry((MessageTool(pg_engine, service),))
+    original_path = f"/{created['ref']}/{relative_path}"
+    result = await registry.execute(
+        name="message",
+        args={"content": "Shared report", "media": [original_path]},
+        ctx=ToolContext(user_id=user_id, session_id=session_id),
+    )
+
+    assert isinstance(result.side_effect, MessageDeliveryEffect)
+    ref = result.side_effect.delivery_refs[0]
+    assert ref.workspace_id == workspace_id
+    assert ref.workspace_relative_path == relative_path
+
+    renamed_response = await client.patch(
+        f"/api/workspaces/{quote(created['ref'], safe='@')}",
+        json={"name": "After Rename"},
+    )
+    assert renamed_response.status_code == 200
+    workspace_page = (await client.get("/api/workspaces")).json()
+    renamed = next(item for item in workspace_page["items"] if item["id"] == str(ref.workspace_id))
+    recovered_path = f"/{renamed['ref']}/{ref.workspace_relative_path}"
+
+    stale = await client.get(
+        f"/api/workspace/files/{quote(ref.path, safe='/@')}",
+        params={"openoctopus_device": "server"},
+    )
+    recovered = await client.get(
+        f"/api/workspace/files/{quote(recovered_path, safe='/@')}",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert stale.status_code == 404
+    assert recovered.status_code == 200
+    assert recovered.content == b"shared report"
 
 
 async def test_recursive_list_synthesizes_directories_and_skips_noise(workspace_api) -> None:

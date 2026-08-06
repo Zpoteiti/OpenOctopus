@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from openctopus_server.errors.codes import ErrorCode
@@ -18,10 +18,29 @@ class ToolRoutingMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceFileDeliveryRef:
+    path: str
+    workspace_id: UUID
+    workspace_relative_path: str
+    filename: str
+    mime: str
+    size: int
+    type: Literal["workspace_file"] = "workspace_file"
+    openoctopus_device: Literal["server"] = "server"
+    online_only: Literal[False] = False
+
+
+@dataclass(frozen=True, slots=True)
+class MessageDeliveryEffect:
+    delivery_refs: tuple[WorkspaceFileDeliveryRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ToolResult:
     content: RawToolResultContent
     is_error: bool = False
     code: ErrorCode | None = None
+    side_effect: MessageDeliveryEffect | None = None
 
 
 @dataclass(frozen=True, slots=True)

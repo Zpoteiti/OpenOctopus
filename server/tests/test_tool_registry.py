@@ -3,7 +3,13 @@ from typing import Any
 from uuid import uuid4
 
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
+from openctopus_server.tools.base import (
+    MessageDeliveryEffect,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolRoutingMode,
+)
 from openctopus_server.tools.device_field import DEVICE_FIELD_MARKER, DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import (
     ToolRegistry,
@@ -55,6 +61,17 @@ class _IntrinsicDeviceTool(_EchoTool):
         }
         schema["input_schema"]["required"].append(DEVICE_FIELD_NAME)
         return schema
+
+
+class _ErrorWithSideEffectTool(_EchoTool):
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        return ToolResult(
+            content="failed",
+            is_error=True,
+            code=ErrorCode.TOOL_DELIVERY_FAILED,
+            side_effect=MessageDeliveryEffect(delivery_refs=()),
+        )
 
 
 def _ctx() -> ToolContext:
@@ -199,3 +216,16 @@ async def test_intrinsic_device_tool_keeps_its_marked_device_argument() -> None:
     assert tool.received_args == {"value": "hello", DEVICE_FIELD_NAME: "server"}
     assert tool.received_ctx == ctx
     assert result.is_error is False
+
+
+async def test_registry_discards_side_effects_from_error_results() -> None:
+    registry = ToolRegistry((_ErrorWithSideEffectTool(),))
+
+    result = await registry.execute(
+        name="echo",
+        args={"value": "hello", DEVICE_FIELD_NAME: "server"},
+        ctx=_ctx(),
+    )
+
+    assert result.is_error is True
+    assert result.side_effect is None
