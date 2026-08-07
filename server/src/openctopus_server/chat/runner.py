@@ -1,16 +1,20 @@
 import asyncio
+import inspect
 import json
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.chat.compaction import (
     StaleCompactionSelectionError,
     commit_stage_one,
@@ -28,8 +32,11 @@ from openctopus_server.chat.context import (
 from openctopus_server.chat.public_projection import message_response
 from openctopus_server.chat.repair import repair_unpaired_tool_uses
 from openctopus_server.chat.stream import StreamSubscriber
+from openctopus_server.chat.token_estimator import estimate_request_tokens
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
+from openctopus_server.config import get_settings
 from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun
+from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.provider.anthropic import (
     AnthropicProvider,
     Provider,
@@ -57,6 +64,7 @@ from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.skills import get_skills_cache
 
 ProviderFactory = Callable[[ProviderConfig], Provider]
+RequestTokenEstimator = Callable[..., int | Awaitable[int]]
 
 _MAX_ITERATIONS = 200
 _COMPACTION_SYSTEM = (
@@ -65,6 +73,16 @@ _COMPACTION_SYSTEM = (
     "open questions, and errors. Do not add new instructions or commentary."
 )
 _COMPACTION_REQUEST = "Write the compacted summary now."
+
+
+@lru_cache
+def get_context_admission() -> KeyedAdmission:
+    settings = get_settings()
+    return KeyedAdmission(
+        global_limit=settings.chat_context_max_concurrency,
+        per_key_limit=settings.chat_context_max_concurrency_per_user,
+        timeout_seconds=settings.chat_context_queue_timeout_seconds,
+    )
 
 
 @dataclass(slots=True)
@@ -90,6 +108,21 @@ class _PreparedTurn:
     user_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletedProviderTurn:
+    turn: TurnStart
+    assistant: Message
+    user_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _UnhandledProviderFailure:
+    pass
+
+
+_UNHANDLED_PROVIDER_FAILURE = _UnhandledProviderFailure()
+
+
 class ChatRuntime:
     def __init__(
         self,
@@ -98,12 +131,16 @@ class ChatRuntime:
         provider_factory: ProviderFactory | None = None,
         tool_registry: ToolRegistry | None = None,
         workspace_service: WorkspaceService | None = None,
+        context_admission: KeyedAdmission | None = None,
+        request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
     ) -> None:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
         self.limiter = ProviderLimiter()
         self.tool_registry = tool_registry or build_py3_registry()
         self.workspace_service = workspace_service
+        self.context_admission = context_admission or get_context_admission()
+        self._estimate_request_tokens = request_token_estimator
         self.skills_cache = get_skills_cache()
         self._provider_factory = provider_factory or AnthropicProvider
         self._providers: dict[tuple[str, str], Provider] = {}
@@ -367,68 +404,13 @@ class ChatRuntime:
         repeated_count = 0
 
         for iteration in range(_MAX_ITERATIONS):
-            try:
-                prepared: _PreparedTurn | None = None
-                for attempt in range(2):
-                    async with AsyncSession(self.engine, expire_on_commit=False) as db:
-                        turn = await capture_pending_for_turn(db, turn=turn)
-                    async with state.lock:
-                        self._set_active_turn(state, turn, inherit_preview=True)
-                    try:
-                        prepared = await self._prepare_turn(turn)
-                        turn = prepared.turn
-                        break
-                    except StaleCompactionSelectionError:
-                        if attempt == 1:
-                            raise
-                if prepared is None:
-                    raise RuntimeError("Turn preflight did not produce provider context")
-            except Exception as exc:
-                await self._fail_preflight(state, turn, exc)
+            completed = await self._invoke_provider_iteration(state, turn)
+            if isinstance(completed, _UnhandledProviderFailure):
+                raise RuntimeError("Provider failure recovery failed")
+            if completed is None:
                 return
-
-            await self._claim_promoted_subscriber(state, turn)
-            await self._publish_turn_started(state, turn)
-            if await self._cancel_requested(turn.session_id):
-                await self._cancel_turn(state, turn, [])
-                return
-
-            provider = await self._provider_for(prepared.config)
-
-            async def on_delta(channel: str, text: str) -> None:
-                await self._publish(
-                    state,
-                    turn.turn_id,
-                    {
-                        "type": "token_delta",
-                        "turn_id": str(turn.turn_id),
-                        "channel": channel,
-                        "text": text,
-                    },
-                )
-
-            try:
-                result = await provider.stream_turn(
-                    config=prepared.config,
-                    system=prepared.system,
-                    messages=prepared.messages,
-                    effort=turn.effort,
-                    limiter=self.limiter,
-                    on_delta=on_delta,
-                    tools=prepared.tools,
-                )
-                assistant = await self._persist_assistant_message(
-                    state,
-                    turn,
-                    content=result.content,
-                    fingerprint=result.fingerprint,
-                )
-            except ProviderInvocationError as exc:
-                await self._fail_provider(state, turn, protocol=exc.protocol)
-                return
-            except Exception:
-                await self._fail_provider(state, turn, protocol=False)
-                return
+            turn = completed.turn
+            assistant = completed.assistant
 
             tool_uses = [block for block in assistant.content if block.get("type") == "tool_use"]
             if not tool_uses:
@@ -477,7 +459,7 @@ class ChatRuntime:
                     name=tool_name,
                     args=tool_input,
                     ctx=ToolContext(
-                        user_id=prepared.user_id,
+                        user_id=completed.user_id,
                         session_id=turn.session_id,
                     ),
                 )
@@ -582,6 +564,126 @@ class ChatRuntime:
             await self._transfer_turn_subscriber(state, turn.turn_id, next_turn)
             turn = next_turn
 
+    async def _invoke_provider_iteration(
+        self,
+        state: _SessionState,
+        turn: TurnStart,
+    ) -> _CompletedProviderTurn | _UnhandledProviderFailure | None:
+        started = False
+        try:
+            user_id = await self._session_owner_id(turn.session_id)
+        except Exception as exc:
+            await self._fail_preflight(state, turn, exc)
+            return None
+
+        admitted = False
+        try:
+            async with self._context_slot(user_id):
+                admitted = True
+                try:
+                    prepared: _PreparedTurn | None = None
+                    for attempt in range(2):
+                        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                            turn = await capture_pending_for_turn(db, turn=turn)
+                        async with state.lock:
+                            self._set_active_turn(state, turn, inherit_preview=True)
+                        try:
+                            prepared = await self._prepare_turn(turn)
+                            turn = prepared.turn
+                            break
+                        except StaleCompactionSelectionError:
+                            if attempt == 1:
+                                raise
+                    if prepared is None:
+                        raise RuntimeError("Turn preflight did not produce provider context")
+
+                    await self._claim_promoted_subscriber(state, turn)
+                    await self._publish_turn_started(state, turn)
+                    started = True
+                    if await self._cancel_requested(turn.session_id):
+                        await self._cancel_turn(state, turn, [])
+                        return None
+
+                    provider = await self._provider_for(prepared.config)
+
+                    async def on_delta(channel: str, text: str) -> None:
+                        await self._publish(
+                            state,
+                            turn.turn_id,
+                            {
+                                "type": "token_delta",
+                                "turn_id": str(turn.turn_id),
+                                "channel": channel,
+                                "text": text,
+                            },
+                        )
+
+                    result = await provider.stream_turn(
+                        config=prepared.config,
+                        system=prepared.system,
+                        messages=prepared.messages,
+                        effort=turn.effort,
+                        limiter=self.limiter,
+                        on_delta=on_delta,
+                        tools=prepared.tools,
+                    )
+                    content = result.content
+                    fingerprint = result.fingerprint
+                    prepared_user_id = prepared.user_id
+                    del prepared, provider, result
+                except Exception as exc:
+                    try:
+                        if started:
+                            error = exc if isinstance(exc, ProviderInvocationError) else None
+                            await self._fail_provider(state, turn, error=error)
+                        else:
+                            await self._fail_preflight(state, turn, exc)
+                    except Exception:
+                        try:
+                            await self._fail_unexpected_chain(state)
+                        except Exception:
+                            return _UNHANDLED_PROVIDER_FAILURE
+                    return None
+        except Exception as exc:
+            if admitted:
+                raise
+            await self._fail_preflight(state, turn, exc)
+            return None
+
+        assistant = await self._persist_assistant_message(
+            state,
+            turn,
+            content=content,
+            fingerprint=fingerprint,
+        )
+        return _CompletedProviderTurn(
+            turn=turn,
+            assistant=assistant,
+            user_id=prepared_user_id,
+        )
+
+    async def _session_owner_id(self, session_id: UUID) -> UUID:
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            user_id = await db.scalar(select(Session.user_id).where(Session.id == session_id))
+        if user_id is None:
+            raise RuntimeError("Session disappeared while waiting for context admission")
+        return user_id
+
+    @asynccontextmanager
+    async def _context_slot(self, user_id: UUID) -> AsyncIterator[None]:
+        admitted = False
+        try:
+            async with self.context_admission.slot(user_id):
+                admitted = True
+                yield
+        except AdmissionTimeoutError as exc:
+            if admitted:
+                raise
+            raise ProviderInvocationError(
+                "Context admission timed out",
+                safe_message="The server is busy preparing other conversations. Please retry.",
+            ) from exc
+
     async def _prepare_turn(self, turn: TurnStart) -> _PreparedTurn:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             await repair_unpaired_tool_uses(db, session_id=turn.session_id)
@@ -644,17 +746,14 @@ class ChatRuntime:
                 current_fingerprint=provider_fingerprint(config),
                 add_compaction_continuation=False,
             )
+            user_id = session.user_id
 
-        provider = await self._provider_for(config)
         should_compact = False
         if config.max_context_tokens is not None and config.compaction_threshold_tokens is not None:
-            input_tokens = await provider.count_tokens(
-                config=config,
+            input_tokens = await self._estimate_tokens(
                 system=system,
                 messages=prospective_messages,
                 tools=registry_schemas,
-                effort=turn.effort,
-                limiter=self.limiter,
             )
             should_compact = compaction_required(
                 input_tokens=input_tokens,
@@ -663,6 +762,7 @@ class ChatRuntime:
             )
 
         if should_compact and pending_rows and active_rows:
+            provider = await self._provider_for(config)
             summary_content = await self._generate_summary(
                 provider=provider,
                 config=config,
@@ -684,87 +784,80 @@ class ChatRuntime:
             compacted = True
         elif should_compact and not pending_rows:
             source_ids = stage_two_source_ids(active_rows)
-            if not source_ids:
-                raise ProviderInvocationError(
-                    "Compaction is required but no active history is eligible"
+            if source_ids:
+                provider = await self._provider_for(config)
+                source_set = set(source_ids)
+                tail_messages = project_message_rows(
+                    [row for row in active_rows if row.id in source_set],
+                    current_fingerprint=provider_fingerprint(config),
                 )
-            source_set = set(source_ids)
-            tail_messages = project_message_rows(
-                [row for row in active_rows if row.id in source_set],
-                current_fingerprint=provider_fingerprint(config),
-            )
-            summary_content = await self._generate_summary(
-                provider=provider,
-                config=config,
-                messages=_stage_two_summary_messages(tail_messages),
-            )
-            async with AsyncSession(self.engine, expire_on_commit=False) as db:
-                await commit_stage_two(
-                    db,
-                    session_id=turn.session_id,
-                    source_ids=source_ids,
-                    summary_content=summary_content,
+                summary_content = await self._generate_summary(
+                    provider=provider,
+                    config=config,
+                    messages=_stage_two_summary_messages(tail_messages),
                 )
-            compacted = True
-        elif should_compact:
-            raise ProviderInvocationError(
-                "Compaction is required but no active history is eligible"
-            )
+                async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                    await commit_stage_two(
+                        db,
+                        session_id=turn.session_id,
+                        source_ids=source_ids,
+                        summary_content=summary_content,
+                    )
+                compacted = True
         elif pending_rows:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 turn = await promote_pending_for_turn(db, turn=turn)
 
-        async with AsyncSession(self.engine, expire_on_commit=False) as db:
-            config = await load_provider_config(db)
-            session = await db.get(Session, turn.session_id)
-            if session is None:
-                raise RuntimeError("Session disappeared while preparing a turn")
-            final_rows = list(
-                (
-                    await db.execute(
-                        select(Message)
-                        .where(
-                            Message.session_id == turn.session_id,
-                            Message.is_compacted.is_(False),
-                        )
-                        .order_by(Message.created_at, Message.id)
-                    )
+        provider_messages = prospective_messages
+        if compacted:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                config = await load_provider_config(db)
+                system, provider_messages = await build_provider_context(
+                    db,
+                    session_id=turn.session_id,
+                    config=config,
+                    workspace_service=self.workspace_service,
+                    skills_cache=self.skills_cache,
                 )
-                .scalars()
-                .all()
-            )
-            provider_messages = project_provider_messages(
-                final_rows,
-                current_fingerprint=provider_fingerprint(config),
-            )
-        if (
-            compacted
-            and config.max_context_tokens is not None
-            and config.compaction_threshold_tokens is not None
-        ):
-            provider = await self._provider_for(config)
-            input_tokens = await provider.count_tokens(
-                config=config,
+            await self._estimate_tokens(
                 system=system,
                 messages=provider_messages,
                 tools=registry_schemas,
-                effort=turn.effort,
-                limiter=self.limiter,
             )
-            if compaction_required(
-                input_tokens=input_tokens,
-                max_context_tokens=config.max_context_tokens,
-                threshold_tokens=config.compaction_threshold_tokens,
-            ):
-                raise ProviderInvocationError("Compaction did not create enough context headroom")
         return _PreparedTurn(
             turn=turn,
             config=config,
             system=system,
             messages=provider_messages,
             tools=registry_schemas,
-            user_id=session.user_id,
+            user_id=user_id,
         )
+
+    async def _estimate_tokens(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> int:
+        estimator = self._estimate_request_tokens
+        if inspect.iscoroutinefunction(estimator) or inspect.iscoroutinefunction(
+            getattr(estimator, "__call__", None)
+        ):
+            result = estimator(system=system, messages=messages, tools=tools)
+        else:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    estimator,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                )
+            )
+            result = await await_future_cancellation_safe(worker)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def _generate_summary(
         self,
@@ -848,7 +941,7 @@ class ChatRuntime:
         await self._fail_provider(
             state,
             turn,
-            protocol=isinstance(exc, ProviderInvocationError) and exc.protocol,
+            error=exc if isinstance(exc, ProviderInvocationError) else None,
         )
 
     async def _fail_provider(
@@ -856,13 +949,13 @@ class ChatRuntime:
         state: _SessionState,
         turn: TurnStart,
         *,
-        protocol: bool,
+        error: ProviderInvocationError | None = None,
     ) -> None:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             message = await persist_assistant(
                 db,
                 turn=turn,
-                content=[_synthetic_error_content(protocol=protocol)],
+                content=[_synthetic_error_content(error=error)],
                 fingerprint=None,
                 failed=True,
             )
@@ -889,7 +982,7 @@ class ChatRuntime:
         for row in repaired:
             await self._publish_message(state, turn, row)
         try:
-            await self._fail_provider(state, turn, protocol=False)
+            await self._fail_provider(state, turn)
         finally:
             await self._close_turn_subscriber(state, turn.turn_id)
 
@@ -1217,12 +1310,18 @@ class ChatRuntime:
         return winner
 
 
-def _synthetic_error_content(*, protocol: bool) -> dict[str, str]:
-    if protocol:
-        text = "The model provider returned an unsupported response."
+def _synthetic_error_content(*, error: ProviderInvocationError | None) -> dict[str, str]:
+    if error is not None and error.protocol:
+        code = ErrorCode.PROVIDER_PROTOCOL_ERROR
+        message = "The model provider returned an unsupported response."
     else:
-        text = "The model provider could not complete this response. Please try again."
-    return {"type": "text", "text": text}
+        code = ErrorCode.PROVIDER_UNAVAILABLE
+        message = (
+            error.safe_message
+            if error is not None and error.safe_message is not None
+            else "The model provider could not complete this response. Please try again."
+        )
+    return {"type": "text", "text": f"[{code.value}] {message}"}
 
 
 def _stage_two_summary_messages(

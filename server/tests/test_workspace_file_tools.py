@@ -138,6 +138,25 @@ async def test_workspace_file_tool_normalizes_its_internal_timeout(monkeypatch) 
     assert result.content[1]["text"].startswith("[tool_exec_timeout]")
 
 
+async def test_document_read_uses_its_extended_configured_timeout(monkeypatch) -> None:
+    dispatcher = _BlockingDispatcher()
+    registry = ToolRegistry(
+        build_workspace_file_tools(
+            dispatcher,
+            document_read_timeout_seconds=0.01,
+        )
+    )
+    monkeypatch.setitem(WORKSPACE_FILE_TOOL_TIMEOUT_SECONDS, "read_file", 30)
+
+    result = await registry.execute(
+        name="read_file",
+        args={"path": "report.pdf", "openoctopus_device": "server"},
+        ctx=_ctx(),
+    )
+
+    assert result.code == ErrorCode.TOOL_EXEC_TIMEOUT
+
+
 async def test_workspace_file_tool_does_not_swallow_external_cancellation(monkeypatch) -> None:
     dispatcher = _BlockingDispatcher()
     registry = ToolRegistry(build_workspace_file_tools(dispatcher))

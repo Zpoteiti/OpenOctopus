@@ -11,6 +11,7 @@ from uuid import UUID
 
 from fastapi import Depends
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.locks import KeyedLockManager
@@ -196,19 +197,18 @@ class WorkspaceFS:
         *,
         max_bytes: int,
     ) -> AsyncIterator[bytes]:
-        async with self.materialization_slot():
-            collected = bytearray()
-            async for chunk in chunks:
-                remaining = max_bytes + 1 - len(collected)
-                collected.extend(chunk[:remaining])
-                if len(collected) > max_bytes:
-                    raise WorkspaceError(
-                        ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
-                        "Workspace upload exceeds the REST upload limit",
-                    )
-            data = bytes(collected)
-            del collected
-            yield data
+        collected = bytearray()
+        async for chunk in chunks:
+            remaining = max_bytes + 1 - len(collected)
+            collected.extend(chunk[:remaining])
+            if len(collected) > max_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                    "Workspace upload exceeds the REST upload limit",
+                )
+        data = bytes(collected)
+        del collected
+        yield data
 
     async def read(
         self,
@@ -860,14 +860,7 @@ class WorkspaceFS:
 
 async def _run_transform(transform: Callable[[bytes], bytes], current: bytes) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        try:
-            await worker
-        except Exception:
-            pass
-        raise
+    return await await_future_cancellation_safe(worker)
 
 
 async def _run_optional_transform(
@@ -875,14 +868,7 @@ async def _run_optional_transform(
     current: bytes | None,
 ) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        try:
-            await worker
-        except Exception:
-            pass
-        raise
+    return await await_future_cancellation_safe(worker)
 
 
 async def _metadata_pages(

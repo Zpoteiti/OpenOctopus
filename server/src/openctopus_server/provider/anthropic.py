@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -22,8 +22,15 @@ class ProviderResult:
 
 
 class ProviderInvocationError(Exception):
-    def __init__(self, message: str, *, protocol: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        protocol: bool = False,
+        safe_message: str | None = None,
+    ) -> None:
         self.protocol = protocol
+        self.safe_message = safe_message
         super().__init__(message)
 
 
@@ -39,17 +46,6 @@ class Provider(Protocol):
         on_delta: DeltaCallback,
         tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResult: ...
-
-    async def count_tokens(
-        self,
-        *,
-        config: ProviderConfig,
-        system: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        effort: Effort | None,
-        limiter: ProviderLimiter,
-    ) -> int: ...
 
     async def close(self) -> None: ...
 
@@ -126,7 +122,10 @@ class AnthropicProvider:
                     if projection_attempt < 2 and _is_retryable(exc):
                         await asyncio.sleep(0.25 * (2**projection_attempt))
                         continue
-                    raise ProviderInvocationError(f"Provider request failed: {exc}") from exc
+                    raise ProviderInvocationError(
+                        "Provider request failed",
+                        safe_message=_safe_provider_rejection(exc, config=config),
+                    ) from exc
 
             if switch_to_text_only:
                 # ADR-026 gives the stripped projection a fresh retry budget.
@@ -134,75 +133,6 @@ class AnthropicProvider:
                 stripped_images = True
                 continue
             raise ProviderInvocationError("Provider request failed")
-
-    async def count_tokens(
-        self,
-        *,
-        config: ProviderConfig,
-        system: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        effort: Effort | None,
-        limiter: ProviderLimiter,
-    ) -> int:
-        await limiter.configure(config.max_concurrent_requests)
-        projected_messages = messages
-        stripped_images = False
-
-        while True:
-            switch_to_text_only = False
-            for projection_attempt in range(3):
-                try:
-                    async with limiter.slot():
-                        return await self._count_attempt(
-                            config=config,
-                            system=system,
-                            messages=projected_messages,
-                            tools=tools,
-                            effort=effort,
-                        )
-                except ProviderInvocationError:
-                    raise
-                except Exception as exc:
-                    if (
-                        not stripped_images
-                        and _contains_images(projected_messages)
-                        and _is_image_compatibility_error(exc)
-                    ):
-                        switch_to_text_only = True
-                        break
-                    if projection_attempt < 2 and _is_retryable(exc):
-                        await asyncio.sleep(0.25 * (2**projection_attempt))
-                        continue
-                    raise ProviderInvocationError(f"Provider token count failed: {exc}") from exc
-
-            if switch_to_text_only:
-                projected_messages = _strip_images(projected_messages)
-                stripped_images = True
-                continue
-            raise ProviderInvocationError("Provider token count failed")
-
-    async def _count_attempt(
-        self,
-        *,
-        config: ProviderConfig,
-        system: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        effort: Effort | None,
-    ) -> int:
-        request: dict[str, Any] = {
-            "model": config.model,
-            "system": system,
-            "messages": messages,
-            "cache_control": {"type": "ephemeral"},
-        }
-        if tools:
-            request["tools"] = tools
-        request.update(_thinking_controls(effort))
-        count_method: Any = self._client.messages.count_tokens
-        result = await count_method(**request)
-        return int(result.input_tokens)
 
     async def _stream_attempt(
         self,
@@ -318,6 +248,54 @@ def _is_retryable(exc: Exception) -> bool:
         return True
     status = getattr(exc, "status_code", None)
     return status == 408 or status == 429 or (isinstance(status, int) and status >= 500)
+
+
+def _safe_provider_rejection(
+    exc: Exception,
+    *,
+    config: ProviderConfig,
+) -> str | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, bool) or not isinstance(status, int) or not 400 <= status < 500:
+        return None
+    message: object = None
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping):
+        error = body.get("error")
+        if isinstance(error, Mapping):
+            message = error.get("message")
+    if message is None:
+        message = getattr(exc, "message", None)
+    if not isinstance(message, str):
+        return None
+    message = " ".join(message.split())
+    if not message:
+        return None
+    lowered = message.casefold()
+    if lowered.startswith("error code:") or any(marker in message for marker in "{}[]"):
+        # The Anthropic SDK formats JSON error bodies as Python reprs in
+        # ``message``. Treat that as a raw response body, not a safe upstream
+        # sentence.
+        return None
+    forbidden = (
+        "http://",
+        "https://",
+        "authorization",
+        "bearer ",
+        "api key",
+        "api_key",
+        config.api_key.casefold(),
+        config.endpoint.casefold(),
+    )
+    if any(value and value in lowered for value in forbidden):
+        return None
+    if not any(
+        marker in lowered
+        for marker in ("context", "token limit", "too many tokens", "prompt is too long")
+    ):
+        return None
+    prefix = f"Provider rejected the request (HTTP {status}): "
+    return prefix + message[: 1_000 - len(prefix)]
 
 
 def _is_image_compatibility_error(exc: Exception) -> bool:

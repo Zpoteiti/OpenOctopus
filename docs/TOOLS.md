@@ -27,7 +27,7 @@ This is a *design* document. Use it during implementation as the source of truth
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
 - **Path policy** (ADR-043, ADR-108, ADR-123): relative paths are accepted and resolve to the **personal workspace on the target device**. On the server, `WorkspaceService` resolves the authenticated virtual path and `WorkspaceFS` maps it to the user's RustFS object prefix; on a client, it is the device's local `workspace_path`. Absolute paths are also accepted. **Shared workspaces always require absolute paths in the `name@suffix` form** (e.g. `/production-department@a4f7e2d1/sprint.md`) — they have no implicit relative base, and strict-mode resolution requires both name and suffix to match the workspace row exactly. Names are validated per ADR-109.
 - **Workspace writes funnel through `WorkspaceService`** server-side (ADR-045, ADR-123). Its internal `WorkspaceFS` owns object-key mapping, quota checks, mutation coordination, and RustFS/MinIO-SDK error normalization.
-- **Server workspace IO is bounded inside the workspace service** (ADR-122, ADR-123). Tool schemas do not expose object-storage concepts; the implementation owns a bounded RustFS client pool, paged metadata scans, workspace mutation locks, and bounded in-memory transforms.
+- **Server workspace IO is bounded inside the workspace service** (ADR-122, ADR-123). Tool schemas do not expose object-storage concepts; the implementation owns a bounded RustFS client pool, paged metadata scans, workspace mutation locks, and bounded in-memory transforms. REST upload/download admission is separate and never consumes Agent file-tool permits. Document reads additionally use per-user/global conversion admission before downloading bytes and keep parsing inside a resource-limited child process.
 - **File policy is per target install site.** On Python-main server workspaces, `WorkspaceService` is the authorization boundary: paths are normalized and checked against the selected personal/shared workspace before internal mapping to RustFS keys. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target device config. With `sandbox_mode=true` (default), resolved paths must stay under `workspace_path`; with `sandbox_mode=false`, the trusted device may address paths outside `workspace_path`.
 - **Every real tool result is wrapped** (ADR-095): provider-facing `tool_result.content` is normalized to a safe block array. The first block is a server-generated `[untrusted tool result]: ...` warning text block; raw string output becomes the following text block, and raw safe block arrays are appended after the warning. Image bytes are not modified. Uniform across all tools — web_fetch body, exec stdout, read_file output, MCP response, everything. The wrap is the signal; no system-prompt rule.
 
@@ -96,7 +96,9 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - Server impl: `openoctopus_server/tools/read_file.py`
 - Client impl: `openoctopus_client/tools/read_file.py`
 
-**Purpose:** Read a file (text, image, or document). Line-based pagination for large text files; PDF/DOCX/XLSX/PPTX parsing built-in; images returned as Anthropic `image` blocks.
+**Purpose:** Read a file (text, image, or document). Line-based pagination for
+large text files; isolated MarkItDown conversion for PDF/DOCX/XLSX/PPTX; images
+returned as Anthropic `image` blocks.
 
 **Source schema (matches nanobot):**
 ```json
@@ -122,7 +124,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
       },
       "pages": {
         "type": "string",
-        "description": "Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"
+        "description": "Page number or inclusive range for PDF files, e.g. '1-5' (default: first 20 pages, max 20 pages)"
       },
       "force": {
         "type": "boolean",
@@ -140,17 +142,36 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - **Default text response:** `limit=2000` lines, output prefixed `LINE_NUM| <line>`. Tail includes `(Showing lines X-Y of Z. Use offset=X+1 to continue.)` — self-documenting pagination.
 - **128k char hard cap** applied on top of line-based limit; safety net for pathological line lengths.
 - **Blocked device paths** (nanobot pattern): `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/full`, `/dev/stdin/out/err`, `/dev/tty`, `/proc/<pid>/fd/[012]` — refused to avoid hangs.
-- **PDFs:** text extraction via `pages` arg; max 20 pages per call.
-- **Office docs** (`.docx`/`.xlsx`/`.pptx`): text extraction via built-in parsers.
+- **Documents are isolated:** `.pdf`, `.docx`, `.xlsx`, and `.pptx` bytes are
+  passed to a Linux child with configured address-space, CPU, wall-clock, queue,
+  and output limits. The child directly instantiates only the MarkItDown
+  converter selected by the trusted suffix; it does not initialize the
+  orchestrator, plugins, default discovery, or Magika. It receives bytes, never
+  a URL or local path.
+- **PDF paging:** omitted `pages` reads `1..min(20, total)`; a single page or
+  inclusive range may select at most 20 existing pages. Results start with
+  `[PDF pages N-M of T]` and include the exact next `pages` range when more pages
+  remain. Empty extracted text states that OCR is unavailable.
+- **Office safety:** `.docx`/`.xlsx`/`.pptx` containers are checked for
+  encryption, path traversal, excessive members, declared size, and compression
+  ratio before MarkItDown imports or converts them.
+- **Deferred conversion features:** no VLM, OCR, audio/video, Azure, YouTube,
+  archive recursion, or remote-document fetch is enabled in Py4.
 - **Images** (detected by mime/magic bytes): returned as `text + image` content blocks, not plain text. The image block shape is Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
 - **Detection fallback:** if image magic-byte detection is inconclusive, try the normal text path. If the file is not readable text and not a supported document type, return an error instead of embedding arbitrary binary bytes into text.
 - **Dedup:** if the file's revision + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads. Server RustFS files use their opaque ETag as the revision; clients may use `mtime` plus size.
 - Tool results are normalized by the shared helper per ADR-095 before reaching the LLM: the first `tool_result.content` block is the server warning text block, followed by the raw text/image result blocks.
 
-**Timeout:** 30s internal, no agent override (ADR-075).
+**Timeout:** Non-document reads keep the 30s internal timeout. Document reads use
+the deployment-derived authorization + conversion-admission + 30s
+materialization + child-conversion deadline; there is no agent override.
 **Result cap:** 128,000 characters (ADR-076 override).
-**Errors:** `WorkspaceError::NotFound`, `WorkspaceError::PermissionDenied`, `WorkspaceError::SymlinkEscape`, `WorkspaceError::BlockedPath`.
-**Related ADRs:** 038, 041, 043, 071, 072, 076, 095.
+**Errors:** Normal workspace errors plus `tool_content_conversion_busy`,
+`tool_exec_timeout`, `tool_content_conversion_resource_exceeded`, and
+`tool_content_conversion_failed`. Invalid PDF range syntax/bounds use
+`tool_invalid_args`. These remain ordinary tool results so the model can retry
+or explain the failure.
+**Related ADRs:** 038, 041, 043, 071, 072, 076, 095, 130.
 
 ---
 
@@ -730,13 +751,32 @@ REST equivalent; frontend callers can still download or replace the raw
   - IPv6 ULA `fc00::/7` and link-local `fe80::/10`
 - **Client site:** if `sandbox_mode=true`, rejects targets matching `device.ssrf_denylist` (CIDR, host, or `host:port`). The default sandbox-device denylist contains private/reserved ranges and common metadata-service addresses. Users remove entries from the denylist to allow known internal services. If `sandbox_mode=false`, private/internal access is allowed by default; trusted devices created without an explicit list store `[]`, while any explicit deny entries the user keeps still reject matching targets.
 - **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command can still make its own network calls subject only to command-denylist/env policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
-- Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity encoding, rejects compressed responses, and raw-streams at most 5 MB before extraction. Uses a readability extractor (jina/readability-style) to convert HTML → `extractMode` output. Output is capped at `maxChars` (`100..50000`, default 50,000).
+- Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity
+  encoding, rejects compressed responses, and raw-streams at most 5 MB before
+  extraction. The server site has separate per-user/global admission for the
+  complete fetch, including download and conversion; admission timeout returns
+  the existing `network_timeout` result.
+- On the Python-main server site, validated HTML is converted only after the
+  bounded network path finishes. `extractMode=markdown` uses the same isolated
+  MarkItDown child as documents, with only `HtmlConverter` registered;
+  `extractMode=text` uses bounded BeautifulSoup extraction in that child.
+  Relative links are resolved against the final validated URL, unsafe/noisy
+  elements are removed, and declared charsets (including GB18030) are decoded
+  before UTF-8 conversion. MarkItDown never receives the URL and cannot fetch
+  remote or local content. Non-HTML responses retain bounded charset decoding.
+- The existing SSRF validation, redirect revalidation, compressed-body rejection,
+  5 MB byte cap, and 30s total deadline remain authoritative. Output is capped
+  at `maxChars` (`100..50000`, default 50,000).
 - Tool result content is normalized per ADR-095 before the LLM sees it: warning text block first, fetched page content after it.
 
 **Timeout:** 30s total, 10s connect.
 **Result cap:** 50,000 characters (tool's own cap via `maxChars`). Shared 16k global cap (ADR-076) doesn't apply — web_fetch's cap is explicit in schema.
-**Errors:** `NetworkError::SsrfBlocked`, `NetworkError::DNSFailed`, `NetworkError::Timeout`, `NetworkError::HttpError`.
-**Related ADRs:** 050 (per-device config), 052 (server block-list + per-device client denylist), 073 (device policy gates), 074 (untrusted content treatment), 095 (result wrap).
+**Errors:** Existing network errors plus
+`tool_content_conversion_busy`, `tool_exec_timeout`,
+`tool_content_conversion_resource_exceeded`, and
+`tool_content_conversion_failed` for HTML conversion. If the encompassing
+30-second deadline wins, the result remains `network_timeout`.
+**Related ADRs:** 050 (per-device config), 052 (server block-list + per-device client denylist), 073 (device policy gates), 074 (untrusted content treatment), 095 (result wrap), 130 (fair admission + isolated HTML conversion).
 
 ---
 

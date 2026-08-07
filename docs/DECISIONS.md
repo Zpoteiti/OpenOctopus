@@ -347,32 +347,33 @@ inputs are unchanged; volatile execution state does not churn it.
 ### ADR-024 · Skills: always-on full body; conditional name + description
 
 **Status:** accepted
-**Python-main clarification:** Py4 keeps prompt construction memory-bounded.
-`SKILL.md` bodies are capped at 64,000 characters, discovery at 200 skills, and
-aggregate always-on bodies at 128,000 characters. Once the aggregate cap is
-reached, remaining always-on skills fall back to the conditional
-name/description/read-path entry rather than growing the system prompt without
-bound. The skills cache is a weighted process LRU, not an unbounded per-user map.
+**Python-main clarification:** Py4 examines at most 200 deterministic candidates.
+Conditional skills retain only bounded frontmatter and a read path during
+prompt construction. Every discovered valid always-on body is rendered
+completely; there is no aggregate cap or fallback downgrade. Per-manifest
+write/load limits and the weighted process LRU are defined by ADR-082 and
+ADR-085. If the final combined request exceeds the real model context, the
+Provider remains authoritative.
 **Decision:** SkillInfo has `always_on: bool`. Skills marked always-on have their full SKILL.md body inlined in the system prompt. Conditional skills appear as one-line entries (`name: description`) with a pointer to load via `read_file(path="skills/{name}/SKILL.md")`.
 **Consequences:** Progressive disclosure. Large skill libraries don't bloat every prompt. Agent knows what exists and can pull on demand.
 
 ### ADR-025 · Tokenizer-based counts, not byte heuristics
 
 **Status:** accepted
-**Python-main clarification:** ADR-101 replaces the former Rust
-`tiktoken-rs` dependency with a Python tokenizer strategy revalidated for the
-configured model.
+**Python-main clarification:** Py4 uses pinned Python `tiktoken` with a packaged,
+hash-verified `o200k_base` asset as a deterministic Provider-independent
+estimate. Startup initializes it with outbound tokenizer download disabled.
 **Decision:** Compaction threshold checks use tokenizer counts, not byte-count
 heuristics. Required for correctness across different tokenizers.
-Python-main obtains the configured model's exact input count through the
-Anthropic-compatible `messages/count_tokens` endpoint. An endpoint must support
-that route when compaction is enabled; OpenOctopus does not silently fall back
-to a byte or unrelated-model estimate. The count request mirrors the normal
-request's system, tools, messages, cache control, and thinking controls. It uses
-the shared provider limiter, transient retry policy, and image-compatibility
-fallback.
-**Consequences:** Token counting is an explicit provider-prompt concern rather
-than an approximation from serialized byte length.
+Python-main estimates the complete system prompt, textual/thinking message
+content, tool names/descriptions/schemas, tool input/results and structural
+overhead. Images receive a fixed estimate plus textual metadata instead of
+tokenizing base64. It never requires or calls a Provider count-tokens route.
+The estimate may trigger at most one eligible compaction stage; it does not
+locally reject or repeatedly compact a final over-threshold request.
+**Consequences:** Compaction and memory planning are deterministic across
+Anthropic-compatible gateways, while the Provider remains authoritative for
+the actual model context window.
 
 ### ADR-026 · Vision retry lives in the provider layer
 
@@ -445,16 +446,13 @@ into `S2`; the old summary then becomes `is_compacted=true`. The boolean is the
 sole provider/compaction membership flag, not a permanent "was summarized"
 label.
 
-Token counting and summary generation happen outside database transactions. A
-counting or summary failure commits no compaction state. After a successful
-compaction commit, the runner recounts the exact rebuilt normal request once.
-If it still crosses the trigger, the compacted state remains durable but the
-runner does not issue the oversized normal request; it fails the turn visibly.
-At a Stage 1 boundary,
-the runner promotes the captured human batch, persists a synthetic assistant
-error, and fails the turn; at Stage 2 it persists the same terminal error after
-the preserved human turn. There is no heuristic fallback or automatic
-compaction retry loop.
+Local estimation and summary generation happen outside database transactions. A
+summary failure commits no compaction state. After a successful compaction
+commit, the runner rebuilds and re-estimates the normal request once. If it
+still crosses the configured trigger—or no history was eligible—OO sends exactly
+one final request instead of locally rejecting it or entering another
+compaction loop. The Provider is authoritative for the actual context window;
+a rejection is persisted through the sanitized Provider-error path.
 
 **Units clarification:** all thresholds are **tokens**. Tool result caps
 (ADR-076) are **characters** — roughly 4× smaller in token terms. A max-size
@@ -991,16 +989,33 @@ Users who want automatic retention can use agent + cron (ADR-053).
 - **Required frontmatter fields:** `name` (string), `description` (string).
 - **Optional frontmatter fields:** `always_on` (boolean, defaults to `false`).
 - **Folder name must match frontmatter `name`.** A skill at `skills/weekly-digest/SKILL.md` MUST have `name: weekly-digest` in frontmatter. Mismatch is invalid.
+- **Frontmatter is bounded.** The opening delimiter, at most 16 KiB of YAML,
+  and closing delimiter must fit the shared bounded prefix. Conditional-skill
+  discovery range-reads only that prefix plus one look-ahead byte.
+- **Always-on size is bounded per manifest.** An `always_on: true` SKILL.md must
+  be valid UTF-8, no larger than 64 KiB in full, and its body must estimate to
+  at most 16,000 `o200k_base` tokens. Valid always-on bodies are never
+  aggregate-truncated or silently changed to conditional.
 - **Write-time validation.** `WorkspaceService` runs the SKILL.md validator ONLY when the destination path matches `skills/*/SKILL.md` (exactly one level deep, exact filename). Writes to `skills/{name}/FORMS.md` or any other supporting file pass through untouched.
 - **On validation failure:** write is rejected with `WorkspaceError::InvalidSkillFormat`. The agent/user must fix the file before re-saving, or save under a different filename (which won't be scanned).
 
-**Consequences:** Malformed SKILL.md files can never exist in a scanner path; the loader never has to handle invalid input at read time. A skill's identity is its folder — displayed name and storage path can't diverge.
+**Consequences:** Supported Agent/REST writes cannot create malformed scanner
+manifests. The loader repeats validation because RustFS objects can also be
+written outside OO; an examined malformed manifest fails the whole snapshot. A
+skill's identity is its folder — displayed name and storage path cannot diverge.
 
 ### ADR-083 · Skill discovery scans exactly one level deep
 
 **Status:** accepted
-**Decision:** At agent-loop start, the skills loader enumerates `skills/*/SKILL.md` — exactly one level deep. Any SKILL.md at `skills/foo/bar/SKILL.md` or deeper is NOT discovered. Supporting files can live at any depth under `skills/{name}/` (e.g. `skills/pdf-skill/scripts/fill_form.py`); only the top-level SKILL.md drives discovery.
-**Consequences:** Flat, predictable skill namespace. No recursion cost at load time. Skill authors organize the internals of their folder however they like — nested scripts, reference docs, assets, all invisible to the scanner.
+**Decision:** At agent-loop start, the skills loader discovers only direct
+`skills/<name>/SKILL.md` manifests. It scans at most 1,000 ordered raw listing
+records and examines at most the first 200 resulting direct child candidates;
+a candidate without SKILL.md still consumes one position. Any SKILL.md at
+`skills/foo/bar/SKILL.md` or deeper is not discovered. Supporting files can
+live at any depth under `skills/{name}/`.
+**Consequences:** The namespace and discovery work are deterministic and
+bounded. A workspace may contain more conditional skills under normal quota,
+but only the lexicographically first 200 candidates are advertised.
 
 ### ADR-084 · Skill install paths: user browser + agent `file_transfer`
 
@@ -1016,8 +1031,16 @@ Rejected: a dedicated `install_skill` server tool. Would require URL allowlistin
 ### ADR-085 · Skills cache mirrors `tools_registry`
 
 **Status:** accepted
-**Decision:** the workspace service maintains a per-user skills cache. It is populated lazily at agent-loop start and invalidated by any write/delete under `skills/` via the single-write-path guarantee (ADR-045). Stale-read tolerance matches ADR-071: a single turn may see an outdated skill list, and the agent self-corrects on the next iteration.
-**Consequences:** One parse per skill per cache lifecycle. Minimal overhead on the hot path (context build). Cache consistency bounded by one turn — same envelope as the tools cache.
+**Decision:** The workspace service maintains a 64 MiB weighted global LRU of
+immutable per-user skill snapshots. Conditional entries retain frontmatter and
+their `read_file` path only; always-on entries retain their complete validated
+body. A per-user single-flight coalesces concurrent cache misses. Any successful
+write/delete under `skills/` increments that user's generation and invalidates
+the entry, so an older in-flight load cannot repopulate stale content.
+**Consequences:** Concurrent turns for one user perform one snapshot load,
+different users do not block each other, and cache memory is globally bounded.
+Valid snapshots that do not remain cached can still be used by their requesting
+turn; cache capacity never changes prompt semantics.
 
 ### ADR-086 · `delete_folder` shared tool (recursive, no flag)
 
@@ -1878,9 +1901,9 @@ includes partial token previews.
 **Context:** The server hosts user workspaces as RustFS objects behind `WorkspaceService` — SOUL.md, MEMORY.md, `skills/`, `.attachments/`, arbitrary user-uploaded files. Any of these could contain executable content (a shell script, a Python file, a binary). The agent itself can write such content via `write_file`. The question: can the agent, or the content, cause the server to execute something?
 **Decision:** **No.** The agent's server-side tool surface is deliberately restricted to non-executing operations:
 
-- **File tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `list_dir`, `find_files`, `grep`) — byte-level operations through `WorkspaceService`. Read and write content, never interpret it.
+- **File tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `list_dir`, `find_files`, `grep`) — byte-level operations through `WorkspaceService`. Document `read_file` may parse PDF/OOXML as inert data in the ADR-130 resource-limited MarkItDown child; it never executes macros, scripts, plugins, or embedded programs.
 - **`message`** — delivers text/media to a channel. No execution.
-- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the unconditional block-list (RFC-1918, 100.64/10, link-local, loopback, IPv6 equivalents — ADR-052) applies. Content is returned as bytes; server does not evaluate.
+- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the unconditional block-list (RFC-1918, 100.64/10, link-local, loopback, IPv6 equivalents — ADR-052) applies. Bounded HTML may be converted as inert data in the ADR-130 child; scripts and active content are removed, not evaluated.
 - **`cron`** — schedules future agent invocations. Does not itself execute anything.
 - **`file_transfer`** — moves bytes between server and a device. No execution.
 
@@ -2030,7 +2053,8 @@ wire format. Seven `system_config` keys carry forward (`llm_endpoint`,
 `llm_max_output_tokens`). Python
 server implements the provider adapter using the Anthropic Python SDK.
 Provider validation before config write is retained. Tokenizer changes from
-`tiktoken-rs` to a Python tokenizer strategy (revalidated per model).
+`tiktoken-rs` to the packaged `o200k_base` estimator in ADR-025; the Provider
+does not need a count-tokens endpoint.
 **Context:** OpenOctopus needs an LLM. The choices: (a) ship a per-provider client trait (Anthropic Messages API, OpenAI Chat Completions, Bedrock, Gemini, etc. — each with its own request/response/tool-call shape), (b) speak one wire format and let the admin put a compatible endpoint or gateway in front for everything else. Option (a) has been the prior-OpenOctopus pattern and produced provider-switching bugs, vision-strip drift, and tool-call-format edge cases. OpenAI chat completions was the M1b-M1d bootstrap format, but M1f needs native `tool_use`, `tool_result`, `thinking`, and image blocks.
 **Decision:** **Anthropic Messages API ONLY.** OpenOctopus speaks one request shape, one response shape, one tool-call format. If an admin wants OpenAI / Bedrock / Gemini / a local model that does not expose an Anthropic-compatible endpoint, they put a gateway in front and configure OpenOctopus to talk to it. Format translation lives in the gateway, not in OpenOctopus.
 
@@ -2934,10 +2958,12 @@ conversation state.
 **Status:** accepted
 **Python-main clarification:** Single ASGI worker with asyncio concurrency is
 the definitive model. Redis is not introduced. CPU-intensive synchronous work
-(file parsing with markitdown, PDF extraction, RAG document ingestion) crosses
-a thread/process boundary via `loop.run_in_executor`, `ProcessPoolExecutor`,
-or subprocess rather than blocking the event loop or requiring multi-worker
-horizontal scale. Multi-worker deployment requires a future ADR.
+(file parsing with MarkItDown and PDF extraction) runs in a resource-limited,
+killable subprocess rather than blocking the event loop or requiring
+multi-worker horizontal scale. Process-local fair admission bounds REST
+transfers, context construction, web fetches, and conversion children.
+Multi-worker deployment requires a future ADR and cannot treat those limits as
+cross-process coordination.
 
 **Context:** OpenOctopus workload is dominated by I/O: Anthropic Messages requests,
 database access, browser streaming responses, device WebSockets, and file
@@ -2964,6 +2990,9 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
   `system_config.llm_max_concurrent_requests` semaphore. `0` or missing means
   unlimited in-process provider concurrency; positive values cap all Anthropic
   Messages calls made through the shared provider adapter.
+- Provider capacity does not bound prepared-context memory. Separate required
+  global/per-user context admission starts before prompt construction and is
+  held through compaction and the final Provider request.
 - Blocking work must not run on the event loop. Workspace file IO, hashing,
   recursive find_files/grep, copy/move, and other CPU/blocking filesystem work must
   use an explicit background/thread boundary with bounded concurrency.
@@ -2973,10 +3002,11 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
 - Per-session scheduler state is evicted once it has no runner, queued start, or
   subscriber. A later message recreates it from PostgreSQL-backed session state;
   active users of a state hold a short lease so eviction cannot split a session.
-- Server workspace operations will need their own Py4 implementation boundary:
-  RustFS client lifecycle, object-client connection pool sizing, workspace IO
-  concurrency limits, and backpressure are not part of the public API, but must
-  be configured or bounded inside the server before file APIs/tools are enabled.
+- Py4 server-workspace, REST-transfer, web-fetch, context, and content-conversion
+  limits are required deployment configuration. Acquisition is per-user before
+  global capacity, every failure/cancellation releases both, and no PostgreSQL
+  connection is retained while waiting for admission, object bytes, a child, or
+  a Provider response.
 
 **Consequences:** The Python server alpha keeps deployment and device routing
 simple. A single process can still handle hundreds of I/O-bound sessions if
@@ -3017,14 +3047,13 @@ provider/tool preparation, and temporary files must be deleted after the
 request/job completes or fails.
 
 `WorkspaceService` is the authenticated virtual-path boundary for REST handlers
-and agent tools. It resolves personal/shared access in PostgreSQL and retains
-the authorization row lock through bounded materialized operations. Streaming
-REST downloads are the exception: authorization produces a private immutable
-target ticket, the DB transaction ends before waiting/yielding bytes, and an
-already-authorized open download may finish after membership revocation. REST
-uploads likewise use a short preflight before body collection and re-resolve
-authorization/quota in a fresh transaction at the write boundary. `WorkspaceFS` accepts
-only already-authorized immutable targets and owns object-key mapping, quota,
+and agent tools. It resolves personal/shared access in a short PostgreSQL
+transaction, materializes a private immutable ticket, and closes that
+transaction before admission waits, request/response bodies, RustFS access,
+document conversion, or Provider work. An already-authorized operation may
+therefore finish after membership revocation; storage remains authoritative for
+the object's current existence and revision. `WorkspaceFS` accepts only
+already-authorized immutable targets and owns object-key mapping, quota,
 mutation locks, and MinIO/S3 error normalization. Trusted account/workspace
 lifecycle code may call its retire/purge operations directly; other handlers,
 channel adapters, transfer code, and prompt/context builders never call the
@@ -3090,7 +3119,7 @@ It is not stored in `system_config` and is not editable through
 | `OPENOCTOPUS_OBJECT_STORAGE_REGION` | RustFS S3 region string, such as `us-east-1`. |
 | `OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY` | Access key. |
 | `OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY` | Secret key. |
-| `OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS` | Required per-process object-call and HTTP-pool limit, from 1 through 256. |
+| `OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS` | Required per-process workspace/internal logical object-call and HTTP-pool limit, from 5 through 256. Runtime health uses one additional fixed connection. |
 
 Missing, invalid, or unreachable object-storage config prevents server startup;
 the health route reports later reachability failures rather than falling back
@@ -3102,13 +3131,28 @@ write/stat/exact-read/delete capability, then recovers durable
 threshold, not a hard wall-clock guarantee: safe cancellation waits for a
 synchronous object mutation and cleanup to finish. Runtime `/health` is lighter
 and non-mutating; it checks PostgreSQL and RustFS bucket reachability with
-independent two-second deadlines.
+independent two-second deadlines. RustFS checks are single-flight on a dedicated
+one-connection client and pool, so they neither borrow workspace capacity nor
+queue behind user operations. The per-process RustFS connection ceiling is
+therefore the configured workspace/internal limit plus this one health connection.
+
+All workspace and internal object operations share one logical semaphore.
+Synchronous MinIO metadata and mutation calls use the SDK; cancellable reads use
+a locally created presigned GET through one `httpx.AsyncClient` with redirects
+and environment proxies disabled. The health client is the sole exception and
+has its fixed one-connection budget. The signed query is never returned, logged,
+persisted, or included in normalized errors. Required REST upload plus download
+concurrency must be strictly below the configured object connection count,
+reserving at least one slot for Agent/internal work.
 
 Account and last-member deletion first fence the in-process target, then commit
 metadata deletion plus a `workspace_deletions` row. RustFS purge and removal of
 that row happen afterward. A post-commit purge failure still returns logical
 deletion success; cleanup retries periodically in the running process and again
-at startup.
+at startup. Each runtime purge runs in a dedicated child with a configured
+deadline; shutdown waits a configured grace, then terminates/kills and reaps the
+child while retaining the durable row for replay. Startup recovery remains
+synchronous in Py4.
 
 **Consequences:** Python-main no longer has a durable
 `OPENOCTOPUS_WORKSPACE_ROOT`-style server directory. Deployments must provide
@@ -3382,6 +3426,74 @@ synthetically cancelled.
 **Consequences:** The stop button prevents future work without erasing a final
 answer that already completed. Every persisted assistant tool-use batch remains
 fully paired, and idle sessions never retain a stale cancel flag.
+
+### ADR-130 · Py4 uses fair local admission and isolated MarkItDown conversion
+
+**Status:** accepted
+
+**Context:** The first Py4 implementation let slow REST bodies share Agent
+materialization capacity, retained more skill content than conditional prompts
+need, parsed Office/PDF and HTML with hand-written in-process paths, allowed a
+runtime RustFS purge to delay shutdown indefinitely, and left administrator
+user quota fields incomplete. These are shared-resource and correctness
+boundaries for a single process expected to serve hundreds of concurrent
+sessions.
+
+**Decision:** Py4 adopts the following one-process boundaries:
+
+- REST uploads and downloads have independent global admission plus one keyed
+  per-user cap shared across both directions. Queue timeouts return HTTP 429
+  `workspace_transfer_busy` with `Retry-After`; an upload idle timeout returns
+  HTTP 408 `workspace_transfer_timeout`. A started download owns its permits and
+  RustFS response until its body closes. These REST limits never apply to Agent
+  file operations.
+- Skill discovery and caching follow ADR-082, ADR-083, and ADR-085. Conditional
+  skills load only bounded frontmatter; every discovered valid always-on body is
+  rendered completely. `tiktoken==0.13.0` with a packaged, hash-verified
+  `o200k_base` asset provides deterministic local estimation. OO does not require
+  a third-party Provider count-tokens endpoint, does not locally reject a final
+  oversized request, and safely persists the Provider's context rejection.
+- One shared per-user/global conversion admission serves document `read_file`
+  and HTML conversion. Document admission is acquired before RustFS
+  materialization. Each conversion uses a fresh Linux spawn child that applies
+  `RLIMIT_AS` and `RLIMIT_CPU` before importing parser libraries. The parent
+  applies a wall deadline, terminates/kills when needed, reaps the child, and
+  releases admission on success, failure, timeout, or cancellation.
+- The child directly instantiates exactly one trusted MarkItDown 0.1.7 PDF,
+  DOCX, XLSX, PPTX, or HTML converter and receives only bounded bytes plus
+  explicit metadata—never a URL or local path. It does not initialize the
+  MarkItDown orchestrator, plugins, default discovery, or Magika. OOXML receives
+  ZIP safety preflight. PDF input is sliced to at most 20 pages and returns
+  total/continuation markers. VLM, OCR, audio/video, Azure, YouTube, archive
+  recursion, and remote-document fetching remain out of scope.
+- Server `web_fetch` retains OO's URL validation, repeated SSRF checks,
+  redirect/deadline policy, identity encoding, and 5 MB response cap. Only the
+  already-downloaded HTML crosses the conversion boundary. Markdown uses the
+  isolated HTML converter; text mode uses bounded BeautifulSoup parsing in the
+  same child. Web admission is separate so slow network peers do not occupy a
+  conversion child while downloading.
+- Conversion queue, resource, and input failures are ordinary tool results with
+  stable codes `tool_content_conversion_busy`,
+  `tool_content_conversion_resource_exceeded`, and
+  `tool_content_conversion_failed`; wall/CPU expiry retains
+  `tool_exec_timeout`. The model can retry or explain these results.
+- Administrator user listings populate required `quota_bytes`, `bytes_used`,
+  and `locked` values using live personal-workspace scans after the database
+  transaction closes. Scans use the existing global heavy-operation cap of four
+  and fail the whole page with the existing storage 503 rather than returning
+  partial/null quota state.
+
+All related deployment settings are required environment variables with startup
+validation. Operators must budget roughly conversion concurrency multiplied by
+per-child memory, plus parent/server memory; web bodies and prepared contexts
+have separate configured bounds. These controls are explicitly process-local
+under ADR-122.
+
+**Consequences:** Slow or adversarial work is queued fairly and cancellably
+without holding database connections or Agent materialization capacity.
+Document fidelity is delegated to one pinned conversion library while OO keeps
+the security and resource boundary. Py4 remains single-worker; horizontal scale
+still requires a command/routing and distributed-admission design.
 
 ---
 

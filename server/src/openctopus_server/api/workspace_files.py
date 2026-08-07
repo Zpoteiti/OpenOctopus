@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+import math
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Receive, Scope, Send
 
+from openctopus_server.admission import (
+    AdmissionLease,
+    AdmissionTimeoutError,
+    KeyedDirectionalAdmission,
+)
 from openctopus_server.auth.dependencies import get_current_user
+from openctopus_server.config import Settings, get_settings
 from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
 from openctopus_server.dto.workspace_file import (
@@ -31,32 +41,50 @@ router = APIRouter(prefix="/api/workspace", tags=["Workspace Files"])
 _STRONG_ETAG = re.compile(r'^"([\x21\x23-\x7e]+)"$')
 
 
+@lru_cache
+def get_rest_transfer_admission() -> KeyedDirectionalAdmission:
+    settings = get_settings()
+    return KeyedDirectionalAdmission(
+        direction_limits={
+            "upload": settings.rest_upload_max_concurrency,
+            "download": settings.rest_download_max_concurrency,
+        },
+        per_key_limit=settings.rest_transfer_max_concurrency_per_user,
+        timeout_seconds=settings.rest_transfer_queue_timeout_seconds,
+    )
+
+
 class _ClosingStreamingResponse(StreamingResponse):
     def __init__(
         self,
         content: AsyncIterator[bytes],
         *,
         closer: Callable[[], Awaitable[None]],
+        send_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(content, **kwargs)
         self._closer = closer
+        self._send_timeout_seconds = send_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def bounded_send(message: Any) -> None:
+            if self._send_timeout_seconds is None or message["type"] != "http.response.body":
+                await send(message)
+                return
+            async with asyncio.timeout(self._send_timeout_seconds):
+                await send(message)
+
         try:
-            await super().__call__(scope, receive, send)
+            await super().__call__(scope, receive, bounded_send)
         finally:
             await self._closer()
 
 
 def require_server_device(
-    openoctopus_device: Annotated[str, Query()],
+    openoctopus_device: Annotated[Literal["server"], Query()],
 ) -> None:
-    if openoctopus_device != "server":
-        raise WorkspaceError(
-            ErrorCode.WORKSPACE_INVALID_REQUEST,
-            "Py4 workspace files require openoctopus_device=server",
-        )
+    del openoctopus_device
 
 
 @router.get(
@@ -83,22 +111,37 @@ async def download_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    admission: KeyedDirectionalAdmission = Depends(get_rest_transfer_admission),
+    settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     ticket = await service.authorize_download(db, user_id=user.id, path=path)
     await db.commit()
-    stream = await service.open_download(ticket)
+    lease = await _acquire_transfer(admission, user.id, "download", settings)
+    try:
+        stream = await service.open_download(ticket)
+    except BaseException:
+        await lease.aclose()
+        raise
+
+    async def close_download() -> None:
+        try:
+            await stream.aclose()
+        finally:
+            await lease.aclose()
 
     async def body() -> AsyncIterator[bytes]:
-        try:
-            while chunk := await stream.read():
-                yield chunk
-        finally:
-            await stream.aclose()
+        while True:
+            async with asyncio.timeout(settings.rest_transfer_idle_timeout_seconds):
+                chunk = await stream.read()
+            if not chunk:
+                return
+            yield chunk
 
     try:
         return _ClosingStreamingResponse(
             body(),
-            closer=stream.aclose,
+            closer=close_download,
+            send_timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
             media_type="application/octet-stream",
             headers={
                 "Content-Length": str(stream.size),
@@ -108,7 +151,7 @@ async def download_file(
             },
         )
     except BaseException:
-        await stream.aclose()
+        await close_download()
         raise
 
 
@@ -133,6 +176,8 @@ async def upload_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    admission: KeyedDirectionalAdmission = Depends(get_rest_transfer_admission),
+    settings: Settings = Depends(get_settings),
     if_match_header: Annotated[str | None, Header(alias="If-Match")] = None,
     if_none_match_header: Annotated[str | None, Header(alias="If-None-Match")] = None,
 ) -> FileMutationResponse:
@@ -141,21 +186,31 @@ async def upload_file(
     ):
         raise _invalid("Workspace uploads require application/octet-stream")
     if_match, if_none_match = _conditions(if_match_header, if_none_match_header)
-    max_bytes = await service.upload_limit(db, user_id=user.id, path=path)
+    ticket = await service.authorize_upload(db, user_id=user.id, path=path)
     await db.commit()
-    content_length = _content_length(request)
-    if content_length is not None and content_length > max_bytes:
-        raise _too_large()
-    async with service.collect_upload(request.stream(), max_bytes=max_bytes) as data:
-        metadata = await service.write_collected_upload(
-            db,
-            user_id=user.id,
-            path=path,
-            data=data,
-            if_match=if_match,
-            if_none_match=if_none_match,
-        )
-        await db.commit()
+    try:
+        slot = admission.slot(user.id, "upload")
+        async with slot:
+            content_length = _content_length(request)
+            if content_length is not None and content_length > ticket.max_bytes:
+                raise _too_large()
+            chunks = _idle_upload_chunks(
+                request.stream(),
+                timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
+            )
+            async with service.collect_upload(chunks, max_bytes=ticket.max_bytes) as data:
+                fresh_ticket = await service.authorize_upload(db, user_id=user.id, path=path)
+                await db.commit()
+                if len(data) > fresh_ticket.max_bytes:
+                    raise _too_large()
+                metadata = await service.write_authorized_upload(
+                    fresh_ticket,
+                    data=data,
+                    if_match=if_match,
+                    if_none_match=if_none_match,
+                )
+    except AdmissionTimeoutError as exc:
+        raise _transfer_busy(settings) from exc
     return _mutation_response(response, path=path, metadata=metadata)
 
 
@@ -387,6 +442,46 @@ async def grep_workspace_files(
         "next_offset": page.next_offset,
         "truncated": page.truncated,
     }
+
+
+async def _acquire_transfer(
+    admission: KeyedDirectionalAdmission,
+    user_id: UUID,
+    direction: str,
+    settings: Settings,
+) -> AdmissionLease:
+    try:
+        return await admission.acquire(user_id, direction)
+    except AdmissionTimeoutError as exc:
+        raise _transfer_busy(settings) from exc
+
+
+async def _idle_upload_chunks(
+    chunks: AsyncIterator[bytes],
+    *,
+    timeout_seconds: float,
+) -> AsyncIterator[bytes]:
+    iterator = aiter(chunks)
+    while True:
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                chunk = await anext(iterator)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_TIMEOUT,
+                "Workspace upload timed out while waiting for request data",
+            ) from exc
+        yield chunk
+
+
+def _transfer_busy(settings: Settings) -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_TRANSFER_BUSY,
+        "Workspace transfer capacity is busy; retry later",
+        headers={"Retry-After": str(math.ceil(settings.rest_transfer_queue_timeout_seconds))},
+    )
 
 
 def _conditions(if_match: str | None, if_none_match: str | None) -> tuple[str | None, bool]:

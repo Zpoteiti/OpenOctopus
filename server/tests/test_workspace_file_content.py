@@ -1,9 +1,11 @@
 from base64 import b64decode
 from io import BytesIO
+from uuid import uuid4
 
 import pytest
 from docx import Document
 
+from openctopus_server.admission import KeyedAdmission
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError
 from openctopus_server.workspace.file_content import (
@@ -44,13 +46,13 @@ def test_png_is_returned_as_an_anthropic_image_block() -> None:
     assert b64decode(rendered[1]["source"]["data"]) == png
 
 
-def test_docx_text_is_extracted_from_in_memory_bytes() -> None:
+async def test_docx_text_is_extracted_from_in_memory_bytes() -> None:
     document = Document()
     document.add_paragraph("Workspace report")
     output = BytesIO()
     document.save(output)
 
-    rendered = render_file_content("report.docx", output.getvalue())
+    rendered = await _parser().parse("report.docx", output.getvalue(), user_id=uuid4())
 
     assert rendered == "Workspace report"
 
@@ -67,9 +69,9 @@ async def test_document_parser_uses_a_bounded_disposable_worker() -> None:
     document.add_paragraph("Parsed outside the event loop")
     output = BytesIO()
     document.save(output)
-    parser = DocumentParser(max_concurrency=1, timeout_seconds=5)
+    parser = _parser()
 
-    rendered = await parser.parse("report.docx", output.getvalue())
+    rendered = await parser.parse("report.docx", output.getvalue(), user_id=uuid4())
 
     assert rendered == "Parsed outside the event loop"
 
@@ -95,3 +97,11 @@ async def test_streamed_text_has_an_aggregate_character_cap() -> None:
 
     assert len(rendered) <= 128_000
     assert rendered.endswith("[truncated]")
+
+
+def _parser() -> DocumentParser:
+    return DocumentParser(
+        admission=KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=1),
+        memory_mb=1024,
+        timeout_seconds=20,
+    )

@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Hashable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 
+from openctopus_server.async_utils import await_future_cancellation_safe
+
 
 @dataclass
 class _LockEntry:
@@ -36,10 +38,14 @@ class KeyedLockManager:
             async with entry.lock:
                 yield
         finally:
-            async with self._guard:
-                entry.leases -= 1
-                if entry.leases == 0 and not entry.lock.locked():
-                    self._entries.pop(key, None)
+            cleanup = asyncio.create_task(self._release(key, entry))
+            await await_future_cancellation_safe(cleanup)
+
+    async def _release(self, key: Hashable, entry: _LockEntry) -> None:
+        async with self._guard:
+            entry.leases -= 1
+            if entry.leases == 0 and not entry.lock.locked():
+                self._entries.pop(key, None)
 
     @asynccontextmanager
     async def hold_many(self, keys: tuple[Hashable, ...]) -> AsyncIterator[None]:

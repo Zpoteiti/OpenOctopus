@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from storage_http import object_storage_for_fake
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
@@ -47,37 +48,28 @@ async def test_download_waiting_for_storage_capacity_does_not_block_workspace_re
     assert await opening is stream
 
 
-async def test_upload_collection_holds_materialization_slot_until_caller_finishes() -> None:
+async def test_upload_collection_does_not_take_an_agent_materialization_slot() -> None:
     storage = AsyncMock()
     workspace_fs = WorkspaceFS(storage, materialization_concurrency=1)
-    first_ready = asyncio.Event()
-    release_first = asyncio.Event()
-    second_consumed = asyncio.Event()
+    first_chunk_read = asyncio.Event()
+    release_upload = asyncio.Event()
 
-    async def first_chunks():
+    async def chunks():
         yield b"first"
-
-    async def second_chunks():
-        second_consumed.set()
+        first_chunk_read.set()
+        await release_upload.wait()
         yield b"second"
 
-    async def first_upload() -> None:
-        async with workspace_fs.collect_upload(first_chunks(), max_bytes=10) as data:
-            assert data == b"first"
-            first_ready.set()
-            await release_first.wait()
+    async def collect() -> None:
+        async with workspace_fs.collect_upload(chunks(), max_bytes=20) as data:
+            assert data == b"firstsecond"
 
-    async def second_upload() -> None:
-        async with workspace_fs.collect_upload(second_chunks(), max_bytes=10) as data:
-            assert data == b"second"
-
-    first = asyncio.create_task(first_upload())
-    await first_ready.wait()
-    second = asyncio.create_task(second_upload())
-    await asyncio.sleep(0)
-    assert not second_consumed.is_set()
-    release_first.set()
-    await asyncio.gather(first, second)
+    upload = asyncio.create_task(collect())
+    await first_chunk_read.wait()
+    async with asyncio.timeout(0.1), workspace_fs.materialization_slot():
+        pass
+    release_upload.set()
+    await upload
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -176,8 +168,11 @@ class _MemoryMinio:
         object_name: str,
         data: io.BytesIO,
         length: int,
+        *,
+        num_parallel_uploads: int,
     ) -> SimpleNamespace:
         del bucket
+        assert num_parallel_uploads == 1
         content = data.read(length)
         with self._guard:
             self.put_calls += 1
@@ -202,10 +197,18 @@ class _FailingSecondPutMinio(_MemoryMinio):
         object_name: str,
         data: io.BytesIO,
         length: int,
+        *,
+        num_parallel_uploads: int,
     ) -> SimpleNamespace:
         if self.put_calls == 1:
             raise _S3Error("InternalError")
-        return super().put_object(bucket, object_name, data, length)
+        return super().put_object(
+            bucket,
+            object_name,
+            data,
+            length,
+            num_parallel_uploads=num_parallel_uploads,
+        )
 
 
 class _BlockingStatMinio(_MemoryMinio):
@@ -245,6 +248,8 @@ class _BlockingPutMinio(_MemoryMinio):
         object_name: str,
         data: io.BytesIO,
         length: int,
+        *,
+        num_parallel_uploads: int,
     ) -> SimpleNamespace:
         with self._guard:
             self.active_puts += 1
@@ -252,7 +257,13 @@ class _BlockingPutMinio(_MemoryMinio):
             self.entered.set()
         self.release.wait(timeout=2)
         try:
-            return super().put_object(bucket, object_name, data, length)
+            return super().put_object(
+                bucket,
+                object_name,
+                data,
+                length,
+                num_parallel_uploads=num_parallel_uploads,
+            )
         finally:
             with self._guard:
                 self.active_puts -= 1
@@ -359,10 +370,18 @@ class _CapacityMinio(_MemoryMinio):
         object_name: str,
         data: io.BytesIO,
         length: int,
+        *,
+        num_parallel_uploads: int,
     ) -> SimpleNamespace:
         self._enter_operation()
         try:
-            return super().put_object(bucket, object_name, data, length)
+            return super().put_object(
+                bucket,
+                object_name,
+                data,
+                length,
+                num_parallel_uploads=num_parallel_uploads,
+            )
         finally:
             self._leave_operation()
 
@@ -380,7 +399,11 @@ def _fs(
     materialization_concurrency: int = 4,
     heavy_operation_concurrency: int = 4,
 ) -> WorkspaceFS:
-    storage = ObjectStorage(client, "openoctopus", max_connections=max_connections)
+    storage = object_storage_for_fake(
+        client,
+        "openoctopus",
+        max_connections=max_connections,
+    )
     return WorkspaceFS(
         storage,
         materialization_concurrency=materialization_concurrency,
@@ -1093,6 +1116,40 @@ async def test_edit_serializes_with_unconditional_write() -> None:
     await asyncio.gather(editing, writing)
 
     assert await fs.read(target, "file.txt") == b"writer"
+
+
+async def test_repeated_edit_cancellation_waits_for_transform_thread() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client, materialization_concurrency=1)
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.write(target, "file.txt", b"before", quota_bytes=100)
+    transform_entered = threading.Event()
+    release_transform = threading.Event()
+
+    def transform(current: bytes) -> bytes:
+        assert current == b"before"
+        transform_entered.set()
+        assert release_transform.wait(timeout=2)
+        return b"edited"
+
+    editing = asyncio.create_task(fs.edit(target, "file.txt", transform, quota_bytes=100))
+    await _wait_for(transform_entered.is_set)
+    editing.cancel()
+    await asyncio.sleep(0)
+    editing.cancel()
+    await asyncio.sleep(0)
+    editing.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert not editing.done()
+        assert fs.mutation_lock_count == 1
+    finally:
+        release_transform.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await editing
+    assert fs.mutation_lock_count == 0
 
 
 async def test_500_personal_workspaces_stay_isolated_with_bounded_object_io() -> None:

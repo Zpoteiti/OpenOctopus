@@ -16,6 +16,8 @@ class ErrorCode(StrEnum):
     WORKSPACE_FILE_CHANGED = "workspace_file_changed"
     WORKSPACE_STORAGE_UNAVAILABLE = "workspace_storage_unavailable"
     WORKSPACE_STORAGE_ERROR = "workspace_storage_error"
+    WORKSPACE_TRANSFER_BUSY = "workspace_transfer_busy"
+    WORKSPACE_TRANSFER_TIMEOUT = "workspace_transfer_timeout"
     WORKSPACE_INVALID_REQUEST = "workspace_invalid_request"
     WORKSPACE_REF_CONFLICT = "workspace_ref_conflict"
     # Tool
@@ -30,6 +32,9 @@ class ErrorCode(StrEnum):
     TOOL_INVALID_REGEX = "tool_invalid_regex"
     TOOL_INVALID_GLOB = "tool_invalid_glob"
     TOOL_EXEC_TIMEOUT = "tool_exec_timeout"
+    TOOL_CONTENT_CONVERSION_BUSY = "tool_content_conversion_busy"
+    TOOL_CONTENT_CONVERSION_RESOURCE_EXCEEDED = "tool_content_conversion_resource_exceeded"
+    TOOL_CONTENT_CONVERSION_FAILED = "tool_content_conversion_failed"
     TOOL_COMMAND_DENIED = "tool_command_denied"
     TOOL_ENV_NOT_ALLOWED = "tool_env_not_allowed"
     TOOL_CWD_OUTSIDE_WORKSPACE = "tool_cwd_outside_workspace"

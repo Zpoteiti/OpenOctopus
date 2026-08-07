@@ -9,10 +9,15 @@ import httpx
 import pytest
 
 import openctopus_server.tools.web_fetch as web_fetch_module
+from openctopus_server.admission import KeyedAdmission
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext, ToolResult
 from openctopus_server.tools.truncate import TRUNCATION_MARKER
-from openctopus_server.tools.web_fetch import DEFAULT_MAX_CHARS, WebFetchTool
+from openctopus_server.tools.web_fetch import (
+    DEFAULT_MAX_CHARS,
+    HtmlContentConverter,
+    WebFetchTool,
+)
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
 PUBLIC_IP = "93.184.216.34"
@@ -55,6 +60,50 @@ def _ctx() -> ToolContext:
     return ToolContext(user_id=uuid4(), session_id=uuid4())
 
 
+class _StubContentConverter:
+    def __init__(self, result: str = "unused") -> None:
+        self.result = result
+        self.calls: list[dict[str, Any]] = []
+
+    async def parse_html(
+        self,
+        data: bytes,
+        *,
+        user_id: Any,
+        charset: str,
+        base_url: str,
+        mode: str,
+        max_chars: int,
+    ) -> str:
+        self.calls.append(
+            {
+                "data": data,
+                "user_id": user_id,
+                "charset": charset,
+                "base_url": base_url,
+                "mode": mode,
+                "max_chars": max_chars,
+            }
+        )
+        return self.result
+
+
+def _web_fetch_tool(
+    *,
+    resolver: Resolver | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    content_converter: HtmlContentConverter | None = None,
+    web_admission: KeyedAdmission | None = None,
+) -> WebFetchTool:
+    return WebFetchTool(
+        web_admission=web_admission
+        or KeyedAdmission(global_limit=2, per_key_limit=1, timeout_seconds=1),
+        content_converter=content_converter or _StubContentConverter(),
+        resolver=resolver,
+        transport=transport,
+    )
+
+
 def _public_resolver(calls: list[tuple[str, int]] | None = None) -> Resolver:
     async def resolve(hostname: str, port: int) -> list[str]:
         if calls is not None:
@@ -80,7 +129,7 @@ async def test_fetch_pins_checked_ip_and_preserves_host_and_sni() -> None:
         captured["accept_encoding"] = request.headers["accept-encoding"]
         return _streaming_text_response("hello", headers={"content-type": "text/plain"})
 
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=_public_resolver(resolver_calls),
         transport=httpx.MockTransport(handler),
     )
@@ -98,7 +147,7 @@ async def test_fetch_pins_checked_ip_and_preserves_host_and_sni() -> None:
 
 
 def test_fetch_schema_advertises_hard_max_chars() -> None:
-    max_chars = WebFetchTool().schema()["input_schema"]["properties"]["maxChars"]
+    max_chars = _web_fetch_tool().schema()["input_schema"]["properties"]["maxChars"]
 
     assert max_chars == {
         "type": "integer",
@@ -129,7 +178,7 @@ async def test_fetch_blocks_non_public_dns_targets(address: str) -> None:
     async def resolve(hostname: str, port: int) -> list[str]:
         return [address]
 
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=resolve,
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
     )
@@ -144,7 +193,7 @@ async def test_fetch_rejects_mixed_public_and_private_dns_answers() -> None:
     async def resolve(hostname: str, port: int) -> list[str]:
         return [PUBLIC_IP, "127.0.0.1"]
 
-    tool = WebFetchTool(resolver=resolve, transport=httpx.MockTransport(lambda request: None))
+    tool = _web_fetch_tool(resolver=resolve, transport=httpx.MockTransport(lambda request: None))
 
     result = await tool.execute({"url": "http://mixed.example"}, _ctx())
 
@@ -160,7 +209,7 @@ async def test_fetch_rechecks_dns_immediately_before_connect() -> None:
         calls += 1
         return [PUBLIC_IP] if calls == 1 else ["127.0.0.1"]
 
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=rebinding_resolver,
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
     )
@@ -170,6 +219,76 @@ async def test_fetch_rechecks_dns_immediately_before_connect() -> None:
     assert calls == 2
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+async def test_fetch_admission_is_acquired_before_dns_and_is_released() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    resolver_calls: list[str] = []
+
+    async def blocking_resolver(hostname: str, port: int) -> list[str]:
+        del port
+        resolver_calls.append(hostname)
+        entered.set()
+        await release.wait()
+        return [PUBLIC_IP]
+
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=0.01)
+    tool = _web_fetch_tool(
+        web_admission=admission,
+        resolver=blocking_resolver,
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response("ok", headers={"content-type": "text/plain"})
+        ),
+    )
+    first = asyncio.create_task(tool.execute({"url": "https://first.example"}, _ctx()))
+    await entered.wait()
+
+    second = await tool.execute({"url": "https://second.example"}, _ctx())
+
+    assert second.code is ErrorCode.NETWORK_TIMEOUT
+    assert resolver_calls == ["first.example"]
+    release.set()
+    assert await first == ToolResult(content="ok")
+    assert admission.entry_count == 0
+
+
+async def test_fetch_admission_is_held_through_html_conversion() -> None:
+    entered_conversion = asyncio.Event()
+    release_conversion = asyncio.Event()
+    resolver_calls: list[str] = []
+
+    class BlockingConverter(_StubContentConverter):
+        async def parse_html(self, *args: Any, **kwargs: Any) -> str:
+            entered_conversion.set()
+            await release_conversion.wait()
+            return "converted"
+
+    async def counting_resolver(hostname: str, port: int) -> list[str]:
+        del port
+        resolver_calls.append(hostname)
+        return [PUBLIC_IP]
+
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=0.01)
+    tool = _web_fetch_tool(
+        web_admission=admission,
+        content_converter=BlockingConverter(),
+        resolver=counting_resolver,
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "<p>body</p>", headers={"content-type": "text/html; charset=utf-8"}
+            )
+        ),
+    )
+    first = asyncio.create_task(tool.execute({"url": "https://first.example"}, _ctx()))
+    await entered_conversion.wait()
+
+    second = await tool.execute({"url": "https://second.example"}, _ctx())
+
+    assert second.code is ErrorCode.NETWORK_TIMEOUT
+    assert resolver_calls == ["first.example", "first.example"]
+    release_conversion.set()
+    assert await first == ToolResult(content="converted")
 
 
 async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None:
@@ -182,7 +301,7 @@ async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None
         requests.append(str(request.url))
         return httpx.Response(302, headers={"location": "http://private.example/secret"})
 
-    tool = WebFetchTool(resolver=resolve, transport=httpx.MockTransport(handler))
+    tool = _web_fetch_tool(resolver=resolve, transport=httpx.MockTransport(handler))
 
     result = await tool.execute({"url": "https://public.example/start"}, _ctx())
 
@@ -203,7 +322,9 @@ async def test_fetch_extracts_readable_html(mode: str, expected: str) -> None:
         "<html><body><h1>Hello</h1><p>See <a href='/docs'>docs</a>.</p>"
         "<script>ignore me</script></body></html>"
     )
-    tool = WebFetchTool(
+    converter = _StubContentConverter(expected)
+    tool = _web_fetch_tool(
+        content_converter=converter,
         resolver=_public_resolver(),
         transport=httpx.MockTransport(
             lambda request: _streaming_text_response(
@@ -213,16 +334,27 @@ async def test_fetch_extracts_readable_html(mode: str, expected: str) -> None:
         ),
     )
 
+    ctx = _ctx()
     result = await tool.execute(
         {"url": "https://example.com", "extractMode": mode},
-        _ctx(),
+        ctx,
     )
 
     assert _result_text(result) == expected
+    assert converter.calls == [
+        {
+            "data": html.encode(),
+            "user_id": ctx.user_id,
+            "charset": "utf-8",
+            "base_url": "https://example.com",
+            "mode": mode,
+            "max_chars": DEFAULT_MAX_CHARS,
+        }
+    ]
 
 
 async def test_fetch_applies_requested_and_maximum_output_caps() -> None:
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(lambda request: _streaming_text_response("x" * 60_000)),
     )
@@ -243,7 +375,7 @@ async def test_fetch_applies_requested_and_maximum_output_caps() -> None:
 async def test_fetch_rejects_compressed_body_without_reading_or_decompressing() -> None:
     compressed_bomb = gzip.compress(b"x" * (web_fetch_module.MAX_RESPONSE_BYTES + 1))
     stream = _TrackingStream(compressed_bomb)
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
@@ -266,7 +398,7 @@ async def test_fetch_rejects_compressed_body_without_reading_or_decompressing() 
 
 async def test_fetch_stops_stream_at_exact_raw_body_cap() -> None:
     stream = _ChunkTrackingStream([b"x" * web_fetch_module.MAX_RESPONSE_BYTES, b"must-not-be-read"])
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
@@ -287,7 +419,7 @@ async def test_fetch_maps_dns_timeout_and_http_errors() -> None:
     async def dns_failure(hostname: str, port: int) -> list[str]:
         raise socket.gaierror("no address")
 
-    dns_tool = WebFetchTool(
+    dns_tool = _web_fetch_tool(
         resolver=dns_failure,
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),
     )
@@ -295,11 +427,11 @@ async def test_fetch_maps_dns_timeout_and_http_errors() -> None:
     def timeout_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow", request=request)
 
-    timeout_tool = WebFetchTool(
+    timeout_tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(timeout_handler),
     )
-    http_tool = WebFetchTool(
+    http_tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(lambda request: httpx.Response(503)),
     )
@@ -319,7 +451,7 @@ async def test_fetch_enforces_total_timeout_during_resolution(monkeypatch) -> No
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(web_fetch_module, "TOTAL_TIMEOUT_SECONDS", 0.01)
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=never_resolves,
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),
     )
@@ -342,7 +474,7 @@ async def test_fetch_enforces_total_timeout_during_resolution(monkeypatch) -> No
     ],
 )
 async def test_fetch_rejects_invalid_args(args: dict[str, Any]) -> None:
-    tool = WebFetchTool(
+    tool = _web_fetch_tool(
         resolver=_public_resolver(),
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unused")),
     )

@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from openctopus_server.workspace.locks import KeyedLockManager
 
 
@@ -39,4 +41,32 @@ async def test_hold_many_deduplicates_keys() -> None:
     async with locks.hold_many(("same", "same")):
         assert locks.entry_count == 1
 
+    assert locks.entry_count == 0
+
+
+async def test_repeated_cancellation_cannot_interrupt_lease_cleanup() -> None:
+    locks = KeyedLockManager()
+    entered = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def holder() -> None:
+        async with locks.hold("workspace"):
+            entered.set()
+            await release_holder.wait()
+
+    task = asyncio.create_task(holder())
+    await entered.wait()
+    await locks._guard.acquire()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert not task.done()
+    finally:
+        locks._guard.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert locks.entry_count == 0

@@ -5,6 +5,11 @@
 **Depends on:** Py3 agent loop and bounded single-worker runtime
 **Canonical decisions:** ADR-043–046, ADR-075–080, ADR-108–109, ADR-122–123
 
+> **Historical note (2026-08-07):** This implemented foundation remains useful
+> background, but its fixed shared REST materialization limit and unbounded
+> runtime-purge shutdown details are superseded by the accepted
+> [Py4 merge-hardening design](2026-08-06-py4-merge-hardening-markitdown-design.md).
+
 ## Outcome
 
 Py4a fixes the implementation boundary for Python-main server workspaces before

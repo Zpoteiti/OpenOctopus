@@ -22,12 +22,12 @@ class WorkspaceToolDispatcher:
         engine: AsyncEngine,
         service: WorkspaceService,
         *,
-        document_parser: DocumentParser | None = None,
+        document_parser: DocumentParser,
         read_cache_entries: int = 512,
     ) -> None:
         self._engine = engine
         self._service = service
-        self._parser = document_parser or DocumentParser()
+        self._parser = document_parser
         self._read_cache = _ReadCache(read_cache_entries)
 
     async def __call__(
@@ -105,19 +105,29 @@ class WorkspaceToolDispatcher:
         offset = cast(int, args["offset"])
         limit = cast(int, args["limit"])
         pages = cast(str | None, args["pages"])
-        metadata = await self._service.stat(db, user_id=ctx.user_id, path=path)
-        probe_key = (ctx.session_id, path, metadata.etag, offset, limit, pages)
-        if self._read_cache.seen(probe_key) and not cast(bool, args["force"]):
-            return ToolResult(content=f"[File unchanged since last read: {path}]")
-        result = await self._service.read_for_tool(
+        force = cast(bool, args["force"])
+        ticket = await self._service.authorize_tool_read(
             db,
             user_id=ctx.user_id,
             path=path,
+        )
+        await db.commit()
+
+        def unchanged_etag(etag: str) -> bool:
+            probe_key = (ctx.session_id, path, etag, offset, limit, pages)
+            return not force and self._read_cache.seen(probe_key)
+
+        result = await self._service.read_for_tool(
+            ticket,
+            user_id=ctx.user_id,
             offset=offset,
             limit=limit,
             pages=pages,
             parser=self._parser,
+            unchanged_etag=unchanged_etag,
         )
+        if result is None:
+            return ToolResult(content=f"[File unchanged since last read: {path}]")
         key = (ctx.session_id, path, result.etag, offset, limit, pages)
         self._read_cache.put(key)
         return ToolResult(content=result.content)

@@ -1,11 +1,15 @@
+import math
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
 from typing import Any
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from openctopus_server.admission import KeyedAdmission
+from openctopus_server.config import get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
@@ -16,10 +20,35 @@ from openctopus_server.tools.device_field import (
 )
 from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.result import normalize_tool_result
-from openctopus_server.tools.web_fetch import Resolver, WebFetchTool
+from openctopus_server.tools.web_fetch import HtmlContentConverter, Resolver, WebFetchTool
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
 from openctopus_server.tools.workspace_files import build_workspace_file_tools
+from openctopus_server.workspace.file_content import DocumentParser
 from openctopus_server.workspace.service import WorkspaceService
+
+
+@lru_cache
+def get_content_converter() -> DocumentParser:
+    settings = get_settings()
+    return DocumentParser(
+        admission=KeyedAdmission(
+            global_limit=settings.content_conversion_max_concurrency,
+            per_key_limit=1,
+            timeout_seconds=settings.content_conversion_queue_timeout_seconds,
+        ),
+        memory_mb=settings.content_conversion_memory_mb,
+        timeout_seconds=settings.content_conversion_timeout_seconds,
+    )
+
+
+@lru_cache
+def get_web_fetch_admission() -> KeyedAdmission:
+    settings = get_settings()
+    return KeyedAdmission(
+        global_limit=settings.web_fetch_max_concurrency,
+        per_key_limit=settings.web_fetch_max_concurrency_per_user,
+        timeout_seconds=settings.web_fetch_queue_timeout_seconds,
+    )
 
 
 def inject_device_routing(
@@ -145,8 +174,19 @@ def build_py3_registry(
     *,
     resolver: Resolver | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    web_admission: KeyedAdmission | None = None,
+    content_converter: HtmlContentConverter | None = None,
 ) -> ToolRegistry:
-    return ToolRegistry((WebFetchTool(resolver=resolver, transport=transport),))
+    return ToolRegistry(
+        (
+            WebFetchTool(
+                web_admission=web_admission or get_web_fetch_admission(),
+                content_converter=content_converter or get_content_converter(),
+                resolver=resolver,
+                transport=transport,
+            ),
+        )
+    )
 
 
 def build_py4_registry(
@@ -155,13 +195,35 @@ def build_py4_registry(
     *,
     resolver: Resolver | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    web_admission: KeyedAdmission | None = None,
+    content_converter: DocumentParser | None = None,
 ) -> ToolRegistry:
-    backend = WorkspaceToolDispatcher(engine, workspace_service)
+    settings = get_settings()
+    converter = content_converter or get_content_converter()
+    backend = WorkspaceToolDispatcher(
+        engine,
+        workspace_service,
+        document_parser=converter,
+    )
     return ToolRegistry(
         (
-            WebFetchTool(resolver=resolver, transport=transport),
+            WebFetchTool(
+                web_admission=web_admission or get_web_fetch_admission(),
+                content_converter=converter,
+                resolver=resolver,
+                transport=transport,
+            ),
             MessageTool(engine, workspace_service),
-            *build_workspace_file_tools(backend),
+            *build_workspace_file_tools(
+                backend,
+                document_read_timeout_seconds=math.ceil(
+                    5
+                    + settings.content_conversion_queue_timeout_seconds
+                    + 30
+                    + settings.content_conversion_timeout_seconds
+                    + 5
+                ),
+            ),
         )
     )
 

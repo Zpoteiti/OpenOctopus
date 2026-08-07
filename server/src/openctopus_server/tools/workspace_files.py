@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -66,7 +67,8 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "pages": {
                     "type": "string",
                     "description": (
-                        "Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"
+                        "Page range for PDF files, e.g. '1-5' "
+                        "(default: first 20 pages, max 20 pages)"
                     ),
                 },
                 "force": {
@@ -555,9 +557,16 @@ _ARG_MODELS: dict[str, _ArgsModel] = {
 
 
 class WorkspaceFileTool(Tool):
-    def __init__(self, name: str, backend: WorkspaceToolBackend) -> None:
+    def __init__(
+        self,
+        name: str,
+        backend: WorkspaceToolBackend,
+        *,
+        document_read_timeout_seconds: float = 30,
+    ) -> None:
         self._name = name
         self._backend = backend
+        self._document_read_timeout_seconds = document_read_timeout_seconds
 
     def name(self) -> str:
         return self._name
@@ -580,6 +589,19 @@ class WorkspaceFileTool(Tool):
                 code=ErrorCode.TOOL_INVALID_ARGS,
             )
         timeout_seconds = WORKSPACE_FILE_TOOL_TIMEOUT_SECONDS[self._name]
+        parsed_path = parsed.model_dump().get("path")
+        if (
+            self._name == "read_file"
+            and isinstance(parsed_path, str)
+            and PurePosixPath(parsed_path).suffix.lower()
+            in {
+                ".pdf",
+                ".docx",
+                ".xlsx",
+                ".pptx",
+            }
+        ):
+            timeout_seconds = self._document_read_timeout_seconds
         try:
             async with asyncio.timeout(timeout_seconds):
                 return await self._backend(self._name, parsed.model_dump(), ctx)
@@ -609,5 +631,14 @@ class WorkspaceFileTool(Tool):
 
 def build_workspace_file_tools(
     backend: WorkspaceToolBackend,
+    *,
+    document_read_timeout_seconds: float = 30,
 ) -> tuple[WorkspaceFileTool, ...]:
-    return tuple(WorkspaceFileTool(name, backend) for name in WORKSPACE_FILE_TOOL_SCHEMAS)
+    return tuple(
+        WorkspaceFileTool(
+            name,
+            backend,
+            document_read_timeout_seconds=document_read_timeout_seconds,
+        )
+        for name in WORKSPACE_FILE_TOOL_SCHEMAS
+    )

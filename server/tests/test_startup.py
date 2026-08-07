@@ -11,6 +11,26 @@ from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.main import _lifespan
 
 
+def _settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        object_storage_endpoint="http://127.0.0.1:9000",
+        object_storage_bucket="test",
+        object_storage_region="us-east-1",
+        object_storage_access_key="test-access",
+        object_storage_secret_key="test-secret",
+        workspace_deletion_purge_timeout_seconds=300,
+        workspace_deletion_shutdown_grace_seconds=5,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    converter = SimpleNamespace(probe=AsyncMock())
+    monkeypatch.setattr("openctopus_server.main.initialize_token_estimator", Mock())
+    monkeypatch.setattr("openctopus_server.main.get_content_converter", lambda: converter)
+    return converter
+
+
 def _app_with_runtime() -> tuple[FastAPI, SimpleNamespace]:
     app = FastAPI()
     runtime = SimpleNamespace(runner_instance_id=uuid4(), close=AsyncMock())
@@ -28,13 +48,15 @@ def _engine() -> tuple[Mock, AsyncMock]:
     return engine, connection
 
 
-async def test_lifespan_runs_storage_probe_and_closes_storage() -> None:
+async def test_lifespan_runs_storage_probe_and_closes_storage(
+    _startup_dependencies: SimpleNamespace,
+) -> None:
     app, runtime = _app_with_runtime()
     engine, connection = _engine()
     storage = Mock(probe_startup=AsyncMock(), close=AsyncMock())
 
     with (
-        patch("openctopus_server.main.get_settings"),
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
         patch("openctopus_server.main.get_object_storage", return_value=storage),
         patch(
@@ -45,6 +67,7 @@ async def test_lifespan_runs_storage_probe_and_closes_storage() -> None:
     ):
         async with _lifespan(app):
             storage.probe_startup.assert_awaited_once()
+            _startup_dependencies.probe.assert_awaited_once()
             recover_deletions.assert_awaited_once()
 
     assert connection.execute.await_count == 2
@@ -68,7 +91,7 @@ async def test_lifespan_fails_startup_when_storage_probe_fails() -> None:
     )
 
     with (
-        patch("openctopus_server.main.get_settings"),
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
         patch("openctopus_server.main.get_object_storage", return_value=storage),
         patch(
@@ -90,7 +113,7 @@ async def test_lifespan_disposes_database_when_storage_construction_fails() -> N
     engine, _ = _engine()
 
     with (
-        patch("openctopus_server.main.get_settings"),
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
         patch(
             "openctopus_server.main.get_object_storage",
@@ -121,7 +144,7 @@ async def test_lifespan_cancels_a_probe_after_the_outer_timeout() -> None:
 
     storage.probe_startup.side_effect = never_finishes
     with (
-        patch("openctopus_server.main.get_settings"),
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
         patch("openctopus_server.main.get_object_storage", return_value=storage),
         patch("openctopus_server.main.STARTUP_PROBE_TIMEOUT_SECONDS", 0.01),
@@ -140,7 +163,7 @@ async def test_lifespan_cleans_resources_when_turn_recovery_fails() -> None:
     storage = Mock(probe_startup=AsyncMock(), close=AsyncMock())
 
     with (
-        patch("openctopus_server.main.get_settings"),
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
         patch("openctopus_server.main.get_object_storage", return_value=storage),
         patch(
@@ -160,3 +183,21 @@ async def test_lifespan_cleans_resources_when_turn_recovery_fails() -> None:
     runtime.close.assert_awaited_once()
     storage.close.assert_awaited_once()
     engine.dispose.assert_awaited_once()
+
+
+async def test_lifespan_fails_before_database_when_content_probe_fails(
+    _startup_dependencies: SimpleNamespace,
+) -> None:
+    app, _ = _app_with_runtime()
+    _startup_dependencies.probe.side_effect = RuntimeError("missing converter")
+
+    with (
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
+        patch("openctopus_server.main.get_engine") as get_engine,
+        pytest.raises(SystemExit),
+    ):
+        async with _lifespan(app):
+            pytest.fail("lifespan should not start")
+
+    _startup_dependencies.probe.assert_awaited_once()
+    get_engine.assert_not_called()

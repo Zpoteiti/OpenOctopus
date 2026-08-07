@@ -6,15 +6,17 @@ import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache, partial
 from io import BytesIO
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
+import httpx
 import urllib3
 from minio import Minio
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.config import Settings, get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
@@ -23,8 +25,48 @@ STARTUP_PROBE_KEY = "_openoctopus/startup-probe"
 _PROBE_BYTES = 32
 MAX_LIST_PAGE_SIZE = 1000
 STREAM_CHUNK_SIZE = 64 * 1024
+_PRESIGNED_GET_LIFETIME = timedelta(minutes=5)
+_ASYNC_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+_ASYNC_REQUEST_ATTEMPTS = 3
+_SIGNED_URL_EXTENSION = "openoctopus.presigned_url"
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
+
+
+class _PresignedGetTransport(httpx.AsyncBaseTransport):
+    """Send a signed URL while exposing only its query-free form to HTTPX logs."""
+
+    def __init__(self, *, max_connections: int) -> None:
+        self._transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+            )
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        signed_url = request.extensions.pop(_SIGNED_URL_EXTENSION, None)
+        if not isinstance(signed_url, str):
+            raise httpx.RequestError("Object storage request was not signed", request=request)
+        extensions = dict(request.extensions)
+        signed_request = httpx.Request(
+            request.method,
+            signed_url,
+            headers=request.headers,
+            extensions=extensions,
+        )
+        try:
+            response = await self._transport.handle_async_request(signed_request)
+        except httpx.RequestError:
+            response = None
+        if response is None:
+            del signed_url, signed_request
+            raise httpx.RequestError("Object storage request failed", request=request) from None
+        response.request = request
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
 
 
 @dataclass(frozen=True)
@@ -76,18 +118,20 @@ class ObjectStream:
         self.etag = etag
         self._storage = storage
         self._response = response
+        self._chunks = response.aiter_raw(chunk_size=STREAM_CHUNK_SIZE)
         self._closed = False
         self._lock = asyncio.Lock()
 
     async def read(self) -> bytes:
+        failure: WorkspaceError | None = None
         try:
             async with self._lock:
                 if self._closed:
                     return b""
-                chunk = await self._storage._run_stream_operation(
-                    self._response.read,
-                    STREAM_CHUNK_SIZE,
-                )
+                try:
+                    chunk = await anext(self._chunks)
+                except StopAsyncIteration:
+                    chunk = b""
                 if not isinstance(chunk, bytes):
                     raise WorkspaceError(
                         ErrorCode.WORKSPACE_STORAGE_ERROR,
@@ -100,12 +144,18 @@ class ObjectStream:
             close_task = asyncio.create_task(self.aclose())
             await _wait_for_worker(close_task)
             raise
-        except Exception:
+        except Exception as exc:
+            failure = normalize_storage_error(exc)
+            failure.__cause__ = None
+            failure.__context__ = None
+            failure.__traceback__ = None
             try:
                 await self.aclose()
             except WorkspaceError:
                 pass
-            raise
+        if failure is not None:
+            raise failure from None
+        raise AssertionError("unreachable object stream read state")
 
     async def aclose(self) -> None:
         async with self._lock:
@@ -115,13 +165,18 @@ class ObjectStream:
         if self._closed:
             return
         self._closed = True
+        failure: WorkspaceError | None = None
         try:
-            await self._storage._run_stream_operation(
-                _close_response,
-                self._response,
-            )
+            await _close_async_response(self._response)
+        except Exception as exc:
+            failure = normalize_storage_error(exc)
+            failure.__cause__ = None
+            failure.__context__ = None
+            failure.__traceback__ = None
         finally:
             self._storage._semaphore.release()
+        if failure is not None:
+            raise failure from None
 
 
 class ObjectStorage:
@@ -134,17 +189,32 @@ class ObjectStorage:
         max_connections: int,
         *,
         http_client: urllib3.PoolManager | None = None,
+        async_client: httpx.AsyncClient | None = None,
+        health_client: Any | None = None,
+        health_http_client: urllib3.PoolManager | None = None,
     ) -> None:
         self.client = client
         self.bucket = bucket
         self.max_connections = max_connections
         self._semaphore = asyncio.Semaphore(max_connections)
         self._http_client = http_client
+        self._async_client = async_client
+        self._health_client = health_client if health_client is not None else client
+        self._health_http_client = health_http_client
         self._executor = ThreadPoolExecutor(
             max_workers=max_connections,
             thread_name_prefix="openoctopus-rustfs",
         )
+        self._health_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="openoctopus-rustfs-health",
+        )
         self._cancelled_workers: set[asyncio.Future[Any]] = set()
+        self._health_lock = asyncio.Lock()
+        self._health_worker: asyncio.Future[Any] | None = None
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     async def execute(self, operation: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         return await self._execute(
@@ -222,61 +292,119 @@ class ObjectStorage:
         return await self.execute(stat_and_validate)
 
     async def open_stream(self, object_name: str) -> ObjectStream:
-        await self._semaphore.acquire()
-        try:
-            worker = asyncio.get_running_loop().run_in_executor(
-                self._executor,
-                partial(self._open_stream_response, object_name),
-            )
-        except Exception as exc:
-            self._semaphore.release()
-            raise normalize_storage_error(exc) from exc
-        try:
-            response, size, etag = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            try:
-                await _wait_for_worker(worker)
-                if not worker.cancelled() and worker.exception() is None:
-                    response, _, _ = worker.result()
-                    close_worker = asyncio.get_running_loop().run_in_executor(
-                        self._executor,
-                        _close_response,
-                        response,
-                    )
-                    await _wait_for_worker(close_worker)
-            finally:
-                self._semaphore.release()
-            raise
-        except Exception as exc:
-            self._semaphore.release()
-            raise normalize_storage_error(exc) from exc
-        return ObjectStream(self, response, size=size, etag=etag)
+        return await self._open_async_stream(object_name)
 
-    def _open_stream_response(self, object_name: str) -> tuple[Any, int, str]:
-        response = self.client.get_object(self.bucket, object_name)
-        try:
-            size, etag = _stream_metadata(response)
-        except Exception:
-            _close_response(response)
-            raise
-        return response, size, etag
-
-    async def _run_stream_operation(
+    async def _open_async_stream(
         self,
-        operation: Callable[..., _T],
-        *args: Any,
-    ) -> _T:
-        worker = asyncio.get_running_loop().run_in_executor(
-            self._executor,
-            partial(operation, *args),
-        )
+        object_name: str,
+        *,
+        offset: int = 0,
+        length: int = 0,
+    ) -> ObjectStream:
+        await self._semaphore.acquire()
+        response: httpx.Response | None = None
+        transferred = False
+        failure: WorkspaceError | None = None
         try:
-            return await asyncio.shield(worker)
+            response = await self._send_async_get(
+                object_name,
+                offset=offset,
+                length=length,
+            )
+            size, etag = _stream_metadata(response)
+            stream = ObjectStream(self, response, size=size, etag=etag)
+            transferred = True
+            return stream
         except asyncio.CancelledError:
-            await _wait_for_worker(worker)
+            if response is not None:
+                await _close_async_response_safely(response)
             raise
         except Exception as exc:
-            raise normalize_storage_error(exc) from exc
+            if response is not None:
+                await _close_async_response_safely(response)
+            failure = normalize_storage_error(exc)
+            failure.__cause__ = None
+            failure.__context__ = None
+            failure.__traceback__ = None
+            logger.warning("Object storage GET failed: %s", failure.code.value)
+        finally:
+            if not transferred:
+                self._semaphore.release()
+        if failure is not None:
+            raise failure from None
+        raise AssertionError("unreachable object storage open state")
+
+    async def _send_async_get(
+        self,
+        object_name: str,
+        *,
+        offset: int,
+        length: int,
+    ) -> httpx.Response:
+        if self._async_client is None:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_STORAGE_ERROR,
+                "Object storage async client is not configured",
+            )
+        signed_url = self.client.presigned_get_object(
+            self.bucket,
+            object_name,
+            expires=_PRESIGNED_GET_LIFETIME,
+        )
+        redacted_url = httpx.URL(signed_url).copy_with(query=None)
+        headers = {"Accept-Encoding": "identity"}
+        ranged = offset > 0 or length > 0
+        if ranged:
+            last_byte = offset + length - 1
+            headers["Range"] = f"bytes={offset}-{last_byte}"
+        for attempt in range(_ASYNC_REQUEST_ATTEMPTS):
+            request = self._async_client.build_request(
+                "GET",
+                redacted_url,
+                headers=headers,
+                extensions={_SIGNED_URL_EXTENSION: signed_url},
+            )
+            try:
+                response = await self._async_client.send(
+                    request,
+                    stream=True,
+                    follow_redirects=False,
+                )
+            except httpx.RequestError:
+                if attempt + 1 == _ASYNC_REQUEST_ATTEMPTS:
+                    raise
+                await asyncio.sleep(0.2 * (2**attempt))
+                continue
+            finally:
+                request.extensions.pop(_SIGNED_URL_EXTENSION, None)
+            if response.status_code in _ASYNC_RETRY_STATUSES:
+                await _close_async_response(response)
+                if attempt + 1 == _ASYNC_REQUEST_ATTEMPTS:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
+                        "Object storage is unavailable",
+                    )
+                await asyncio.sleep(0.2 * (2**attempt))
+                continue
+            expected_status = 206 if ranged else 200
+            if response.status_code == expected_status:
+                return response
+            await _close_async_response(response)
+            if response.status_code == 404:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_NOT_FOUND,
+                    "Workspace file was not found",
+                )
+            if response.status_code in {401, 403, 429}:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
+                    "Object storage is unavailable",
+                )
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_STORAGE_ERROR,
+                "Object storage request failed",
+            )
+        raise AssertionError("unreachable object storage retry state")
 
     async def list_page(
         self,
@@ -368,35 +496,31 @@ class ObjectStorage:
     ) -> StoredObject:
         if max_bytes < 1:
             raise ValueError("max_bytes must be positive")
-
-        def read_and_close() -> StoredObject:
-            requested_length = min(length, max_bytes) if length else max_bytes
-            if not length or length > max_bytes:
-                requested_length += 1
-            response = self.client.get_object(
-                self.bucket,
-                object_name,
-                offset=offset,
-                length=requested_length,
-            )
-            try:
-                data = response.read(requested_length)
-                headers = getattr(response, "headers", {})
-                etag = headers.get("ETag") if headers is not None else None
-                if isinstance(etag, str):
-                    etag = etag.strip('"')
-                if not etag:
-                    raise ValueError("object response is missing an ETag")
-                return StoredObject(
-                    data=data[:max_bytes],
-                    etag=etag,
-                    truncated=len(data) > max_bytes,
-                )
-            finally:
-                response.close()
-                response.release_conn()
-
-        return await self.execute(read_and_close)
+        requested_length = min(length, max_bytes) if length else max_bytes
+        if not length or length > max_bytes:
+            requested_length += 1
+        ranged = offset > 0 or length > 0
+        stream = await self._open_async_stream(
+            object_name,
+            offset=offset,
+            length=requested_length if ranged else 0,
+        )
+        collected = bytearray()
+        try:
+            while len(collected) < requested_length:
+                chunk = await stream.read()
+                if not chunk:
+                    break
+                remaining = requested_length - len(collected)
+                collected.extend(chunk[:remaining])
+        finally:
+            await stream.aclose()
+        data = bytes(collected)
+        return StoredObject(
+            data=data[:max_bytes],
+            etag=stream.etag,
+            truncated=len(data) > max_bytes,
+        )
 
     async def write(self, object_name: str, data: bytes) -> ObjectMetadata:
         def put_and_validate() -> ObjectMetadata:
@@ -405,6 +529,7 @@ class ObjectStorage:
                 object_name,
                 BytesIO(data),
                 len(data),
+                num_parallel_uploads=1,
             )
             etag = getattr(result, "etag", None)
             if not isinstance(etag, str) or not etag:
@@ -459,20 +584,62 @@ class ObjectStorage:
                     pass
 
     async def check_health(self) -> None:
-        exists = await self.execute_detached_on_cancel(
-            self.client.bucket_exists,
-            self.bucket,
-        )
+        async with self._health_lock:
+            if self._closing:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
+                    "Object storage is unavailable",
+                )
+            worker = self._health_worker
+            if worker is None:
+                worker = asyncio.get_running_loop().run_in_executor(
+                    self._health_executor,
+                    self._health_client.bucket_exists,
+                    self.bucket,
+                )
+                self._health_worker = worker
+                worker.add_done_callback(self._health_worker_done)
+        try:
+            exists = await asyncio.shield(worker)
+        except Exception as exc:
+            normalized = normalize_storage_error(exc)
+            logger.warning("Object storage health check failed: %s", normalized.code.value)
+            raise normalized from exc
         if not exists:
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
                 "Object storage bucket is unavailable",
             )
 
+    def _health_worker_done(self, worker: asyncio.Future[Any]) -> None:
+        try:
+            worker.exception()
+        except BaseException:
+            pass
+        if self._health_worker is worker:
+            self._health_worker = None
+
     async def close(self) -> None:
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._close_impl())
+            close_task = self._close_task
+        await await_future_cancellation_safe(close_task)
+
+    async def _close_impl(self) -> None:
+        async with self._health_lock:
+            self._closing = True
+            health_worker = self._health_worker
+        if health_worker is not None:
+            await _wait_for_worker(health_worker)
         if self._cancelled_workers:
             await asyncio.gather(*self._cancelled_workers, return_exceptions=True)
+        if self._async_client is not None:
+            await self._async_client.aclose()
+        await asyncio.to_thread(self._health_executor.shutdown)
         await asyncio.to_thread(self._executor.shutdown)
+        if self._health_http_client is not None:
+            await asyncio.to_thread(self._health_http_client.clear)
         if self._http_client is not None:
             await asyncio.to_thread(self._http_client.clear)
 
@@ -490,6 +657,24 @@ async def _wait_for_worker(worker: asyncio.Future[Any]) -> None:
             worker.exception()
         except BaseException:
             pass
+
+
+async def _close_async_response_safely(response: httpx.Response) -> None:
+    try:
+        await _close_async_response(response)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+async def _close_async_response(response: Any) -> None:
+    close_task = asyncio.create_task(response.aclose())
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        await _wait_for_worker(close_task)
+        raise
 
 
 def build_object_storage(settings: Settings) -> ObjectStorage:
@@ -518,11 +703,37 @@ def build_object_storage(settings: Settings) -> ObjectStorage:
         region=settings.object_storage_region,
         http_client=http_client,
     )
+    health_http_client = urllib3.PoolManager(
+        num_pools=1,
+        maxsize=1,
+        block=True,
+        timeout=urllib3.Timeout(connect=5, read=30),
+        retries=retries,
+    )
+    health_client = Minio(
+        endpoint=endpoint,
+        access_key=settings.object_storage_access_key,
+        secret_key=settings.object_storage_secret_key,
+        secure=secure,
+        region=settings.object_storage_region,
+        http_client=health_http_client,
+    )
+    async_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30, connect=5),
+        transport=_PresignedGetTransport(
+            max_connections=settings.object_storage_max_connections,
+        ),
+        follow_redirects=False,
+        trust_env=False,
+    )
     return ObjectStorage(
         client,
         settings.object_storage_bucket,
         settings.object_storage_max_connections,
         http_client=http_client,
+        async_client=async_client,
+        health_client=health_client,
+        health_http_client=health_http_client,
     )
 
 
@@ -553,7 +764,13 @@ def normalize_storage_error(exc: Exception) -> WorkspaceError:
         or status_code in {500, 502, 503, 504}
         or isinstance(
             exc,
-            (ConnectionError, TimeoutError, OSError, urllib3.exceptions.HTTPError),
+            (
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                httpx.RequestError,
+                urllib3.exceptions.HTTPError,
+            ),
         )
     ):
         return WorkspaceError(
@@ -580,21 +797,6 @@ def _stream_metadata(response: Any) -> tuple[int, str]:
     if not isinstance(etag, str) or not etag.strip('"'):
         raise ValueError("object response is missing an ETag")
     return size, etag.strip('"')
-
-
-def _close_response(response: Any) -> None:
-    close_error: Exception | None = None
-    try:
-        response.close()
-    except Exception as exc:
-        close_error = exc
-    try:
-        response.release_conn()
-    except Exception as exc:
-        if close_error is None:
-            close_error = exc
-    if close_error is not None:
-        raise close_error
 
 
 def _metadata(item: Any, *, expected_name: str | None = None) -> ObjectMetadata:

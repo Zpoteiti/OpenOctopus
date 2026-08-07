@@ -6,6 +6,12 @@
 **Canonical decisions:** ADR-021–024, ADR-038–046, ADR-071, ADR-075–088,
 ADR-095, ADR-108–109, ADR-121–124, ADR-127
 
+> **Historical note (2026-08-07):** This document records the original Py4
+> contract. Its REST admission, skill-loading, Office/PDF parsing, HTML
+> conversion, deletion-shutdown, and administrator-usage details are superseded
+> by the accepted
+> [Py4 merge-hardening design](2026-08-06-py4-merge-hardening-markitdown-design.md).
+
 ## Outcome
 
 Py4 turns the Py4a storage foundation into a usable server workspace. Authenticated

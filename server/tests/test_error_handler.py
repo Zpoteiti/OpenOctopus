@@ -1,4 +1,8 @@
+from fastapi import Request
+
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.errors.http import openoctopus_error_handler
 
 
 async def test_error_handler_returns_code_and_message(async_client):
@@ -18,6 +22,20 @@ async def test_error_handler_returns_code_and_message(async_client):
     body = response.json()
     assert "code" in body
     assert "message" in body
+
+
+async def test_workspace_error_handler_preserves_retry_header() -> None:
+    response = await openoctopus_error_handler(
+        Request({"type": "http", "method": "GET", "path": "/", "headers": []}),
+        WorkspaceError(
+            ErrorCode.WORKSPACE_TRANSFER_BUSY,
+            "Workspace transfer capacity is busy",
+            headers={"Retry-After": "5"},
+        ),
+    )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "5"
 
 
 def test_error_status_map_covers_all_new_codes():
@@ -49,6 +67,8 @@ def test_error_status_map_covers_workspace_codes():
         ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE: 413,
         ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE: 503,
         ErrorCode.WORKSPACE_STORAGE_ERROR: 503,
+        ErrorCode.WORKSPACE_TRANSFER_BUSY: 429,
+        ErrorCode.WORKSPACE_TRANSFER_TIMEOUT: 408,
     }
 
     assert {code: ERROR_STATUS[code] for code in expected} == expected

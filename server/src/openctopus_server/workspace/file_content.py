@@ -4,20 +4,23 @@ import asyncio
 import base64
 import codecs
 import multiprocessing
-from collections.abc import Awaitable, Callable
-from io import BytesIO
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import PurePosixPath
 from typing import Any, cast
+from uuid import UUID
 
-from docx import Document
-from openpyxl import load_workbook
-from pptx import Presentation
-from pypdf import PdfReader
-
+from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError
+from openctopus_server.workspace.content_conversion_worker import (
+    PROTOCOL_VERSION,
+    WorkerRequest,
+    exited_for_cpu_limit,
+    run_conversion_worker,
+)
 
 MAX_READ_CHARS = 128_000
 _IMAGE_SIGNATURES = (
@@ -30,82 +33,158 @@ _IMAGE_SIGNATURES = (
 
 
 class DocumentParser:
-    def __init__(self, *, max_concurrency: int = 2, timeout_seconds: float = 30) -> None:
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+    def __init__(
+        self,
+        *,
+        admission: KeyedAdmission,
+        memory_mb: int,
+        timeout_seconds: float,
+        worker_target: Callable[[Connection, WorkerRequest], None] | None = None,
+    ) -> None:
+        if memory_mb <= 0 or timeout_seconds <= 0:
+            raise ValueError("Document parser limits must be positive")
+        self._admission = admission
+        self._memory_mb = memory_mb
         self._timeout_seconds = timeout_seconds
+        self._worker_target = worker_target
 
-    async def parse(self, path: str, data: bytes, *, pages: str | None = None) -> str:
-        async with self._semaphore:
-            context = multiprocessing.get_context("spawn")
-            parent, child = context.Pipe(duplex=False)
-            process = context.Process(
-                target=_document_worker,
-                args=(child, path, data, pages),
-                daemon=True,
+    @asynccontextmanager
+    async def admit(self, user_id: UUID) -> AsyncIterator[_AdmittedConversion]:
+        try:
+            async with self._admission.slot(user_id):
+                yield _AdmittedConversion(self)
+        except AdmissionTimeoutError as exc:
+            raise ToolError(
+                ErrorCode.TOOL_CONTENT_CONVERSION_BUSY,
+                "Content conversion is busy; try again",
+            ) from exc
+
+    async def parse(
+        self,
+        path: str,
+        data: bytes,
+        *,
+        user_id: UUID,
+        pages: str | None = None,
+    ) -> str:
+        async with self.admit(user_id) as conversion:
+            return await conversion.parse(path, data, pages=pages)
+
+    async def parse_html(
+        self,
+        data: bytes,
+        *,
+        user_id: UUID,
+        charset: str,
+        base_url: str,
+        mode: str,
+        max_chars: int,
+    ) -> str:
+        async with self.admit(user_id) as conversion:
+            return await conversion.parse_html(
+                data,
+                charset=charset,
+                base_url=base_url,
+                mode=mode,
+                max_chars=max_chars,
             )
-            started = False
-            try:
-                process.start()
-                started = True
-                child.close()
-                deadline = asyncio.get_running_loop().time() + self._timeout_seconds
-                while not parent.poll():
-                    if not process.is_alive():
-                        raise _invalid("Workspace document parser exited unexpectedly")
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        raise ToolError(
-                            ErrorCode.TOOL_EXEC_TIMEOUT,
-                            "Workspace document parsing timed out",
-                        )
-                    await asyncio.sleep(min(0.01, remaining))
+
+    async def probe(self) -> None:
+        await self._run({"operation": "probe"})
+
+    async def _run(self, request: WorkerRequest) -> str:
+        request = {
+            **request,
+            "memory_mb": self._memory_mb,
+            "timeout_seconds": self._timeout_seconds,
+        }
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=self._worker_target or run_conversion_worker,
+            args=(child, request),
+            daemon=True,
+        )
+        started = False
+        try:
+            process.start()
+            started = True
+            child.close()
+            return await self._receive(parent, process)
+        finally:
+            child.close()
+            parent.close()
+            if started:
+                await _reap_process_cancellation_safe(process)
+
+    async def _receive(self, parent: Connection, process: BaseProcess) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout_seconds
+        while True:
+            if parent.poll():
                 try:
                     message: object = parent.recv()
                 except EOFError as exc:
-                    raise _invalid("Workspace document parser exited unexpectedly") from exc
-                if (
-                    not isinstance(message, tuple)
-                    or len(message) != 3
-                    or not isinstance(message[0], bool)
-                    or not isinstance(message[1], str)
-                    or not isinstance(message[2], str)
-                ):
-                    raise _invalid("Workspace document parser returned invalid content")
-                ok, code, value = message
-                if not ok:
-                    raise ToolError(ErrorCode(code), value)
-                return cast(str, value)
-            finally:
-                child.close()
-                parent.close()
-                if started:
-                    await _reap_process(process)
+                    raise _conversion_failed(
+                        "Content conversion worker exited unexpectedly"
+                    ) from exc
+                return _parse_worker_message(message)
+            if not process.is_alive():
+                process.join(timeout=0)
+                if parent.poll():
+                    continue
+                if exited_for_cpu_limit(process.exitcode):
+                    raise ToolError(ErrorCode.TOOL_EXEC_TIMEOUT, "Content conversion timed out")
+                raise _conversion_failed("Content conversion worker exited unexpectedly")
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise ToolError(ErrorCode.TOOL_EXEC_TIMEOUT, "Content conversion timed out")
+            await asyncio.sleep(min(0.01, remaining))
 
 
-def _document_worker(
-    connection: Connection,
-    path: str,
-    data: bytes,
-    pages: str | None,
-) -> None:
-    try:
-        result = render_file_content(path, data, pages=pages)
-        if not isinstance(result, str):
-            raise _invalid("Workspace document parser returned invalid content")
-        connection.send((True, "", result))
-    except ToolError as exc:
-        connection.send((False, exc.code.value, exc.message))
-    except Exception:
-        connection.send(
-            (False, ErrorCode.TOOL_INVALID_ARGS.value, "Workspace document could not be parsed")
+class _AdmittedConversion:
+    def __init__(self, parser: DocumentParser) -> None:
+        self._parser = parser
+
+    async def parse(self, path: str, data: bytes, *, pages: str | None = None) -> str:
+        return await self._parser._run(
+            {
+                "operation": "document",
+                "path": path,
+                "data": data,
+                "pages": pages,
+            }
         )
-    finally:
-        connection.close()
+
+    async def parse_html(
+        self,
+        data: bytes,
+        *,
+        charset: str,
+        base_url: str,
+        mode: str,
+        max_chars: int,
+    ) -> str:
+        return await self._parser._run(
+            {
+                "operation": "html",
+                "data": data,
+                "charset": charset,
+                "base_url": base_url,
+                "mode": mode,
+                "max_chars": max_chars,
+            }
+        )
 
 
 async def _reap_process(process: BaseProcess) -> None:
-    if process.is_alive():
-        process.terminate()
+    for _ in range(10):
+        process.join(timeout=0)
+        if not process.is_alive():
+            process.close()
+            return
+        await asyncio.sleep(0.01)
+    process.terminate()
     for _ in range(100):
         process.join(timeout=0)
         if not process.is_alive():
@@ -117,6 +196,39 @@ async def _reap_process(process: BaseProcess) -> None:
         process.join(timeout=0)
         await asyncio.sleep(0.01)
     process.close()
+
+
+async def _reap_process_cancellation_safe(process: BaseProcess) -> None:
+    reap_task = asyncio.create_task(_reap_process(process))
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(reap_task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _parse_worker_message(message: object) -> str:
+    if (
+        not isinstance(message, tuple)
+        or len(message) != 4
+        or message[0] != PROTOCOL_VERSION
+        or not isinstance(message[1], bool)
+        or not isinstance(message[2], str)
+        or not isinstance(message[3], str)
+    ):
+        raise _conversion_failed("Content conversion worker returned invalid content")
+    _, ok, code, value = cast(tuple[int, bool, str, str], message)
+    if ok:
+        return value
+    try:
+        error_code = ErrorCode(code)
+    except ValueError as exc:
+        raise _conversion_failed("Content conversion worker returned an unknown error") from exc
+    raise ToolError(error_code, value)
 
 
 def render_file_content(
@@ -145,7 +257,7 @@ def render_file_content(
 
     suffix = PurePosixPath(path).suffix.lower()
     if suffix in {".pdf", ".docx", ".xlsx", ".pptx"}:
-        return _cap(_extract_document(suffix, data, pages=pages))
+        raise _invalid("Workspace documents must be read through the isolated parser")
     if b"\x00" in data:
         raise _invalid("Workspace file is binary and cannot be read as text")
     try:
@@ -238,54 +350,6 @@ async def render_streamed_text(
     return _cap(rendered)
 
 
-def _extract_document(suffix: str, data: bytes, *, pages: str | None) -> str:
-    try:
-        if suffix == ".pdf":
-            reader = PdfReader(BytesIO(data))
-            indexes = _page_indexes(pages, len(reader.pages))
-            return "\n\n".join(reader.pages[index].extract_text() or "" for index in indexes)
-        if suffix == ".docx":
-            document = Document(BytesIO(data))
-            return "\n".join(paragraph.text for paragraph in document.paragraphs)
-        if suffix == ".xlsx":
-            workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
-            try:
-                lines: list[str] = []
-                for sheet in workbook.worksheets:
-                    lines.append(f"## {sheet.title}")
-                    lines.extend(
-                        "\t".join("" if value is None else str(value) for value in row)
-                        for row in sheet.iter_rows(values_only=True)
-                    )
-                return "\n".join(lines)
-            finally:
-                workbook.close()
-        presentation = Presentation(BytesIO(data))
-        slides: list[str] = []
-        for index, slide in enumerate(presentation.slides, start=1):
-            text = [shape.text for shape in slide.shapes if hasattr(shape, "text")]
-            slides.append(f"## Slide {index}\n" + "\n".join(text))
-        return "\n\n".join(slides)
-    except ToolError:
-        raise
-    except Exception as exc:
-        raise _invalid("Workspace document could not be parsed") from exc
-
-
-def _page_indexes(value: str | None, count: int) -> range:
-    if value is None:
-        return range(min(count, 20))
-    parts = value.split("-", 1)
-    try:
-        start = int(parts[0])
-        end = int(parts[-1])
-    except ValueError as exc:
-        raise _invalid("PDF pages must be a range such as 1-5") from exc
-    if start < 1 or end < start or end - start + 1 > 20 or end > count:
-        raise _invalid("PDF page range is invalid or exceeds 20 pages")
-    return range(start - 1, end)
-
-
 def _image_media_type(data: bytes) -> str | None:
     for signature, media_type in _IMAGE_SIGNATURES:
         if data.startswith(signature):
@@ -304,3 +368,7 @@ def _cap(value: str) -> str:
 
 def _invalid(message: str) -> ToolError:
     return ToolError(ErrorCode.TOOL_INVALID_ARGS, message)
+
+
+def _conversion_failed(message: str) -> ToolError:
+    return ToolError(ErrorCode.TOOL_CONTENT_CONVERSION_FAILED, message)

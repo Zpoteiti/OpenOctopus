@@ -4,7 +4,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import OpenOctopusError
+from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
 
 ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_NOT_FOUND: 404,
@@ -20,6 +20,8 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE: 413,
     ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE: 503,
     ErrorCode.WORKSPACE_STORAGE_ERROR: 503,
+    ErrorCode.WORKSPACE_TRANSFER_BUSY: 429,
+    ErrorCode.WORKSPACE_TRANSFER_TIMEOUT: 408,
     ErrorCode.WORKSPACE_INVALID_REQUEST: 400,
     ErrorCode.WORKSPACE_REF_CONFLICT: 409,
     ErrorCode.TOOL_NO_MATCH: 409,
@@ -54,6 +56,7 @@ async def openoctopus_error_handler(request: Request, exc: Exception) -> JSONRes
     return JSONResponse(
         status_code=status,
         content={"code": exc.code.value, "message": exc.message},
+        headers=exc.headers if isinstance(exc, WorkspaceError) else None,
     )
 
 

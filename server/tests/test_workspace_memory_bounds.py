@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from storage_http import object_storage_for_fake
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
@@ -116,8 +117,11 @@ class _PagedClient:
         object_name: str,
         data: io.BytesIO,
         length: int,
+        *,
+        num_parallel_uploads: int,
     ) -> SimpleNamespace:
         del bucket, data
+        assert num_parallel_uploads == 1
         self.put_calls += 1
         self.objects[object_name] = (length, "written-etag")
         return SimpleNamespace(etag="written-etag")
@@ -163,7 +167,7 @@ class _DelimiterClient:
 
 async def test_read_uses_limit_plus_one_and_never_unbounded_response_read() -> None:
     client = _ReadClient(b"0123456789")
-    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    storage = object_storage_for_fake(client, "openoctopus", max_connections=1)
     try:
         stored = await storage.read("file.txt", offset=2, max_bytes=4)
     finally:

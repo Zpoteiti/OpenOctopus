@@ -84,10 +84,14 @@ info:
     **Python-main deployment/concurrency boundary (ADR-122):**
     The Python server alpha runs one ASGI worker and uses asyncio tasks for
     I/O-bound concurrency. Redis and cross-worker command routing are not
-    server-alpha dependencies. LLM
-    provider concurrency is controlled by the admin-configured
-    `llm_max_concurrent_requests` semaphore. File IO, hashing, recursive
-    grep/find_files, and transfers must not block the event loop.
+    server-alpha dependencies. Process-local global and per-user admission
+    bounds REST transfers, prompt construction, `web_fetch`, and isolated
+    content conversion; these limits are not cross-worker rate limits. LLM
+    provider concurrency remains independently controlled by the
+    admin-configured `llm_max_concurrent_requests` semaphore. File IO, hashing,
+    recursive grep/find_files, transfers, and document conversion must not
+    block the event loop. No PostgreSQL connection is retained while waiting
+    for admission, RustFS bytes, a conversion child, or the Provider.
 
     **Not in this spec:**
 
@@ -134,7 +138,9 @@ paths:
       description: |
         Checks PostgreSQL and RustFS concurrently. RustFS health is a
         non-mutating bucket-existence check; the stronger read/write/stat/delete
-        capability probe runs only at startup.
+        capability probe runs only at startup. Runtime probes are single-flight
+        on one dedicated RustFS connection, separate from the configured
+        workspace object-operation pool.
       responses:
         '200':
           description: Both dependencies are connected.
@@ -828,33 +834,29 @@ paths:
   #
   /api/workspace/files/{path}:
     description: |
-      Workspace file route for explicit `openoctopus_device`. `server` targets the
-      server-side workspace service. Paired device names route over
-      `/ws/device`; offline-but-paired targets return `device_unreachable`.
+      Py4 server-workspace file route. `openoctopus_device` is explicit and must
+      be `server`.
     parameters:
       - name: path
         in: path
         required: true
         description: |
-          Path on the target `openoctopus_device`. With `server`, relative paths
-          resolve to the authenticated user's personal server workspace, while
-          absolute `/name@suffix/...` paths address shared workspaces. With a
-          device name, the client resolves relative paths against its
-          configured `workspace_path`; absolute paths outside that tree are
-          allowed only when the device `sandbox_mode=false`. Sandbox mode must
-          still enforce containment after resolution.
+          Path in the server workspace. Relative paths resolve to the
+          authenticated user's personal workspace; absolute
+          `/name@suffix/...` paths address shared workspaces.
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
     get:
       tags: [Workspace Files]
       summary: Read workspace file contents
       description: |
-        For `openoctopus_device=server`, authorizes through `WorkspaceService` and streams the
-        server workspace object bytes. For a paired device target, the server
-        relays the authenticated HTTP response to the device WebSocket file
-        stream with bounded buffering/backpressure; it does not stage the file
-        into RustFS. This route is also how the browser downloads current-web
-        `MessageDeliveryRef` workspace files.
+        Authorizes through `WorkspaceService` and streams the server workspace
+        object bytes. This route is also how the browser downloads current-web
+        `MessageDeliveryRef` workspace files. Downloads use process-local
+        fair admission shared per user with uploads, plus an independent global
+        download limit. Admission is held until the response closes. A queue
+        timeout returns `workspace_transfer_busy`; if a body send stalls after
+        200 headers, the stream closes because its status can no longer change.
       responses:
         '200':
           description: OK — returns a backpressured raw file stream.
@@ -877,19 +879,31 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: Transfer admission timed out (`workspace_transfer_busy`).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, minimum: 1 }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     put:
       tags: [Workspace Files]
       summary: Write workspace file contents
       description: |
         Full-content replace. Accepts raw `application/octet-stream` bytes.
-        For `openoctopus_device=server`, implicit `mkdir -p` on the parent path
-        (ADR-088) and `WorkspaceService` quota checks apply. Device targets route the
-        write over `/ws/device` and the client applies its local fs policy.
+        Implicit `mkdir -p` on the parent path (ADR-088) and
+        `WorkspaceService` quota checks apply.
         Server-side writes, hashes, and recursive operations must use the
         workspace service's background/thread boundary rather than blocking the
         FastAPI or agent event loop.
         Missing precondition headers mean an intentional unconditional full
         replacement. `If-None-Match: *` provides race-safe creation.
+        Server uploads use the same per-user transfer limit as downloads and a
+        separate global upload limit. The permit covers request-body collection
+        through the RustFS write. Queue timeout returns
+        `workspace_transfer_busy`; lack of progress while receiving the next
+        body chunk returns `workspace_transfer_timeout` and does not commit a
+        file.
       parameters:
         - name: If-Match
           in: header
@@ -920,6 +934,16 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409':
           description: Quota lock (SoftLocked), operation exceeds 80% single-op cap, or operation exceeds the 64 MiB REST request body collection cap (UploadTooLarge).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '408':
+          description: Upload body made no progress before the idle timeout (`workspace_transfer_timeout`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: Transfer admission timed out (`workspace_transfer_busy`).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, minimum: 1 }
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     patch:
       tags: [Workspace Files]
@@ -1742,18 +1766,18 @@ paths:
           - `llm_model` (string) — model name passed in the Anthropic Messages
             request body. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
-            (e.g. `128000`). Counted for the configured model through the
-            Anthropic-compatible `POST /v1/messages/count_tokens` route selected
-            for ADR-025. ADR-101.
+            (e.g. `128000`). OO estimates the full request locally with its
+            packaged `o200k_base` tokenizer; the configured Provider remains
+            authoritative for the actual model limit. ADR-025, ADR-101.
           - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
             trigger. Missing disables compaction. When configured,
             `llm_max_context_tokens` is required and the threshold must be
             strictly smaller than that context window. The trigger compares
-            `llm_max_context_tokens − tokenizer_count(prompt)` with
+            `llm_max_context_tokens − local_token_estimate(prompt)` with
             `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-            = `threshold − 4000`. The configured endpoint must implement the
-            count route; there is no byte/tokenizer fallback. ADR-028, ADR-101,
-            ADR-126.
+            = `threshold − 4000`. At most one eligible compaction stage runs
+            before a final request; the endpoint does not need a count-tokens
+            route. ADR-025, ADR-028, ADR-101, ADR-126.
           - `llm_max_concurrent_requests` (int) — optional
             in-process semaphore in the shared LLM provider layer. A configured
             `0` means unlimited and creates no semaphore. A positive integer
@@ -1863,6 +1887,9 @@ paths:
         `quota_bytes`, `bytes_used`, and `locked` are flat response fields for
         the user's personal server workspace, derived through `WorkspaceService`;
         they are not columns on `users` and do not aggregate shared workspaces.
+        Usage is scanned live after the database transaction closes, with at
+        most four scans in flight. If any scan fails, the whole page returns
+        the existing storage-unavailable 503 rather than partial or null data.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1877,6 +1904,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/AdminUser' }
+        '503':
+          description: A personal-workspace usage scan failed; no partial page is returned.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/admin/users/{id}:
     description: Python-main admin user management route.
@@ -2024,14 +2054,11 @@ components:
       in: query
       required: true
       description: |
-        Install site for file operations. `server` names OpenOctopus's built-in
-        server workspace. Py4 accepts only `server`. Beginning with Py5,
-        paired device names route over `/ws/device`; the
-        client applies its `workspace_path` and `sandbox_mode`. Paired-but-offline
-        devices remain valid names and return an error with code
-        `device_unreachable` at dispatch.
+        Install site for file operations. Py4 accepts only `server`, which names
+        OpenOctopus's built-in server workspace.
       schema:
         type: string
+        enum: [server]
 
   responses:
     BadRequest:
@@ -2058,9 +2085,13 @@ components:
             Stable error code from `openoctopus_server/errors/`.
             Examples: `not_found`, `forbidden`, `soft_locked`,
             `upload_too_large`, `invalid_skill_format`,
+            `workspace_transfer_busy`, `workspace_transfer_timeout`,
             `private_address_blocked`, `ambiguous_edit`,
             `no_match`, `invalid_schedule`, `destination_exists`,
-            `unsupported_config_key`, `last_admin_required`.
+            `unsupported_config_key`, `last_admin_required`,
+            `tool_content_conversion_busy`,
+            `tool_content_conversion_resource_exceeded`, and
+            `tool_content_conversion_failed`.
         message: { type: string }
 
     User:

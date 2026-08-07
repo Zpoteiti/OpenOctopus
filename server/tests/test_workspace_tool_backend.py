@@ -3,7 +3,6 @@ from uuid import uuid4
 
 from openctopus_server.tools.base import ToolContext
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
-from openctopus_server.workspace.fs import FileMetadata
 from openctopus_server.workspace.service import PatchEditResult, ToolFileRead
 
 
@@ -11,20 +10,32 @@ class _WorkspaceService:
     def __init__(self) -> None:
         self.writes: list[tuple[object, str, bytes]] = []
         self.reads = 0
-        self.stats = 0
+        self.authorizations = 0
         self.calls: list[str] = []
         self.etag = "revision-1"
 
-    async def stat(self, db, *, user_id, path):
+    async def authorize_tool_read(self, db, *, user_id, path):
         del db, user_id, path
-        self.stats += 1
-        self.calls.append("stat")
-        return FileMetadata(size=5, etag=self.etag)
+        self.authorizations += 1
+        self.calls.append("authorize")
+        return SimpleNamespace()
 
-    async def read_for_tool(self, db, *, user_id, path, offset, limit, pages, parser):
-        del db, user_id, path, limit, parser
+    async def read_for_tool(
+        self,
+        ticket,
+        *,
+        user_id,
+        offset,
+        limit,
+        pages,
+        parser,
+        unchanged_etag,
+    ):
+        del ticket, user_id, limit, parser
         self.reads += 1
         self.calls.append("read")
+        if unchanged_etag(self.etag):
+            return None
         content = f"{offset}|hello" if pages is None else f"pages={pages}"
         return ToolFileRead(etag=self.etag, content=content, size=5)
 
@@ -42,9 +53,17 @@ def _ctx() -> ToolContext:
     )
 
 
+def _backend(pg_engine, service: _WorkspaceService) -> WorkspaceToolDispatcher:
+    return WorkspaceToolDispatcher(
+        pg_engine,
+        service,  # type: ignore[arg-type]
+        document_parser=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+
 async def test_backend_dispatches_write_through_workspace_service(pg_engine) -> None:
     service = _WorkspaceService()
-    backend = WorkspaceToolDispatcher(pg_engine, service)  # type: ignore[arg-type]
+    backend = _backend(pg_engine, service)
     ctx = _ctx()
 
     result = await backend(
@@ -60,7 +79,7 @@ async def test_backend_dispatches_write_through_workspace_service(pg_engine) -> 
 
 async def test_backend_read_cache_is_scoped_by_session_and_force_bypasses(pg_engine) -> None:
     service = _WorkspaceService()
-    backend = WorkspaceToolDispatcher(pg_engine, service)  # type: ignore[arg-type]
+    backend = _backend(pg_engine, service)
     ctx = _ctx()
     args = {"path": "notes/a.txt", "offset": 1, "limit": 20, "pages": None, "force": False}
 
@@ -77,14 +96,14 @@ async def test_backend_read_cache_is_scoped_by_session_and_force_bypasses(pg_eng
     assert unchanged.content == "[File unchanged since last read: notes/a.txt]"
     assert forced.content == "1|hello"
     assert other_session.content == "1|hello"
-    assert service.reads == 3
-    assert service.stats == 4
-    assert service.calls[:3] == ["stat", "read", "stat"]
+    assert service.reads == 4
+    assert service.authorizations == 4
+    assert service.calls[:4] == ["authorize", "read", "authorize", "read"]
 
 
 async def test_backend_read_cache_includes_pdf_pages_in_identity(pg_engine) -> None:
     service = _WorkspaceService()
-    backend = WorkspaceToolDispatcher(pg_engine, service)  # type: ignore[arg-type]
+    backend = _backend(pg_engine, service)
     ctx = _ctx()
     args = {"path": "paper.pdf", "offset": 1, "limit": 20, "pages": "1", "force": False}
 
@@ -95,13 +114,13 @@ async def test_backend_read_cache_includes_pdf_pages_in_identity(pg_engine) -> N
     assert first.content == "pages=1"
     assert unchanged.content == "[File unchanged since last read: paper.pdf]"
     assert second_page.content == "pages=2"
-    assert service.reads == 2
-    assert service.stats == 3
+    assert service.reads == 3
+    assert service.authorizations == 3
 
 
 async def test_backend_read_cache_miss_when_etag_changes(pg_engine) -> None:
     service = _WorkspaceService()
-    backend = WorkspaceToolDispatcher(pg_engine, service)  # type: ignore[arg-type]
+    backend = _backend(pg_engine, service)
     ctx = _ctx()
     args = {"path": "notes/a.txt", "offset": 1, "limit": 20, "pages": None, "force": False}
 

@@ -11,8 +11,9 @@ from uuid import UUID
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.workspace.file_content import (
     DocumentParser,
     render_file_content,
@@ -57,12 +58,24 @@ from openctopus_server.workspace.storage import ObjectStream, StoredObject
 from openctopus_server.workspace.text_edit import apply_text_edit
 
 REST_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+TOOL_MATERIALIZATION_TIMEOUT_SECONDS = 30.0
+TOOL_AUTHORIZATION_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
 class DownloadTicket:
     target: WorkspaceTarget
     relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class UploadTicket:
+    target: WorkspaceTarget
+    relative_path: str
+    quota_bytes: int
+    max_bytes: int
+    user_id: UUID
+    display_path: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +104,21 @@ class ToolFileRead:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolReadTicket:
+    target: WorkspaceTarget
+    relative_path: str
+    display_path: str
+    suffix: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedToolFile:
+    etag: str
+    content: bytes | str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorizedWorkspaceFile:
     target: WorkspaceTarget
     relative_path: str
@@ -111,6 +139,7 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=path)
         async with self._fs.file_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            await db.commit()
             return await self._fs.stat(resolved.target, resolved.relative_path)
 
     async def resolve_delivery_file(
@@ -123,6 +152,7 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=path)
         async with self._fs.file_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            await db.commit()
             metadata = await self._fs.stat(resolved.target, resolved.relative_path)
             return AuthorizedWorkspaceFile(
                 target=resolved.target,
@@ -142,9 +172,26 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=path)
         async with self._fs.materialization_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            await db.commit()
             return await self._fs.read(
                 resolved.target,
                 resolved.relative_path,
+                offset=offset,
+                length=length,
+            )
+
+    async def read_personal_for_prompt(
+        self,
+        *,
+        user_id: UUID,
+        path: str,
+        offset: int = 0,
+        length: int = 0,
+    ) -> bytes:
+        async with self._fs.materialization_slot():
+            return await self._fs.read(
+                WorkspaceTarget.personal(user_id),
+                path,
                 offset=offset,
                 length=length,
             )
@@ -155,84 +202,159 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=path)
         async with self._fs.materialization_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            await db.commit()
             return await self._fs.read_with_metadata(resolved.target, resolved.relative_path)
 
-    async def read_for_tool(
+    async def authorize_tool_read(
         self,
         db: AsyncSession,
         *,
         user_id: UUID,
         path: str,
+    ) -> ToolReadTicket:
+        try:
+            async with asyncio.timeout(TOOL_AUTHORIZATION_TIMEOUT_SECONDS):
+                resolved = await self._preflight(db, user_id=user_id, path=path)
+        except TimeoutError as exc:
+            raise ToolError(
+                ErrorCode.TOOL_EXEC_TIMEOUT,
+                "Workspace file authorization timed out after 5 seconds",
+            ) from exc
+        return ToolReadTicket(
+            target=resolved.target,
+            relative_path=resolved.relative_path,
+            display_path=path,
+            suffix=PurePosixPath(path).suffix.lower(),
+        )
+
+    async def read_for_tool(
+        self,
+        ticket: ToolReadTicket,
+        *,
+        user_id: UUID,
         offset: int,
         limit: int,
         pages: str | None,
         parser: DocumentParser,
-    ) -> ToolFileRead:
-        await self._preflight(db, user_id=user_id, path=path)
-        async with self._fs.materialization_slot():
-            resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
-            metadata = await self._fs.stat(resolved.target, resolved.relative_path)
-            suffix = PurePosixPath(path).suffix.lower()
-            if metadata.size > MAX_EDIT_BYTES:
-                if suffix in {".pdf", ".docx", ".xlsx", ".pptx"}:
-                    raise WorkspaceError(
-                        ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT,
-                        "Workspace document exceeds the 8 MiB materialization limit",
-                    )
-                stream = await self._fs.open_stream(resolved.target, resolved.relative_path)
-                try:
-                    streamed_content = await render_streamed_text(
-                        stream.read,
-                        offset=offset,
-                        limit=limit,
-                    )
-                    return ToolFileRead(
-                        etag=stream.etag,
-                        content=streamed_content,
-                        size=stream.size,
-                    )
-                finally:
-                    await stream.aclose()
-            stream = await self._fs.open_stream(resolved.target, resolved.relative_path)
-            try:
-                chunks: list[bytes] = []
-                collected = 0
-                while chunk := await stream.read():
-                    collected += len(chunk)
-                    if collected > MAX_EDIT_BYTES:
-                        raise WorkspaceError(
-                            ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT,
-                            "Workspace file exceeds the 8 MiB materialization limit",
-                        )
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-                if suffix in {".pdf", ".docx", ".xlsx", ".pptx"}:
-                    materialized_content: str | list[dict[str, Any]] = await parser.parse(
-                        path,
-                        data,
-                        pages=pages,
-                    )
-                else:
-                    materialized_content = await _run_cpu(
-                        render_file_content,
-                        path,
-                        data,
-                        offset=offset,
-                        limit=limit,
-                        pages=pages,
-                    )
-                return ToolFileRead(
-                    etag=stream.etag,
-                    content=materialized_content,
-                    size=stream.size,
+        unchanged_etag: Callable[[str], bool],
+    ) -> ToolFileRead | None:
+        is_document = ticket.suffix in {".pdf", ".docx", ".xlsx", ".pptx"}
+        if is_document:
+            async with parser.admit(user_id) as conversion:
+                materialized = await self._materialize_tool_file(
+                    ticket,
+                    offset=offset,
+                    limit=limit,
+                    unchanged_etag=unchanged_etag,
+                    document=True,
                 )
-            finally:
-                await stream.aclose()
+                if materialized is None:
+                    return None
+                if isinstance(materialized.content, str):
+                    return ToolFileRead(
+                        etag=materialized.etag,
+                        content=materialized.content,
+                        size=materialized.size,
+                    )
+                content = await conversion.parse(
+                    ticket.display_path,
+                    materialized.content,
+                    pages=pages,
+                )
+                return ToolFileRead(
+                    etag=materialized.etag,
+                    content=content,
+                    size=materialized.size,
+                )
+        materialized = await self._materialize_tool_file(
+            ticket,
+            offset=offset,
+            limit=limit,
+            unchanged_etag=unchanged_etag,
+            document=False,
+        )
+        if materialized is None:
+            return None
+        if isinstance(materialized.content, str):
+            return ToolFileRead(
+                etag=materialized.etag,
+                content=materialized.content,
+                size=materialized.size,
+            )
+        rendered_content = await _run_cpu(
+            render_file_content,
+            ticket.display_path,
+            materialized.content,
+            offset=offset,
+            limit=limit,
+            pages=pages,
+        )
+        return ToolFileRead(
+            etag=materialized.etag,
+            content=rendered_content,
+            size=materialized.size,
+        )
+
+    async def _materialize_tool_file(
+        self,
+        ticket: ToolReadTicket,
+        *,
+        offset: int,
+        limit: int,
+        unchanged_etag: Callable[[str], bool],
+        document: bool,
+    ) -> _MaterializedToolFile | None:
+        try:
+            async with asyncio.timeout(TOOL_MATERIALIZATION_TIMEOUT_SECONDS):
+                async with self._fs.materialization_slot():
+                    stream = await self._fs.open_stream(ticket.target, ticket.relative_path)
+                    try:
+                        if unchanged_etag(stream.etag):
+                            return None
+                        if stream.size > MAX_EDIT_BYTES:
+                            if document:
+                                raise WorkspaceError(
+                                    ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT,
+                                    "Workspace document exceeds the 8 MiB materialization limit",
+                                )
+                            content = await render_streamed_text(
+                                stream.read,
+                                offset=offset,
+                                limit=limit,
+                            )
+                            return _MaterializedToolFile(
+                                etag=stream.etag,
+                                content=content,
+                                size=stream.size,
+                            )
+                        chunks: list[bytes] = []
+                        collected = 0
+                        while chunk := await stream.read():
+                            collected += len(chunk)
+                            if collected > MAX_EDIT_BYTES:
+                                raise WorkspaceError(
+                                    ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT,
+                                    "Workspace file exceeds the 8 MiB materialization limit",
+                                )
+                            chunks.append(chunk)
+                        return _MaterializedToolFile(
+                            etag=stream.etag,
+                            content=b"".join(chunks),
+                            size=stream.size,
+                        )
+                    finally:
+                        await stream.aclose()
+        except TimeoutError as exc:
+            raise ToolError(
+                ErrorCode.TOOL_EXEC_TIMEOUT,
+                "Workspace file materialization timed out after 30 seconds",
+            ) from exc
 
     async def list_dir(self, db: AsyncSession, *, user_id: UUID, path: str) -> list[DirectoryEntry]:
         await self._preflight(db, user_id=user_id, path=path)
         async with self._fs.file_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+            await db.commit()
             return await self._fs.list_dir(resolved.target, resolved.relative_path)
 
     async def list_dir_page(
@@ -244,6 +366,7 @@ class WorkspaceService:
         limit: int,
         offset: int = 0,
         include_noise_directories: bool = False,
+        scan_limit: int = 10_000,
     ) -> DirectoryPage:
         normalized_path = _search_path(path)
         await self._preflight(db, user_id=user_id, path=normalized_path)
@@ -253,11 +376,34 @@ class WorkspaceService:
                 user_id=user_id,
                 path=normalized_path,
             )
+            await db.commit()
             return await self._fs.list_dir_page(
                 resolved.target,
                 resolved.relative_path,
                 limit=limit,
                 offset=offset,
+                scan_limit=scan_limit,
+                include_noise_directories=include_noise_directories,
+            )
+
+    async def list_personal_for_prompt(
+        self,
+        *,
+        user_id: UUID,
+        path: str,
+        limit: int,
+        offset: int = 0,
+        include_noise_directories: bool = False,
+        scan_limit: int = 10_000,
+    ) -> DirectoryPage:
+        normalized_path = _search_path(path)
+        async with self._fs.file_operation_slot():
+            return await self._fs.list_dir_page(
+                WorkspaceTarget.personal(user_id),
+                normalized_path,
+                limit=limit,
+                offset=offset,
+                scan_limit=scan_limit,
                 include_noise_directories=include_noise_directories,
             )
 
@@ -267,6 +413,22 @@ class WorkspaceService:
 
     async def authorized_usage(self, target: WorkspaceTarget) -> int:
         return await self._fs.usage(target)
+
+    async def personal_usages(self, user_ids: list[UUID]) -> list[int]:
+        usages: list[int] = []
+        for start in range(0, len(user_ids), 4):
+            tasks = [
+                asyncio.create_task(self._fs.usage(WorkspaceTarget.personal(user_id)))
+                for user_id in user_ids[start : start + 4]
+            ]
+            try:
+                usages.extend(await asyncio.gather(*tasks))
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+        return usages
 
     async def authorize_download(
         self,
@@ -316,6 +478,7 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=normalized_path)
         async with self._fs.heavy_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=normalized_path)
+            await db.commit()
             objects, truncated = await self._fs.scan_objects(
                 resolved.target,
                 resolved.relative_path,
@@ -367,6 +530,7 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=normalized_path)
         async with self._fs.heavy_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=normalized_path)
+            await db.commit()
             objects, truncated = await self._fs.scan_objects(
                 resolved.target,
                 resolved.relative_path,
@@ -420,6 +584,7 @@ class WorkspaceService:
         await self._preflight(db, user_id=user_id, path=normalized_path)
         async with self._fs.heavy_operation_slot():
             resolved = await self._resolver.resolve(db, user_id=user_id, path=normalized_path)
+            await db.commit()
             objects, truncated = await self._fs.scan_objects(
                 resolved.target,
                 resolved.relative_path,
@@ -577,15 +742,22 @@ class WorkspaceService:
             truncated=False,
         )
 
-    async def upload_limit(
+    async def authorize_upload(
         self,
         db: AsyncSession,
         *,
         user_id: UUID,
         path: str,
-    ) -> int:
+    ) -> UploadTicket:
         resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
-        return min(REST_UPLOAD_MAX_BYTES, resolved.quota_bytes * 4 // 5)
+        return UploadTicket(
+            target=resolved.target,
+            relative_path=resolved.relative_path,
+            quota_bytes=resolved.quota_bytes,
+            max_bytes=min(REST_UPLOAD_MAX_BYTES, resolved.quota_bytes * 4 // 5),
+            user_id=user_id,
+            display_path=path,
+        )
 
     def collect_upload(
         self,
@@ -615,6 +787,7 @@ class WorkspaceService:
             async with self._fs.materialization_slot():
                 await _run_cpu(_validate_skill_write, path, data, user_id=user_id)
                 resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+                await db.commit()
                 return await self._fs.write_collected_upload(
                     resolved.target,
                     resolved.relative_path,
@@ -626,29 +799,31 @@ class WorkspaceService:
         finally:
             self._invalidate_skills(user_id, path)
 
-    async def write_collected_upload(
+    async def write_authorized_upload(
         self,
-        db: AsyncSession,
+        ticket: UploadTicket,
         *,
-        user_id: UUID,
-        path: str,
         data: bytes,
         if_match: str | None = None,
         if_none_match: bool = False,
     ) -> FileMetadata:
-        await _run_cpu(_validate_skill_write, path, data, user_id=user_id)
-        resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+        await _run_cpu(
+            _validate_skill_write,
+            ticket.display_path,
+            data,
+            user_id=ticket.user_id,
+        )
         try:
             return await self._fs.write_collected_upload(
-                resolved.target,
-                resolved.relative_path,
+                ticket.target,
+                ticket.relative_path,
                 data,
-                quota_bytes=resolved.quota_bytes,
+                quota_bytes=ticket.quota_bytes,
                 if_match=if_match,
                 if_none_match=if_none_match,
             )
         finally:
-            self._invalidate_skills(user_id, path)
+            self._invalidate_skills(ticket.user_id, ticket.display_path)
 
     async def edit(
         self,
@@ -668,6 +843,7 @@ class WorkspaceService:
         try:
             async with self._fs.materialization_slot():
                 resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+                await db.commit()
                 return await self._fs.edit_materialized(
                     resolved.target,
                     resolved.relative_path,
@@ -723,6 +899,7 @@ class WorkspaceService:
         try:
             async with self._fs.materialization_slot():
                 resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+                await db.commit()
                 metadata = await self._fs.edit_optional_materialized(
                     resolved.target,
                     resolved.relative_path,
@@ -746,6 +923,7 @@ class WorkspaceService:
         try:
             async with self._fs.file_operation_slot():
                 resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+                await db.commit()
                 await self._fs.delete_file(
                     resolved.target,
                     resolved.relative_path,
@@ -774,6 +952,7 @@ class WorkspaceService:
             resolved = [
                 await self._resolver.resolve(db, user_id=user_id, path=edit.path) for edit in edits
             ]
+            await db.commit()
             replacement_counts = [0] * len(edits)
             transforms: list[FileTransform] = []
             for index, (edit, target) in enumerate(zip(edits, resolved, strict=True)):
@@ -839,6 +1018,7 @@ class WorkspaceService:
         try:
             async with self._fs.file_operation_slot():
                 resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+                await db.commit()
                 await self._fs.delete_folder(resolved.target, resolved.relative_path)
         finally:
             self._invalidate_skills(user_id, path)
@@ -895,14 +1075,7 @@ def _personal_relative_path(path: str, user_id: UUID) -> str:
 
 async def _run_cpu[T](function: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        try:
-            await worker
-        except Exception:
-            pass
-        raise
+    return await await_future_cancellation_safe(worker)
 
 
 def _merge_scan_truncation[T](page: ResultPage[T], truncated: bool) -> ResultPage[T]:

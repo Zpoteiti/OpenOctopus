@@ -13,9 +13,13 @@ from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from storage_http import object_storage_for_fake
 
+from openctopus_server.admission import KeyedDirectionalAdmission
+from openctopus_server.api.workspace_files import get_rest_transfer_admission
+from openctopus_server.config import get_settings
 from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import Session, User, Workspace, WorkspaceMember
 from openctopus_server.tools.base import MessageDeliveryEffect, ToolContext
@@ -89,8 +93,9 @@ class _MemoryMinio:
         object_name: str,
         stream: Any,
         length: int,
+        **kwargs: Any,
     ) -> SimpleNamespace:
-        del bucket
+        del bucket, kwargs
         data = stream.read(length)
         assert len(data) == length
         return SimpleNamespace(etag=self._store(object_name, data))
@@ -131,7 +136,7 @@ class _MemoryMinio:
 @pytest_asyncio.fixture
 async def workspace_storage(test_app) -> AsyncIterator[_MemoryMinio]:
     client = _MemoryMinio()
-    storage = ObjectStorage(client, "test", max_connections=1)
+    storage = object_storage_for_fake(client, "test", max_connections=1)
     test_app.dependency_overrides[get_object_storage] = lambda: storage
     _workspace_fs_for_storage.cache_clear()
     try:
@@ -165,6 +170,14 @@ def _assert_standard_error(response, status: int, code: str | None = None) -> No
 async def test_runtime_openapi_describes_raw_download_and_upload(async_client) -> None:
     schema = (await async_client.get("/openapi.json")).json()
     operations = schema["paths"]["/api/workspace/files/{path}"]
+
+    device = next(
+        parameter
+        for parameter in operations["get"]["parameters"]
+        if parameter["name"] == "openoctopus_device"
+    )
+    assert device["required"] is True
+    assert device["schema"]["const"] == "server"
 
     download = operations["get"]["responses"]["200"]
     assert set(download["headers"]) == {
@@ -345,6 +358,213 @@ async def test_slow_upload_body_does_not_hold_database_connection(workspace_api)
     response = await uploading
     assert response.status_code == 200
     assert storage.data_for(user_id, "slow-upload.bin") == b"firstsecond"
+
+
+@pytest.mark.parametrize(
+    ("race", "status", "code"),
+    [
+        ("revoke", 404, "workspace_not_found"),
+        ("quota", 409, "workspace_upload_too_large"),
+    ],
+)
+async def test_upload_reauthorizes_after_collecting_body(
+    workspace_api,
+    pg_engine,
+    race: str,
+    status: int,
+    code: str,
+) -> None:
+    client, storage, user_id = workspace_api
+    workspace_id = uuid4()
+    suffix = workspace_id.hex[:8]
+    async with AsyncSession(pg_engine) as db:
+        db.add(
+            Workspace(
+                id=workspace_id,
+                name="UploadRace",
+                suffix=suffix,
+                quota_bytes=100,
+                created_by=user_id,
+            )
+        )
+        db.add(WorkspaceMember(workspace_id=workspace_id, user_id=user_id))
+        await db.commit()
+
+    body_requested = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_body() -> AsyncIterator[bytes]:
+        yield b"payload"
+        body_requested.set()
+        await release.wait()
+
+    uploading = asyncio.create_task(
+        client.put(
+            f"/api/workspace/files//UploadRace@{suffix}/race.bin",
+            params={"openoctopus_device": "server"},
+            headers={"Content-Type": "application/octet-stream"},
+            content=slow_body(),
+        )
+    )
+    await asyncio.wait_for(body_requested.wait(), timeout=1)
+    async with AsyncSession(pg_engine) as db:
+        if race == "revoke":
+            await db.execute(
+                delete(WorkspaceMember).where(
+                    WorkspaceMember.workspace_id == workspace_id,
+                    WorkspaceMember.user_id == user_id,
+                )
+            )
+        else:
+            workspace = await db.get(Workspace, workspace_id)
+            assert workspace is not None
+            workspace.quota_bytes = 1
+        await db.commit()
+    release.set()
+
+    response = await uploading
+    _assert_standard_error(response, status, code)
+    assert f"workspaces/{workspace_id}/race.bin" not in storage.objects
+
+
+async def test_upload_waiting_for_object_storage_does_not_hold_database_connection(
+    workspace_api,
+) -> None:
+    client, storage, user_id = workspace_api
+    entered = threading.Event()
+    release = threading.Event()
+    original_put = storage.put_object
+
+    def blocking_put(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        entered.set()
+        release.wait(timeout=2)
+        return original_put(*args, **kwargs)
+
+    storage.put_object = blocking_put  # type: ignore[method-assign]
+    uploading = asyncio.create_task(
+        client.put(
+            "/api/workspace/files/slow-storage.bin",
+            params={"openoctopus_device": "server"},
+            headers={"Content-Type": "application/octet-stream"},
+            content=b"data",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    try:
+        assert get_engine().pool.checkedout() == 0
+    finally:
+        release.set()
+
+    response = await uploading
+    assert response.status_code == 200
+    assert storage.data_for(user_id, "slow-storage.bin") == b"data"
+
+
+async def test_transfer_queue_timeout_is_retryable_and_releases_waiter(
+    workspace_api,
+    test_app,
+) -> None:
+    client, storage, user_id = workspace_api
+    admission = KeyedDirectionalAdmission(
+        direction_limits={"upload": 1, "download": 1},
+        per_key_limit=1,
+        timeout_seconds=0.01,
+    )
+    test_app.dependency_overrides[get_rest_transfer_admission] = lambda: admission
+    held = await admission.acquire(user_id, "upload")
+    try:
+        response = await client.put(
+            "/api/workspace/files/queued.bin",
+            params={"openoctopus_device": "server"},
+            headers={"Content-Type": "application/octet-stream"},
+            content=b"queued",
+        )
+    finally:
+        await held.aclose()
+
+    _assert_standard_error(response, 429, "workspace_transfer_busy")
+    assert response.headers["retry-after"] == "5"
+    assert storage.data_for(user_id, "queued.bin") is None
+    assert admission.entry_count == 0
+
+
+async def test_download_queue_uses_shared_user_limit_and_retry_header(
+    workspace_api,
+    test_app,
+) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "queued-download.bin", b"data")
+    admission = KeyedDirectionalAdmission(
+        direction_limits={"upload": 1, "download": 1},
+        per_key_limit=1,
+        timeout_seconds=0.01,
+    )
+    test_app.dependency_overrides[get_rest_transfer_admission] = lambda: admission
+    held = await admission.acquire(user_id, "upload")
+    try:
+        response = await client.get(
+            "/api/workspace/files/queued-download.bin",
+            params={"openoctopus_device": "server"},
+        )
+    finally:
+        await held.aclose()
+
+    _assert_standard_error(response, 429, "workspace_transfer_busy")
+    assert response.headers["retry-after"] == "5"
+    assert admission.entry_count == 0
+
+
+async def test_completed_download_releases_transfer_admission(
+    workspace_api,
+    test_app,
+) -> None:
+    client, storage, user_id = workspace_api
+    storage.seed(user_id, "complete-download.bin", b"data")
+    admission = KeyedDirectionalAdmission(
+        direction_limits={"upload": 1, "download": 1},
+        per_key_limit=1,
+        timeout_seconds=0.1,
+    )
+    test_app.dependency_overrides[get_rest_transfer_admission] = lambda: admission
+
+    response = await client.get(
+        "/api/workspace/files/complete-download.bin",
+        params={"openoctopus_device": "server"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"data"
+    assert admission.entry_count == 0
+
+
+async def test_upload_idle_timeout_returns_408_without_writing(
+    workspace_api,
+    test_app,
+) -> None:
+    client, storage, user_id = workspace_api
+    admission = KeyedDirectionalAdmission(
+        direction_limits={"upload": 1, "download": 1},
+        per_key_limit=1,
+        timeout_seconds=0.1,
+    )
+    settings = get_settings().model_copy(update={"rest_transfer_idle_timeout_seconds": 0.01})
+    test_app.dependency_overrides[get_rest_transfer_admission] = lambda: admission
+    test_app.dependency_overrides[get_settings] = lambda: settings
+
+    async def stalled_body() -> AsyncIterator[bytes]:
+        yield b"partial"
+        await asyncio.Event().wait()
+
+    response = await client.put(
+        "/api/workspace/files/stalled.bin",
+        params={"openoctopus_device": "server"},
+        headers={"Content-Type": "application/octet-stream"},
+        content=stalled_body(),
+    )
+
+    _assert_standard_error(response, 408, "workspace_transfer_timeout")
+    assert storage.data_for(user_id, "stalled.bin") is None
+    assert admission.entry_count == 0
 
 
 async def test_put_file_returns_uniform_json_mutation_shape(workspace_api) -> None:

@@ -27,6 +27,9 @@
   "TOOL_CELL_INDEX_OUT_OF_RANGE": "tool_cell_index_out_of_range",
   "TOOL_CHANNEL_NOT_CONFIGURED": "tool_channel_not_configured",
   "TOOL_COMMAND_DENIED": "tool_command_denied",
+  "TOOL_CONTENT_CONVERSION_BUSY": "tool_content_conversion_busy",
+  "TOOL_CONTENT_CONVERSION_FAILED": "tool_content_conversion_failed",
+  "TOOL_CONTENT_CONVERSION_RESOURCE_EXCEEDED": "tool_content_conversion_resource_exceeded",
   "TOOL_CRON_JOB_NOT_FOUND": "tool_cron_job_not_found",
   "TOOL_CWD_OUTSIDE_WORKSPACE": "tool_cwd_outside_workspace",
   "TOOL_DB_ERROR": "tool_db_error",
@@ -63,5 +66,7 @@
   "WORKSPACE_STORAGE_ERROR": "workspace_storage_error",
   "WORKSPACE_STORAGE_UNAVAILABLE": "workspace_storage_unavailable",
   "WORKSPACE_SYMLINK_ESCAPE": "workspace_symlink_escape",
+  "WORKSPACE_TRANSFER_BUSY": "workspace_transfer_busy",
+  "WORKSPACE_TRANSFER_TIMEOUT": "workspace_transfer_timeout",
   "WORKSPACE_UPLOAD_TOO_LARGE": "workspace_upload_too_large"
 }
