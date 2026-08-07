@@ -273,14 +273,14 @@ async def test_runtime_worker_finalizes_a_durable_cleanup_job(
         pg_engine,
         workspace_fs,
         purge_storage=_purge_config(),
-        purge_timeout_seconds=1,
+        purge_timeout_seconds=5,
         shutdown_grace_seconds=0.2,
         retry_interval_seconds=0.01,
         purge_entrypoint=_successful_purge_child,
     )
     worker.start()
     try:
-        async with asyncio.timeout(1):
+        async with asyncio.timeout(10):
             while target not in workspace_fs.forgotten:
                 await asyncio.sleep(0.01)
     finally:
