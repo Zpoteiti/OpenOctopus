@@ -1,19 +1,54 @@
+import math
 from collections.abc import Iterable
 from copy import deepcopy
+from dataclasses import replace
+from functools import lru_cache
 from typing import Any
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from openctopus_server.admission import KeyedAdmission
+from openctopus_server.config import get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError
-from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
 from openctopus_server.tools.device_field import (
     DEVICE_FIELD_MARKER,
     DEVICE_FIELD_NAME,
     openoctopus_device_field,
 )
+from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.result import normalize_tool_result
-from openctopus_server.tools.web_fetch import Resolver, WebFetchTool
+from openctopus_server.tools.web_fetch import HtmlContentConverter, Resolver, WebFetchTool
+from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
+from openctopus_server.tools.workspace_files import build_workspace_file_tools
+from openctopus_server.workspace.file_content import DocumentParser
+from openctopus_server.workspace.service import WorkspaceService
+
+
+@lru_cache
+def get_content_converter() -> DocumentParser:
+    settings = get_settings()
+    return DocumentParser(
+        admission=KeyedAdmission(
+            global_limit=settings.content_conversion_max_concurrency,
+            per_key_limit=1,
+            timeout_seconds=settings.content_conversion_queue_timeout_seconds,
+        ),
+        memory_mb=settings.content_conversion_memory_mb,
+        timeout_seconds=settings.content_conversion_timeout_seconds,
+    )
+
+
+@lru_cache
+def get_web_fetch_admission() -> KeyedAdmission:
+    settings = get_settings()
+    return KeyedAdmission(
+        global_limit=settings.web_fetch_max_concurrency,
+        per_key_limit=settings.web_fetch_max_concurrency_per_user,
+        timeout_seconds=settings.web_fetch_queue_timeout_seconds,
+    )
 
 
 def inject_device_routing(
@@ -68,9 +103,16 @@ class ToolRegistry:
             self._tools[name] = tool
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [
-            inject_device_routing(tool.schema(), sites=("server",)) for tool in self._tools.values()
-        ]
+        schemas: list[dict[str, Any]] = []
+        for tool in self._tools.values():
+            if tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
+                schema = inject_device_routing(tool.schema(), sites=("server",))
+            elif tool.routing_mode is ToolRoutingMode.INTRINSIC_DEVICE:
+                schema = extend_openoctopus_device_enums(tool.schema(), extra=())
+            else:
+                schema = deepcopy(tool.schema())
+            schemas.append(schema)
+        return schemas
 
     async def execute(
         self,
@@ -87,20 +129,23 @@ class ToolRegistry:
             )
 
         routed_args = dict(args)
-        device = routed_args.pop(DEVICE_FIELD_NAME, None)
-        if device is None:
-            return _normalized_error(
-                ErrorCode.TOOL_MISSING_REQUIRED_FIELD,
-                f"Missing required field: {DEVICE_FIELD_NAME}",
-            )
-        if device != "server":
-            return _normalized_error(
-                ErrorCode.TOOL_DEVICE_UNREACHABLE,
-                f"Tool install site is unavailable: {device}",
-            )
+        routed_ctx = ctx
+        if tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
+            device = routed_args.pop(DEVICE_FIELD_NAME, None)
+            if device is None:
+                return _normalized_error(
+                    ErrorCode.TOOL_MISSING_REQUIRED_FIELD,
+                    f"Missing required field: {DEVICE_FIELD_NAME}",
+                )
+            if device != "server":
+                return _normalized_error(
+                    ErrorCode.TOOL_DEVICE_UNREACHABLE,
+                    f"Tool install site is unavailable: {device}",
+                )
+            routed_ctx = replace(ctx, openoctopus_device=device)
 
         try:
-            result = await tool.execute(routed_args, ctx)
+            result = await tool.execute(routed_args, routed_ctx)
         except OpenOctopusError as exc:
             result = ToolResult(
                 content=_error_text(exc.code, exc.message),
@@ -121,6 +166,7 @@ class ToolRegistry:
             ),
             is_error=result.is_error,
             code=result.code,
+            side_effect=result.side_effect if not result.is_error else None,
         )
 
 
@@ -128,8 +174,58 @@ def build_py3_registry(
     *,
     resolver: Resolver | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    web_admission: KeyedAdmission | None = None,
+    content_converter: HtmlContentConverter | None = None,
 ) -> ToolRegistry:
-    return ToolRegistry((WebFetchTool(resolver=resolver, transport=transport),))
+    return ToolRegistry(
+        (
+            WebFetchTool(
+                web_admission=web_admission or get_web_fetch_admission(),
+                content_converter=content_converter or get_content_converter(),
+                resolver=resolver,
+                transport=transport,
+            ),
+        )
+    )
+
+
+def build_py4_registry(
+    engine: AsyncEngine,
+    workspace_service: WorkspaceService,
+    *,
+    resolver: Resolver | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    web_admission: KeyedAdmission | None = None,
+    content_converter: DocumentParser | None = None,
+) -> ToolRegistry:
+    settings = get_settings()
+    converter = content_converter or get_content_converter()
+    backend = WorkspaceToolDispatcher(
+        engine,
+        workspace_service,
+        document_parser=converter,
+    )
+    return ToolRegistry(
+        (
+            WebFetchTool(
+                web_admission=web_admission or get_web_fetch_admission(),
+                content_converter=converter,
+                resolver=resolver,
+                transport=transport,
+            ),
+            MessageTool(engine, workspace_service),
+            *build_workspace_file_tools(
+                backend,
+                document_read_timeout_seconds=math.ceil(
+                    5
+                    + settings.content_conversion_queue_timeout_seconds
+                    + 30
+                    + settings.content_conversion_timeout_seconds
+                    + 5
+                ),
+            ),
+        )
+    )
 
 
 def _normalized_error(code: ErrorCode, message: str) -> ToolResult:

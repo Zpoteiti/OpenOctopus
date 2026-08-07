@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
+from typing import Any, Literal
 from uuid import UUID
 
 from openctopus_server.errors.codes import ErrorCode
@@ -10,20 +11,48 @@ type ToolResultContentBlock = dict[str, Any]
 type RawToolResultContent = str | list[ToolResultContentBlock]
 
 
+class ToolRoutingMode(StrEnum):
+    ROUTING_ONLY = "routing_only"
+    INTRINSIC_DEVICE = "intrinsic_device"
+    PURE_SERVER = "pure_server"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceFileDeliveryRef:
+    path: str
+    workspace_id: UUID
+    workspace_relative_path: str
+    filename: str
+    mime: str
+    size: int
+    type: Literal["workspace_file"] = "workspace_file"
+    openoctopus_device: Literal["server"] = "server"
+    online_only: Literal[False] = False
+
+
+@dataclass(frozen=True, slots=True)
+class MessageDeliveryEffect:
+    delivery_refs: tuple[WorkspaceFileDeliveryRef, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     content: RawToolResultContent
     is_error: bool = False
     code: ErrorCode | None = None
+    side_effect: MessageDeliveryEffect | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     user_id: UUID
     session_id: UUID
+    openoctopus_device: str | None = None
 
 
 class Tool(ABC):
+    routing_mode = ToolRoutingMode.ROUTING_ONLY
+
     @abstractmethod
     def name(self) -> str:
         """Return the provider-visible tool name."""

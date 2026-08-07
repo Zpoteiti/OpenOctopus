@@ -9,16 +9,20 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import openctopus_server.chat.runner as chat_runner
+from openctopus_server.admission import KeyedAdmission
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Session, SystemConfig, TurnRun, User
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.anthropic import (
     DeltaCallback,
+    ProviderInvocationError,
     ProviderResult,
     provider_fingerprint,
 )
@@ -27,8 +31,10 @@ from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
-from openctopus_server.tools.registry import ToolRegistry, build_py3_registry
+from openctopus_server.tools.registry import ToolRegistry, build_py3_registry, build_py4_registry
 from openctopus_server.tools.result import UNTRUSTED_TOOL_RESULT_WARNING
+from openctopus_server.workspace.fs import DirectoryEntry, DirectoryPage, FileMetadata
+from openctopus_server.workspace.skills import SkillsCache
 
 
 @dataclass(slots=True)
@@ -36,6 +42,7 @@ class _ProviderStep:
     content: list[dict[str, Any]]
     started: asyncio.Event | None = None
     release: asyncio.Event | None = None
+    error: ProviderInvocationError | None = None
 
 
 class _ScriptedProvider:
@@ -68,22 +75,21 @@ class _ScriptedProvider:
             step.started.set()
         if step.release is not None:
             await step.release.wait()
+        if step.error is not None:
+            raise step.error
         return ProviderResult(
             content=deepcopy(step.content),
             fingerprint=provider_fingerprint(config),
         )
 
-    async def count_tokens(
+    async def estimate_tokens(
         self,
         *,
-        config: ProviderConfig,
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        effort: Effort | None,
-        limiter: ProviderLimiter,
     ) -> int:
-        del config, system, messages, tools, effort, limiter
+        del system, messages, tools
         return 1
 
     async def close(self) -> None:
@@ -143,15 +149,93 @@ class _ScriptedTool(Tool):
             self.active -= 1
 
 
+class _CountingPromptWorkspace:
+    def __init__(self) -> None:
+        self.read_paths: list[str] = []
+        self.list_calls = 0
+
+    async def read_personal_for_prompt(self, *, user_id, path, offset=0, length=0) -> bytes:
+        del user_id, offset, length
+        self.read_paths.append(path)
+        raise WorkspaceError(ErrorCode.WORKSPACE_NOT_FOUND, "missing")
+
+    async def list_personal_for_prompt(
+        self,
+        *,
+        user_id,
+        path,
+        limit,
+        offset=0,
+        include_noise_directories=False,
+        scan_limit=10_000,
+    ) -> DirectoryPage:
+        del user_id, path, limit, offset, include_noise_directories, scan_limit
+        self.list_calls += 1
+        raise WorkspaceError(ErrorCode.WORKSPACE_NOT_FOUND, "missing")
+
+
+class _Py4Workspace(_CountingPromptWorkspace):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[tuple[UUID, str, bytes]] = []
+
+    async def write(self, db, *, user_id, path, data) -> FileMetadata:
+        del db
+        self.writes.append((user_id, path, data))
+        return FileMetadata(size=len(data), etag="written", created=True)
+
+
+class _SkillPromptWorkspace(_CountingPromptWorkspace):
+    def __init__(self, files: dict[str, bytes]) -> None:
+        super().__init__()
+        self.files = files
+
+    async def read_personal_for_prompt(self, *, user_id, path, offset=0, length=0) -> bytes:
+        del user_id, offset
+        self.read_paths.append(path)
+        if path not in self.files:
+            raise WorkspaceError(ErrorCode.WORKSPACE_NOT_FOUND, "missing")
+        data = self.files[path]
+        return data[:length] if length else data
+
+    async def list_personal_for_prompt(
+        self,
+        *,
+        user_id,
+        path,
+        limit,
+        offset=0,
+        include_noise_directories=False,
+        scan_limit=10_000,
+    ) -> DirectoryPage:
+        del user_id, include_noise_directories, scan_limit
+        assert path == "skills"
+        names = sorted({file_path.split("/")[1] for file_path in self.files})
+        entries = tuple(
+            DirectoryEntry(path=f"skills/{name}", is_directory=True, size=None)
+            for name in names[offset : offset + limit]
+        )
+        return DirectoryPage(items=entries, next_offset=None, truncated=False)
+
+
 @pytest_asyncio.fixture
 async def install_runtime(test_app, pg_engine):
     runtimes: list[ChatRuntime] = []
 
-    def install(provider: _ScriptedProvider, tool: _ScriptedTool) -> ChatRuntime:
+    def install(
+        provider: _ScriptedProvider,
+        tool: _ScriptedTool,
+        workspace_service=None,
+    ) -> ChatRuntime:
+        async def estimate_tokens(**kwargs: Any) -> int:
+            return await provider.estimate_tokens(**kwargs)
+
         runtime = ChatRuntime(
             pg_engine,
             provider_factory=lambda config: provider,
             tool_registry=ToolRegistry((tool,)),
+            workspace_service=workspace_service,
+            request_token_estimator=estimate_tokens,
         )
         test_app.state.chat_runtime = runtime
         runtimes.append(runtime)
@@ -284,6 +368,23 @@ async def test_two_turn_react_uses_distinct_turn_ids_on_one_stream(
     assert [run.status for run in runs] == ["completed", "completed"]
 
 
+async def test_normal_agent_turn_builds_workspace_prompt_once(
+    user_client,
+    pg_engine,
+    install_runtime,
+) -> None:
+    await _configure_provider(pg_engine)
+    provider = _ScriptedProvider([_ProviderStep(content=[{"type": "text", "text": "done"}])])
+    workspace = _CountingPromptWorkspace()
+    install_runtime(provider, _ScriptedTool([]), workspace)
+
+    response = await _post(user_client, uuid4(), "start")
+
+    assert response.status_code == 200
+    assert workspace.read_paths == ["SOUL.md", "MEMORY.md"]
+    assert workspace.list_calls == 1
+
+
 async def test_web_fetch_runs_end_to_end_through_the_agent_loop(
     user_client,
     test_app,
@@ -347,6 +448,67 @@ async def test_web_fetch_runs_end_to_end_through_the_agent_loop(
             "tool_result",
             "assistant",
         ]
+    finally:
+        await runtime.close()
+
+
+async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "write-1",
+                        "name": "write_file",
+                        "input": {
+                            "path": "notes/a.txt",
+                            "content": "hello",
+                            DEVICE_FIELD_NAME: "server",
+                        },
+                    }
+                ]
+            ),
+            _ProviderStep(content=[{"type": "text", "text": "Saved."}]),
+        ]
+    )
+    workspace = _Py4Workspace()
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=build_py4_registry(pg_engine, workspace),  # type: ignore[arg-type]
+        workspace_service=workspace,  # type: ignore[arg-type]
+    )
+    test_app.state.chat_runtime = runtime
+    try:
+        response = await _post(user_client, uuid4(), "save a note")
+
+        assert response.status_code == 200
+        assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
+            "web_fetch",
+            "message",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "delete_file",
+            "delete_folder",
+            "list_dir",
+            "find_files",
+            "grep",
+            "notebook_edit",
+        ]
+        assert workspace.writes and workspace.writes[0][1:] == ("notes/a.txt", b"hello")
+        provider_result = provider.calls[1]["messages"][-1]["content"][0]
+        assert provider_result["tool_use_id"] == "write-1"
+        assert "Wrote notes/a.txt (5 bytes)." in str(provider_result["content"])
+        assert workspace.read_paths == ["SOUL.md", "MEMORY.md"] * 2
+        assert workspace.list_calls == 1
     finally:
         await runtime.close()
 
@@ -636,7 +798,7 @@ async def test_pending_promoted_during_preflight_claims_newest_stream(
             await release_second_count.wait()
         return 1
 
-    monkeypatch.setattr(provider, "count_tokens", blocking_count_tokens)
+    monkeypatch.setattr(provider, "estimate_tokens", blocking_count_tokens)
     runtime = install_runtime(provider, _ScriptedTool([]))
     original_register = runtime.register
 
@@ -713,7 +875,7 @@ async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
             return 99_000
         return 1
 
-    monkeypatch.setattr(provider, "count_tokens", count_tokens)
+    monkeypatch.setattr(provider, "estimate_tokens", count_tokens)
     first_task = asyncio.create_task(_post(user_client, session_id, "first"))
     await asyncio.wait_for(count_started.wait(), timeout=2)
     second_task = asyncio.create_task(_post(user_client, session_id, "second"))
@@ -749,7 +911,7 @@ async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
     assert len(provider.calls) == 4
 
 
-async def test_compaction_without_eligible_source_fails_before_normal_call(
+async def test_oversized_request_without_eligible_history_is_sent_once_to_provider(
     user_client,
     pg_engine,
     install_runtime,
@@ -757,13 +919,15 @@ async def test_compaction_without_eligible_source_fails_before_normal_call(
 ):
     await _configure_provider(pg_engine)
     await _enable_compaction(pg_engine)
-    provider = _ScriptedProvider([])
+    provider = _ScriptedProvider(
+        [_ProviderStep(content=[{"type": "text", "text": "provider accepted"}])]
+    )
 
     async def count_tokens(**kwargs: Any) -> int:
         del kwargs
         return 99_000
 
-    monkeypatch.setattr(provider, "count_tokens", count_tokens)
+    monkeypatch.setattr(provider, "estimate_tokens", count_tokens)
     install_runtime(provider, _ScriptedTool([]))
     session_id = uuid4()
 
@@ -771,15 +935,331 @@ async def test_compaction_without_eligible_source_fails_before_normal_call(
 
     assert response.status_code == 200
     assert [event["status"] for event in _events(response) if event["type"] == "turn_finished"] == [
-        "failed"
+        "completed"
     ]
-    assert provider.calls == []
+    assert len(provider.calls) == 1
     history = await _history(user_client, session_id)
     assert [message["message_kind"] for message in history["messages"]] == [
         "human",
-        "synthetic_assistant_error",
+        "assistant",
     ]
-    assert history["status"] == "failed"
+    assert history["status"] == "idle"
+
+
+async def test_two_hundred_always_on_skills_reach_provider_and_safe_rejection_reaches_user(
+    user_client,
+    pg_engine,
+    install_runtime,
+    monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    await _enable_compaction(pg_engine)
+    files = {
+        f"skills/skill-{index:03}/SKILL.md": (
+            "---\n"
+            f"name: skill-{index:03}\n"
+            f"description: Skill {index}\n"
+            "always_on: true\n"
+            "---\n"
+            f"complete body {index}"
+        ).encode()
+        for index in range(200)
+    }
+    workspace = _SkillPromptWorkspace(files)
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[],
+                error=ProviderInvocationError(
+                    "Provider request failed",
+                    safe_message="Provider rejected the request (HTTP 400): context window exceeded",
+                ),
+            )
+        ]
+    )
+    estimates = 0
+
+    async def estimate_tokens(**kwargs: Any) -> int:
+        nonlocal estimates
+        estimates += 1
+        assert kwargs["system"].count("(always-on)") == 200
+        assert all(f"complete body {index}" in kwargs["system"] for index in range(200))
+        return 99_000
+
+    monkeypatch.setattr(provider, "estimate_tokens", estimate_tokens)
+    monkeypatch.setattr(
+        "openctopus_server.workspace.skills.count_text_tokens",
+        lambda text: len(text),
+    )
+    runtime = install_runtime(provider, _ScriptedTool([]), workspace)
+    runtime.skills_cache = SkillsCache()
+
+    response = await _post(user_client, uuid4(), "too large because of skills")
+
+    assert response.status_code == 200
+    assert [event["status"] for event in _events(response) if event["type"] == "turn_finished"] == [
+        "failed"
+    ]
+    assert estimates == 1
+    assert len(provider.calls) == 1
+    persisted = next(event for event in _events(response) if event["type"] == "message_persisted")
+    text = persisted["message"]["content"][0]["text"]
+    assert text.startswith("[provider_unavailable]")
+    assert "context window exceeded" in text
+
+
+async def test_context_admission_is_held_through_provider_and_times_out_cleanly(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[{"type": "text", "text": "first completed"}],
+                started=started,
+                release=release,
+            )
+        ]
+    )
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=0.5)
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ScriptedTool([]),)),
+        context_admission=admission,
+    )
+    test_app.state.chat_runtime = runtime
+
+    first_task = asyncio.create_task(_post(user_client, uuid4(), "first"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    assert pg_engine.pool.checkedout() == 0
+    second_task = asyncio.create_task(_post(user_client, uuid4(), "second"))
+    await asyncio.sleep(0.1)
+    assert pg_engine.pool.checkedout() == 0
+    second = await second_task
+    release.set()
+    first = await asyncio.wait_for(first_task, timeout=2)
+
+    assert [event["status"] for event in _events(first) if event["type"] == "turn_finished"] == [
+        "completed"
+    ]
+    assert [event["status"] for event in _events(second) if event["type"] == "turn_finished"] == [
+        "failed"
+    ]
+    persisted = next(event for event in _events(second) if event["type"] == "message_persisted")
+    assert persisted["message"]["content"][0]["text"] == (
+        "[provider_unavailable] The server is busy preparing other conversations. Please retry."
+    )
+    assert len(provider.calls) == 1
+    assert admission.entry_count == 0
+    await runtime.close()
+
+
+@pytest.mark.parametrize("failure_phase", ["preflight", "provider"])
+async def test_context_admission_is_held_while_failure_is_persisted(
+    user_client,
+    test_app,
+    pg_engine,
+    monkeypatch,
+    failure_phase,
+):
+    await _configure_provider(pg_engine)
+    second_provider_started = asyncio.Event()
+    failure_persistence_started = asyncio.Event()
+    release_failure_persistence = asyncio.Event()
+    provider_steps = []
+    if failure_phase == "provider":
+        provider_steps.append(
+            _ProviderStep(
+                content=[],
+                error=ProviderInvocationError("provider failed"),
+            )
+        )
+    provider_steps.append(
+        _ProviderStep(
+            content=[{"type": "text", "text": "second completed"}],
+            started=second_provider_started,
+        )
+    )
+    provider = _ScriptedProvider(provider_steps)
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=2)
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ScriptedTool([]),)),
+        context_admission=admission,
+    )
+    test_app.state.chat_runtime = runtime
+    if failure_phase == "preflight":
+        original_prepare_turn = runtime._prepare_turn
+        prepare_calls = 0
+
+        async def fail_first_preflight(pending_turn):
+            nonlocal prepare_calls
+            prepare_calls += 1
+            if prepare_calls == 1:
+                raise RuntimeError("preflight failed")
+            return await original_prepare_turn(pending_turn)
+
+        original_fail_preflight = runtime._fail_preflight
+
+        async def block_preflight_persistence(state, failed_turn, exc):
+            failure_persistence_started.set()
+            await release_failure_persistence.wait()
+            await original_fail_preflight(state, failed_turn, exc)
+
+        monkeypatch.setattr(runtime, "_prepare_turn", fail_first_preflight)
+        monkeypatch.setattr(runtime, "_fail_preflight", block_preflight_persistence)
+    else:
+        original_fail_provider = runtime._fail_provider
+
+        async def block_provider_failure_persistence(state, failed_turn, *, error=None):
+            failure_persistence_started.set()
+            await release_failure_persistence.wait()
+            await original_fail_provider(state, failed_turn, error=error)
+
+        monkeypatch.setattr(runtime, "_fail_provider", block_provider_failure_persistence)
+
+    first_task = asyncio.create_task(_post(user_client, uuid4(), "first"))
+    await asyncio.wait_for(failure_persistence_started.wait(), timeout=2)
+    second_task = asyncio.create_task(_post(user_client, uuid4(), "second"))
+    try:
+        await asyncio.sleep(0.1)
+        assert not second_provider_started.is_set()
+    finally:
+        release_failure_persistence.set()
+
+    first, second = await asyncio.gather(first_task, second_task)
+    assert [event["status"] for event in _events(first) if event["type"] == "turn_finished"] == [
+        "failed"
+    ]
+    assert [event["status"] for event in _events(second) if event["type"] == "turn_finished"] == [
+        "completed"
+    ]
+    assert admission.entry_count == 0
+    await runtime.close()
+
+
+async def test_context_admission_is_held_during_failure_recovery(
+    user_client,
+    test_app,
+    pg_engine,
+    monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    second_provider_started = asyncio.Event()
+    recovery_started = asyncio.Event()
+    release_recovery = asyncio.Event()
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(content=[], error=ProviderInvocationError("provider failed")),
+            _ProviderStep(
+                content=[{"type": "text", "text": "second completed"}],
+                started=second_provider_started,
+            ),
+        ]
+    )
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=2)
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ScriptedTool([]),)),
+        context_admission=admission,
+    )
+    test_app.state.chat_runtime = runtime
+    original_fail_provider = runtime._fail_provider
+    fail_provider_calls = 0
+
+    async def fail_first_persistence(state, failed_turn, *, error=None):
+        nonlocal fail_provider_calls
+        fail_provider_calls += 1
+        if fail_provider_calls == 1:
+            raise RuntimeError("failure persistence failed")
+        await original_fail_provider(state, failed_turn, error=error)
+
+    original_recovery = runtime._fail_unexpected_chain
+
+    async def block_recovery(state):
+        recovery_started.set()
+        await release_recovery.wait()
+        await original_recovery(state)
+
+    monkeypatch.setattr(runtime, "_fail_provider", fail_first_persistence)
+    monkeypatch.setattr(runtime, "_fail_unexpected_chain", block_recovery)
+
+    first_task = asyncio.create_task(_post(user_client, uuid4(), "first"))
+    await asyncio.wait_for(recovery_started.wait(), timeout=2)
+    second_task = asyncio.create_task(_post(user_client, uuid4(), "second"))
+    try:
+        await asyncio.sleep(0.1)
+        assert not second_provider_started.is_set()
+    finally:
+        release_recovery.set()
+
+    first, second = await asyncio.gather(first_task, second_task)
+    assert [event["status"] for event in _events(first) if event["type"] == "turn_finished"] == [
+        "failed"
+    ]
+    assert [event["status"] for event in _events(second) if event["type"] == "turn_finished"] == [
+        "completed"
+    ]
+    assert admission.entry_count == 0
+    await runtime.close()
+
+
+async def test_context_admission_is_released_before_tool_execution(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(content=[_tool_use("tool-1", "one")]),
+            _ProviderStep(content=[{"type": "text", "text": "second completed"}]),
+            _ProviderStep(content=[{"type": "text", "text": "first completed"}]),
+        ]
+    )
+    tool = _ScriptedTool(
+        [
+            _ToolStep(
+                result=ToolResult(content="result"),
+                started=tool_started,
+                release=release_tool,
+            )
+        ]
+    )
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=2)
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((tool,)),
+        context_admission=admission,
+    )
+    test_app.state.chat_runtime = runtime
+
+    first_task = asyncio.create_task(_post(user_client, uuid4(), "first"))
+    await asyncio.wait_for(tool_started.wait(), timeout=2)
+    second = await asyncio.wait_for(_post(user_client, uuid4(), "second"), timeout=2)
+    release_tool.set()
+    first = await asyncio.wait_for(first_task, timeout=2)
+
+    assert [event["status"] for event in _events(second) if event["type"] == "turn_finished"] == [
+        "completed"
+    ]
+    assert [event["status"] for event in _events(first) if event["type"] == "turn_finished"] == [
+        "completed",
+        "completed",
+    ]
+    assert len(provider.calls) == 3
+    assert admission.entry_count == 0
+    await runtime.close()
 
 
 async def test_stage_two_stale_pending_recaptures_as_stage_one_boundary(
@@ -810,7 +1290,7 @@ async def test_stage_two_stale_pending_recaptures_as_stage_one_boundary(
         del kwargs
         return counts.popleft()
 
-    monkeypatch.setattr(provider, "count_tokens", count_tokens)
+    monkeypatch.setattr(provider, "estimate_tokens", count_tokens)
     install_runtime(
         provider,
         _ScriptedTool([_ToolStep(result=ToolResult(content="result"))]),

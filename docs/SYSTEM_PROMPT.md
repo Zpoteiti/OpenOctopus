@@ -308,8 +308,21 @@ the public DTO layer does not own a second grammar.
 ### Skills
 - Only loaded from personal workspace `/<user_id>/skills/`.
 - Shared workspaces have no skills folder by design — avoids 100+ shared-workspace agents carrying every department's SOPs in-prompt.
-- Always-on skills: full SKILL.md body inlined.
-- Conditional skills: one-line `name: description` with a pointer to the `read_file` call that loads the full body.
+- Discovery scans at most 1,000 ordered workspace listing records and examines
+  the first 200 direct `skills/<name>/` candidates. Missing manifests consume a
+  candidate position; malformed examined manifests fail the snapshot rather
+  than being silently skipped.
+- Always-on skills: the complete valid `SKILL.md` body is inlined. There is no
+  aggregate truncation or downgrade to conditional. Each always-on manifest is
+  independently limited to 64 KiB UTF-8 and 16,000 estimated `o200k_base`
+  tokens at write time and defensively at load time. A combined prompt that is
+  too large is sent once and the Provider remains authoritative.
+- Conditional skills: only bounded YAML frontmatter is loaded into the snapshot;
+  the prompt renders one `name: description` line with the `read_file` path that
+  loads the full body on demand. Bodies are not downloaded, decoded, tokenized,
+  or cached during prompt construction.
+- Concurrent cache misses for one user share a single immutable snapshot load;
+  cache invalidation during that load prevents stale repopulation.
 - The `create_skill` skill is auto-installed at user registration so every agent knows how to install additional skills by file-transferring into `/<user_id>/skills/<name>/`.
 
 ### Workspaces

@@ -1,6 +1,7 @@
 """Shared pytest fixtures and configuration."""
 
 import uuid
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -8,10 +9,15 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from openctopus_server.api.workspace_files import get_rest_transfer_admission
+from openctopus_server.chat.runner import get_context_admission
 from openctopus_server.config import get_settings
 from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
 from openctopus_server.main import create_app
+from openctopus_server.tools.registry import get_content_converter, get_web_fetch_admission
+from openctopus_server.workspace.fs import _workspace_fs_for_storage
+from openctopus_server.workspace.storage import ObjectStorage, get_object_storage
 
 
 @pytest.fixture(autouse=True)
@@ -19,7 +25,19 @@ def _clear_settings_and_engine_cache():
     """Ensure singleton caches are cleared around every test."""
     get_settings.cache_clear()
     get_engine.cache_clear()
+    get_object_storage.cache_clear()
+    get_rest_transfer_admission.cache_clear()
+    get_context_admission.cache_clear()
+    get_content_converter.cache_clear()
+    get_web_fetch_admission.cache_clear()
+    _workspace_fs_for_storage.cache_clear()
     yield
+    _workspace_fs_for_storage.cache_clear()
+    get_object_storage.cache_clear()
+    get_rest_transfer_admission.cache_clear()
+    get_context_admission.cache_clear()
+    get_content_converter.cache_clear()
+    get_web_fetch_admission.cache_clear()
     get_engine.cache_clear()
     get_settings.cache_clear()
 
@@ -85,7 +103,13 @@ async def test_app(pg_engine, monkeypatch):
     get_settings.cache_clear()
     get_engine.cache_clear()
 
-    return create_app()
+    app = create_app()
+    client = Mock()
+    client.list_objects.return_value = []
+    object_storage = ObjectStorage(client, "test", max_connections=1)
+    object_storage.check_health = AsyncMock()  # type: ignore[method-assign]
+    app.dependency_overrides[get_object_storage] = lambda: object_storage
+    return app
 
 
 @pytest_asyncio.fixture

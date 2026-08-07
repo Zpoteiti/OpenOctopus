@@ -242,6 +242,7 @@ class Workspace(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    suffix: Mapped[str] = mapped_column(Text, nullable=False)
     quota_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
@@ -266,6 +267,23 @@ class WorkspaceMember(Base):
     )
     joined_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WorkspaceDeletion(Base):
+    __tablename__ = "workspace_deletions"
+
+    kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('personal', 'shared')",
+            name="check_workspace_deletion_kind",
+        ),
     )
 
 

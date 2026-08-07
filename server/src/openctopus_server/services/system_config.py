@@ -4,6 +4,10 @@ import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.db.advisory import (
+    lock_personal_quota_write,
+    lock_shared_quota_write,
+)
 from openctopus_server.db.models import SystemConfig
 from openctopus_server.dto.config import AdminConfig, ConfigPatch
 from openctopus_server.errors.codes import ErrorCode
@@ -80,6 +84,14 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
                 "SELECT pg_advisory_xact_lock(hashtextextended('openoctopus:llm_token_limits', 0))"
             )
         )
+        existing = await _get_all_rows(db)
+
+    if "quota_bytes" in data:
+        await lock_personal_quota_write(db)
+        existing = await _get_all_rows(db)
+
+    if "shared_workspace_quota_bytes" in data:
+        await lock_shared_quota_write(db)
         existing = await _get_all_rows(db)
 
     max_output_tokens = int(

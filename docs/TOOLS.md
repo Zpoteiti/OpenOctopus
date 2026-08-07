@@ -25,10 +25,10 @@ This is a *design* document. Use it during implementation as the source of truth
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
-- **Path policy** (ADR-043, ADR-108, ADR-123): relative paths are accepted and resolve to the **personal workspace on the target device**. On the server, that is a virtual workspace path mapped by `workspace_fs` to the user's MinIO object prefix; on a client, it is the device's local `workspace_path`. Absolute paths are also accepted. **Shared workspaces always require absolute paths in the `name@suffix` form** (e.g. `/production-department@a4f7e2d1/sprint.md`) — they have no implicit relative base, and strict-mode resolution requires both name and suffix to match the workspace row exactly. Names are validated per ADR-109.
-- **Workspace writes funnel through `workspace_fs`** server-side (ADR-045, ADR-123). It owns object-key resolution, quota check, SKILL.md validation, skills-cache invalidation, temporary staging/materialization, and MinIO error normalization.
-- **Server workspace IO is bounded inside `workspace_fs`** (ADR-122, ADR-123). Tool schemas do not expose MinIO concepts, but the implementation must own object-client pooling, workspace IO backpressure, same-path mutation races, quota races, temp cleanup, and S3/MinIO error normalization before enabling Workspace Files at Py4 scale.
-- **File policy is per target install site.** On Python-main server workspaces, `workspace_fs` is the hard boundary: paths are normalized, checked against the selected personal/shared workspace view, and mapped to MinIO keys only after authorization. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target device config. With `sandbox_mode=true` (default), resolved paths must stay under `workspace_path`; with `sandbox_mode=false`, the trusted device may address paths outside `workspace_path`.
+- **Path policy** (ADR-043, ADR-108, ADR-123): relative paths are accepted and resolve to the **personal workspace on the target device**. On the server, `WorkspaceService` resolves the authenticated virtual path and `WorkspaceFS` maps it to the user's RustFS object prefix; on a client, it is the device's local `workspace_path`. Absolute paths are also accepted. **Shared workspaces always require absolute paths in the `name@suffix` form** (e.g. `/production-department@a4f7e2d1/sprint.md`) — they have no implicit relative base, and strict-mode resolution requires both name and suffix to match the workspace row exactly. Names are validated per ADR-109.
+- **Workspace writes funnel through `WorkspaceService`** server-side (ADR-045, ADR-123). Its internal `WorkspaceFS` owns object-key mapping, quota checks, mutation coordination, and RustFS/MinIO-SDK error normalization.
+- **Server workspace IO is bounded inside the workspace service** (ADR-122, ADR-123). Tool schemas do not expose object-storage concepts; the implementation owns a bounded RustFS client pool, paged metadata scans, workspace mutation locks, and bounded in-memory transforms. REST upload/download admission is separate and never consumes Agent file-tool permits. Document reads additionally use per-user/global conversion admission before downloading bytes and keep parsing inside a resource-limited child process.
+- **File policy is per target install site.** On Python-main server workspaces, `WorkspaceService` is the authorization boundary: paths are normalized and checked against the selected personal/shared workspace before internal mapping to RustFS keys. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target device config. With `sandbox_mode=true` (default), resolved paths must stay under `workspace_path`; with `sandbox_mode=false`, the trusted device may address paths outside `workspace_path`.
 - **Every real tool result is wrapped** (ADR-095): provider-facing `tool_result.content` is normalized to a safe block array. The first block is a server-generated `[untrusted tool result]: ...` warning text block; raw string output becomes the following text block, and raw safe block arrays are appended after the warning. Image bytes are not modified. Uniform across all tools — web_fetch body, exec stdout, read_file output, MCP response, everything. The wrap is the signal; no system-prompt rule.
 
 ---
@@ -96,7 +96,9 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - Server impl: `openoctopus_server/tools/read_file.py`
 - Client impl: `openoctopus_client/tools/read_file.py`
 
-**Purpose:** Read a file (text, image, or document). Line-based pagination for large text files; PDF/DOCX/XLSX/PPTX parsing built-in; images returned as Anthropic `image` blocks.
+**Purpose:** Read a file (text, image, or document). Line-based pagination for
+large text files; isolated MarkItDown conversion for PDF/DOCX/XLSX/PPTX; images
+returned as Anthropic `image` blocks.
 
 **Source schema (matches nanobot):**
 ```json
@@ -122,7 +124,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
       },
       "pages": {
         "type": "string",
-        "description": "Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"
+        "description": "Page number or inclusive range for PDF files, e.g. '1-5' (default: first 20 pages, max 20 pages)"
       },
       "force": {
         "type": "boolean",
@@ -140,17 +142,36 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - **Default text response:** `limit=2000` lines, output prefixed `LINE_NUM| <line>`. Tail includes `(Showing lines X-Y of Z. Use offset=X+1 to continue.)` — self-documenting pagination.
 - **128k char hard cap** applied on top of line-based limit; safety net for pathological line lengths.
 - **Blocked device paths** (nanobot pattern): `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/full`, `/dev/stdin/out/err`, `/dev/tty`, `/proc/<pid>/fd/[012]` — refused to avoid hangs.
-- **PDFs:** text extraction via `pages` arg; max 20 pages per call.
-- **Office docs** (`.docx`/`.xlsx`/`.pptx`): text extraction via built-in parsers.
+- **Documents are isolated:** `.pdf`, `.docx`, `.xlsx`, and `.pptx` bytes are
+  passed to a Linux child with configured address-space, CPU, wall-clock, queue,
+  and output limits. The child directly instantiates only the MarkItDown
+  converter selected by the trusted suffix; it does not initialize the
+  orchestrator, plugins, default discovery, or Magika. It receives bytes, never
+  a URL or local path.
+- **PDF paging:** omitted `pages` reads `1..min(20, total)`; a single page or
+  inclusive range may select at most 20 existing pages. Results start with
+  `[PDF pages N-M of T]` and include the exact next `pages` range when more pages
+  remain. Empty extracted text states that OCR is unavailable.
+- **Office safety:** `.docx`/`.xlsx`/`.pptx` containers are checked for
+  encryption, path traversal, excessive members, declared size, and compression
+  ratio before MarkItDown imports or converts them.
+- **Deferred conversion features:** no VLM, OCR, audio/video, Azure, YouTube,
+  archive recursion, or remote-document fetch is enabled in Py4.
 - **Images** (detected by mime/magic bytes): returned as `text + image` content blocks, not plain text. The image block shape is Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
 - **Detection fallback:** if image magic-byte detection is inconclusive, try the normal text path. If the file is not readable text and not a supported document type, return an error instead of embedding arbitrary binary bytes into text.
-- **Dedup:** if the file's `mtime` + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads.
+- **Dedup:** if the file's revision + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads. Server RustFS files use their opaque ETag as the revision; clients may use `mtime` plus size.
 - Tool results are normalized by the shared helper per ADR-095 before reaching the LLM: the first `tool_result.content` block is the server warning text block, followed by the raw text/image result blocks.
 
-**Timeout:** 30s internal, no agent override (ADR-075).
+**Timeout:** Non-document reads keep the 30s internal timeout. Document reads use
+the deployment-derived authorization + conversion-admission + 30s
+materialization + child-conversion deadline; there is no agent override.
 **Result cap:** 128,000 characters (ADR-076 override).
-**Errors:** `WorkspaceError::NotFound`, `WorkspaceError::PermissionDenied`, `WorkspaceError::SymlinkEscape`, `WorkspaceError::BlockedPath`.
-**Related ADRs:** 038, 041, 043, 071, 072, 076, 095.
+**Errors:** Normal workspace errors plus `tool_content_conversion_busy`,
+`tool_exec_timeout`, `tool_content_conversion_resource_exceeded`, and
+`tool_content_conversion_failed`. Invalid PDF range syntax/bounds use
+`tool_invalid_args`. These remain ordinary tool results so the model can retry
+or explain the failure.
+**Related ADRs:** 038, 041, 043, 071, 072, 076, 095, 130.
 
 ---
 
@@ -187,7 +208,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 
 **Mechanism:**
 - **Implicit `mkdir -p`** on the path's parent (ADR-088). `Path(path).parent.mkdir(parents=True, exist_ok=True)` runs before the write.
-- **Server side:** routes through `workspace_fs::write` which performs (in order): workspace authorization, lock check (`SoftLocked` if current usage is greater than quota), single-op cap (`UploadTooLarge` if `content.size > quota * 0.8`), the actual write, then workspace_fs usage accounting.
+- **Server side:** routes through `WorkspaceService.write`, which authorizes the virtual path before internal `WorkspaceFS` lock, quota, and RustFS write handling.
 - **SKILL.md validation:** if `path` matches `skills/*/SKILL.md` (exactly one level deep, exact filename), run the YAML-frontmatter validator before the write commits. Reject malformed input with `WorkspaceError::InvalidSkillFormat`. Folder name must match frontmatter `name` (ADR-082).
 - **Skills cache invalidation:** any successful write under `skills/` invalidates the user's skills cache entry (ADR-085).
 - **Client side:** subject to the target device's `sandbox_mode`; sandbox mode confines writes to the device's `workspace_path`.
@@ -321,7 +342,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - Source schema stays device-free; merge injects `openoctopus_device` like other shared file tools.
 - Applies edits in the selected install site. `action=replace` requires `old_text` and `new_text`; `action=add` requires `new_text`.
 - `dry_run=true` validates paths and replacement matches, then returns a summary without writing.
-- Server side writes through `workspace_fs`, so quota, SKILL.md validation, skills-cache invalidation, object IO bounds, and path safety still apply.
+- Server side writes through `WorkspaceService`, so authorization, quota, SKILL.md validation, skills-cache invalidation, object IO bounds, and path safety still apply.
 - Client side uses the device's normal workspace resolver and `sandbox_mode`.
 - OpenOctopus path policy still applies after routing. Relative paths resolve to the selected personal workspace. Shared server workspace edits use the same `/name@suffix/...` absolute path form as other file tools.
 
@@ -358,7 +379,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 ```
 
 **Mechanism:**
-- **Server side:** routes through `workspace_fs.delete_file`. It resolves the virtual path to a MinIO object key, reads object metadata for usage accounting, deletes the object, and updates `workspace_fs` usage state. If the path is a folder/prefix, return `ToolError::IsDirectory` (directs to `delete_folder`).
+- **Server side:** routes through `WorkspaceService.delete_file`. It authorizes the virtual path, maps it internally to a RustFS object key, and deletes it under the workspace mutation lock. If the path is a folder/prefix, return `ToolError::IsDirectory` (directs to `delete_folder`).
 - **Symlink handling:** server object storage has no symlink following. Client implementations delete the link itself, never follow.
 - **Skills cache invalidation:** if the deleted path is under `skills/`, invalidate the cache.
 - **Lock interaction:** delete is allowed even when current usage is greater than `quota_bytes` (ADR-078). Once usage drops back under, lock auto-lifts on next non-delete attempt.
@@ -397,7 +418,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 
 **Mechanism:**
 - **Always recursive, no flag** (ADR-086). The tool's only purpose is recursive deletion; a non-recursive variant is `rmdir` and too niche for v1.
-- **Server side:** lists all objects under the resolved folder prefix, sums their bytes for usage accounting, deletes the object prefix through `workspace_fs`, and updates workspace usage state. Lock auto-lifts if this brings usage under quota.
+- **Server side:** `WorkspaceService` authorizes the folder, then internal `WorkspaceFS` deletes its paged RustFS prefix under the workspace mutation lock. Lock auto-lifts if this brings usage under quota.
 - **Client side:** subject to `sandbox_mode` like other writes. In sandbox mode, can only remove inside `workspace_path`.
 - **Rejects** if `path` is a file (suggests `delete_file`) or doesn't exist.
 - **Symlinks inside** the tree are unlinked, never followed outside.
@@ -429,7 +450,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
     "properties": {
       "path": { "type": "string", "description": "The directory path to list" },
       "recursive": { "type": "boolean", "description": "Recursively list all files (default false)" },
-      "max_entries": { "type": "integer", "description": "Maximum entries to return (default 200)", "minimum": 1 }
+      "max_entries": { "type": "integer", "description": "Maximum entries to return (default 200, max 1000)", "minimum": 1, "maximum": 1000 }
     },
     "required": ["path"]
   }
@@ -441,7 +462,9 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 - **Auto-ignored noise dirs** (mirror of nanobot's list): `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.coverage`, `htmlcov`.
 - **Non-recursive output:** entries with a `📁 ` / `📄 ` prefix per entry (visual, LLM-friendly).
 - **Recursive output:** flat list of relative paths, with trailing `/` for directories.
-- **`max_entries` cap:** if exceeded, output truncated with `(truncated, showing first X of Y entries)` note.
+- **`max_entries` cap:** if a one-entry look-ahead proves more results exist,
+  output is truncated with `(truncated, showing first X entries)`; the server
+  does not scan the remaining RustFS prefix only to calculate a total.
 - **Reject** if path doesn't exist or is a file (`ToolError::NotADirectory`).
 
 **Timeout:** 10s internal.
@@ -617,7 +640,10 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 ```
 
 **Mechanism:**
-- Wraps ripgrep (via subprocess call to `rg`, or Python regex fallback if rg is not installed).
+- **Server RustFS site:** streams bounded object bodies and uses a
+  timeout-capable regex engine; it never stages a workspace tree or invokes
+  `rg` against server disk. **Client sites:** may invoke local `rg` with a
+  contract-compatible fallback.
 - Skips binary files and files >2 MB automatically.
 - Respects `.gitignore` and the noise-dir ignore list.
 - `output_mode=files_with_matches` is the default — favor it for broad searches to stay scoped.
@@ -640,6 +666,10 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 
 **Purpose:** Edit a Jupyter notebook (`.ipynb`) cell — replace source, insert a new cell after an index, or delete an existing cell.
 
+**REST availability:** Agent tool only. Py4 intentionally defines no dedicated
+REST equivalent; frontend callers can still download or replace the raw
+`.ipynb` file through the normal Workspace Files API.
+
 **Source schema (matches nanobot):**
 ```json
 {
@@ -660,7 +690,7 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
 ```
 
 **Mechanism:**
-- Parses the notebook JSON, operates on the specified cell, writes the modified notebook back through `workspace_fs` on server (so quota + SKILL.md validation edge cases still apply if someone puts a SKILL.md-shaped file inside a .ipynb, though that's an odd case).
+- Parses the notebook JSON, operates on the specified cell, writes the modified notebook back through `WorkspaceService` on server (so quota and validation rules still apply).
 - `edit_mode=replace` (default): replaces `source` of cell at `cell_index`. `new_source` required in this mode.
 - `edit_mode=insert`: inserts a new cell AFTER `cell_index`. `cell_type` optional (default `code`). `new_source` required.
 - `edit_mode=delete`: removes cell at `cell_index`. `new_source` / `cell_type` ignored.
@@ -721,13 +751,32 @@ fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool 
   - IPv6 ULA `fc00::/7` and link-local `fe80::/10`
 - **Client site:** if `sandbox_mode=true`, rejects targets matching `device.ssrf_denylist` (CIDR, host, or `host:port`). The default sandbox-device denylist contains private/reserved ranges and common metadata-service addresses. Users remove entries from the denylist to allow known internal services. If `sandbox_mode=false`, private/internal access is allowed by default; trusted devices created without an explicit list store `[]`, while any explicit deny entries the user keeps still reject matching targets.
 - **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command can still make its own network calls subject only to command-denylist/env policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
-- Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity encoding, rejects compressed responses, and raw-streams at most 5 MB before extraction. Uses a readability extractor (jina/readability-style) to convert HTML → `extractMode` output. Output is capped at `maxChars` (`100..50000`, default 50,000).
+- Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity
+  encoding, rejects compressed responses, and raw-streams at most 5 MB before
+  extraction. The server site has separate per-user/global admission for the
+  complete fetch, including download and conversion; admission timeout returns
+  the existing `network_timeout` result.
+- On the Python-main server site, validated HTML is converted only after the
+  bounded network path finishes. `extractMode=markdown` uses the same isolated
+  MarkItDown child as documents, with only `HtmlConverter` registered;
+  `extractMode=text` uses bounded BeautifulSoup extraction in that child.
+  Relative links are resolved against the final validated URL, unsafe/noisy
+  elements are removed, and declared charsets (including GB18030) are decoded
+  before UTF-8 conversion. MarkItDown never receives the URL and cannot fetch
+  remote or local content. Non-HTML responses retain bounded charset decoding.
+- The existing SSRF validation, redirect revalidation, compressed-body rejection,
+  5 MB byte cap, and 30s total deadline remain authoritative. Output is capped
+  at `maxChars` (`100..50000`, default 50,000).
 - Tool result content is normalized per ADR-095 before the LLM sees it: warning text block first, fetched page content after it.
 
 **Timeout:** 30s total, 10s connect.
 **Result cap:** 50,000 characters (tool's own cap via `maxChars`). Shared 16k global cap (ADR-076) doesn't apply — web_fetch's cap is explicit in schema.
-**Errors:** `NetworkError::SsrfBlocked`, `NetworkError::DNSFailed`, `NetworkError::Timeout`, `NetworkError::HttpError`.
-**Related ADRs:** 050 (per-device config), 052 (server block-list + per-device client denylist), 073 (device policy gates), 074 (untrusted content treatment), 095 (result wrap).
+**Errors:** Existing network errors plus
+`tool_content_conversion_busy`, `tool_exec_timeout`,
+`tool_content_conversion_resource_exceeded`, and
+`tool_content_conversion_failed` for HTML conversion. If the encompassing
+30-second deadline wins, the result remains `network_timeout`.
+**Related ADRs:** 050 (per-device config), 052 (server block-list + per-device client denylist), 073 (device policy gates), 074 (untrusted content treatment), 095 (result wrap), 130 (fair admission + isolated HTML conversion).
 
 ---
 
@@ -740,11 +789,19 @@ These three tools have no client-side counterpart. Their implementations live en
 **Lives in:** `openoctopus_server/tools/message.py`
 
 **Availability:** Not registered or executable in Py3. Py4 introduces the
-initial current-web/server-workspace subset after `workspace_fs` exists. Paired
+initial current-web/server-workspace subset after `WorkspaceService` exists. Paired
 device media begins with the client milestone, and explicit third-party
 `channel`/`chat_id` plus `buttons` activate with the channel milestone. The
 schema below is the final forward contract, not the Py3 registry surface
 (ADR-127).
+
+The initial Py4 provider-visible schema exposes only `content`, optional
+`media`, and `openoctopus_device` fixed to `server`. It does not advertise
+`channel`, `chat_id`, or `buttons` before their owning channel milestone.
+`content` must contain non-whitespace text and is capped at 16,000 characters;
+`media` accepts at most ten unique server-workspace paths. Py4 only stats those
+files, so the 8 MiB editing limit does not apply; unknown MIME types use
+`application/octet-stream`.
 
 **Purpose:** Send a message to the user, optionally with file attachments or inline keyboard buttons. `content` is required; `channel` and `chat_id` default to the current session's values. Specify them explicitly for cross-channel reach.
 
@@ -804,16 +861,20 @@ schema below is the final forward contract, not the Py3 registry surface
   - If `channel` + `chat_id` specified → delivers to that target. Cross-channel reach.
 - Once channel adapters exist, looks up the user's config for an explicit target channel (`discord_configs` / `telegram_configs`); if none, returns `ToolError::ChannelNotConfigured`.
 - For each media path:
-  - If `openoctopus_device="server"`: opens via `workspace_fs::read` (validates user authorization, path policy, and quota-lock read behavior). Beginning in Py4, web delivery emits a durable workspace file ref in provider-hidden delivery state/`delivery_refs`; for later third-party channels, the adapter streams workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
+  - If `openoctopus_device="server"`: Py4 current-web delivery uses `WorkspaceService` to authorize and stat the file without reading its bytes, then emits a durable workspace file ref in provider-hidden delivery state/`delivery_refs`. Later third-party channel adapters will stream authorized workspace bytes into the platform's native media/file upload API. Handles base64-in-DB images per ADR-059 / ADR-044 when the file is part of provider-visible conversation history.
   - If `openoctopus_device="<client_name>"` and the target channel is `web`: does not fetch or stage the file at send time. It writes user-visible, provider-hidden delivery state with an online-only `device_file` entry in `delivery_refs` containing the device name and path. The frontend later downloads through `GET /api/workspace/files/{path}?openoctopus_device=<client_name>`, which relays the browser response to the live device WebSocket. Download fails at click time with `device_unreachable`, `not_found`, or policy errors if the device/path is unavailable.
-  - If `openoctopus_device="<client_name>"` and the target channel is a third-party platform (`telegram`, `discord`, `feishu`, `weixin`, ...): server streams bytes from the device over `/ws/device` and forwards them directly into the platform's upload API. The bytes are not staged into MinIO or the server workspace. The platform owns the delivered copy after success.
+  - If `openoctopus_device="<client_name>"` and the target channel is a third-party platform (`telegram`, `discord`, `feishu`, `weixin`, ...): server streams bytes from the device over `/ws/device` and forwards them directly into the platform's upload API. The bytes are not written to RustFS or the server workspace. The platform owns the delivered copy after success.
 - `buttons` renders as inline keyboard rows on channels that support it (Telegram, Discord's button components); plain text channels ignore the param with no error.
 - The provider-visible transcript remains the assistant message containing the
   `message` tool use plus its matching persisted `tool_result`, which records
-  delivery success/failure. The Py4 delivery helper persists user-visible
-  delivery state outside provider replay; it must not insert another
-  provider-visible assistant row between that tool use and result. Exact
-  ownership/linking of the provider-hidden state is finalized with Py4.
+  delivery success/failure. The agent supplies workspace paths, never
+  `delivery_refs`. For current-web delivery, the Py4 helper generates refs,
+  links them to the matching `tool_use_id`, and appends them to the existing
+  assistant row containing that tool use. Server-workspace refs also retain the
+  immutable workspace ID and workspace-relative path so a future frontend can
+  recover from a shared-workspace rename. The helper commits this sidecar update
+  with the matching tool result and does not insert another provider-visible
+  assistant row. Provider replay ignores `delivery_refs`.
 
 **Timeout:** 30s internal.
 **Result cap:** 16,000 characters.
@@ -828,7 +889,7 @@ schema below is the final forward contract, not the Py3 registry surface
 
 **Purpose:** Copy or move files within and across devices. Supports all four
 direction combinations: `server -> server`, `server -> client`, `client -> server`,
-and `client -> client`. Server-to-server uses `workspace_fs`. Cross-device
+and `client -> client`. Server-to-server uses `WorkspaceService`. Cross-device
 directions stream over the device WebSocket. `client -> client` bridges through
 the server as a pure relay without buffering the whole file. Destination exists
 always rejects (no overwrite flag). Partial transfer cleanup is
@@ -875,8 +936,8 @@ before exposing the tool to the model.
 
 **Mechanism:**
 - Source schema in `openoctopus_server` — the server merge step injects `openoctopus_src_device` and `openoctopus_dst_device`, then extends both enums with paired device names.
-- `server -> server` reads through `workspace_fs.read_file`, rejects an existing destination, writes through `workspace_fs.write_file`, and deletes the source after a successful `mode="move"`.
-- Client Alpha `server -> client` and `client -> server` first resolve the named user device and require it to be connected. If the device is offline, the tool returns `device_unreachable`. `server -> client` sends a normal `TransferBegin(ServerToClient)` followed by binary chunks and waits for the client acknowledgement. `client -> server` sends `TransferBegin(ClientToServer)` as an upload request to the client; the client streams bytes and returns `TransferEnd(ok=true, sha256=...)`, then the server verifies, writes atomically through `workspace_fs` to MinIO-compatible object storage, and sends the final acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with sha256 verification. Server-side temporary staging is deleted after success or failure.
+- `server -> server` reads, writes, and conditionally deletes through `WorkspaceService`, rejecting an existing destination before the copy.
+- Client Alpha `server -> client` and `client -> server` first resolve the named user device and require it to be connected. If the device is offline, the tool returns `device_unreachable`. `server -> client` sends a normal `TransferBegin(ServerToClient)` followed by binary chunks and waits for the client acknowledgement. `client -> server` sends `TransferBegin(ClientToServer)` as an upload request to the client; the client streams bytes and returns `TransferEnd(ok=true, sha256=...)`, then the server verifies and writes through `WorkspaceService` to RustFS before sending the final acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with sha256 verification; the later transfer implementation must remain bounded without a durable local file cache.
 - `client -> client` uses the same protocol shape. The server bridges bytes from source device WebSocket to destination device WebSocket without buffering the whole file.
 - **Reject** if `dst_path` already exists (no implicit overwrite, no overwrite flag), `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
 
@@ -1322,7 +1383,7 @@ class Tool(ABC):
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult: ...
 ```
 
-`ToolContext` carries: `user_id`, `session_id`, `openoctopus_device` (for shared/MCP tools), and references to shared state (workspace_fs, channel registry, MCP manager).
+`ToolContext` carries: `user_id`, `session_id`, `openoctopus_device` (for shared/MCP tools), and references to shared state (`WorkspaceService`, channel registry, MCP manager).
 
 ### Schema merging at session start
 

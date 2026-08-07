@@ -455,7 +455,7 @@ Recommended chunk size: ~64 KB. Larger is fine; smaller adds per-frame
 overhead. Client receivers should stream chunks to their local workspace path,
 or to the next hop for bridge transfers. Server receivers on Python-main stage
 chunks in temporary files or streams, verify the digest, then persist the final
-object through `workspace_fs` to MinIO-compatible object storage (ADR-123).
+object through `WorkspaceService` to RustFS (ADR-123).
 Temporary staging is deleted after success or failure. The later
 client-to-client bridge must not buffer the full file.
 
@@ -513,12 +513,12 @@ The `message` tool with `media: [...]` and a `openoctopus_device` other than
   When the browser later downloads the file through the Workspace Files `GET`
   route, the server opens a temporary WS transfer/relay slot and forwards device
   chunks into the HTTP response with bounded buffering. This is not a durable
-  `file_transfer`; there is no server destination path and no MinIO write.
+  `file_transfer`; there is no server destination path and no RustFS write.
 - For third-party channels, the tool opens a WS transfer/relay from the device
   and streams those chunks directly into the platform's native media/file upload
   API. The server must not buffer the full file. If the device leg or platform
   upload fails, the `message` tool fails.
-- For `openoctopus_device="server"`, the tool reads bytes from `workspace_fs`; web
+- For `openoctopus_device="server"`, the tool reads bytes through `WorkspaceService`; web
   delivery emits a workspace file ref, while third-party delivery uploads the
   bytes to the platform.
 

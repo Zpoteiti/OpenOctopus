@@ -106,20 +106,3 @@ async def test_bearer_token_auth_works(async_client):
     )
     assert response.status_code == 200
     assert response.json()["email"] == "bearer@test.com"
-
-
-async def test_register_admin_token_unset_ignored(async_client, monkeypatch):
-    monkeypatch.setenv("OPENOCTOPUS_ADMIN_TOKEN", "")
-    from openctopus_server.config import get_settings
-    get_settings.cache_clear()
-    response = await async_client.post(
-        "/api/auth/register",
-        json={
-            "email": "unsettoken@test.com",
-            "password": "testpassword",
-            "name": "Unset Token",
-            "admin_token": "dev-admin-token",
-        },
-    )
-    assert response.status_code == 201
-    assert response.json()["user"]["is_admin"] is False

@@ -6,7 +6,12 @@ semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
 `create_all()`; Alembic or equivalent migration framework is deferred until
 production launch after frontend completion (ADR-057, ADR-069).
 
-**Twelve tables.** Account deletion is a single `DELETE FROM users WHERE id = $1`; every user-referencing FK has `ON DELETE CASCADE` defined inline (ADR-058) — with one explicit exception in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace persists for its remaining members when the creator's account is removed.
+**Thirteen tables.** Account deletion fences affected workspaces, then commits
+the user deletion and durable object-cleanup intents together. RustFS purge is
+idempotent and may finish after that logical deletion. Every user-referencing
+FK has `ON DELETE CASCADE` defined inline (ADR-058), with one explicit exception
+in `workspaces.created_by` (`ON DELETE SET NULL`, see ADR-108) so a workspace
+persists for its remaining members when the creator's account is removed.
 
 This doc is the canonical reference for the schema's *shape*. When Python
 implementation SQL or ORM metadata exists, it must be kept in sync with this
@@ -88,10 +93,10 @@ CREATE TABLE IF NOT EXISTS users (
 ```
 
 - `password_hash` — argon2 (or bcrypt — implementer's choice within reason). Never returned by any API.
-- `is_admin` — true for any user who registered with the `ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
+- `is_admin` — true for any user who registered with the `OPENOCTOPUS_ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
 - **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
 - **No inline channel fields** — Discord/Telegram live in their own tables (ADR-090).
-- **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing MinIO object sizes under the workspace prefix (or maintained via a denormalized counter/index hidden inside `workspace_fs`; not part of the API contract).
+- **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing paged RustFS object metadata under the workspace prefix.
 
 ---
 
@@ -201,7 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
 ```
 
 - `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection, except optional OpenOctopus `tool_result.code` metadata is retained for storage/public diagnostics and stripped from the strict provider request. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) live only in workspaces; the DB carries path-text markers and the agent reaches bytes via `read_file`. Remote attachment runtime failures are also persisted as server-authored text marker blocks so the user message is not lost.
-- `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. It remains `[]` through Py3; the first producer arrives with the initial Py4 `message` tool (ADR-127). Web `message(media=...)` uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Server workspace refs are durable and point at `openoctopus_device="server"` paths. Device refs are online-only pointers to `(device name, path)`; the browser resolves them later through the Workspace Files `GET` route and may receive `device_unreachable`, `not_found`, or policy errors at click time. Third-party channel native uploads do not need a OpenOctopus download ref unless a later UI wants to render platform receipts.
+- `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. It remains `[]` through Py3; the first producer arrives with the initial Py4 `message` tool (ADR-127). Web `message(media=...)` uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Each ref links to its generating `tool_use_id`. Server workspace refs are durable and retain the virtual path plus immutable workspace ID/workspace-relative path so a frontend can recover from a shared-workspace rename. Device refs are online-only pointers to `(device name, path)`; the browser resolves them later through the Workspace Files `GET` route and may receive `device_unreachable`, `not_found`, or policy errors at click time. Third-party channel native uploads do not need a OpenOctopus download ref unless a later UI wants to render platform receipts.
 - `llm_fingerprint` — nullable model/provider fingerprint for assistant rows that contain opaque thinking state. Provider replay may use raw `thinking` / `redacted_thinking` blocks only when this matches the current compatible model segment.
 - `message_kind` — stored OpenOctopus semantic discriminator: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. Provider projection derives `role='user'` for `human`, `tool_result`, and `synthetic_tool_result`; it derives `role='assistant'` for the other three kinds. This avoids JSONB inspection and prevents invalid stored role/kind pairs (ADR-089, ADR-126).
 - `is_compacted` — provider/compaction context membership. `FALSE` means the row participates in normal provider replay and may be input to a later compaction. `TRUE` means the row remains available for canonical history/audit but is excluded from both. A `compaction_summary` begins `FALSE` and may later become `TRUE` when absorbed into a newer summary.
@@ -369,18 +374,24 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 CREATE TABLE IF NOT EXISTS workspaces (
     id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     name         TEXT         NOT NULL,
+    suffix       TEXT         NOT NULL,
     quota_bytes  BIGINT       NOT NULL,
     created_by   UUID         REFERENCES users(id) ON DELETE SET NULL,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 ```
 
-- `id` — UUID primary key. Drives the MinIO object prefix `workspaces/{id}/` and the public-facing `name@suffix` addressing form (ADR-108, ADR-123) where `suffix` is the first 8 hex chars of `id` (auto-extended on collision per ADR-108).
+- `id` — UUID primary key. Drives the RustFS object prefix `workspaces/{id}/`.
 - `name` — display label. **Not unique.** Two unrelated teams may both create a workspace called "Xmas gift". The validator in ADR-109 enforces character rules (no `/`, `\`, `@`, `:`, control chars, etc.), NFC-normalizes, and length-caps at 64 chars.
+- `suffix` — persisted 8+ hex-character addressing suffix. It starts with the
+  shortest collision-free prefix of `id` allowed by ADR-108 and remains stable
+  across renames and membership changes.
 - `quota_bytes` — capped at `system_config.shared_workspace_quota_bytes` at create and rename time.
 - Quota state for both personal and shared workspaces is exposed through `Workspace` API responses (`quota_bytes`, `bytes_used`, `locked`) from `GET /api/workspaces` and `GET /api/workspaces/{workspace_ref}`; there is no separate personal-only quota route.
 - `created_by` — author. **Exception to ADR-058**: uses `ON DELETE SET NULL`, not `CASCADE`. Removing the creator's user account does not delete a workspace that still has other members; `created_by` becomes NULL and the membership rows survive.
-- Last-member-leaves auto-deletion (per `DELETE FROM workspace_members WHERE workspace_id = $1`) is enforced in application code (`workspace_fs`), not SQL — when no `workspace_members` rows remain for a `workspaces.id`, the row is deleted and the corresponding MinIO object prefix is deleted.
+- Last-member-leaves auto-deletion is enforced in application code under a
+  PostgreSQL workspace-row lock. The workspace row and a durable cleanup intent
+  commit together; RustFS prefix deletion then runs idempotently.
 
 ---
 
@@ -403,7 +414,29 @@ CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_
 
 ---
 
-## 12. `cron_jobs` — scheduled agent invocations
+## 12. `workspace_deletions` — durable RustFS cleanup intents
+
+```sql
+CREATE TABLE IF NOT EXISTS workspace_deletions (
+    kind        TEXT        NOT NULL CHECK (kind IN ('personal', 'shared')),
+    target_id   UUID        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (kind, target_id)
+);
+```
+
+- The composite key identifies `users/{target_id}/` or
+  `workspaces/{target_id}/`; there is intentionally no FK because the metadata
+  row is deleted in the same transaction that creates this cleanup intent.
+- Lifecycle order is: retire the in-process target, commit metadata deletion
+  plus this row, purge the RustFS prefix, then delete this row.
+- Post-commit purge failure does not undo or misreport the logical deletion.
+  The running process retries pending rows periodically, and startup recovery
+  drains them after the RustFS capability probe.
+
+---
+
+## 13. `cron_jobs` — scheduled agent invocations
 
 ```sql
 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -439,7 +472,10 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 
 ## Constraints summary
 
-- Every user-referencing FK has `ON DELETE CASCADE` (ADR-058) → account deletion is one statement. **Sole exception:** `workspaces.created_by` uses `ON DELETE SET NULL` per ADR-108 so a workspace persists for its remaining members when its creator's account is removed.
+- Every user-referencing FK has `ON DELETE CASCADE` (ADR-058). Account deletion
+  is an application transaction because it also records durable RustFS cleanup
+  intents. **Sole FK exception:** `workspaces.created_by` uses `ON DELETE SET
+  NULL` per ADR-108 so a workspace persists for its remaining members.
 - No surrogate "is_active" / "deleted_at" columns — deletes are hard, undo lives in admin's backup strategy.
 - No migration framework before production launch (ADR-069). Schema changes
   during the development rebuild require resetting the development database;

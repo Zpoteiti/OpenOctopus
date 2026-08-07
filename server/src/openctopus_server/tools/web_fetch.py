@@ -1,18 +1,18 @@
 import asyncio
 import ipaddress
-import re
 import socket
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from html.parser import HTMLParser
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import NetworkError
+from openctopus_server.errors.exceptions import NetworkError, ToolError
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
 from openctopus_server.tools.truncate import truncate_head
 
@@ -23,6 +23,20 @@ MAX_RESPONSE_BYTES = 5_000_000
 MAX_REDIRECTS = 10
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0
+
+
+class HtmlContentConverter(Protocol):
+    async def parse_html(
+        self,
+        data: bytes,
+        *,
+        user_id: UUID,
+        charset: str,
+        base_url: str,
+        mode: str,
+        max_chars: int,
+    ) -> str: ...
+
 
 WEB_FETCH_SCHEMA: dict[str, Any] = {
     "name": "web_fetch",
@@ -68,9 +82,13 @@ class WebFetchTool(Tool):
     def __init__(
         self,
         *,
+        web_admission: KeyedAdmission,
+        content_converter: HtmlContentConverter,
         resolver: Resolver | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        self._web_admission = web_admission
+        self._content_converter = content_converter
         self._resolver = resolver or _resolve_dns
         self._transport = transport
 
@@ -84,7 +102,6 @@ class WebFetchTool(Tool):
         return DEFAULT_MAX_CHARS
 
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        del ctx
         try:
             parsed_args = _WebFetchArgs.model_validate(args)
             _parse_target(parsed_args.url)
@@ -95,17 +112,25 @@ class WebFetchTool(Tool):
         timeout = httpx.Timeout(TOTAL_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS)
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
-                async with httpx.AsyncClient(
-                    transport=self._transport,
-                    timeout=timeout,
-                    follow_redirects=False,
-                    trust_env=False,
-                ) as client:
-                    text = await self._fetch(
-                        client,
-                        url=parsed_args.url,
-                        extract_mode=parsed_args.extract_mode,
-                    )
+                async with self._web_admission.slot(ctx.user_id):
+                    async with httpx.AsyncClient(
+                        transport=self._transport,
+                        timeout=timeout,
+                        follow_redirects=False,
+                        trust_env=False,
+                    ) as client:
+                        text = await self._fetch(
+                            client,
+                            user_id=ctx.user_id,
+                            url=parsed_args.url,
+                            extract_mode=parsed_args.extract_mode,
+                            max_chars=max_chars,
+                        )
+                    return ToolResult(content=truncate_head(text, max_chars))
+        except AdmissionTimeoutError:
+            return _error_result(ErrorCode.NETWORK_TIMEOUT, "web_fetch admission timed out")
+        except ToolError as exc:
+            return _error_result(exc.code, exc.message)
         except NetworkError as exc:
             return _error_result(exc.code, exc.message)
         except httpx.TimeoutException:
@@ -118,14 +143,14 @@ class WebFetchTool(Tool):
                 f"web_fetch request failed: {exc}",
             )
 
-        return ToolResult(content=truncate_head(text, max_chars))
-
     async def _fetch(
         self,
         client: httpx.AsyncClient,
         *,
+        user_id: UUID,
         url: str,
         extract_mode: Literal["markdown", "text"],
+        max_chars: int,
     ) -> str:
         current_url = url
         for redirect_count in range(MAX_REDIRECTS + 1):
@@ -160,10 +185,16 @@ class WebFetchTool(Tool):
                 body = await _read_limited(response)
             finally:
                 await response.aclose()
-            decoded = _decode(body, encoding)
             if "text/html" in content_type or "application/xhtml+xml" in content_type:
-                return _extract_html(decoded, mode=extract_mode, base_url=current_url)
-            return decoded
+                return await self._content_converter.parse_html(
+                    body,
+                    user_id=user_id,
+                    charset=encoding,
+                    base_url=current_url,
+                    mode=extract_mode,
+                    max_chars=max_chars,
+                )
+            return _decode(body, encoding)
 
         raise AssertionError("redirect loop terminated unexpectedly")
 
@@ -321,109 +352,6 @@ def _decode(body: bytes, encoding: str) -> str:
         return body.decode(encoding, errors="replace")
     except LookupError:
         return body.decode("utf-8", errors="replace")
-
-
-_BLOCK_TAGS = {
-    "article",
-    "aside",
-    "blockquote",
-    "div",
-    "footer",
-    "header",
-    "main",
-    "nav",
-    "ol",
-    "p",
-    "pre",
-    "section",
-    "table",
-    "tr",
-    "ul",
-}
-_SKIP_TAGS = {"script", "style", "noscript", "template", "svg"}
-
-
-class _ReadableHTMLParser(HTMLParser):
-    def __init__(self, *, mode: Literal["markdown", "text"], base_url: str) -> None:
-        super().__init__(convert_charrefs=True)
-        self.mode = mode
-        self.base_url = base_url
-        self.parts: list[str] = []
-        self.skip_depth = 0
-        self.links: list[str | None] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag = tag.lower()
-        if tag in _SKIP_TAGS:
-            self.skip_depth += 1
-            return
-        if self.skip_depth:
-            return
-        if tag == "br":
-            self.parts.append("\n")
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n\n")
-        elif tag == "li":
-            self.parts.append("\n- " if self.mode == "markdown" else "\n")
-        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            prefix = f"{'#' * int(tag[1])} " if self.mode == "markdown" else ""
-            self.parts.append(f"\n\n{prefix}")
-        elif tag == "a":
-            href = dict(attrs).get("href")
-            resolved = urljoin(self.base_url, href) if href else None
-            self.links.append(resolved)
-            if resolved is not None and self.mode == "markdown":
-                self.parts.append("[")
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag in _SKIP_TAGS:
-            if self.skip_depth:
-                self.skip_depth -= 1
-            return
-        if self.skip_depth:
-            return
-        if tag == "a":
-            href = self.links.pop() if self.links else None
-            if href is not None and self.mode == "markdown":
-                self.parts.append(f"]({href})")
-        elif (
-            tag in _BLOCK_TAGS
-            or tag == "li"
-            or tag
-            in {
-                "h1",
-                "h2",
-                "h3",
-                "h4",
-                "h5",
-                "h6",
-            }
-        ):
-            self.parts.append("\n\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self.skip_depth:
-            self.parts.append(data)
-
-    def rendered(self) -> str:
-        text = "".join(self.parts).replace("\r", "\n")
-        text = re.sub(r"[\t\f\v ]+", " ", text)
-        text = re.sub(r" *\n *", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
-
-
-def _extract_html(
-    source: str,
-    *,
-    mode: Literal["markdown", "text"],
-    base_url: str,
-) -> str:
-    parser = _ReadableHTMLParser(mode=mode, base_url=base_url)
-    parser.feed(source)
-    parser.close()
-    return parser.rendered()
 
 
 def _error_result(code: ErrorCode, message: str) -> ToolResult:

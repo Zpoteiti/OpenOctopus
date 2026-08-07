@@ -347,26 +347,33 @@ inputs are unchanged; volatile execution state does not churn it.
 ### ADR-024 · Skills: always-on full body; conditional name + description
 
 **Status:** accepted
+**Python-main clarification:** Py4 examines at most 200 deterministic candidates.
+Conditional skills retain only bounded frontmatter and a read path during
+prompt construction. Every discovered valid always-on body is rendered
+completely; there is no aggregate cap or fallback downgrade. Per-manifest
+write/load limits and the weighted process LRU are defined by ADR-082 and
+ADR-085. If the final combined request exceeds the real model context, the
+Provider remains authoritative.
 **Decision:** SkillInfo has `always_on: bool`. Skills marked always-on have their full SKILL.md body inlined in the system prompt. Conditional skills appear as one-line entries (`name: description`) with a pointer to load via `read_file(path="skills/{name}/SKILL.md")`.
 **Consequences:** Progressive disclosure. Large skill libraries don't bloat every prompt. Agent knows what exists and can pull on demand.
 
 ### ADR-025 · Tokenizer-based counts, not byte heuristics
 
 **Status:** accepted
-**Python-main clarification:** ADR-101 replaces the former Rust
-`tiktoken-rs` dependency with a Python tokenizer strategy revalidated for the
-configured model.
+**Python-main clarification:** Py4 uses pinned Python `tiktoken` with a packaged,
+hash-verified `o200k_base` asset as a deterministic Provider-independent
+estimate. Startup initializes it with outbound tokenizer download disabled.
 **Decision:** Compaction threshold checks use tokenizer counts, not byte-count
 heuristics. Required for correctness across different tokenizers.
-Python-main obtains the configured model's exact input count through the
-Anthropic-compatible `messages/count_tokens` endpoint. An endpoint must support
-that route when compaction is enabled; OpenOctopus does not silently fall back
-to a byte or unrelated-model estimate. The count request mirrors the normal
-request's system, tools, messages, cache control, and thinking controls. It uses
-the shared provider limiter, transient retry policy, and image-compatibility
-fallback.
-**Consequences:** Token counting is an explicit provider-prompt concern rather
-than an approximation from serialized byte length.
+Python-main estimates the complete system prompt, textual/thinking message
+content, tool names/descriptions/schemas, tool input/results and structural
+overhead. Images receive a fixed estimate plus textual metadata instead of
+tokenizing base64. It never requires or calls a Provider count-tokens route.
+The estimate may trigger at most one eligible compaction stage; it does not
+locally reject or repeatedly compact a final over-threshold request.
+**Consequences:** Compaction and memory planning are deterministic across
+Anthropic-compatible gateways, while the Provider remains authoritative for
+the actual model context window.
 
 ### ADR-026 · Vision retry lives in the provider layer
 
@@ -439,16 +446,13 @@ into `S2`; the old summary then becomes `is_compacted=true`. The boolean is the
 sole provider/compaction membership flag, not a permanent "was summarized"
 label.
 
-Token counting and summary generation happen outside database transactions. A
-counting or summary failure commits no compaction state. After a successful
-compaction commit, the runner recounts the exact rebuilt normal request once.
-If it still crosses the trigger, the compacted state remains durable but the
-runner does not issue the oversized normal request; it fails the turn visibly.
-At a Stage 1 boundary,
-the runner promotes the captured human batch, persists a synthetic assistant
-error, and fails the turn; at Stage 2 it persists the same terminal error after
-the preserved human turn. There is no heuristic fallback or automatic
-compaction retry loop.
+Local estimation and summary generation happen outside database transactions. A
+summary failure commits no compaction state. After a successful compaction
+commit, the runner rebuilds and re-estimates the normal request once. If it
+still crosses the configured trigger—or no history was eligible—OO sends exactly
+one final request instead of locally rejecting it or entering another
+compaction loop. The Provider is authoritative for the actual context window;
+a rejection is persisted through the sanitized Provider-error path.
 
 **Units clarification:** all thresholds are **tokens**. Tool result caps
 (ADR-076) are **characters** — roughly 4× smaller in token terms. A max-size
@@ -680,7 +684,7 @@ shape before applying the OpenOctopus merge transform.
 **Why the `openoctopus_` prefix?** The routing field name must not collide with any tool author's native arg. An MCP tool might legitimately have a `device` argument (e.g., selecting a GPU, audio device, or display). The reserved `openoctopus_` prefix guarantees the merger's injected property never clobbers a tool's own args.
 
 Dispatch:
-- `openoctopus_device="server"` → `workspace_fs` or the relevant server-side implementation directly
+- `openoctopus_device="server"` → authenticated `WorkspaceService` or the relevant server-side implementation
 - otherwise → WebSocket `ToolCall` frame to the named device
 
 **Consequences:** Source schemas stay pristine and testable against nanobot fixtures. For routing-only tools, `openoctopus_device` only appears in the post-merge schema the LLM sees. Agent sees `edit_file` not `edit_file_server` vs `edit_file_laptop`. Reserved name is collision-proof.
@@ -732,7 +736,7 @@ merge correctly.
 **Context:** Original decision required absolute paths in all tool args for unambiguity. Matching nanobot's tool surface (its schemas don't distinguish relative/absolute at the schema level) and removing friction for the common case (reading `MEMORY.md`) motivated relaxing this. A second revision (ADR-108) replaces the bare-name form for shared workspaces with `name@suffix` to support same-named workspaces and rename without breaking identifiers.
 **Decision:**
 
-- **`openoctopus_device="server"` + relative path** → resolved against the caller's personal workspace view. Python-main maps that virtual path to the user's MinIO object prefix (ADR-123); it is not a server disk directory. Example: `read_file(openoctopus_device="server", path="MEMORY.md")` reads the user's `MEMORY.md`.
+- **`openoctopus_device="server"` + relative path** → resolved against the caller's personal workspace view. Python-main maps that virtual path to the user's RustFS object prefix (ADR-123); it is not a server disk directory. Example: `read_file(openoctopus_device="server", path="MEMORY.md")` reads the user's `MEMORY.md`.
 - **`openoctopus_device="server"` + absolute path with the user's own UUID as leading segment** → explicit personal access. Example: `read_file(openoctopus_device="server", path="/{user_id}/skills/foo/SKILL.md")`. Rare; relative form is preferred.
 - **`openoctopus_device="server"` + absolute path with `<name>@<suffix>` leading segment** → shared workspace access (ADR-108). Example: `read_file(openoctopus_device="server", path="/production-department@a4f7e2d1/sprint.md")`. Both `name` and `suffix` must match the workspace row exactly (strict mode); the server does not silently rebind on rename.
 - **`openoctopus_device="<client>"` + any path** → resolved against the device's `workspace_path` when relative; absolute paths are accepted and, under `sandbox_mode=true`, must still resolve inside `workspace_path`. Clients are single-workspace, so the distinction is cosmetic.
@@ -745,8 +749,8 @@ merge correctly.
 
 **Status:** accepted
 **Context:** Prior OpenOctopus had `/api/files` (ephemeral upload cache, 24h TTL) running parallel to `/api/workspace/files/` (durable user tree). Two storage systems for files caused drift across message-send, context-load, and channel delivery.
-**Decision:** Workspace is canonical for files the agent operates on. No `/api/files`, no `file_store.rs`. On Python-main, server workspace bytes are persisted in MinIO-compatible object storage behind `workspace_fs` (ADR-123), not in a durable server disk tree. Channel adapters that receive raw attachment bytes may place those bytes under the virtual path `/.attachments/{inbound_id}/{filename}` in the user's server workspace; that object counts toward quota like any other workspace content. **M1d browser correction:** browser uploads first write bytes through `PUT /api/workspace/files/{path}?openoctopus_device=server`; `POST /api/sessions/{id}/messages` then references that existing path and does not move, copy, or rename the file into `.attachments/`. **Note:** this `.attachments/` concept exists only on the server. Client devices have no equivalent — bytes that flow to a client via `file_transfer` or `write_file` land directly in `device.workspace_path` with no special media subdir.
-**Consequences:** One durable file model for agent-accessible files. Inbound channel bytes and durable server-side attachments live in workspace paths. Device-origin outbound media is split by target channel capability: web delivery stores an online-only device file reference and lets the browser download later through the normal Workspace Files `GET` relay with `openoctopus_device=<device>`; third-party channel delivery streams bytes through the server directly into the platform's native file/media upload API. Neither path stages device bytes into MinIO. If durable OpenOctopus storage is wanted, the agent must first use `file_transfer` to copy the file into `openoctopus_device="server"`.
+**Decision:** Workspace is canonical for files the agent operates on. No `/api/files`, no `file_store.rs`. On Python-main, server workspace bytes are persisted in RustFS behind `WorkspaceService` (ADR-123), not in a durable server disk tree. Channel adapters that receive raw attachment bytes may place those bytes under the virtual path `/.attachments/{inbound_id}/{filename}` in the user's server workspace; that object counts toward quota like any other workspace content. **M1d browser correction:** browser uploads first write bytes through `PUT /api/workspace/files/{path}?openoctopus_device=server`; `POST /api/sessions/{id}/messages` then references that existing path and does not move, copy, or rename the file into `.attachments/`. **Note:** this `.attachments/` concept exists only on the server. Client devices have no equivalent — bytes that flow to a client via `file_transfer` or `write_file` land directly in `device.workspace_path` with no special media subdir.
+**Consequences:** One durable file model for agent-accessible files. Inbound channel bytes and durable server-side attachments live in workspace paths. Device-origin outbound media is split by target channel capability: web delivery stores an online-only device file reference and lets the browser download later through the normal Workspace Files `GET` relay with `openoctopus_device=<device>`; third-party channel delivery streams bytes through the server directly into the platform's native file/media upload API. Neither path writes device bytes to RustFS. If durable OpenOctopus storage is wanted, the agent must first use `file_transfer` to copy the file into `openoctopus_device="server"`.
 
 **Storage by attachment type:**
 
@@ -763,10 +767,10 @@ If the user or agent later deletes a workspace attachment to reclaim quota:
 - **Image deleted:** conversation history still renders + replays via the DB base64. Only the agent's ability to `read_file` that specific path is lost (path-text marker per ADR-027 lets the agent still reason about provenance).
 - **Non-image file deleted:** the agent permanently loses access to the bytes (no DB copy to fall back on). The path-text marker remains in history so the agent knows the file existed.
 
-### ADR-045 · `workspace_fs` is the single write path server-side
+### ADR-045 · `WorkspaceService` is the single authorized write path server-side
 
 **Status:** accepted
-**Decision:** One service module owns path resolution + quota reserve/rollback + skills-cache invalidation + symlink-escape check. All REST handlers + server tools that write to workspace go through it. No independent `tokio::fs::write` calls for user data.
+**Decision:** `WorkspaceService` owns authenticated virtual-path resolution and is the entry point for REST handlers and server tools. Its internal `WorkspaceFS` owns immutable-target mapping, quota, mutation locks, and RustFS operations. Trusted deletion lifecycle code may call retire/purge directly; no other target-based or object-client path is public.
 **Consequences:** One bug-fix location for path safety, one place to add quota enforcement, deterministic skills-cache invalidation on any write under `skills/`.
 
 ### ADR-046 · All typed errors live in `openoctopus_server/errors/`
@@ -782,7 +786,7 @@ If the user or agent later deletes a workspace attachment to reclaim quota:
 Blocking tool work (file IO, hashing, recursive find_files/grep, transfer
 staging) must cross an explicit background/thread boundary so the single
 asyncio event loop stays responsive. This applies to both server-side
-`workspace_fs` operations and client-side device tools.
+`WorkspaceService` operations and client-side device tools.
 **Context:** Nanobot's tool timeout model (confirmed empirically). Tools that have legitimately variable duration (shell commands, some MCPs) expose `timeout` as a schema parameter the agent can set within bounds. Tools with bounded scope (file ops, web_fetch, message, cron) enforce fixed internal timeouts with no agent override.
 **Decision:**
 - **No central dispatcher-level timeout wrapper.** Each tool owns its timeout enforcement in its own `execute()`.
@@ -876,7 +880,7 @@ pub trait Tool: Send + Sync {
 
 **Consequences:** Each tool is a testable unit. Default-methods pattern means tools only override what's different from defaults (most tools just need name/schema/execute). Cross-cutting concerns (truncation, timeout, permission pre-check) can be added via default methods later without breaking implementers.
 
-### ADR-078 · Quota: one global value + workspace_fs-owned usage
+### ADR-078 · Quota: one global value + workspace-service-owned usage
 
 **Status:** accepted
 **Python-main clarification:** Python-main has two quota layers:
@@ -890,16 +894,16 @@ pub trait Tool: Send + Sync {
   `quota_bytes`, not against any member's personal quota.
 - **Shared workspace members** have equal permissions: creator and invited
   members share the same read/write/delete rights. No role-based ACL.
-- `workspace_fs` enforces both personal and shared workspace quota depending
+- Internal `WorkspaceFS` enforces both personal and shared workspace quota depending
   on which workspace path is being written.
-**Context:** Python-main hosts server workspaces in MinIO-compatible object storage (ADR-123). Without bounds, an agent or user can fill object storage and break the service for everyone. Prior OpenOctopus had no quota at all. Nanobot runs single-user and didn't need one.
+**Context:** Python-main hosts server workspaces in RustFS (ADR-123). Without bounds, an agent or user can fill object storage and break the service for everyone. Prior OpenOctopus had no quota at all. Nanobot runs single-user and didn't need one.
 **Decision:**
 - **One global quota value.** Stored in `system_config` under key `quota_bytes`. Admin-editable via admin UI; takes effect immediately for all users. No per-user override. Effective default 500 MiB when missing.
-- **Usage authority.** `workspace_fs` is the only authority for server-side workspace usage. The schema does not require a `users.bytes_used` column. Implementations may compute usage on demand by listing object sizes under the workspace's object prefix, or maintain an internal cache/counter hidden behind `workspace_fs`; either way, API callers see the same result.
-- **Two-layer check before every write (enforced at the single workspace_fs choke point per ADR-045):**
+- **Usage authority.** The workspace service is the only authority for server-side workspace usage. The schema does not require a `users.bytes_used` column. Py4a computes usage from paged RustFS metadata behind internal `WorkspaceFS`; API callers never supply usage or quota values.
+- **Two-layer check before every write (enforced at the internal `WorkspaceFS` choke point per ADR-045):**
   1. **Lock rule:** if current usage is greater than `quota_bytes`, all writes/edits/adds are rejected with `WorkspaceError::SoftLocked`. Only `delete_file` and `delete_folder` are allowed. Lock auto-lifts as soon as a delete pulls usage back under quota — no explicit unlock step.
   2. **Single-op cap:** any single operation bigger than 80% of `quota_bytes` is rejected with `WorkspaceError::UploadTooLarge`. Applies to `write_file` content size, positive `edit_file` delta, and per-file or total folder bytes in `file_transfer` writes whose destination is the server.
-- **REST upload ingress.** Browser `PUT /api/workspace/files/{path}` asks `workspace_fs` for a body collection limit before reading request bytes. That limit is derived from the same single-op cap and the REST memory cap, but does not inspect current workspace usage; the authoritative lock, single-op, and total-quota checks still happen once inside the `workspace_fs` write path.
+- **REST upload ingress.** Browser `PUT /api/workspace/files/{path}` asks `WorkspaceService` for a body collection limit before reading request bytes. That limit is derived from the same single-op cap and REST memory cap; authoritative checks happen inside internal `WorkspaceFS`.
 - **What counts.** Every persisted object under the user's personal workspace prefix — SOUL.md, MEMORY.md, `skills/**`, `.attachments/**`, arbitrary user files. No exemptions. Shared workspace usage is the same rule over the shared workspace object prefix.
 - **Read API.** Quota state is returned on `Workspace` objects:
   `GET /api/workspaces` returns the personal workspace plus accessible shared
@@ -918,9 +922,9 @@ pub trait Tool: Send + Sync {
 **Status:** accepted
 **Context:** Earlier drafts stored quota usage in `users.bytes_used`, which required reconciliation when disk writes and DB updates drifted. The schema now deliberately omits that column (SCHEMA.md §2).
 **Decision:** v1 exposes `bytes_used` through `Workspace` responses, but storage
-is an implementation detail of `workspace_fs`. The simplest correct
+is an implementation detail of the workspace service. The simplest correct
 implementation is on-demand object-size calculation by listing the workspace
-object prefix. If performance later requires it, `workspace_fs` may add an
+object prefix. If performance later requires it, internal `WorkspaceFS` may add an
 internal counter/cache plus reconciliation without changing the public API or
 `users` schema.
 **Consequences:** No background reconciliation task is required for M1. There
@@ -960,7 +964,7 @@ The agent sees the note in context, can reference it in its reply, and the user 
 counting toward quota. No background cleanup, no TTL, no auto-deletion.
 Users clean up via workspace UI or agent tools (`delete_file`/`delete_folder`).
 Users who want automatic retention can use agent + cron (ADR-053).
-**Context:** Channel-adapter chat-drop images may land in the server workspace's virtual `.attachments/{inbound_id}/{filename}` prefix (ADR-044, ADR-123). Browser-uploaded files can also accumulate anywhere the frontend writes them, including `.attachments/uploads/...`. Without cleanup, these MinIO objects accumulate monotonically and consume quota. A background sweeper (every 6 hours, 30-day age threshold) was proposed.
+**Context:** Channel-adapter chat-drop images may land in the server workspace's virtual `.attachments/{inbound_id}/{filename}` prefix (ADR-044, ADR-123). Browser-uploaded files can also accumulate anywhere the frontend writes them, including `.attachments/uploads/...`. Without cleanup, these RustFS objects accumulate monotonically and consume quota. A background sweeper (every 6 hours, 30-day age threshold) was proposed.
 **Decision:** No server-side sweeper. The user is responsible for managing their own workspace usage. If `.attachments/` fills their quota, the soft-lock behavior from ADR-078 surfaces the problem through the UI (`Workspace.locked` from `GET /api/workspaces` shows `true`) and through agent tool errors (`WorkspaceError::SoftLocked`). From there the user — or the agent, on the user's behalf — deletes old attachments via the workspace browser or `delete_file` / `delete_folder` tools.
 **Consequences:**
 - Zero server-side auto-deletion. Every byte on a user's workspace is there because the user or their agent put it there and hasn't removed it.
@@ -985,24 +989,41 @@ Users who want automatic retention can use agent + cron (ADR-053).
 - **Required frontmatter fields:** `name` (string), `description` (string).
 - **Optional frontmatter fields:** `always_on` (boolean, defaults to `false`).
 - **Folder name must match frontmatter `name`.** A skill at `skills/weekly-digest/SKILL.md` MUST have `name: weekly-digest` in frontmatter. Mismatch is invalid.
-- **Write-time validation.** `workspace_fs` runs the SKILL.md validator ONLY when the destination path matches `skills/*/SKILL.md` (exactly one level deep, exact filename). Writes to `skills/{name}/FORMS.md` or any other supporting file pass through untouched.
+- **Frontmatter is bounded.** The opening delimiter, at most 16 KiB of YAML,
+  and closing delimiter must fit the shared bounded prefix. Conditional-skill
+  discovery range-reads only that prefix plus one look-ahead byte.
+- **Always-on size is bounded per manifest.** An `always_on: true` SKILL.md must
+  be valid UTF-8, no larger than 64 KiB in full, and its body must estimate to
+  at most 16,000 `o200k_base` tokens. Valid always-on bodies are never
+  aggregate-truncated or silently changed to conditional.
+- **Write-time validation.** `WorkspaceService` runs the SKILL.md validator ONLY when the destination path matches `skills/*/SKILL.md` (exactly one level deep, exact filename). Writes to `skills/{name}/FORMS.md` or any other supporting file pass through untouched.
 - **On validation failure:** write is rejected with `WorkspaceError::InvalidSkillFormat`. The agent/user must fix the file before re-saving, or save under a different filename (which won't be scanned).
 
-**Consequences:** Malformed SKILL.md files can never exist in a scanner path; the loader never has to handle invalid input at read time. A skill's identity is its folder — displayed name and storage path can't diverge.
+**Consequences:** Supported Agent/REST writes cannot create malformed scanner
+manifests. The loader repeats validation because RustFS objects can also be
+written outside OO; an examined malformed manifest fails the whole snapshot. A
+skill's identity is its folder — displayed name and storage path cannot diverge.
 
 ### ADR-083 · Skill discovery scans exactly one level deep
 
 **Status:** accepted
-**Decision:** At agent-loop start, the skills loader enumerates `skills/*/SKILL.md` — exactly one level deep. Any SKILL.md at `skills/foo/bar/SKILL.md` or deeper is NOT discovered. Supporting files can live at any depth under `skills/{name}/` (e.g. `skills/pdf-skill/scripts/fill_form.py`); only the top-level SKILL.md drives discovery.
-**Consequences:** Flat, predictable skill namespace. No recursion cost at load time. Skill authors organize the internals of their folder however they like — nested scripts, reference docs, assets, all invisible to the scanner.
+**Decision:** At agent-loop start, the skills loader discovers only direct
+`skills/<name>/SKILL.md` manifests. It scans at most 1,000 ordered raw listing
+records and examines at most the first 200 resulting direct child candidates;
+a candidate without SKILL.md still consumes one position. Any SKILL.md at
+`skills/foo/bar/SKILL.md` or deeper is not discovered. Supporting files can
+live at any depth under `skills/{name}/`.
+**Consequences:** The namespace and discovery work are deterministic and
+bounded. A workspace may contain more conditional skills under normal quota,
+but only the lexicographically first 200 candidates are advertised.
 
 ### ADR-084 · Skill install paths: user browser + agent `file_transfer`
 
 **Status:** accepted
 **Context:** Skills need a path from "somewhere external" to `skills/{name}/` on the server workspace. Prior OpenOctopus considered a dedicated `install_skill` server tool that would clone from git URLs or unpack tarballs.
 **Decision:** Two paths, both reusing existing infrastructure:
-1. **User upload/edit via the browser.** The frontend edits workspace files through the standard `/api/workspace/files/{path}` REST surface. Users can drop in a pre-authored SKILL.md, flip `always_on`, or manage supporting files. All writes go through workspace_fs → quota + SKILL.md validation apply.
-2. **Agent `file_transfer` from a paired client.** Typical flow: user installs the skill on a client machine via the skill author's installer (e.g. `npx openoctopus-skills-install pdf-skill` on their laptop). The user then tells the agent to install it. Agent uses `file_transfer` to copy the files from the client workspace into the server workspace virtual path `skills/pdf-skill/`, which `workspace_fs` persists under the user's MinIO object prefix. The paired client must be connected when the transfer dispatches. Same quota + validation rules.
+1. **User upload/edit via the browser.** The frontend edits workspace files through the standard `/api/workspace/files/{path}` REST surface. Users can drop in a pre-authored SKILL.md, flip `always_on`, or manage supporting files. All writes go through `WorkspaceService`, so quota and SKILL.md validation apply.
+2. **Agent `file_transfer` from a paired client.** Typical flow: user installs the skill on a client machine via the skill author's installer (e.g. `npx openoctopus-skills-install pdf-skill` on their laptop). The user then tells the agent to install it. Agent uses `file_transfer` to copy the files from the client workspace into the server workspace virtual path `skills/pdf-skill/`, which `WorkspaceService` persists under the user's RustFS object prefix. The paired client must be connected when the transfer dispatches. Same quota + validation rules.
 
 Rejected: a dedicated `install_skill` server tool. Would require URL allowlisting, tarball-security handling, and a private-repo auth story. The `file_transfer` pattern reuses the existing sandbox + credential model on the client side, leaving server surface minimal.
 **Consequences:** One fewer server tool. No network-fetching code on the server. Skills can originate from any source (git, npm, custom installers, hand-authored) as long as they end up on a paired device that is connected when the transfer runs.
@@ -1010,8 +1031,16 @@ Rejected: a dedicated `install_skill` server tool. Would require URL allowlistin
 ### ADR-085 · Skills cache mirrors `tools_registry`
 
 **Status:** accepted
-**Decision:** `workspace_fs` maintains a per-user skills cache: `DashMap<user_id, Vec<SkillInfo>>`. Populated lazily at agent-loop start (when `ContextInputs.skills` is assembled) if the entry is absent. Invalidated by any write/delete under `skills/` via the single-write-path guarantee (ADR-045). Stale-read tolerance matches ADR-071: a single turn may see an outdated skill list, and the agent self-corrects on the next iteration.
-**Consequences:** One parse per skill per cache lifecycle. Minimal overhead on the hot path (context build). Cache consistency bounded by one turn — same envelope as the tools cache.
+**Decision:** The workspace service maintains a 64 MiB weighted global LRU of
+immutable per-user skill snapshots. Conditional entries retain frontmatter and
+their `read_file` path only; always-on entries retain their complete validated
+body. A per-user single-flight coalesces concurrent cache misses. Any successful
+write/delete under `skills/` increments that user's generation and invalidates
+the entry, so an older in-flight load cannot repopulate stale content.
+**Consequences:** Concurrent turns for one user perform one snapshot load,
+different users do not block each other, and cache memory is globally bounded.
+Valid snapshots that do not remain cached can still be used by their requesting
+turn; cache capacity never changes prompt semantics.
 
 ### ADR-086 · `delete_folder` shared tool (recursive, no flag)
 
@@ -1020,7 +1049,7 @@ Rejected: a dedicated `install_skill` server tool. Would require URL allowlistin
 **Decision:** New shared tool `delete_folder(device, path)`. Always recursive — deletes the folder and every file/subfolder inside. No flag; a non-recursive variant (`rmdir` on empty dirs only) is too niche for v1.
 - **Schema in `openoctopus_server/tools/`** alongside the other shared tools (ADR-038). `device` enum is injected at merge time (ADR-071).
 - **Implementations in both `openoctopus_server` and `openoctopus_client`.**
-- **Server implementation** routes through `workspace_fs`: lists objects under the resolved folder prefix, sums bytes for usage accounting, deletes the prefix in MinIO-compatible object storage, updates workspace usage state, and invalidates the skills cache if any path was under `skills/`. Lock auto-lifts if this brings usage back under quota.
+- **Server implementation** routes through `WorkspaceService`: it authorizes the folder, deletes the paged RustFS prefix through internal `WorkspaceFS`, and invalidates the skills cache if any path was under `skills/`. Lock auto-lifts if this brings usage back under quota.
 - **Client implementation** is bounded by the client's `sandbox_mode`. In sandbox mode, removal is restricted to inside `workspace_path`. In trusted mode, it follows whatever path the agent provides.
 - **Rejects** if `path` is a file (error directs to `delete_file`) or does not exist.
 
@@ -1038,8 +1067,8 @@ is server-orchestrated, destination-executed, best-effort: the server knows
 the transfer manifest and tells the destination to delete already-written
 paths; if cleanup fails (e.g. device disconnect), the tool result returns
 warning and user/agent handles manually. Server workspace writes go through
-`workspace_fs` to MinIO; temporary disk staging is allowed only as internal
-implementation detail and must be cleaned after success/failure. Shared
+`WorkspaceService` to RustFS; the future transfer implementation must use a
+bounded stream and may not add a durable local file cache. Shared
 workspace members have equal permissions; `file_transfer` into a locked
 shared workspace is rejected like any other write.
 **Context:** Originally `file_transfer` was a cross-device-only copy primitive. A separate `move_file` was considered for same-device rename. Keeping them separate felt cleaner conceptually, but a unified tool is fewer tool slots for the agent to learn and reuses the cross-device byte-moving machinery for all file relocations.
@@ -1544,8 +1573,15 @@ milestone when the project transitions from dev-machine to deployed service.
 
 ### ADR-058 · Every user-referencing FK has `ON DELETE CASCADE` inline
 
-**Status:** accepted
-**Decision:** Cascades defined at table-create time, not via `ALTER TABLE` migrations. Account deletion is a single `DELETE FROM users WHERE id = $1` that cleans up devices (tokens are inline per ADR-091), sessions, messages, cron_jobs, discord_configs, telegram_configs automatically.
+**Status:** accepted (revised by Py4a workspace cleanup)
+**Decision:** Cascades are defined at table-create time, not via `ALTER TABLE`
+migrations. Account deletion is an application transaction: it locks and fences
+the personal workspace and any last-member shared workspaces, inserts durable
+`workspace_deletions` cleanup intents, then deletes the user. Database cascades
+remove devices, sessions, messages, cron jobs, and channel configs. RustFS
+prefix cleanup happens idempotently after commit; a transient purge failure is
+retried at runtime and startup and does not make the committed account deletion
+appear to fail.
 
 ### ADR-059 · Messages store provider-shape content blocks as JSONB; images inline as base64
 
@@ -1862,12 +1898,12 @@ includes partial token previews.
 ### ADR-072 · Server is not a code execution environment for agents
 
 **Status:** accepted
-**Context:** The server hosts user workspaces as MinIO objects behind `workspace_fs` — SOUL.md, MEMORY.md, `skills/`, `.attachments/`, arbitrary user-uploaded files. Any of these could contain executable content (a shell script, a Python file, a binary). The agent itself can write such content via `write_file`. The question: can the agent, or the content, cause the server to execute something?
+**Context:** The server hosts user workspaces as RustFS objects behind `WorkspaceService` — SOUL.md, MEMORY.md, `skills/`, `.attachments/`, arbitrary user-uploaded files. Any of these could contain executable content (a shell script, a Python file, a binary). The agent itself can write such content via `write_file`. The question: can the agent, or the content, cause the server to execute something?
 **Decision:** **No.** The agent's server-side tool surface is deliberately restricted to non-executing operations:
 
-- **File tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `list_dir`, `find_files`, `grep`) — byte-level operations through `workspace_fs`. Read and write content, never interpret it.
+- **File tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `list_dir`, `find_files`, `grep`) — byte-level operations through `WorkspaceService`. Document `read_file` may parse PDF/OOXML as inert data in the ADR-130 resource-limited MarkItDown child; it never executes macros, scripts, plugins, or embedded programs.
 - **`message`** — delivers text/media to a channel. No execution.
-- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the unconditional block-list (RFC-1918, 100.64/10, link-local, loopback, IPv6 equivalents — ADR-052) applies. Content is returned as bytes; server does not evaluate.
+- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the unconditional block-list (RFC-1918, 100.64/10, link-local, loopback, IPv6 equivalents — ADR-052) applies. Bounded HTML may be converted as inert data in the ADR-130 child; scripts and active content are removed, not evaluated.
 - **`cron`** — schedules future agent invocations. Does not itself execute anything.
 - **`file_transfer`** — moves bytes between server and a device. No execution.
 
@@ -2017,7 +2053,8 @@ wire format. Seven `system_config` keys carry forward (`llm_endpoint`,
 `llm_max_output_tokens`). Python
 server implements the provider adapter using the Anthropic Python SDK.
 Provider validation before config write is retained. Tokenizer changes from
-`tiktoken-rs` to a Python tokenizer strategy (revalidated per model).
+`tiktoken-rs` to the packaged `o200k_base` estimator in ADR-025; the Provider
+does not need a count-tokens endpoint.
 **Context:** OpenOctopus needs an LLM. The choices: (a) ship a per-provider client trait (Anthropic Messages API, OpenAI Chat Completions, Bedrock, Gemini, etc. — each with its own request/response/tool-call shape), (b) speak one wire format and let the admin put a compatible endpoint or gateway in front for everything else. Option (a) has been the prior-OpenOctopus pattern and produced provider-switching bugs, vision-strip drift, and tool-call-format edge cases. OpenAI chat completions was the M1b-M1d bootstrap format, but M1f needs native `tool_use`, `tool_result`, `thinking`, and image blocks.
 **Decision:** **Anthropic Messages API ONLY.** OpenOctopus speaks one request shape, one response shape, one tool-call format. If an admin wants OpenAI / Bedrock / Gemini / a local model that does not expose an Anthropic-compatible endpoint, they put a gateway in front and configure OpenOctopus to talk to it. Format translation lives in the gateway, not in OpenOctopus.
 
@@ -2340,6 +2377,7 @@ Two new tables. Eight-table schema (SCHEMA.md) becomes ten-table.
 CREATE TABLE IF NOT EXISTS workspaces (
     id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT         NOT NULL,                  -- not unique
+    suffix      TEXT         NOT NULL,                  -- assigned 8+ hex chars
     quota_bytes BIGINT       NOT NULL,
     created_by  UUID         REFERENCES users(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -2355,11 +2393,11 @@ CREATE TABLE IF NOT EXISTS workspace_members (
 CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
 ```
 
-`workspaces.created_by` uses `ON DELETE SET NULL` (not `CASCADE`) — deleting the creator should not delete the workspace if other members exist. Explicit exception to ADR-058's "every user-referencing FK has CASCADE" rule. Last-member-leaves auto-deletion is application logic in the workspace_fs layer (triggered by the DELETE on `workspace_members`), not a SQL cascade.
+`workspaces.created_by` uses `ON DELETE SET NULL` (not `CASCADE`) — deleting the creator should not delete the workspace if other members exist. Explicit exception to ADR-058's "every user-referencing FK has CASCADE" rule. Last-member deletion is application logic under a workspace-row lock: the workspace metadata deletion and durable RustFS cleanup intent commit together, then prefix cleanup runs idempotently.
 
 #### Storage layout
 
-Python-main server workspaces use MinIO object prefixes (ADR-123), not durable
+Python-main server workspaces use RustFS object prefixes (ADR-123), not durable
 server disk directories. Shared workspaces use a stable prefix derived from
 `workspaces.id`; personal workspaces use a stable prefix derived from `users.id`.
 UUIDs do not collide with each other across the user/workspace tables.
@@ -2380,7 +2418,7 @@ Always `<name>@<suffix>` where `suffix` is the first 8 hex characters of `worksp
 #### Suffix length and collision handling
 
 - **Default 8 hex chars** (32 bits). Collision probability inside a single user's accessible workspaces is ~1e-8 even with hundreds of memberships.
-- **Auto-extend on collision** at workspace-create or member-add time: if the new suffix would collide with an existing workspace already accessible to any prospective member, extend the suffix length by one hex char (then two, etc.) until unique. Same convention as `git`'s short-hash extension. Once assigned, a workspace's suffix length is stable for its lifetime — never re-shortened.
+- **Auto-extend on collision at workspace creation:** if the new suffix would collide with an existing workspace already accessible to the creator, extend the suffix length by one hex char (then two, etc.) until unique. Same convention as `git`'s short-hash extension. The assigned suffix is persisted in `workspaces.suffix`; its length is stable for the workspace lifetime and it is never recomputed or re-shortened. A later member addition that would collide in the prospective member's accessible set is rejected with `workspace_ref_conflict` instead of changing an existing workspace's stable ref.
 - The `@` separator is a reserved character in workspace names (rejected by the validator in ADR-109) so name+suffix parsing is unambiguous.
 
 #### Resolution (strict mode)
@@ -2393,7 +2431,7 @@ The single resolver runs across REST + agent-tool-path entry points:
 fn resolve_workspace_segment(user_id: Uuid, segment: &str) -> Result<Uuid, WorkspaceError> {
     let (name, suffix_hex) = segment.rsplit_once('@')
         .ok_or(WorkspaceError::MalformedSegment)?;
-    // workspace where: id::text LIKE '<suffix>%'
+    // workspace where: suffix = <suffix_hex>
     //                  AND name = <name>
     //                  AND user is in workspace_members
     // unique → return id; zero matches → 404; >1 → bug (suffix collision detection failed at create)
@@ -2473,7 +2511,7 @@ def canonicalize_device_name(raw: str) -> str:
 
 - `POST /api/workspaces` body `name`, `PATCH /api/workspaces/{...}` body `name`.
 - `POST /api/devices` body `name`, `PATCH /api/devices/{name}/config` body `name` (rename).
-- `workspace_fs::write` when destination matches `skills/*/SKILL.md` — the YAML-frontmatter `name` field gets the same validation pass on top of the existing ADR-082 folder-match check.
+- `WorkspaceService.write` when destination matches `skills/*/SKILL.md` — the YAML-frontmatter `name` field gets the same validation pass on top of the existing ADR-082 folder-match check.
 
 #### Consequences
 
@@ -2568,7 +2606,7 @@ Browser message writes use one strict base shape:
 
 Both arrays are required. The server rejects the request only when both are empty. `content[]` accepts text blocks and direct inline base64 `image_url` blocks. Direct image blocks are persisted and sent to the provider, but are not written to workspace and do not create path markers by themselves. External `http(s)` image URL ingestion is not part of M1d.
 
-`attachments[]` contains references to existing workspace files. Browser uploads first write bytes through `PUT /api/workspace/files/{path}?openoctopus_device=server`; the message API then validates and reads those paths. Message send does not move, copy, rename, delete, or garbage-collect files. The path-text marker points to the original referenced path. Image attachments produce a marker plus a generated base64 `image_url`; non-image attachments produce only the marker. Attachment file inspection goes through `workspace_fs`: non-image detection reads only the small image-signature header, and the full file is read only after the header identifies a supported image type.
+`attachments[]` contains references to existing workspace files. Browser uploads first write bytes through `PUT /api/workspace/files/{path}?openoctopus_device=server`; the message API then validates and reads those paths. Message send does not move, copy, rename, delete, or garbage-collect files. The path-text marker points to the original referenced path. Image attachments produce a marker plus a generated base64 `image_url`; non-image attachments produce only the marker. Attachment file inspection goes through `WorkspaceService`: non-image detection reads only the small image-signature header, and the full file is read only after the header identifies a supported image type.
 
 If an attachment image has the same decoded bytes as a direct `content[].image_url`, OpenOctopus keeps the direct image block, skips the duplicate generated image block, and inserts the attachment marker immediately before the matching direct image block. Equality is exact decoded-byte equality, not raw base64 string equality or perceptual similarity. Direct-image hashes are computed only when `attachments[]` is non-empty; with no attachment refs, the already-validated `content[]` is preserved unchanged.
 
@@ -2578,7 +2616,7 @@ M1d implements tool schema merge v0 only. Shared file tool source schemas remain
 - The browser, REST, and tool surfaces all force explicit file target selection.
 - The message API has one strict request shape and no legacy string shorthand.
 - Workspace file placement belongs to workspace write APIs, not chat.
-- Quota enforcement stays in `workspace_fs` mutating operations. Message send only reads existing attachment refs.
+- Quota enforcement stays in internal `WorkspaceFS` mutating operations. Message send only reads existing attachment refs.
 - M1f can expand the same `openoctopus_device` field by automatic device/install-site detection without changing the M1d request shape.
 
 **M1f supersession:** ADR-117 keeps the strict `content` + `attachments` arrays
@@ -2790,8 +2828,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py1** | Auth + config | Registration/login + JWT + cookie/bearer + admin `system_config` + admin user management | Py0 | Auth + admin config tests pass; admin can configure fake LLM; no chat yet |
 | **Py2** | Streaming single-provider-turn chat | `POST/GET /api/sessions/{id}/messages` + Postgres transcript and `turn_runs` + Anthropic SDK streaming adapter + best-effort text/thinking `token_delta` preview + detached per-session runner + durable `pending_messages` drain/latest-wins subscriber semantics + `llm_max_concurrent_requests` semaphore + admin `llm_max_output_tokens` | Py1 | Browser can create a session; fake provider streams and persists one complete assistant turn; same-session overlap queues and drains durably; disconnect recovers through full GET state |
 | **Py3** | Agent loop + first tool + compaction | Hand-written ReAct loop + JIT tool-result collapsing + tool progress + cancel/restart + **only** executable `web_fetch` + tool registry + merge algorithm (`inject_device_routing`, `extend_openoctopus_device_enums`) + account/context helpers + two-stage compaction with pending-boundary ordering | Py2 | `web_fetch` works end-to-end; tool-result normalization, tool progress, cancel/restart, multi-`turn_id` ReAct chains, and both compaction stages work |
-| **Py4a** | Design spike | `workspace_fs` 2–3 page spec: object-client pool size/lifecycle, quota race resolution strategy, temp cleanup triggers, MinIO error normalization checklist | Py3 | Spec doc reviewed; answers the four points explicitly |
-| **Py4** | Workspace files + initial `message` tool | `workspace_fs` (per Py4a spec) + file REST API (read/write/edit/list/find/grep/delete/apply_patch/notebook_edit) + server-side shared file tools + MinIO integration + quota + initial web/workspace `message` tool and provider-hidden delivery persistence | Py4a | File API/tool tests pass through workspace_fs; no API touches MinIO directly; current-web message delivery does not insert an extra provider-visible row inside a tool batch |
+| **Py4a** | Workspace foundation | `WorkspaceService`/internal `WorkspaceFS`, bounded RustFS client lifecycle, quota and lifecycle race handling, deletion outbox, error normalization | Py3 | Foundation tests, live RustFS tests, lint, formatting, and strict typing pass |
+| **Py4** | Workspace files + initial `message` tool | workspace-management REST + file REST API (read/write/edit/list/find/grep/delete/apply_patch) + server-side shared file tools (including agent-only `notebook_edit`) + quota + workspace-backed prompt inputs + initial web/workspace `message` tool and provider-hidden delivery persistence | Py4a | File API/tool tests pass through `WorkspaceService`; no API touches RustFS directly; current-web message delivery attaches provider-hidden refs to the existing assistant tool-use row and does not insert an extra provider-visible row inside a tool batch |
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
 | **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
 | **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
@@ -2920,10 +2958,12 @@ conversation state.
 **Status:** accepted
 **Python-main clarification:** Single ASGI worker with asyncio concurrency is
 the definitive model. Redis is not introduced. CPU-intensive synchronous work
-(file parsing with markitdown, PDF extraction, RAG document ingestion) crosses
-a thread/process boundary via `loop.run_in_executor`, `ProcessPoolExecutor`,
-or subprocess rather than blocking the event loop or requiring multi-worker
-horizontal scale. Multi-worker deployment requires a future ADR.
+(file parsing with MarkItDown and PDF extraction) runs in a resource-limited,
+killable subprocess rather than blocking the event loop or requiring
+multi-worker horizontal scale. Process-local fair admission bounds REST
+transfers, context construction, web fetches, and conversion children.
+Multi-worker deployment requires a future ADR and cannot treat those limits as
+cross-process coordination.
 
 **Context:** OpenOctopus workload is dominated by I/O: Anthropic Messages requests,
 database access, browser streaming responses, device WebSockets, and file
@@ -2950,6 +2990,9 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
   `system_config.llm_max_concurrent_requests` semaphore. `0` or missing means
   unlimited in-process provider concurrency; positive values cap all Anthropic
   Messages calls made through the shared provider adapter.
+- Provider capacity does not bound prepared-context memory. Separate required
+  global/per-user context admission starts before prompt construction and is
+  held through compaction and the final Provider request.
 - Blocking work must not run on the event loop. Workspace file IO, hashing,
   recursive find_files/grep, copy/move, and other CPU/blocking filesystem work must
   use an explicit background/thread boundary with bounded concurrency.
@@ -2959,10 +3002,11 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
 - Per-session scheduler state is evicted once it has no runner, queued start, or
   subscriber. A later message recreates it from PostgreSQL-backed session state;
   active users of a state hold a short lease so eviction cannot split a session.
-- Server workspace operations will need their own Py4 implementation boundary:
-  MinIO/S3 client lifecycle, object-client connection pool sizing, workspace IO
-  concurrency limits, and backpressure are not part of the public API, but must
-  be configured or bounded inside the server before file APIs/tools are enabled.
+- Py4 server-workspace, REST-transfer, web-fetch, context, and content-conversion
+  limits are required deployment configuration. Acquisition is per-user before
+  global capacity, every failure/cancellation releases both, and no PostgreSQL
+  connection is retained while waiting for admission, object bytes, a child, or
+  a Provider response.
 
 **Consequences:** The Python server alpha keeps deployment and device routing
 simple. A single process can still handle hundreds of I/O-bound sessions if
@@ -2976,45 +3020,53 @@ production latency benchmark. Horizontal scale is intentionally deferred.
 
 ---
 
-### ADR-123 · Python-main server workspaces are MinIO-backed; disk is temporary only
+### ADR-123 · Python-main server workspaces are RustFS-backed and memory-bounded
 
 **Status:** accepted
-**Python-main clarification:** Python server workspaces persist in MinIO/S3-compatible
-object storage behind `workspace_fs`. Local disk is temporary staging only and must
-be cleaned after use. Object store config is deployment infrastructure (env vars), not
-`system_config`. Python implementation uses `minio-py` SDK. Object keys:
+**Python-main clarification:** Python server workspaces persist in RustFS behind
+`WorkspaceService` and internal `WorkspaceFS`. Py4 uses bounded memory and no
+local staging or cache. Object store config is deployment infrastructure (env vars), not
+`system_config`. Python uses RustFS's S3 API through the `minio-py` SDK. Py4 does
+not add a generic storage-provider interface or support another S3 deployment.
+Object keys:
 `users/{user_id}/...` and `workspaces/{workspace_id}/...`.
 
 **Context:** Rust-era Plexus treated the server workspace as a durable local
 filesystem tree. Python-main is designing for a larger service from the start:
 server instances should not become the durable owner of user files, and future
 scale-out should not require moving or reconciling local workspace directories.
-Object storage is a better persistent boundary for files, while the existing
-`workspace_fs` abstraction keeps tools and REST APIs independent of storage
+Object storage is a better persistent boundary for files, while internal
+`WorkspaceFS` keeps tools and REST APIs independent of storage
 mechanics.
 
-**Decision:** Server-side personal and shared workspace bytes are persisted in a
-MinIO-compatible object store. Local server disk is never the canonical file
+**Decision:** Server-side personal and shared workspace bytes are persisted in
+RustFS. Local server disk is never the canonical file
 store. Disk may be used only for temporary staging or materialization during
 uploads, downloads, parsing, hashing, grep/find_files, file transfer, archive work, or
 provider/tool preparation, and temporary files must be deleted after the
 request/job completes or fails.
 
-`workspace_fs` remains the only read/write/list/delete/copy/rename/quota
-boundary for server-side workspace files. REST handlers, agent tools, channel
-adapters, transfer code, and prompt/context builders never call MinIO directly.
-They operate on OpenOctopus virtual workspace paths; `workspace_fs` resolves those
-paths to object keys and normalizes MinIO/S3 errors into OpenOctopus `WorkspaceError`
-or `ToolError` values.
+`WorkspaceService` is the authenticated virtual-path boundary for REST handlers
+and agent tools. It resolves personal/shared access in a short PostgreSQL
+transaction, materializes a private immutable ticket, and closes that
+transaction before admission waits, request/response bodies, RustFS access,
+document conversion, or Provider work. An already-authorized operation may
+therefore finish after membership revocation; storage remains authoritative for
+the object's current existence and revision. `WorkspaceFS` accepts only
+already-authorized immutable targets and owns object-key mapping, quota,
+mutation locks, and MinIO/S3 error normalization. Trusted account/workspace
+lifecycle code may call its retire/purge operations directly; other handlers,
+channel adapters, transfer code, and prompt/context builders never call the
+RustFS client or target-based file operations directly.
 
-Py4 must treat `workspace_fs` as a real concurrency boundary, not just a thin
+Py4 must treat internal `WorkspaceFS` as a real concurrency boundary, not just a thin
 object-store wrapper. The external API stays simple, but the implementation
 must explicitly handle:
 
-- **Object client capacity:** shared MinIO/S3 client lifecycle, connection pool
+- **Object client capacity:** shared RustFS/minio-py client lifecycle, connection pool
   sizing, request timeouts, retries, and pool-exhaustion behavior.
-- **Server-local backpressure:** bounded concurrency for object IO, temporary
-  file IO, hashing, recursive list/grep, copy/move, and transfer staging so the
+- **Server-local backpressure:** bounded concurrency for object IO, in-memory
+  transforms, hashing, recursive list/grep, copy/move, and transfers so the
   FastAPI/agent event loop is not blocked.
 - **Same-path races:** concurrent write/write, edit/write, delete/write, and
   folder-delete/write conflicts. Py4 must choose a clear strategy such as
@@ -3023,10 +3075,10 @@ must explicitly handle:
 - **Quota races:** concurrent writes can otherwise pass separate pre-checks and
   exceed quota together. Usage accounting, private object indexes/counters, and
   lock auto-lift behavior must be serialized or reconciled inside
-  `workspace_fs`.
-- **Temporary staging cleanup:** staged upload/download/grep/archive/transfer
-  files must be removed on normal failure and have a crash-recovery cleanup
-  path.
+  internal `WorkspaceFS`.
+- **Memory bounds:** byte-returning reads require an explicit bound, metadata
+  scans use pages of at most 1,000 objects, and Py4 transformations materialize
+  no more than 8 MiB per file. Py4 adds no local staging directory or cache.
 - **Error normalization:** missing bucket, bad credentials, object-store
   timeout, transient 5xx, pool exhaustion, and provider-specific S3/MinIO
   errors must become stable OpenOctopus error codes at the API/tool edge.
@@ -3048,11 +3100,11 @@ prefixes do not move because they are keyed by immutable UUIDs.
 
 PostgreSQL remains the metadata and access-control source of truth: users,
 workspace rows, memberships, quotas, sessions, and messages live in Postgres.
-Canonical file bytes live in MinIO. `bytes_used` is exposed through `Workspace`
-responses and computed or cached behind `workspace_fs`; there is no public
+Canonical file bytes live in RustFS. `bytes_used` is exposed through `Workspace`
+responses and computed behind internal `WorkspaceFS`; there is no public
 `users.bytes_used` column. If Py4 needs a private object index table for
 performance or consistency, that table is an implementation detail of
-`workspace_fs`, not a second file API.
+internal `WorkspaceFS`, not a second file API.
 
 Object storage configuration is deployment infrastructure state, like Postgres.
 It is supplied through environment variables, Docker Compose, Kubernetes
@@ -3062,21 +3114,50 @@ It is not stored in `system_config` and is not editable through
 
 | Key | Purpose |
 |---|---|
-| `OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT` | MinIO/S3-compatible endpoint URL. |
+| `OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT` | RustFS S3 endpoint URL, including `http://` or `https://`. |
 | `OPENOCTOPUS_OBJECT_STORAGE_BUCKET` | Bucket used for all server workspace objects. |
-| `OPENOCTOPUS_OBJECT_STORAGE_REGION` | S3 region string; MinIO deployments may use a conventional value such as `us-east-1`. |
+| `OPENOCTOPUS_OBJECT_STORAGE_REGION` | RustFS S3 region string, such as `us-east-1`. |
 | `OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY` | Access key. |
 | `OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY` | Secret key. |
+| `OPENOCTOPUS_OBJECT_STORAGE_MAX_CONNECTIONS` | Required per-process workspace/internal logical object-call and HTTP-pool limit, from 5 through 256. Runtime health uses one additional fixed connection. |
 
-Missing or unreachable object-storage config means server workspace features are
-not configured; startup/health checks and setup UI must surface that directly
-rather than falling back to durable local disk or waiting for an admin config
-patch.
+Missing, invalid, or unreachable object-storage config prevents server startup;
+the health route reports later reachability failures rather than falling back
+to durable local disk or waiting for an admin config patch.
+
+Startup does not create the bucket. It verifies bucket existence plus
+write/stat/exact-read/delete capability, then recovers durable
+`workspace_deletions` rows. The 60-second probe timeout is an outer cancellation
+threshold, not a hard wall-clock guarantee: safe cancellation waits for a
+synchronous object mutation and cleanup to finish. Runtime `/health` is lighter
+and non-mutating; it checks PostgreSQL and RustFS bucket reachability with
+independent two-second deadlines. RustFS checks are single-flight on a dedicated
+one-connection client and pool, so they neither borrow workspace capacity nor
+queue behind user operations. The per-process RustFS connection ceiling is
+therefore the configured workspace/internal limit plus this one health connection.
+
+All workspace and internal object operations share one logical semaphore.
+Synchronous MinIO metadata and mutation calls use the SDK; cancellable reads use
+a locally created presigned GET through one `httpx.AsyncClient` with redirects
+and environment proxies disabled. The health client is the sole exception and
+has its fixed one-connection budget. The signed query is never returned, logged,
+persisted, or included in normalized errors. Required REST upload plus download
+concurrency must be strictly below the configured object connection count,
+reserving at least one slot for Agent/internal work.
+
+Account and last-member deletion first fence the in-process target, then commit
+metadata deletion plus a `workspace_deletions` row. RustFS purge and removal of
+that row happen afterward. A post-commit purge failure still returns logical
+deletion success; cleanup retries periodically in the running process and again
+at startup. Each runtime purge runs in a dedicated child with a configured
+deadline; shutdown waits a configured grace, then terminates/kills and reaps the
+child while retaining the durable row for replay. Startup recovery remains
+synchronous in Py4.
 
 **Consequences:** Python-main no longer has a durable
 `OPENOCTOPUS_WORKSPACE_ROOT`-style server directory. Deployments must provide
-Postgres and MinIO-compatible object storage before server workspace features
-are enabled. Server restarts or redeployments do not move user files. File APIs,
+Postgres and RustFS before server workspace features are enabled. Server
+restarts or redeployments do not move user files. File APIs,
 tools, quota, attachment refs, skills storage, and transfer destinations retain
 the same virtual path semantics while the storage backend is object-based.
 
@@ -3087,7 +3168,7 @@ the same virtual path semantics while the storage backend is object-based.
 file refs with `delivery_refs` metadata; the browser downloads later through
 the Workspace Files GET relay. Third-party channel delivery streams
 device/server bytes directly into the platform's native file upload API.
-Server workspace media persists in MinIO; device media does not
+Server workspace media persists in RustFS; device media does not
 auto-duplicate. Python implementation via FastAPI streaming + httpx. ADR-127
 defers the first producer of `delivery_refs` and the delivery-persistence
 helper to Py4; the column remains empty through Py3.
@@ -3105,7 +3186,7 @@ one boundary:
 - **Web channel:** `message(media=[...], openoctopus_device="<client>")` writes
   user-visible, provider-hidden delivery state with `delivery_refs` metadata
   that names the device and path. It does **not** read the file, upload it to
-  MinIO, or count it toward workspace quota. The frontend renders a file
+  RustFS, or count it toward workspace quota. The frontend renders a file
   chip/link. When the user
   clicks it, the browser calls the Workspace Files download route with the
   recorded `openoctopus_device` and `path`; the server relays that HTTP response to
@@ -3115,11 +3196,11 @@ one boundary:
 - **Third-party channels:** `message(media=[...], openoctopus_device="<client>")`
   streams the bytes from the device over `/ws/device` and immediately uploads
   them to the platform's native file/media API. The platform owns the delivered
-  copy after success. OpenOctopus does not persist those bytes in MinIO and does not
+  copy after success. OpenOctopus does not persist those bytes in RustFS and does not
   count them toward workspace quota. If the device is unreachable, the file is
   unreadable, or the platform upload fails, the `message` tool fails.
-- **Server workspace media:** `openoctopus_device="server"` reads from
-  `workspace_fs`. Web delivery produces durable workspace file refs;
+- **Server workspace media:** `openoctopus_device="server"` reads through
+  `WorkspaceService`. Web delivery produces durable workspace file refs;
   third-party delivery uploads the workspace bytes to the platform.
 - **Durable OpenOctopus links:** If the product needs a file to remain downloadable
   from OpenOctopus after the source device disconnects, the agent must first copy it
@@ -3133,9 +3214,10 @@ The concrete Py4 delivery record/helper must not insert another
 provider-replayed assistant row between the assistant message containing the
 `message` tool use and the user-role tool-result batch that answers it. The
 persisted assistant `tool_use` remains the provider-visible message content and
-the matching persisted `tool_result` records the delivery outcome. Exact
-ownership/linking of provider-hidden delivery state is finalized with the Py4
-implementation rather than prebuilt in Py3.
+the matching persisted `tool_result` records the delivery outcome. Py4 appends
+server-generated refs, each linked by `tool_use_id`, to that existing assistant
+row's provider-hidden `delivery_refs` sidecar and commits the sidecar update with
+the matching tool result.
 
 **Consequences:** Web delivery is cheap and avoids unnecessary object-storage
 writes for files that are only useful while the user's device is online.
@@ -3190,7 +3272,7 @@ recovery foundation while keeping tools themselves out of scope.
   never leapfrogs older pending input.
 - Browser input in Py2 supports Anthropic text blocks, direct inline base64
   image blocks, and optional `effort`. `attachments` must be an empty array;
-  MinIO/workspace attachment references start in Py4.
+  RustFS/workspace attachment references start in Py4.
 - Server-generated `<runtime>` metadata remains persisted and provider-visible,
   but is not part of the public history DTO. Projection code examines only the
   first text block of canonical human and pending messages, accepts only the
@@ -3217,7 +3299,7 @@ or out-of-band tool execution context.
 **Consequences:** Py3 can add the ReAct/tool loop on top of a proven streaming,
 queueing, and recovery lifecycle instead of changing that lifecycle. Py2 is
 larger than a trivial request/response adapter, but it still excludes tools,
-tool progress, workspace attachments, MinIO, compaction, channels, cron,
+tool progress, workspace attachments, RustFS, compaction, channels, cron,
 heartbeat, and multi-worker coordination.
 
 ### ADR-126 · Py3 uses semantic message rows, provider-call turn IDs, and active-row compaction
@@ -3275,13 +3357,19 @@ only needs to prove the ReAct loop with one executable tool.
 **Decision:** Py3 registers and executes `web_fetch` only. It does not expose a
 `message` schema, execute the tool, or implement its delivery-persistence
 helper. Py4 introduces the initial current-web/server-workspace subset after
-`workspace_fs` exists. Device media and cross-channel/buttons behavior remain
+`WorkspaceService` exists. Device media and cross-channel/buttons behavior remain
 gated by the client and channel milestones. `messages.delivery_refs` remains a
 separate provider-hidden sidecar and stays empty through Py3; keeping the
 already-created column avoids a remove-and-readd migration. Py4 must persist
 user-visible delivery state without inserting another provider-replayed
 assistant row between the existing assistant `tool_use` and its matching
-tool-result batch.
+tool-result batch. The agent supplies ordinary workspace paths; it never supplies
+`delivery_refs`. On successful current-web delivery, the server generates refs,
+links each ref to the generating `tool_use_id`, and appends them to the already
+persisted assistant row containing that tool use. Updating this provider-hidden
+sidecar does not change provider replay. The matching tool result is committed in
+the same transaction, and a live `message_persisted` event may republish the same
+assistant message ID as an idempotent updated snapshot for frontend upsert.
 
 **Consequences:** Py3 has one end-to-end executable tool and no speculative
 delivery helper. The final `message` schema remains documented in `TOOLS.md` as
@@ -3339,6 +3427,74 @@ synthetically cancelled.
 answer that already completed. Every persisted assistant tool-use batch remains
 fully paired, and idle sessions never retain a stale cancel flag.
 
+### ADR-130 · Py4 uses fair local admission and isolated MarkItDown conversion
+
+**Status:** accepted
+
+**Context:** The first Py4 implementation let slow REST bodies share Agent
+materialization capacity, retained more skill content than conditional prompts
+need, parsed Office/PDF and HTML with hand-written in-process paths, allowed a
+runtime RustFS purge to delay shutdown indefinitely, and left administrator
+user quota fields incomplete. These are shared-resource and correctness
+boundaries for a single process expected to serve hundreds of concurrent
+sessions.
+
+**Decision:** Py4 adopts the following one-process boundaries:
+
+- REST uploads and downloads have independent global admission plus one keyed
+  per-user cap shared across both directions. Queue timeouts return HTTP 429
+  `workspace_transfer_busy` with `Retry-After`; an upload idle timeout returns
+  HTTP 408 `workspace_transfer_timeout`. A started download owns its permits and
+  RustFS response until its body closes. These REST limits never apply to Agent
+  file operations.
+- Skill discovery and caching follow ADR-082, ADR-083, and ADR-085. Conditional
+  skills load only bounded frontmatter; every discovered valid always-on body is
+  rendered completely. `tiktoken==0.13.0` with a packaged, hash-verified
+  `o200k_base` asset provides deterministic local estimation. OO does not require
+  a third-party Provider count-tokens endpoint, does not locally reject a final
+  oversized request, and safely persists the Provider's context rejection.
+- One shared per-user/global conversion admission serves document `read_file`
+  and HTML conversion. Document admission is acquired before RustFS
+  materialization. Each conversion uses a fresh Linux spawn child that applies
+  `RLIMIT_AS` and `RLIMIT_CPU` before importing parser libraries. The parent
+  applies a wall deadline, terminates/kills when needed, reaps the child, and
+  releases admission on success, failure, timeout, or cancellation.
+- The child directly instantiates exactly one trusted MarkItDown 0.1.7 PDF,
+  DOCX, XLSX, PPTX, or HTML converter and receives only bounded bytes plus
+  explicit metadata—never a URL or local path. It does not initialize the
+  MarkItDown orchestrator, plugins, default discovery, or Magika. OOXML receives
+  ZIP safety preflight. PDF input is sliced to at most 20 pages and returns
+  total/continuation markers. VLM, OCR, audio/video, Azure, YouTube, archive
+  recursion, and remote-document fetching remain out of scope.
+- Server `web_fetch` retains OO's URL validation, repeated SSRF checks,
+  redirect/deadline policy, identity encoding, and 5 MB response cap. Only the
+  already-downloaded HTML crosses the conversion boundary. Markdown uses the
+  isolated HTML converter; text mode uses bounded BeautifulSoup parsing in the
+  same child. Web admission is separate so slow network peers do not occupy a
+  conversion child while downloading.
+- Conversion queue, resource, and input failures are ordinary tool results with
+  stable codes `tool_content_conversion_busy`,
+  `tool_content_conversion_resource_exceeded`, and
+  `tool_content_conversion_failed`; wall/CPU expiry retains
+  `tool_exec_timeout`. The model can retry or explain these results.
+- Administrator user listings populate required `quota_bytes`, `bytes_used`,
+  and `locked` values using live personal-workspace scans after the database
+  transaction closes. Scans use the existing global heavy-operation cap of four
+  and fail the whole page with the existing storage 503 rather than returning
+  partial/null quota state.
+
+All related deployment settings are required environment variables with startup
+validation. Operators must budget roughly conversion concurrency multiplied by
+per-child memory, plus parent/server memory; web bodies and prepared contexts
+have separate configured bounds. These controls are explicitly process-local
+under ADR-122.
+
+**Consequences:** Slow or adversarial work is queued fairly and cancellably
+without holding database connections or Agent materialization capacity.
+Document fidelity is delegated to one pinned conversion library while OO keeps
+the security and resource boundary. Py4 remains single-worker; horizontal scale
+still requires a command/routing and distributed-admission design.
+
 ---
 
 ## Appendix A · Key Design Principles
@@ -3346,14 +3502,14 @@ fully paired, and idle sessions never retain a stale cancel flag.
 Distilled from the ADRs, for fast onboarding of new contributors:
 
 1. **Generic over specialty.** If a generic tool (read_file, edit_file) can do the job, never add a specialty tool (save_memory, update_soul).
-2. **Workspace is the single source of truth for durable user files.** No parallel durable file caches. Server workspace bytes persist in MinIO behind `workspace_fs`; local disk is temporary staging only. Online-only device delivery refs are pointers to paired devices, not durable OpenOctopus files.
+2. **Workspace is the single source of truth for durable user files.** No parallel durable file caches. Server workspace bytes persist in RustFS behind `WorkspaceService`; Py4 uses bounded memory rather than a local file cache. Online-only device delivery refs are pointers to paired devices, not durable OpenOctopus files.
 3. **DB is the single source of truth for conversation state.** In-memory runners are schedulers, not durable state. Every meaningful state change persists immediately.
 4. **Autonomous flows are user messages.** Cron, heartbeat → inject InboundMessage into bus. No `EventKind` branches in the main agent.
 5. **One schema per tool name.** Collisions across install sites are rejected, not auto-versioned.
 6. **No speculative scaffolding.** Fields without consumers are rejected. Add them back in five lines when a consumer appears.
 7. **No rate limiting in v1. No dream in v1.** Admin provisions their LLM; agent maintains MEMORY.md inline.
 8. **Pure functions where possible.** `context::build_context`, the fuzzy matcher, `validate_url` — all pure. Testable with synthetic inputs.
-9. **Crash recovery is passive.** JIT repair on next activity. No startup scans, no background workers.
+9. **Crash recovery is narrow and durable.** Prefer JIT repair, but cross-store workspace deletion uses a small PostgreSQL outbox with runtime and startup recovery.
 10. **Channel adapters are thin.** Platform event → InboundMessage → bus. Agent doesn't know which channel it's on; adapters translate.
 
 ---

@@ -8,6 +8,7 @@ from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
 from openctopus_server.dto.user import UserResponse
 from openctopus_server.services import users
+from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
 
 router = APIRouter(prefix="/api/me", tags=["Me"])
 
@@ -39,7 +40,7 @@ async def patch_me(
 async def delete_me(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
 ) -> Response:
-    await users.assert_not_last_admin(db, user)
-    await users.delete_user(db, user)
+    await users.delete_user(db, user, workspace_fs=workspace_fs)
     return Response(status_code=204)

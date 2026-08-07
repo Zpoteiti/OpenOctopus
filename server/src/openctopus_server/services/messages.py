@@ -282,10 +282,55 @@ async def persist_tool_result(
     turn: TurnStart,
     block: dict[str, Any],
     synthetic: bool = False,
-) -> Message:
+    assistant_message_id: UUID | None = None,
+    delivery_refs: list[dict[str, Any]] | None = None,
+) -> tuple[Message | None, Message]:
+    if (assistant_message_id is None) != (delivery_refs is None):
+        raise ValueError("assistant_message_id and delivery_refs must be provided together")
+    if synthetic and assistant_message_id is not None:
+        raise ValueError("synthetic tool results cannot attach delivery refs")
+
     try:
         await _advisory_lock(db, turn.session_id)
         await _running_turn(db, turn.turn_id)
+        updated_assistant: Message | None = None
+        if assistant_message_id is not None:
+            updated_assistant = (
+                await db.execute(
+                    select(Message)
+                    .where(
+                        Message.id == assistant_message_id,
+                        Message.session_id == turn.session_id,
+                        Message.message_kind == "assistant",
+                        Message.is_compacted.is_(False),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if updated_assistant is None:
+                raise RuntimeError("Message delivery assistant message is unavailable")
+
+            tool_use_id = block.get("tool_use_id")
+            matching_uses = [
+                item
+                for item in updated_assistant.content
+                if item.get("type") == "tool_use" and item.get("id") == tool_use_id
+            ]
+            if len(matching_uses) != 1 or matching_uses[0].get("name") != "message":
+                raise RuntimeError("Message delivery tool use is unavailable")
+            assert delivery_refs is not None
+            if any(ref.get("tool_use_id") != tool_use_id for ref in delivery_refs):
+                raise RuntimeError("Message delivery ref does not match its tool use")
+            if any(
+                isinstance(ref, dict) and ref.get("tool_use_id") == tool_use_id
+                for ref in updated_assistant.delivery_refs
+            ):
+                raise RuntimeError("Message delivery refs are already attached")
+            updated_assistant.delivery_refs = [
+                *updated_assistant.delivery_refs,
+                *[dict(ref) for ref in delivery_refs],
+            ]
+
         message = Message(
             id=uuid.uuid4(),
             session_id=turn.session_id,
@@ -297,7 +342,7 @@ async def persist_tool_result(
         )
         db.add(message)
         await db.commit()
-        return message
+        return updated_assistant, message
     except Exception:
         await db.rollback()
         raise

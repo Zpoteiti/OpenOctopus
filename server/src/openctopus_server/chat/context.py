@@ -12,6 +12,9 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.provider.anthropic import provider_fingerprint
 from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.workspace.skills import SkillsCache
+
+from .prompt import PromptWorkspaceService
 
 _TOOL_RESULT_KINDS = {"tool_result", "synthetic_tool_result"}
 _COMPACTION_CONTINUATION: dict[str, Any] = {
@@ -32,6 +35,8 @@ async def build_provider_context(
     config: ProviderConfig,
     include_pending: bool = False,
     add_compaction_continuation: bool = True,
+    workspace_service: PromptWorkspaceService | None = None,
+    skills_cache: SkillsCache | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     session = await db.get(Session, session_id)
     if session is None:
@@ -54,11 +59,7 @@ async def build_provider_context(
         .scalars()
         .all()
     )
-    projected = project_message_rows(
-        rows,
-        current_fingerprint=provider_fingerprint(config),
-    )
-    appended_pending = False
+    pending_rows: list[PendingMessage] = []
     if include_pending:
         pending_rows = list(
             (
@@ -71,14 +72,37 @@ async def build_provider_context(
             .scalars()
             .all()
         )
-        projected.extend(
-            {"role": "user", "content": [dict(block) for block in row.content]}
-            for row in pending_rows
-        )
-        appended_pending = bool(pending_rows)
+    projected = project_provider_messages(
+        rows,
+        current_fingerprint=provider_fingerprint(config),
+        pending_rows=pending_rows,
+        add_compaction_continuation=add_compaction_continuation,
+    )
+
+    system = await build_system_prompt(
+        db,
+        session=session,
+        user=user,
+        workspace_service=workspace_service,
+        skills_cache=skills_cache,
+    )
+    return system, projected
+
+
+def project_provider_messages(
+    rows: Sequence[Message],
+    *,
+    current_fingerprint: str,
+    pending_rows: Sequence[PendingMessage] = (),
+    add_compaction_continuation: bool = True,
+) -> list[dict[str, Any]]:
+    projected = project_message_rows(rows, current_fingerprint=current_fingerprint)
+    projected.extend(
+        {"role": "user", "content": [dict(block) for block in row.content]} for row in pending_rows
+    )
     if (
         add_compaction_continuation
-        and not appended_pending
+        and not pending_rows
         and rows
         and rows[-1].message_kind == "compaction_summary"
     ):
@@ -88,9 +112,7 @@ async def build_provider_context(
                 "content": [dict(block) for block in _COMPACTION_CONTINUATION["content"]],
             }
         )
-
-    system = await build_system_prompt(db, session=session, user=user)
-    return system, projected
+    return projected
 
 
 def project_message_rows(

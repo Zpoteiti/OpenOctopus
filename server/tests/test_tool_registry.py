@@ -1,8 +1,15 @@
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.tools.base import (
+    MessageDeliveryEffect,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolRoutingMode,
+)
 from openctopus_server.tools.device_field import DEVICE_FIELD_MARKER, DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import (
     ToolRegistry,
@@ -36,6 +43,35 @@ class _EchoTool(Tool):
         self.received_args = args
         self.received_ctx = ctx
         return ToolResult(content=str(args["value"]))
+
+
+class _PureServerTool(_EchoTool):
+    routing_mode = ToolRoutingMode.PURE_SERVER
+
+
+class _IntrinsicDeviceTool(_EchoTool):
+    routing_mode = ToolRoutingMode.INTRINSIC_DEVICE
+
+    def schema(self) -> dict[str, Any]:
+        schema = super().schema()
+        schema["input_schema"]["properties"][DEVICE_FIELD_NAME] = {
+            "type": "string",
+            "enum": ["server"],
+            DEVICE_FIELD_MARKER: True,
+        }
+        schema["input_schema"]["required"].append(DEVICE_FIELD_NAME)
+        return schema
+
+
+class _ErrorWithSideEffectTool(_EchoTool):
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        return ToolResult(
+            content="failed",
+            is_error=True,
+            code=ErrorCode.TOOL_DELIVERY_FAILED,
+            side_effect=MessageDeliveryEffect(delivery_refs=()),
+        )
 
 
 def _ctx() -> ToolContext:
@@ -131,7 +167,7 @@ async def test_registry_consumes_routing_and_normalizes_real_result() -> None:
         ]
     )
     assert tool.received_args == {"value": "hello"}
-    assert tool.received_ctx == ctx
+    assert tool.received_ctx == replace(ctx, openoctopus_device="server")
 
 
 async def test_registry_rejects_missing_or_unavailable_routing() -> None:
@@ -148,3 +184,48 @@ async def test_registry_rejects_missing_or_unavailable_routing() -> None:
     assert missing.code == ErrorCode.TOOL_MISSING_REQUIRED_FIELD
     assert unavailable.is_error is True
     assert unavailable.code == ErrorCode.TOOL_DEVICE_UNREACHABLE
+
+
+async def test_pure_server_tool_has_no_device_argument() -> None:
+    tool = _PureServerTool()
+    registry = ToolRegistry((tool,))
+    ctx = _ctx()
+
+    schema = registry.get_tool_schemas()[0]
+    result = await registry.execute(name="echo", args={"value": "hello"}, ctx=ctx)
+
+    assert DEVICE_FIELD_NAME not in schema["input_schema"]["properties"]
+    assert tool.received_args == {"value": "hello"}
+    assert tool.received_ctx == ctx
+    assert result.is_error is False
+
+
+async def test_intrinsic_device_tool_keeps_its_marked_device_argument() -> None:
+    tool = _IntrinsicDeviceTool()
+    registry = ToolRegistry((tool,))
+    ctx = _ctx()
+
+    schema = registry.get_tool_schemas()[0]
+    result = await registry.execute(
+        name="echo",
+        args={"value": "hello", DEVICE_FIELD_NAME: "server"},
+        ctx=ctx,
+    )
+
+    assert schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == ["server"]
+    assert tool.received_args == {"value": "hello", DEVICE_FIELD_NAME: "server"}
+    assert tool.received_ctx == ctx
+    assert result.is_error is False
+
+
+async def test_registry_discards_side_effects_from_error_results() -> None:
+    registry = ToolRegistry((_ErrorWithSideEffectTool(),))
+
+    result = await registry.execute(
+        name="echo",
+        args={"value": "hello", DEVICE_FIELD_NAME: "server"},
+        ctx=_ctx(),
+    )
+
+    assert result.is_error is True
+    assert result.side_effect is None

@@ -34,24 +34,18 @@ class _ScriptedProvider:
         self.count_calls: list[dict[str, Any]] = []
         self.stream_calls: list[dict[str, Any]] = []
 
-    async def count_tokens(
+    def estimate_tokens(
         self,
         *,
-        config: ProviderConfig,
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        effort: Effort | None,
-        limiter: ProviderLimiter,
     ) -> int:
-        del limiter
         self.count_calls.append(
             {
-                "config": config,
                 "system": system,
                 "messages": messages,
                 "tools": tools,
-                "effort": effort,
             }
         )
         return self._counts.popleft()
@@ -132,7 +126,8 @@ def _install_runtime(
     runtime = ChatRuntime(
         pg_engine,
         provider_factory=lambda config: provider,
-        tool_registry=tool_registry,
+        tool_registry=tool_registry if tool_registry is not None else ToolRegistry(()),
+        request_token_estimator=provider.estimate_tokens,
     )
     test_app.state.chat_runtime = runtime
     return runtime
@@ -275,7 +270,7 @@ async def test_stage_one_orders_summary_before_pending_and_replays_only_active_r
     await runtime.close()
 
 
-async def test_compaction_fails_before_normal_call_when_headroom_is_still_too_small(
+async def test_compaction_still_sends_one_final_call_when_local_estimate_remains_too_large(
     user_client,
     test_app,
     pg_engine,
@@ -283,7 +278,10 @@ async def test_compaction_fails_before_normal_call_when_headroom_is_still_too_sm
     await _configure_compaction(pg_engine)
     provider = _ScriptedProvider(
         counts=[6000, 6000],
-        steps=[_StreamStep([{"type": "text", "text": "S1"}])],
+        steps=[
+            _StreamStep([{"type": "text", "text": "S1"}]),
+            _StreamStep([{"type": "text", "text": "provider accepted"}]),
+        ],
     )
     runtime = _install_runtime(test_app, pg_engine, provider)
     session_id = uuid4()
@@ -311,14 +309,14 @@ async def test_compaction_fails_before_normal_call_when_headroom_is_still_too_sm
     )
 
     assert response.status_code == 200
-    assert _events(response)[-1]["status"] == "failed"
-    assert len(provider.stream_calls) == 1
+    assert _events(response)[-1]["status"] == "completed"
+    assert len(provider.stream_calls) == 2
     rows = await _messages(pg_engine, session_id)
     assert [row.message_kind for row in rows] == [
         "human",
         "compaction_summary",
         "human",
-        "synthetic_assistant_error",
+        "assistant",
     ]
     assert [row.is_compacted for row in rows] == [True, False, False, False]
     await runtime.close()

@@ -15,6 +15,6 @@ class UserResponse(BaseModel):
 
 
 class AdminUserResponse(UserResponse):
-    quota_bytes: int | None = None
-    bytes_used: int | None = None
-    locked: bool | None = None
+    quota_bytes: int
+    bytes_used: int
+    locked: bool

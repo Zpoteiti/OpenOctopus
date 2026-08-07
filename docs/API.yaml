@@ -32,10 +32,10 @@ info:
     | `apply_patch` | `POST /api/workspace/patch` | Query: required `openoctopus_device`; body mirrors nanobot apply_patch args |
     | `delete_file` | `DELETE /api/workspace/files/{path}` | Query: required `openoctopus_device`; always allowed for quota release |
     | `delete_folder` | `DELETE /api/workspace/folders/{path}` | Query: required `openoctopus_device`; recursive, no flag |
-    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, max_entries |
-    | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/head_limit/offset |
-    | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, etc. |
-    | `notebook_edit` | — | REST equivalent not specified |
+    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, limit, offset |
+    | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
+    | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
+    | `notebook_edit` | — | Agent-only in Py4; no REST equivalent |
     | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args |
     | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
@@ -46,7 +46,7 @@ info:
 
     **Auth model:**
 
-    - `ADMIN_TOKEN` env var: permanent secret. Anyone who presents it during
+    - `OPENOCTOPUS_ADMIN_TOKEN` env var: required permanent secret. Anyone who presents it during
       registration becomes admin. Multiple admins are supported — share the
       token with teammates who should have admin rights.
     - All other endpoints use JWT, delivered either via `HttpOnly` cookie
@@ -60,6 +60,12 @@ info:
     - JSON bodies everywhere except file reads, which return raw file bytes
       with an appropriate `Content-Type`, and streaming message POST responses,
       which return newline-delimited JSON events.
+    - Py4 workspace collection routes return
+      `{items, limit, offset, next_offset, truncated}`. `next_offset=null`
+      means no ordinary next page; `truncated=true` means an internal safety
+      ceiling stopped a complete scan. Other historical route families keep
+      their documented response shapes until their owning milestone revisits
+      them.
     - Errors always return a JSON body: `{code, message}`. `code` values come
       from the `ErrorCode` enum in `openoctopus_server/errors/`.
     - Timestamps are ISO 8601 with timezone offset.
@@ -78,10 +84,14 @@ info:
     **Python-main deployment/concurrency boundary (ADR-122):**
     The Python server alpha runs one ASGI worker and uses asyncio tasks for
     I/O-bound concurrency. Redis and cross-worker command routing are not
-    server-alpha dependencies. LLM
-    provider concurrency is controlled by the admin-configured
-    `llm_max_concurrent_requests` semaphore. File IO, hashing, recursive
-    grep/find_files, and transfers must not block the event loop.
+    server-alpha dependencies. Process-local global and per-user admission
+    bounds REST transfers, prompt construction, `web_fetch`, and isolated
+    content conversion; these limits are not cross-worker rate limits. LLM
+    provider concurrency remains independently controlled by the
+    admin-configured `llm_max_concurrent_requests` semaphore. File IO, hashing,
+    recursive grep/find_files, transfers, and document conversion must not
+    block the event loop. No PostgreSQL connection is retained while waiting
+    for admission, RustFS bytes, a conversion child, or the Provider.
 
     **Not in this spec:**
 
@@ -121,6 +131,28 @@ security:
   - bearerAuth: []
 
 paths:
+  /health:
+    get:
+      summary: Check required server dependencies
+      security: []
+      description: |
+        Checks PostgreSQL and RustFS concurrently. RustFS health is a
+        non-mutating bucket-existence check; the stronger read/write/stat/delete
+        capability probe runs only at startup. Runtime probes are single-flight
+        on one dedicated RustFS connection, separate from the configured
+        workspace object-operation pool.
+      responses:
+        '200':
+          description: Both dependencies are connected.
+          content:
+            application/json:
+              example: {status: ok, db: connected, object_storage: connected}
+        '503':
+          description: One or both dependencies are disconnected.
+          content:
+            application/json:
+              example: {status: error, db: connected, object_storage: disconnected}
+
   #
   # --- Auth ---
   #
@@ -130,7 +162,7 @@ paths:
       summary: Register a new account
       description: |
         Creates a new user and their auto-created personal workspace.
-        If `admin_token` in the body matches `ADMIN_TOKEN` env var, the
+        If `admin_token` in the body matches `OPENOCTOPUS_ADMIN_TOKEN`, the
         new user is created with `is_admin=true`. Otherwise a regular
         user. On success, returns the JWT and sets the auth cookie.
       security: []
@@ -252,8 +284,12 @@ paths:
       tags: [Me]
       summary: Delete own account (cascades to all user data)
       description: |
-        Cascades to devices, sessions, messages, cron_jobs, discord_configs,
-        telegram_configs, and personal workspace files (ADR-058).
+        Commits the account deletion and a durable workspace-cleanup intent in
+        PostgreSQL, then purges personal RustFS objects. A post-commit storage
+        failure does not turn the logical deletion into an error: cleanup is
+        retried by the running process and during startup (ADR-058, ADR-123).
+        Database cascades remove devices, sessions, messages, cron_jobs,
+        discord_configs, and telegram_configs.
         Shared workspace memberships are removed; shared workspaces the user
         was in persist for other members.
       responses:
@@ -607,14 +643,15 @@ paths:
         workspaces they can access. Each `Workspace` includes quota state
         (`quota_bytes`, `bytes_used`, `locked`), so there is no separate
         personal quota endpoint.
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 } }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/Workspace' }
+              schema: { $ref: '#/components/schemas/WorkspacePage' }
     post:
       tags: [Workspaces]
       summary: Create a shared workspace (caller auto-added to allow-list)
@@ -631,6 +668,7 @@ paths:
             schema:
               type: object
               required: [name, quota_bytes]
+              additionalProperties: false
               properties:
                 name:
                   type: string
@@ -686,7 +724,7 @@ paths:
       description: |
         Any member of the allow-list can rename or change the quota cap
         (ADR-flat-permissions). Rename only mutates `workspaces.name` —
-        the MinIO object prefix and `workspaces.id` are unchanged, so no
+        the RustFS object prefix and `workspaces.id` are unchanged, so no
         object moves happen. The `suffix` portion of the addressing form is
         also unchanged (it is derived from `id`). However, since strict
         mode (ADR-108) requires both `name` and `suffix` to match in
@@ -699,6 +737,8 @@ paths:
           application/json:
             schema:
               type: object
+              minProperties: 1
+              additionalProperties: false
               properties:
                 name: { type: string }
                 quota_bytes: { type: integer, format: int64 }
@@ -722,14 +762,15 @@ paths:
     get:
       tags: [Workspaces]
       summary: List allow-list for a shared workspace
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 } }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/WorkspaceMember' }
+              schema: { $ref: '#/components/schemas/WorkspaceMemberPage' }
     post:
       tags: [Workspaces]
       summary: Add a user to the allow-list
@@ -746,9 +787,13 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               oneOf:
-                - { required: [user_id], properties: { user_id: { type: string } } }
-                - { required: [email], properties: { email: { type: string, format: email } } }
+                - { required: [user_id] }
+                - { required: [email] }
+              properties:
+                user_id: { type: string, format: uuid }
+                email: { type: string, format: email }
       responses:
         '201':
           description: Member added.
@@ -774,8 +819,8 @@ paths:
       summary: Remove a user from the allow-list
       description: |
         Any member can remove anyone (including themselves). Removing
-        the last member triggers automatic workspace deletion (files
-        purged, quota released).
+        the last member commits workspace deletion plus a durable cleanup
+        intent. RustFS purge is idempotent and retried after transient failure.
       responses:
         '204': { description: Removed. }
 
@@ -789,64 +834,116 @@ paths:
   #
   /api/workspace/files/{path}:
     description: |
-      Workspace file route for explicit `openoctopus_device`. `server` targets the
-      server-side workspace service. Paired device names route over
-      `/ws/device`; offline-but-paired targets return `device_unreachable`.
+      Py4 server-workspace file route. `openoctopus_device` is explicit and must
+      be `server`.
     parameters:
       - name: path
         in: path
         required: true
         description: |
-          Path on the target `openoctopus_device`. With `server`, relative paths
-          resolve to the authenticated user's personal server workspace, while
-          absolute `/name@suffix/...` paths address shared workspaces. With a
-          device name, the client resolves relative paths against its
-          configured `workspace_path`; absolute paths outside that tree are
-          allowed only when the device `sandbox_mode=false`. Sandbox mode must
-          still enforce containment after resolution.
+          Path in the server workspace. Relative paths resolve to the
+          authenticated user's personal workspace; absolute
+          `/name@suffix/...` paths address shared workspaces.
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
     get:
       tags: [Workspace Files]
       summary: Read workspace file contents
       description: |
-        For `openoctopus_device=server`, reads from `workspace_fs` and streams the
-        server workspace object bytes. For a paired device target, the server
-        relays the authenticated HTTP response to the device WebSocket file
-        stream with bounded buffering/backpressure; it does not stage the file
-        into MinIO. This route is also how the browser resolves online-only web
-        `MessageDeliveryRef` device-file chips.
+        Authorizes through `WorkspaceService` and streams the server workspace
+        object bytes. This route is also how the browser downloads current-web
+        `MessageDeliveryRef` workspace files. Downloads use process-local
+        fair admission shared per user with uploads, plus an independent global
+        download limit. Admission is held until the response closes. A queue
+        timeout returns `workspace_transfer_busy`; if a body send stalls after
+        200 headers, the stream closes because its status can no longer change.
       responses:
         '200':
-          description: OK — returns raw file bytes as `application/octet-stream`.
+          description: OK — returns a backpressured raw file stream.
+          headers:
+            ETag:
+              description: Quoted opaque file revision for a later `If-Match`.
+              schema: { type: string }
+            Content-Length:
+              description: File size in bytes.
+              schema: { type: integer, format: int64 }
+            Content-Disposition:
+              description: Safe attachment filename.
+              schema: { type: string }
+            X-Content-Type-Options:
+              description: Always `nosniff` for user-controlled files.
+              schema: { type: string, enum: [nosniff] }
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: Transfer admission timed out (`workspace_transfer_busy`).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, minimum: 1 }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     put:
       tags: [Workspace Files]
       summary: Write workspace file contents
       description: |
         Full-content replace. Accepts raw `application/octet-stream` bytes.
-        For `openoctopus_device=server`, implicit `mkdir -p` on the parent path
-        (ADR-088) and workspace_fs quota checks apply. Device targets route the
-        write over `/ws/device` and the client applies its local fs policy.
+        Implicit `mkdir -p` on the parent path (ADR-088) and
+        `WorkspaceService` quota checks apply.
         Server-side writes, hashes, and recursive operations must use the
         workspace service's background/thread boundary rather than blocking the
         FastAPI or agent event loop.
+        Missing precondition headers mean an intentional unconditional full
+        replacement. `If-None-Match: *` provides race-safe creation.
+        Server uploads use the same per-user transfer limit as downloads and a
+        separate global upload limit. The permit covers request-body collection
+        through the RustFS write. Queue timeout returns
+        `workspace_transfer_busy`; lack of progress while receiving the next
+        body chunk returns `workspace_transfer_timeout` and does not commit a
+        file.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Stale revisions return `workspace_file_changed`.
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string, enum: ['*'] }
+          description: Optional `*` for create-only semantics. Cannot be combined with `If-Match`.
       requestBody:
         required: true
         content:
           application/octet-stream:
             schema: { type: string, format: binary }
       responses:
-        '204': { description: Written. }
+        '200':
+          description: Written. Returns the new metadata and ETag.
+          headers:
+            ETag:
+              description: Quoted opaque revision after the write.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMutation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409':
           description: Quota lock (SoftLocked), operation exceeds 80% single-op cap, or operation exceeds the 64 MiB REST request body collection cap (UploadTooLarge).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '408':
+          description: Upload body made no progress before the idle timeout (`workspace_transfer_timeout`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: Transfer admission timed out (`workspace_transfer_busy`).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, minimum: 1 }
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     patch:
       tags: [Workspace Files]
@@ -857,6 +954,12 @@ paths:
         `line_hint`, and `expected_replacements`. `old_text=""` keeps
         nanobot's create-file shortcut when the target does not exist; ordinary
         create/replace remains available through `PUT`.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Missing means edit the latest locked content.
       requestBody:
         required: true
         content:
@@ -884,13 +987,13 @@ paths:
       responses:
         '200':
           description: Edit applied.
+          headers:
+            ETag:
+              description: Quoted opaque revision after the edit.
+              schema: { type: string }
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  replacements: { type: integer }
-                  created: { type: boolean, default: false }
+              schema: { $ref: '#/components/schemas/FileMutation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -906,6 +1009,12 @@ paths:
       description: |
         Deletes a file from the selected install site. Server deletes are
         always allowed regardless of quota lock state.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: Optional single strong ETag. Missing means unconditional delete.
       responses:
         '204': { description: Deleted. }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -983,16 +1092,7 @@ paths:
           description: Patch applied or dry-run summary generated.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  applied: { type: boolean }
-                  summaries:
-                    type: array
-                    items: { type: string }
-                  warnings:
-                    type: array
-                    items: { type: string }
+              schema: { $ref: '#/components/schemas/StructuredPatchResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1010,7 +1110,8 @@ paths:
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
       - { name: recursive, in: query, required: false, schema: { type: boolean, default: false }, description: 'Recursively list all files (default false).' }
-      - { name: max_entries, in: query, required: false, schema: { type: integer, minimum: 1, default: 200 }, description: 'Maximum entries to return (default 200).' }
+      - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum entries to return.' }
+      - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N matching entries.' }
     get:
       tags: [Workspace Files]
       summary: List workspace directory contents
@@ -1019,9 +1120,7 @@ paths:
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/ListDirEntry' }
+              schema: { $ref: '#/components/schemas/ListDirEntryPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1039,16 +1138,14 @@ paths:
         - { name: type, in: query, required: false, schema: { type: string }, description: 'Optional file type shorthand, e.g. `py`, `ts`, `md`, or `json`.' }
         - { name: include_dirs, in: query, required: false, schema: { type: boolean, default: false }, description: 'Include matching directories as well as files.' }
         - { name: sort, in: query, required: false, schema: { type: string, enum: [path, modified], default: path }, description: 'Sort by path or most recently modified first.' }
-        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 200 }, description: 'Maximum number of paths to return. 0 means all matches up to internal safety limits.' }
-        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N matching entries.' }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum number of paths to return.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N matching entries.' }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { type: string }
+              schema: { $ref: '#/components/schemas/ListDirEntryPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
 
   /api/workspace/grep:
@@ -1067,16 +1164,14 @@ paths:
         - { name: output_mode, in: query, required: false, schema: { type: string, enum: [content, files_with_matches, count], default: files_with_matches }, description: 'Shape of grep results.' }
         - { name: context_before, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context before a match in content mode.' }
         - { name: context_after, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 20, default: 0 }, description: 'Lines of context after a match in content mode.' }
-        - { name: head_limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 1000, default: 250 }, description: 'Maximum number of file entries or content match blocks.' }
-        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 }, description: 'Skip the first N results before applying `head_limit`.' }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum number of file entries or content match blocks.' }
+        - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N results before applying `limit`.' }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { type: string }
+              schema: { $ref: '#/components/schemas/GrepResultPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1671,18 +1766,18 @@ paths:
           - `llm_model` (string) — model name passed in the Anthropic Messages
             request body. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
-            (e.g. `128000`). Counted for the configured model through the
-            Anthropic-compatible `POST /v1/messages/count_tokens` route selected
-            for ADR-025. ADR-101.
+            (e.g. `128000`). OO estimates the full request locally with its
+            packaged `o200k_base` tokenizer; the configured Provider remains
+            authoritative for the actual model limit. ADR-025, ADR-101.
           - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
             trigger. Missing disables compaction. When configured,
             `llm_max_context_tokens` is required and the threshold must be
             strictly smaller than that context window. The trigger compares
-            `llm_max_context_tokens − tokenizer_count(prompt)` with
+            `llm_max_context_tokens − local_token_estimate(prompt)` with
             `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-            = `threshold − 4000`. The configured endpoint must implement the
-            count route; there is no byte/tokenizer fallback. ADR-028, ADR-101,
-            ADR-126.
+            = `threshold − 4000`. At most one eligible compaction stage runs
+            before a final request; the endpoint does not need a count-tokens
+            route. ADR-025, ADR-028, ADR-101, ADR-126.
           - `llm_max_concurrent_requests` (int) — optional
             in-process semaphore in the shared LLM provider layer. A configured
             `0` means unlimited and creates no semaphore. A positive integer
@@ -1790,8 +1885,11 @@ paths:
       description: |
         Lists user identity rows plus personal server workspace quota state.
         `quota_bytes`, `bytes_used`, and `locked` are flat response fields for
-        the user's personal server workspace, derived through `workspace_fs`;
+        the user's personal server workspace, derived through `WorkspaceService`;
         they are not columns on `users` and do not aggregate shared workspaces.
+        Usage is scanned live after the database transaction closes, with at
+        most four scans in flight. If any scan fails, the whole page returns
+        the existing storage-unavailable 503 rather than partial or null data.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1806,6 +1904,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/AdminUser' }
+        '503':
+          description: A personal-workspace usage scan failed; no partial page is returned.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/admin/users/{id}:
     description: Python-main admin user management route.
@@ -1818,10 +1919,11 @@ paths:
       tags: [Admin]
       summary: Delete a user (admin only)
       description: |
-        Deletes a user and relies on DB cascades plus subsystem cleanup for their
-        resources. Admins may delete themselves unless doing so would delete the
-        last admin. If the target is the only remaining admin, the server returns
-        `409 Conflict` with code `last_admin_required`.
+        Deletes a user through the same durable cleanup-outbox flow as
+        `DELETE /api/me`; a post-commit RustFS purge failure is retried and does
+        not change the 204 result. Admins may delete themselves unless doing so
+        would delete the last admin. If the target is the only remaining admin,
+        the server returns `409 Conflict` with code `last_admin_required`.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1952,13 +2054,11 @@ components:
       in: query
       required: true
       description: |
-        Install site for file operations. `server` names OpenOctopus's built-in
-        server workspace. Paired device names route over `/ws/device`; the
-        client applies its `workspace_path` and `sandbox_mode`. Paired-but-offline
-        devices remain valid names and return an error with code
-        `device_unreachable` at dispatch.
+        Install site for file operations. Py4 accepts only `server`, which names
+        OpenOctopus's built-in server workspace.
       schema:
         type: string
+        enum: [server]
 
   responses:
     BadRequest:
@@ -1985,9 +2085,13 @@ components:
             Stable error code from `openoctopus_server/errors/`.
             Examples: `not_found`, `forbidden`, `soft_locked`,
             `upload_too_large`, `invalid_skill_format`,
+            `workspace_transfer_busy`, `workspace_transfer_timeout`,
             `private_address_blocked`, `ambiguous_edit`,
             `no_match`, `invalid_schedule`, `destination_exists`,
-            `unsupported_config_key`, `last_admin_required`.
+            `unsupported_config_key`, `last_admin_required`,
+            `tool_content_conversion_busy`,
+            `tool_content_conversion_resource_exceeded`, and
+            `tool_content_conversion_failed`.
         message: { type: string }
 
     User:
@@ -2047,11 +2151,11 @@ components:
         quota_bytes:
           type: integer
           format: int64
-          description: Personal server workspace quota from `workspace_fs`.
+          description: Personal server workspace quota from `WorkspaceService`.
         bytes_used:
           type: integer
           format: int64
-          description: Personal server workspace usage from `workspace_fs`; not a `users` table column.
+          description: Personal server workspace usage from `WorkspaceService`; not a `users` table column.
         locked:
           type: boolean
           description: Personal server workspace is over quota (`bytes_used > quota_bytes`).
@@ -2122,11 +2226,8 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
           description: |
-            API-only user-visible delivery references. This array remains empty
-            through Py3; its first producer is the initial Py4 `message` tool.
-            These refs are not part of provider replay. Device refs are online-only and are
-            resolved by calling the Workspace Files `GET` route with the
-            recorded `openoctopus_device` and `path`.
+            API-only user-visible delivery references produced by the Py4
+            `message` tool. These refs are not part of provider replay.
         created_at: { type: string, format: date-time }
 
     PendingMessage:
@@ -2242,6 +2343,10 @@ components:
             tool_name: { type: string }
         - type: object
           required: [type, turn_id, message]
+          description: |
+            Idempotent durable message snapshot. The same message ID may appear
+            again after the Py4 `message` tool attaches provider-hidden
+            `delivery_refs`; consumers upsert by message ID.
           properties:
             type: { type: string, enum: [message_persisted] }
             turn_id: { type: string }
@@ -2393,55 +2498,75 @@ components:
             in the persisted user content.
         path:
           type: string
-          description: Existing file path on the selected install site.
+          description: |
+            Original virtual path supplied to `message`. A shared-workspace
+            rename can make it stale; recover through `workspace_id` and
+            `workspace_relative_path`.
 
     MessageDeliveryRef:
       type: object
       description: |
-        Provider-hidden user delivery metadata. `delivery_refs` arrays remain
-        empty through Py3; the initial Py4 `message` tool begins producing
-        these refs.
-      required: [type, openoctopus_device, path, filename, online_only]
+        Provider-hidden user delivery metadata for a durable server-workspace
+        file. The agent/provider never supplies or receives this shape.
+      required:
+        - tool_use_id
+        - type
+        - openoctopus_device
+        - path
+        - workspace_id
+        - workspace_relative_path
+        - filename
+        - mime
+        - size
+        - online_only
       additionalProperties: false
       properties:
+        tool_use_id:
+          type: string
+          description: |
+            Provider tool-use ID that generated this ref. A frontend uses it to
+            associate files with the correct `message` call when one assistant
+            response contains multiple calls.
         type:
           type: string
-          enum: [workspace_file, device_file]
-          description: |
-            `workspace_file` points at durable server workspace bytes.
-            `device_file` points at a paired device path and is resolved only
-            when the user clicks/downloads it.
+          enum: [workspace_file]
+          description: Points at durable server workspace bytes.
         openoctopus_device:
           type: string
-          description: |
-            `server` for durable workspace refs, or a paired device name for
-            online-only device refs. Frontends pass this value back as the
-            Workspace Files `openoctopus_device` query parameter.
+          enum: [server]
+          description: Frontends pass this value to the Workspace Files GET route.
         path:
           type: string
           description: Existing file path on the selected install site.
+        workspace_id:
+          type: string
+          format: uuid
+          description: |
+            Immutable personal/shared workspace ID. A frontend can match this
+            against `GET /api/workspaces` after a shared-workspace rename.
+        workspace_relative_path:
+          type: string
+          description: |
+            Stable path relative to the identified server workspace.
         filename:
           type: string
           description: Display filename. Defaults to the final path segment if the adapter cannot infer anything better.
         mime:
           type: string
-          nullable: true
-          description: Optional media type hint for rendering.
+          description: Conservative media type hint for rendering.
         size:
           type: integer
           format: int64
-          nullable: true
-          description: Optional size hint. Device refs may omit it because the file is not read until click time.
+          minimum: 0
+          description: File size at delivery-ref creation time.
         online_only:
           type: boolean
-          description: |
-            True for device refs. False for durable server workspace refs.
-            Online-only refs may fail later with `device_unreachable`,
-            `not_found`, or device policy errors.
+          enum: [false]
+          description: Always false for durable server-workspace refs.
 
     Workspace:
       type: object
-      required: [id, name, type, quota_bytes, bytes_used]
+      required: [id, name, type, quota_bytes, bytes_used, locked]
       properties:
         id:
           type: string
@@ -2449,7 +2574,7 @@ components:
           description: |
             UUID. For personal workspaces, equals the owner's `users.id`.
             For shared workspaces, the `workspaces.id` row PK (ADR-108).
-            Drives the MinIO object prefix: `users/{id}/` for personal
+            Drives the RustFS object prefix: `users/{id}/` for personal
             workspaces and `workspaces/{id}/` for shared workspaces
             (ADR-123).
         name:
@@ -2461,9 +2586,10 @@ components:
         suffix:
           type: string
           description: |
-            Present for shared workspaces. First 8 hex chars of `id` (auto-extended
-            on collision per ADR-108). The agent and the REST API both address the
-            workspace via the `name@suffix` form derived from these two fields.
+            Present for shared workspaces. Persisted 8+ hex-character prefix of
+            `id`, auto-extended on collision per ADR-108 and stable across
+            renames. The agent and REST API address the workspace via the
+            `name@suffix` form.
         ref:
           type: string
           description: |
@@ -2484,8 +2610,21 @@ components:
             exception to ADR-058's cascade rule).
         members:
           type: array
-          description: Present for shared workspaces.
+          description: Present for shared-workspace create/get/patch responses; omitted from workspace collection summaries. Use the paginated members route for full lists.
           items: { $ref: '#/components/schemas/WorkspaceMember' }
+
+    WorkspacePage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Workspace' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True only when a hard internal safety ceiling stopped the collection. }
 
     WorkspaceMember:
       type: object
@@ -2494,6 +2633,19 @@ components:
         user_id: { type: string }
         email: { type: string, format: email }
         name: { type: string }
+
+    WorkspaceMemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/WorkspaceMember' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True only when a hard internal safety ceiling stopped the collection. }
 
     Device:
       type: object
@@ -2692,14 +2844,106 @@ components:
         dst_path: { type: string }
         mode: { type: string, enum: [copy, move] }
 
+    FileMutation:
+      type: object
+      additionalProperties: false
+      required: [path, size, etag, created]
+      properties:
+        path: { type: string, description: Authorized virtual workspace path. }
+        size: { type: integer, format: int64, minimum: 0 }
+        etag: { type: string, description: Opaque unquoted revision value. }
+        created: { type: boolean }
+        replacements:
+          type: integer
+          minimum: 0
+          description: Present only for text-edit responses.
+
     ListDirEntry:
       type: object
+      additionalProperties: false
       required: [name, path, kind, size]
       properties:
         name: { type: string, description: Entry name (basename). }
-        path: { type: string, description: Relative path from the personal server workspace root. }
+        path: { type: string, description: 'Authorized virtual path; relative for personal requests and absolute `name@suffix` for shared requests.' }
         kind: { type: string, enum: [file, directory, symlink, other] }
         size: { type: integer, format: int64, description: File byte length; zero for non-files. }
+
+    ListDirEntryPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ListDirEntry' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True when the 10,000-object scan ceiling stopped the search. }
+
+    PatchEditResult:
+      type: object
+      additionalProperties: false
+      required: [path, action, size, etag, created, replacements]
+      properties:
+        path: { type: string, description: Authorized virtual workspace path. }
+        action: { type: string, enum: [replace, add] }
+        size: { type: integer, format: int64, minimum: 0 }
+        etag: { type: string, description: Opaque unquoted revision value, or `dry-run` in a dry-run response. }
+        created: { type: boolean }
+        replacements: { type: integer, minimum: 0 }
+
+    StructuredPatchResponse:
+      type: object
+      additionalProperties: false
+      required: [items, dry_run, committed]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PatchEditResult' }
+        dry_run: { type: boolean }
+        committed:
+          type: integer
+          minimum: 0
+          maximum: 20
+          description: Zero for a dry run; otherwise the number of edits committed.
+
+    GrepContextLine:
+      type: object
+      additionalProperties: false
+      required: [line_number, line]
+      properties:
+        line_number: { type: integer, minimum: 1 }
+        line: { type: string }
+
+    GrepResult:
+      type: object
+      additionalProperties: false
+      required: [path]
+      properties:
+        path: { type: string, description: Authorized virtual workspace path. }
+        line_number: { type: integer, minimum: 1 }
+        line: { type: string }
+        count: { type: integer, minimum: 0 }
+        before:
+          type: array
+          items: { $ref: '#/components/schemas/GrepContextLine' }
+        after:
+          type: array
+          items: { $ref: '#/components/schemas/GrepContextLine' }
+
+    GrepResultPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, next_offset, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/GrepResult' }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        offset: { type: integer, minimum: 0 }
+        next_offset: { type: [integer, "null"], minimum: 0 }
+        truncated: { type: boolean, description: True when the 10,000-object scan ceiling stopped the search. }
 
     McpServerConfig:
       type: object

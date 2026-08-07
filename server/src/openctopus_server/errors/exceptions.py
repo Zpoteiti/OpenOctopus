@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 from .codes import ErrorCode
 
 
@@ -9,7 +11,15 @@ class OpenOctopusError(Exception):
 
 
 class WorkspaceError(OpenOctopusError):
-    pass
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.headers = dict(headers) if headers is not None else None
 
 
 class ToolError(OpenOctopusError):
