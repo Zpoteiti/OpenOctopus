@@ -5,11 +5,15 @@ on:
     branches: [main]
     paths:
       - "server/**"
+      - "client/**"
+      - "docs/API.yaml"
       - ".github/workflows/py-server.yml"
   pull_request:
     branches: [main]
     paths:
       - "server/**"
+      - "client/**"
+      - "docs/API.yaml"
       - ".github/workflows/py-server.yml"
 
 jobs:
@@ -50,6 +54,37 @@ jobs:
       - name: Create environment file
         run: cp .env.example .env
 
+      - name: Validate static OpenAPI document
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          import yaml
+
+          path = Path("../docs/API.yaml")
+          document = yaml.safe_load(path.read_text(encoding="utf-8"))
+          if not isinstance(document, dict) or document.get("openapi") != "3.1.0":
+              raise SystemExit("docs/API.yaml is not an OpenAPI 3.1 document")
+
+          def check_refs(value: object) -> None:
+              if isinstance(value, dict):
+                  ref = value.get("$ref")
+                  if isinstance(ref, str) and ref.startswith("#/"):
+                      target: object = document
+                      for part in ref[2:].split("/"):
+                          if not isinstance(target, dict) or part not in target:
+                              raise SystemExit(f"unresolved local OpenAPI $ref: {ref}")
+                          target = target[part]
+                  for child in value.values():
+                      check_refs(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      check_refs(child)
+
+          check_refs(document)
+          print(f"validated {path}")
+          PY
+
       - name: Start RustFS and create workspace bucket
         run: |
           docker run -d --name openoctopus-rustfs \
@@ -78,5 +113,8 @@ jobs:
 
       - name: Run tests
         env:
+          OO_RUN_CAPACITY_HARNESS: "1"
+          OO_RUN_NETWORK_CAPACITY_HARNESS: "1"
           RUN_RUSTFS_INTEGRATION: "1"
+          PY5_REAL_E2E: "1"
         run: pytest -v

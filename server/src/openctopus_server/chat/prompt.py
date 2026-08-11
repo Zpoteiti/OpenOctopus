@@ -135,8 +135,7 @@ async def build_system_prompt(
     device_lines.extend(
         (
             f"- {device.name} — workspace_root: {device.workspace_path}; "
-            f"sandbox_mode: {str(device.sandbox_mode).lower()}; "
-            f"shell_timeout_max: {device.shell_timeout_max}"
+            f"sandbox_mode: {str(device.sandbox_mode).lower()}"
         )
         for device in devices
     )

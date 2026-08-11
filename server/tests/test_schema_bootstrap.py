@@ -13,7 +13,7 @@ EXPECTED_COLUMNS = {
     "messages": 8,
     "pending_messages": 7,
     "turn_runs": 6,
-    "devices": 11,
+    "devices": 9,
     "workspaces": 6,
     "workspace_members": 3,
     "workspace_deletions": 3,
@@ -63,12 +63,43 @@ async def test_indexes_exist(pg_engine):
     assert EXPECTED_INDEXES.issubset(indexes)
 
 
-async def test_shell_timeout_max_check(pg_engine):
+async def test_device_schema_hashes_tokens_and_rejects_invalid_names(pg_engine):
     async with pg_engine.begin() as conn:
-        with pytest.raises(IntegrityError):
+        user_id = (
             await conn.execute(
                 text(
-                    "INSERT INTO devices (token, user_id, name, workspace_path, shell_timeout_max) "
-                    "VALUES ('t1', gen_random_uuid(), 'dev', '/path', -1)"
+                    "INSERT INTO users (email, password_hash, name) "
+                    "VALUES ('device-schema@test.com', 'hash', 'Schema') RETURNING id"
                 )
+            )
+        ).scalar_one()
+
+    with pytest.raises(IntegrityError):
+        async with pg_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO devices (user_id, name, token_hash, token_hint, workspace_path) "
+                    "VALUES (:user_id, 'server', decode(repeat('00', 32), 'hex'), 'hint', '/path')"
+                ),
+                {"user_id": user_id},
+            )
+
+    with pytest.raises(IntegrityError):
+        async with pg_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO devices (user_id, name, token_hash, token_hint, workspace_path) "
+                    "VALUES (:user_id, :name, decode(repeat('01', 32), 'hex'), 'hint', '/path')"
+                ),
+                {"user_id": user_id, "name": "a" * 65},
+            )
+
+    with pytest.raises(IntegrityError):
+        async with pg_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO devices (user_id, name, token_hash, token_hint, workspace_path) "
+                    "VALUES (:user_id, 'laptop', decode('00', 'hex'), 'hint', '/path')"
+                ),
+                {"user_id": user_id},
             )

@@ -1,0 +1,149 @@
+name: Python Client CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "client/**"
+      - "server/**"
+      - "server/tests/fixtures/documents/**"
+      - ".github/workflows/client-spike.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "client/**"
+      - "server/**"
+      - "server/tests/fixtures/documents/**"
+      - ".github/workflows/client-spike.yml"
+
+jobs:
+  frozen-smoke:
+    name: linux-x64
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: client/pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev,build]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Type check
+        run: python -m mypy --strict src tests
+
+      - name: Test
+        run: python -m pytest -v
+
+      - name: Build one-folder bundle
+        run: python -m PyInstaller --noconfirm --clean openoctopus_client.spec
+
+      - name: Smoke test frozen bundle against document corpus
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          mkdir -p metrics
+          python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
+
+      - name: Smoke test frozen runtime, CLI, and multiprocessing child
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
+
+      - name: Upload bundle and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: py5-client-linux-x64
+          path: |
+            client/dist/openoctopus-client
+            client/metrics
+          if-no-files-found: warn
+
+  frozen-device-e2e:
+    name: linux-x64-device-e2e
+    needs: frozen-smoke
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: openoctopus
+          POSTGRES_PASSWORD: octopus
+          POSTGRES_DB: openoctopus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download frozen client bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: py5-client-linux-x64
+          path: client
+
+      - name: Install server dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Create environment file
+        run: cp .env.example .env
+
+      - name: Start RustFS and create workspace bucket
+        run: |
+          docker run -d --name openoctopus-rustfs \
+            -p 9000:9000 -p 9001:9001 \
+            -e RUSTFS_ACCESS_KEY=openoctopus \
+            -e RUSTFS_SECRET_KEY=change-me-object-storage-secret \
+            rustfs/rustfs@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21 \
+            /data
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker logs openoctopus-rustfs
+              exit 1
+            fi
+            sleep 1
+          done
+          python -c "from minio import Minio; Minio('localhost:9000', access_key='openoctopus', secret_key='change-me-object-storage-secret', secure=False).make_bucket('openoctopus')"
+
+      - name: Run frozen device, tool, transfer, and relay E2E
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          PY5_REAL_E2E: "1"
+        run: |
+          chmod +x "$OO_CLIENT_BIN"
+          test -x "$OO_CLIENT_BIN"
+          pytest -v \
+            tests/test_device_client_e2e.py::test_real_chat_runtime_source_client_read_write_and_offline \
+            tests/test_device_client_transfer_e2e.py::test_real_file_transfer_and_device_workspace_relay

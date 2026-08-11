@@ -35,14 +35,14 @@ info:
     | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, limit, offset |
     | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
     | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
-    | `notebook_edit` | — | Agent-only in Py4; no REST equivalent |
-    | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args |
+    | `notebook_edit` | — | Agent-only in Py5; no REST equivalent |
+    | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args; REST requires explicit `mode` |
     | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
     | `message` | — | No REST parallel (browser composes via chat) |
-    | `exec` | — | No REST parallel (rare UI need in v1) |
-    | `write_stdin` | — | No REST parallel; client-only companion for background `exec` sessions |
-    | `list_exec_sessions` | — | No REST parallel; client-only background exec recovery aid |
+    | `exec` | — | Deferred Py6; no Py5 REST or WebSocket frame |
+    | `write_stdin` | — | Deferred Py6; no Py5 REST or WebSocket frame |
+    | `list_exec_sessions` | — | Deferred Py6; no Py5 REST or WebSocket frame |
 
     **Auth model:**
 
@@ -60,7 +60,7 @@ info:
     - JSON bodies everywhere except file reads, which return raw file bytes
       with an appropriate `Content-Type`, and streaming message POST responses,
       which return newline-delimited JSON events.
-    - Py4 workspace collection routes return
+    - Py5 workspace collection routes return
       `{items, limit, offset, next_offset, truncated}`. `next_offset=null`
       means no ordinary next page; `truncated=true` means an internal safety
       ceiling stopped a complete scan. Other historical route families keep
@@ -124,7 +124,7 @@ tags:
   - name: Cron
     description: Scheduled agent invocations
   - name: Admin
-    description: Admin-only system config, user management, and server-side MCPs
+    description: Admin-only system config and user management; server-side MCP route is deferred and unavailable in Py5
 
 security:
   - cookieAuth: []
@@ -558,7 +558,7 @@ paths:
                     Required for the stable request shape, but Py2 and Py3
                     require this array to be empty. They accept text and direct
                     inline base64 images through `content`; workspace/device attachment
-                    references begin with the Py4 workspace-files milestone.
+                    references begin with the Py5 workspace-files milestone.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
               additionalProperties: false
@@ -834,29 +834,37 @@ paths:
   #
   /api/workspace/files/{path}:
     description: |
-      Py4 server-workspace file route. `openoctopus_device` is explicit and must
-      be `server`.
+      Py5 Workspace Files route. `openoctopus_device` is explicit: `server`
+      selects the server workspace, while a paired device name routes to the
+      live device WebSocket. All server and device paths use the same public
+      response shapes; device paths are checked again by the client.
     parameters:
       - name: path
         in: path
         required: true
         description: |
-          Path in the server workspace. Relative paths resolve to the
-          authenticated user's personal workspace; absolute
-          `/name@suffix/...` paths address shared workspaces.
+          Path on the selected install site. For `server`, relative paths
+          resolve to the authenticated user's personal workspace and absolute
+          `/name@suffix/...` paths address shared workspaces. For a paired
+          device, the client applies its own workspace/path policy.
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
     get:
       tags: [Workspace Files]
       summary: Read workspace file contents
       description: |
-        Authorizes through `WorkspaceService` and streams the server workspace
-        object bytes. This route is also how the browser downloads current-web
-        `MessageDeliveryRef` workspace files. Downloads use process-local
-        fair admission shared per user with uploads, plus an independent global
-        download limit. Admission is held until the response closes. A queue
-        timeout returns `workspace_transfer_busy`; if a body send stalls after
-        200 headers, the stream closes because its status can no longer change.
+        For `openoctopus_device=server`, authorizes through `WorkspaceService`
+        and streams RustFS object bytes. For a paired device, opens an
+        `http_relay` transfer only after the client sends `transfer_begin`
+        metadata; required `total_bytes` becomes `Content-Length`, `etag`
+        becomes the quoted `ETag`, and a safe `mime` hint selects the response
+        media type. Device bytes are relayed directly to the browser and are
+        never written to RustFS. Downloads use process-local fair admission
+        shared per user with uploads, plus an independent global download
+        limit. Admission is held until the response closes. There is no Range
+        support. A queue timeout returns `workspace_transfer_busy`; if a body
+        send stalls after 200 headers, the stream closes because its status can
+        no longer change.
       responses:
         '200':
           description: OK — returns a backpressured raw file stream.
@@ -879,6 +887,9 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Paired device is offline or cannot accept the relay (`tool_device_unreachable`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: Transfer admission timed out (`workspace_transfer_busy`).
           headers:
@@ -891,6 +902,9 @@ paths:
       summary: Write workspace file contents
       description: |
         Full-content replace. Accepts raw `application/octet-stream` bytes.
+        For a paired device, the server sends a `workspace_upload` transfer;
+        the client returns committed `size`, opaque `etag`, and `created`
+        metadata in the same `FileMutation` response shape as the server.
         Implicit `mkdir -p` on the parent path (ADR-088) and
         `WorkspaceService` quota checks apply.
         Server-side writes, hashes, and recursive operations must use the
@@ -933,7 +947,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409':
-          description: Quota lock (SoftLocked), operation exceeds 80% single-op cap, or operation exceeds the 64 MiB REST request body collection cap (UploadTooLarge).
+          description: Quota/precondition conflict, paired device offline (`tool_device_unreachable`), or operation exceeds the 64 MiB device upload cap (`workspace_upload_too_large`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '408':
           description: Upload body made no progress before the idle timeout (`workspace_transfer_timeout`).
@@ -944,6 +958,9 @@ paths:
             Retry-After:
               description: Seconds to wait before retrying.
               schema: { type: integer, minimum: 1 }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '502':
+          description: Device or server transfer failed integrity verification.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     patch:
       tags: [Workspace Files]
@@ -998,7 +1015,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Quota lock or operation exceeds quota.
+          description: Quota lock, operation exceeds quota, or paired device is offline (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '422':
           description: Invalid SKILL.md after edit, if skill validation is active for the edited path.
@@ -1020,6 +1037,9 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Paired device is offline (`tool_device_unreachable`) or the target is not a regular file.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/folders/{path}:
     description: Workspace folder route for explicit `openoctopus_device`.
@@ -1039,7 +1059,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Path is a file — use `DELETE /api/workspace/files/{path}`.
+          description: Path is a file — use `DELETE /api/workspace/files/{path}` — or the paired device is offline (`tool_device_unreachable`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/patch:
     description: |
@@ -1097,7 +1118,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: No match, quota lock, invalid patch, or operation exceeds quota.
+          description: No match, quota lock, invalid patch, operation exceeds quota, or paired device is offline (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/list/{path}:
@@ -1124,6 +1145,9 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Paired device is offline (`tool_device_unreachable`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/find-files:
     description: Workspace find_files route for explicit `openoctopus_device`.
@@ -1147,6 +1171,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ListDirEntryPage' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Paired device is offline (`tool_device_unreachable`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/grep:
     description: Workspace grep route for explicit `openoctopus_device`.
@@ -1175,16 +1203,21 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Paired device is offline (`tool_device_unreachable`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/transfer:
     description: |
       Workspace file transfer route. Mirrors the `file_transfer` tool args,
-      rejects destination overwrite, verifies SHA-256 for streamed
-      cross-device copies, and performs moves as copy-then-delete only after
-      the destination write is verified.
+      accepts one regular file between the server and one paired device, or a
+      coordinated local copy/move on one paired device. Client-to-client
+      bridging and destination overwrite are rejected. Streamed transfers
+      verify SHA-256 and perform moves as copy-then-delete only after the
+      destination write is verified.
     post:
       tags: [Workspace Files]
-      summary: Copy or move a file/folder between devices (mirrors `file_transfer`)
+      summary: Copy or move one regular file through the server or paired device
       requestBody:
         required: true
         content:
@@ -1195,16 +1228,25 @@ paths:
           description: Transfer completed.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  bytes_transferred: { type: integer, format: int64 }
-                  warnings:
-                    type: array
-                    items: { type: string }
-                    description: Non-fatal issues (e.g. cross-device move's delete-after-copy failed).
+              schema: { $ref: '#/components/schemas/TransferResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '408':
+          description: Transfer made no progress before the idle timeout.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: Destination exists, quota lock, operation exceeds single-op cap, or target device is offline/unreachable.
+          description: Destination exists, quota/precondition conflict, or target device is offline/unreachable.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: Transfer capacity is busy; retry after the indicated delay.
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '502':
+          description: Streamed transfer failed integrity verification.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: Workspace storage or transfer service unavailable.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   #
   # --- Devices ---
@@ -1219,7 +1261,7 @@ paths:
         Python-main does not paginate this route and does not implement
         `GET /api/devices/{name}`. Responses include `token_hint` for user
         confirmation and never include the plaintext token. `token_hint` is
-        computed as `token[:16] + "..." + token[-6:]`.
+        stored as a non-secret issuance hint.
       responses:
         '200':
           description: OK
@@ -1237,6 +1279,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [name]
               properties:
                 name:
@@ -1266,19 +1309,10 @@ paths:
                     the device is treated as trusted: client file tools may use
                     paths outside `workspace_path`, and private/internal network
                     access is allowed unless explicit deny entries remain.
-                shell_timeout_max:
-                  type: integer
-                  minimum: 0
-                  default: 600
-                  description: |
-                    Per-device cap for exec hard timeouts in seconds. Positive
-                    values bound positive `exec.timeout` requests; `0` means
-                    this device owner permits exec sessions with no hard
-                    timeout, such as long-running services started with
-                    `timeout=0` and `yield_time_ms`.
                 ssrf_denylist:
                   type: array
-                  items: { type: string }
+                  maxItems: 256
+                  items: { type: string, minLength: 1, maxLength: 512 }
                   description: |
                     Optional. CIDR, host, or `host:port` entries blocked by
                     client-site `web_fetch`. Sandbox devices created without an
@@ -1287,32 +1321,6 @@ paths:
                     devices (`sandbox_mode=false`) created without an explicit
                     value store an empty array. Users remove entries to permit a
                     blocked internal target.
-                env_allowlist:
-                  type: array
-                  items: { type: string }
-                  default: [PATH, HOME, LANG, TERM]
-                  description: |
-                    Optional parent-process environment variable names allowed
-                    into `exec` and client MCP subprocesses. Env remains an
-                    allowlist because secret names are not enumerable.
-                command_denylist:
-                  type: array
-                  items: { type: string }
-                  description: |
-                    Optional command-name deny entries enforced before client
-                    `exec` spawns. Created devices receive a small default list
-                    of obvious host-management/destructive commands.
-                mcp_servers:
-                  type: object
-                  additionalProperties: true
-                  description: |
-                    Map of MCP server configs. Stored with full env secrets as
-                    the device's desired config. A newly-created device is not
-                    online yet, so these MCP entries are validated on the
-                    device's first WebSocket connection; failed entries are
-                    removed from stored config by the normal `register_mcp`
-                    rejection path. Requests reject the redaction marker
-                    `"<redacted>"` in any `mcp_servers.*.env.*` value.
       responses:
         '201':
           description: |
@@ -1321,14 +1329,14 @@ paths:
             `openoctopus_dev_` prefix. Lost tokens require
             `POST /api/devices/{name}/regenerate-token`.
             Client startup uses the token via the `OPENOCTOPUS_DEVICE_TOKEN` env
-            var; everything else (workspace_path, sandbox_mode, ssrf_denylist,
-            env_allowlist, command_denylist,
-            etc.) is fetched from the server's `hello_ack` frame at the
-            WebSocket handshake (see PROTOCOL.md, ADR-096 / ADR-097).
+            var; the active device config (`workspace_path`, `sandbox_mode`,
+            `ssrf_denylist`) is fetched from the server's `hello_ack` frame at
+            the WebSocket handshake (see PROTOCOL.md, ADR-096 / ADR-097).
           content:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required: [token, device]
                 properties:
                   token:
@@ -1336,7 +1344,7 @@ paths:
                     description: Bearer token with `openoctopus_dev_` prefix. The device sends it at WebSocket handshake. Shown once.
                   device: { $ref: '#/components/schemas/Device' }
         '400':
-          description: Invalid name after canonicalization, invalid config shape, invalid device policy fields, or redacted MCP env marker supplied.
+          description: Invalid name after canonicalization or invalid active Py5 config.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: |
@@ -1353,28 +1361,17 @@ paths:
         schema: { type: string }
     patch:
       tags: [Devices]
-      summary: Update device config (sandbox mode, timeouts, SSRF/env/command policy, MCPs)
+      summary: Update active Py5 device config
       description: |
-        If `mcp_servers` changes while the device is online, the server sends a
-        validation-only `config_validate` frame first. The client attempts
-        MCP spawn/introspection without activating the candidate config or
-        sending `register_mcp`. Spawn or initial introspection failure returns
-        `400 Bad Request`; within-server duplicate names, cross-install schema
-        drift, name conflicts, or validation disconnect/timeout return
-        `409 Conflict`. In all validation-failure cases, the DB row is not
-        changed. After successful validation and DB commit, or after any
-        non-MCP config commit, the server pushes the authoritative
-        `config_update` frame to the connected device. If the device is
-        offline, `mcp_servers` is stored as desired config and validated on the
-        next WebSocket connection. If `name` changes and the device is online,
-        the authoritative `config_update` includes the new canonical
-        `device_name` so the client updates local display/log state without a
-        reconnect.
+        Py5 accepts only `name`, `workspace_path`, `sandbox_mode`, and
+        `ssrf_denylist`. The active fields are pushed in a `config_update`
+        frame when the device is online. Shell timeout, environment/command
+        policy, and MCP configuration are deferred until their implementing
+        client milestones.
 
         PATCH is a partial top-level update. Omitted fields keep their existing
-        values. If `ssrf_denylist`, `env_allowlist`, `command_denylist`, or
-        `mcp_servers` is provided, it replaces that entire stored field;
-        Python-main does not deep-merge any of them.
+        values. `ssrf_denylist`, when provided, replaces the entire stored
+        field; Python-main does not deep-merge it.
         An empty body or `{}` is a no-op that returns the current `Device`
         response and does not push `config_update`.
 
@@ -1383,13 +1380,13 @@ paths:
         it with the same device-name rules as `POST /api/devices`, then renames
         the device to that stored routing slug; `server` remains reserved and is
         rejected. The existing device token remains valid across rename.
-        Requests reject the redaction marker `"<redacted>"` in any
-        `mcp_servers.*.env.*` value.
+        Deferred fields are rejected rather than silently stored.
       requestBody:
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 name:
                   type: string
@@ -1404,33 +1401,11 @@ paths:
                     file tools to `workspace_path` and applies `ssrf_denylist`
                     for client `web_fetch`; `false` treats the device as
                     trusted for filesystem and private-network access.
-                shell_timeout_max:
-                  type: integer
-                  minimum: 0
-                  description: |
-                    Per-device cap for exec hard timeouts in seconds. Positive
-                    values bound positive `exec.timeout` requests; `0` permits
-                    no-hard-timeout exec sessions on this device.
                 ssrf_denylist:
                   type: array
-                  items: { type: string }
+                  maxItems: 256
+                  items: { type: string, minLength: 1, maxLength: 512 }
                   description: Whole-field replacement client `web_fetch` denylist.
-                env_allowlist:
-                  type: array
-                  items: { type: string }
-                  description: Whole-field replacement env allowlist for `exec` and client MCP subprocesses.
-                command_denylist:
-                  type: array
-                  items: { type: string }
-                  description: Whole-field replacement command denylist for client `exec`.
-                mcp_servers:
-                  type: object
-                  additionalProperties: true
-                  description: |
-                    Whole-field replacement map of MCP server configs. Stored
-                    with full env secrets.
-                    REST responses redact every `env` value as `"<redacted>"`;
-                    writes reject that marker.
                 workspace_path:
                   type: string
                   description: |
@@ -1441,42 +1416,21 @@ paths:
       responses:
         '200':
           description: |
-            Updated. When `mcp_servers` changed and the device is online,
-            the response includes `mcp_discovered` listing all discovered
-            tools, resources, and prompts per MCP server. Users use this
-            to populate `enabled_tools` on subsequent requests.
+            Updated. The response is the active Py5 device DTO directly. If
+            the committed config cannot be pushed because the socket races
+            offline, the write remains committed and `online` is false.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  device: { $ref: '#/components/schemas/Device' }
-                  mcp_discovered:
-                    type: object
-                    additionalProperties:
-                      type: object
-                      properties:
-                        tools:
-                          type: array
-                          items: { type: string }
-                        resources:
-                          type: array
-                          items: { type: string }
-                        prompts:
-                          type: array
-                          items: { type: string }
+              schema: { $ref: '#/components/schemas/Device' }
         '400':
           description: |
-            Invalid name after canonicalization, invalid config shape,
-            invalid device policy fields, redacted MCP env marker supplied, or online
-            MCP spawn/introspection validation failed.
+            Invalid name after canonicalization, invalid config shape, or
+            invalid active device policy fields. Deferred fields are rejected.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            Rename conflicts with an existing canonical device name, online MCP
-            schema validation found a collision, or the device disconnected /
-            timed out during validation before the DB row changed.
+            Rename conflicts with an existing canonical device name.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}:
@@ -1493,7 +1447,7 @@ paths:
         Deletes the device row. This is the state-3 complete wipe from ADR-110:
         the token immediately stops authenticating, any active WebSocket
         connection is closed with 4401, in-flight tool calls on that connection
-        fail as `device_unreachable`, and the device disappears from future
+        fail as `tool_device_unreachable`, and the device disappears from future
         `openoctopus_device` enums.
       responses:
         '204': { description: Removed. }
@@ -1512,9 +1466,9 @@ paths:
       description: |
         Invalidates the old token, returns a new one exactly once, and
         preserves the existing device row, name, workspace path, sandbox mode,
-        SSRF/env/command policy, shell timeout cap, and MCP config. Any active
+        and SSRF policy. Any active
         connection for the old token is closed with 4401; in-flight tool calls
-        on that connection fail as `device_unreachable`. The device remains
+        on that connection fail as `tool_device_unreachable`. The device remains
         paired but appears offline until the user restarts/reconfigures the
         client with the new token.
       responses:
@@ -1524,6 +1478,7 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required: [token, device]
                 properties:
                   token: { type: string }
@@ -1935,10 +1890,13 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/admin/server-mcp:
-    description: Py8 admin server MCP management route.
+    description: |
+      Deferred Py8 design only; this route is not implemented or exposed by
+      Py5. Py5 has no MCP dependency or persisted MCP configuration. The
+      following shape must not be used by a Py5 client or administrator.
     get:
       tags: [Admin]
-      summary: Py8 route — list server-side MCPs
+      summary: Deferred Py8 route — not available in Py5
       description: |
         Py8 server-side MCP route.
 
@@ -1960,7 +1918,7 @@ paths:
                 items: { $ref: '#/components/schemas/McpServerConfig' }
     put:
       tags: [Admin]
-      summary: Py8 route — replace the server-side MCP list
+      summary: Deferred Py8 route — not available in Py5
       description: |
         Py8 server-side MCP route.
 
@@ -2054,11 +2012,13 @@ components:
       in: query
       required: true
       description: |
-        Install site for file operations. Py4 accepts only `server`, which names
-        OpenOctopus's built-in server workspace.
+        Install site for file operations. `server` names OpenOctopus's built-in
+        server workspace; paired device names route to their live `/ws/device`
+        connection. Paired-but-offline names remain valid and return
+        `tool_device_unreachable` rather than disappearing from the contract.
       schema:
         type: string
-        enum: [server]
+        description: "`server` or a paired device name. The per-user merged tool schema supplies the concrete device enum."
 
   responses:
     BadRequest:
@@ -2083,12 +2043,14 @@ components:
           type: string
           description: |
             Stable error code from `openoctopus_server/errors/`.
-            Examples: `not_found`, `forbidden`, `soft_locked`,
-            `upload_too_large`, `invalid_skill_format`,
+            Examples: `device_not_found`, `device_invalid_request`,
+            `tool_device_unreachable`, `tool_device_busy`,
+            `workspace_not_found`, `auth_forbidden`, `workspace_soft_locked`,
+            `workspace_upload_too_large`, `workspace_invalid_skill_format`,
             `workspace_transfer_busy`, `workspace_transfer_timeout`,
-            `private_address_blocked`, `ambiguous_edit`,
-            `no_match`, `invalid_schedule`, `destination_exists`,
-            `unsupported_config_key`, `last_admin_required`,
+            `workspace_transfer_integrity_failed`,
+            `network_ssrf_blocked`, `tool_ambiguous_edit`,
+            `tool_no_match`, `tool_invalid_schedule`, `auth_last_admin_required`,
             `tool_content_conversion_busy`,
             `tool_content_conversion_resource_exceeded`, and
             `tool_content_conversion_failed`.
@@ -2226,7 +2188,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
           description: |
-            API-only user-visible delivery references produced by the Py4
+            API-only user-visible delivery references produced by the
             `message` tool. These refs are not part of provider replay.
         created_at: { type: string, format: date-time }
 
@@ -2345,7 +2307,7 @@ components:
           required: [type, turn_id, message]
           description: |
             Idempotent durable message snapshot. The same message ID may appear
-            again after the Py4 `message` tool attaches provider-hidden
+            again after the Py5 `message` tool attaches provider-hidden
             `delivery_refs`; consumers upsert by message ID.
           properties:
             type: { type: string, enum: [message_persisted] }
@@ -2491,11 +2453,10 @@ components:
           type: string
           description: |
             Required file target. `server` names the built-in server workspace;
-            known device names route over `/ws/device` when online. Unknown/deleted
-            devices fail structural validation. Known devices that are offline
-            or too slow during message attachment expansion do not reject the
-            message; OpenOctopus inserts a sanitized unavailable-marker text block
-            in the persisted user content.
+            a known paired device name creates an online-only reference without
+            opening the file. Unknown/deleted device names fail the message tool;
+            a paired-but-offline device remains a reference and is reported as
+            `tool_device_unreachable` when the browser later downloads it.
         path:
           type: string
           description: |
@@ -2504,65 +2465,43 @@ components:
             `workspace_relative_path`.
 
     MessageDeliveryRef:
-      type: object
       description: |
-        Provider-hidden user delivery metadata for a durable server-workspace
-        file. The agent/provider never supplies or receives this shape.
-      required:
-        - tool_use_id
-        - type
-        - openoctopus_device
-        - path
-        - workspace_id
-        - workspace_relative_path
-        - filename
-        - mime
-        - size
-        - online_only
-      additionalProperties: false
-      properties:
-        tool_use_id:
-          type: string
-          description: |
-            Provider tool-use ID that generated this ref. A frontend uses it to
-            associate files with the correct `message` call when one assistant
-            response contains multiple calls.
-        type:
-          type: string
-          enum: [workspace_file]
-          description: Points at durable server workspace bytes.
-        openoctopus_device:
-          type: string
-          enum: [server]
-          description: Frontends pass this value to the Workspace Files GET route.
-        path:
-          type: string
-          description: Existing file path on the selected install site.
-        workspace_id:
-          type: string
-          format: uuid
-          description: |
-            Immutable personal/shared workspace ID. A frontend can match this
-            against `GET /api/workspaces` after a shared-workspace rename.
-        workspace_relative_path:
-          type: string
-          description: |
-            Stable path relative to the identified server workspace.
-        filename:
-          type: string
-          description: Display filename. Defaults to the final path segment if the adapter cannot infer anything better.
-        mime:
-          type: string
-          description: Conservative media type hint for rendering.
-        size:
-          type: integer
-          format: int64
-          minimum: 0
-          description: File size at delivery-ref creation time.
-        online_only:
-          type: boolean
-          enum: [false]
-          description: Always false for durable server-workspace refs.
+        Provider-hidden user delivery metadata. The agent/provider never
+        supplies or receives this shape. Py5 accepts a union of durable server
+        workspace files and online-only paired-device files.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [tool_use_id, type, openoctopus_device, path, workspace_id, workspace_relative_path, filename, mime, size, online_only]
+          properties:
+            tool_use_id: { type: string }
+            type: { type: string, enum: [workspace_file] }
+            openoctopus_device: { type: string, enum: [server] }
+            path: { type: string }
+            workspace_id: { type: string, format: uuid }
+            workspace_relative_path: { type: string }
+            filename: { type: string }
+            mime: { type: string }
+            size: { type: integer, format: int64, minimum: 0 }
+            online_only: { type: boolean, enum: [false] }
+        - type: object
+          additionalProperties: false
+          required: [tool_use_id, type, openoctopus_device, path, filename, mime, online_only]
+          properties:
+            tool_use_id: { type: string }
+            type: { type: string, enum: [device_file] }
+            openoctopus_device:
+              type: string
+              description: Paired device name used by the live relay route.
+            path: { type: string }
+            filename: { type: string }
+            mime: { type: string }
+            size:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Optional client-supplied metadata; message delivery does not open the file to discover it.
+            online_only: { type: boolean, enum: [true] }
 
     Workspace:
       type: object
@@ -2649,8 +2588,13 @@ components:
 
     Device:
       type: object
-      required: [name, sandbox_mode, workspace_path, shell_timeout_max, ssrf_denylist, env_allowlist, command_denylist, mcp_servers, online, token_hint, created_at]
+      additionalProperties: false
+      required: [id, name, sandbox_mode, workspace_path, ssrf_denylist, online, token_hint, created_at]
       properties:
+        id:
+          type: string
+          format: uuid
+          description: Immutable internal device identifier; never used as a bearer credential.
         name:
           type: string
           description: |
@@ -2668,29 +2612,10 @@ components:
           description: |
             Persisted per-device policy switch. `true` is restricted mode;
             `false` is trusted-device mode. Sessions cannot override it.
-        shell_timeout_max:
-          type: integer
-          minimum: 0
-          description: |
-            Per-device cap for exec hard timeouts in seconds. `0` means no cap
-            and permits no-hard-timeout exec sessions on this device.
         ssrf_denylist:
           type: array
-          items: { type: string }
-        env_allowlist:
-          type: array
-          items: { type: string }
-        command_denylist:
-          type: array
-          items: { type: string }
-        mcp_servers:
-          type: object
-          additionalProperties: true
-          description: |
-            MCP server configs with every `mcp_servers.*.env.*` value
-            redacted as `"<redacted>"` in REST responses. The database stores
-            the full unredacted config; device WebSocket config uses the
-            stored unredacted value.
+          maxItems: 256
+          items: { type: string, minLength: 1, maxLength: 512 }
         online:
           type: boolean
           description: |
@@ -2699,7 +2624,7 @@ components:
         token_hint:
           type: string
           description: |
-            Confirmation hint computed as `token[:16] + "..." + token[-6:]`;
+            Non-secret prefix/suffix hint generated when the token is issued;
             plaintext tokens are not returned by list/update/delete responses.
         created_at: { type: string, format: date-time }
 
@@ -2831,18 +2756,61 @@ components:
 
     TransferRequest:
       type: object
+      additionalProperties: false
       required: [openoctopus_src_device, src_path, openoctopus_dst_device, dst_path, mode]
       description: |
-        Mirrors the `file_transfer` tool's args. The reserved `openoctopus_`
-        prefix on the two device fields matches the agent-visible tool
-        schema exactly (see docs/TOOLS.md) so REST and tool callers use
-        the same names.
+        Mirrors the Py5 `file_transfer` tool's args. At least one endpoint must
+        be `server`, unless both endpoints are the same paired device for a
+        coordinated local transfer. Both paths must identify regular files.
+        Different-device client-to-client bridging and folder transfer are
+        deferred. The reserved `openoctopus_` prefix on the two device fields
+        matches the agent-visible tool schema. The endpoint relation is
+        enforced at runtime: either endpoint may be `server`, or both endpoint
+        values may be the same paired device. Standard JSON Schema has no
+        portable equality operator for two arbitrary string properties, so
+        `x-openoctopus-same-device: true` marks the additional same-device
+        case; different client device names remain invalid.
       properties:
-        openoctopus_src_device: { type: string, description: "`server` or a device name." }
-        src_path: { type: string }
-        openoctopus_dst_device: { type: string, description: "`server` or a device name. Must not already exist at dst_path." }
-        dst_path: { type: string }
+        openoctopus_src_device:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^(?:server|[a-z0-9]+(?:-[a-z0-9]+)*)$'
+          description: "`server` or a canonical device name."
+        src_path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        openoctopus_dst_device:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^(?:server|[a-z0-9]+(?:-[a-z0-9]+)*)$'
+          description: "`server` or a canonical device name. Must not already exist at dst_path."
+        dst_path:
+          type: string
+          minLength: 1
+          maxLength: 4096
         mode: { type: string, enum: [copy, move] }
+      x-openoctopus-same-device: true
+
+    TransferResponse:
+      type: object
+      additionalProperties: false
+      required: [bytes_transferred, sha256, warnings]
+      properties:
+        bytes_transferred:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        warnings:
+          type: array
+          maxItems: 8
+          items: { type: string }
+          description: Non-fatal issues, such as source deletion after a move.
 
     FileMutation:
       type: object
@@ -2949,10 +2917,10 @@ components:
       type: object
       required: [name, command]
       description: |
-        MCP server configuration. In `system_config.server_mcp`, entries are
-        admin shared-service MCPs using shared credentials and the `server`
-        install site. In `devices.mcp_servers`, entries run on that device
-        and use the device name as the install site.
+        Non-normative future MCP server configuration. Py5 has no MCP
+        dependency, route, device column, handshake frame, or persisted MCP
+        configuration. Do not add these fields to the Py5 API or device DTO;
+        a later milestone must define its own contract before implementation.
       properties:
         name:
           type: string

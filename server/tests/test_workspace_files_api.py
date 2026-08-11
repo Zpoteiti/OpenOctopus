@@ -177,7 +177,7 @@ async def test_runtime_openapi_describes_raw_download_and_upload(async_client) -
         if parameter["name"] == "openoctopus_device"
     )
     assert device["required"] is True
-    assert device["schema"]["const"] == "server"
+    assert device["schema"]["type"] == "string"
 
     download = operations["get"]["responses"]["200"]
     assert set(download["headers"]) == {
@@ -231,12 +231,12 @@ async def test_every_file_route_requires_explicit_server_device(
     _assert_standard_error(response, 400)
 
 
-async def test_file_routes_reject_non_server_device(user_client, workspace_storage) -> None:
+async def test_file_routes_report_an_unavailable_paired_device(user_client, workspace_storage) -> None:
     response = await user_client.get(
         "/api/workspace/files/a.txt",
         params={"openoctopus_device": "laptop"},
     )
-    _assert_standard_error(response, 400)
+    _assert_standard_error(response, 409, "tool_device_unreachable")
 
 
 async def test_file_routes_require_authentication(async_client, workspace_storage) -> None:

@@ -4,15 +4,18 @@ import asyncio
 import math
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NoReturn, cast
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 
 from openctopus_server.admission import (
@@ -22,8 +25,26 @@ from openctopus_server.admission import (
 )
 from openctopus_server.auth.dependencies import get_current_user
 from openctopus_server.config import Settings, get_settings
-from openctopus_server.db.models import User
+from openctopus_server.db.engine import get_engine
+from openctopus_server.db.models import Device, User
 from openctopus_server.db.session import get_db
+from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.protocol import TransferBeginFrame
+from openctopus_server.devices.registry import (
+    DeviceBusyError,
+    DeviceRegistry,
+    DeviceUnavailableError,
+)
+from openctopus_server.devices.transfer import TransferError
+from openctopus_server.devices.workspace import (
+    DeviceDirectoryPageResult,
+    DeviceFileMutationResult,
+    DeviceGrepPageResult,
+    DevicePatchEdit,
+    DevicePatchResult,
+    DeviceWorkspaceAction,
+    dispatch_workspace_action,
+)
 from openctopus_server.dto.workspace_file import (
     DirectoryEntryPage,
     FileEditRequest,
@@ -31,14 +52,18 @@ from openctopus_server.dto.workspace_file import (
     GrepResultPage,
     StructuredPatchRequest,
     StructuredPatchResponse,
+    TransferResponse,
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.tools.file_transfer import FileTransferRequest, FileTransferTool
 from openctopus_server.workspace.search import GrepContentMatch, GrepCount
 from openctopus_server.workspace.service import PatchEdit, WorkspaceService, get_workspace_service
 
 router = APIRouter(prefix="/api/workspace", tags=["Workspace Files"])
 _STRONG_ETAG = re.compile(r'^"([\x21\x23-\x7e]+)"$')
+_DEVICE_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+_RELAY_QUEUE_CHUNKS = 4
 
 
 @lru_cache
@@ -81,10 +106,101 @@ class _ClosingStreamingResponse(StreamingResponse):
             await self._closer()
 
 
-def require_server_device(
-    openoctopus_device: Annotated[Literal["server"], Query()],
-) -> None:
-    del openoctopus_device
+@dataclass(frozen=True, slots=True)
+class _RelayMetadata:
+    begin: TransferBeginFrame
+    sink: _RelaySink
+
+
+@dataclass(frozen=True, slots=True)
+class _DeviceMutationMetadata:
+    size: int
+    etag: str
+    created: bool
+
+
+class _RelaySink:
+    """Bounded sink joining a device transfer to a streaming HTTP body."""
+
+    def __init__(self, *, idle_timeout_seconds: float) -> None:
+        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_RELAY_QUEUE_CHUNKS)
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._closed = False
+
+    async def write(self, chunk: bytes) -> None:
+        if not isinstance(chunk, bytes):
+            raise TransferError("workspace_transfer_integrity_failed")
+        if self._closed:
+            raise TransferError("workspace_transfer_timeout")
+        try:
+            async with asyncio.timeout(self._idle_timeout_seconds):
+                await self.queue.put(chunk)
+        except TimeoutError as exc:
+            raise TransferError("workspace_transfer_timeout") from exc
+
+    async def finish(self) -> None:
+        if self._closed:
+            return
+        try:
+            async with asyncio.timeout(self._idle_timeout_seconds):
+                await self.queue.put(None)
+        except TimeoutError as exc:
+            raise TransferError("workspace_transfer_timeout") from exc
+        self._closed = True
+
+    async def abort(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # The browser may have disconnected and no longer be consuming.  Drop
+        # queued relay bytes so the terminal marker can always wake the body.
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            self.queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+
+class _RequestBodySource:
+    """Read a request body incrementally with an idle and byte ceiling."""
+
+    def __init__(
+        self,
+        request: Request,
+        *,
+        max_bytes: int,
+        idle_timeout_seconds: float,
+    ) -> None:
+        self._iterator = aiter(request.stream())
+        self._max_bytes = max_bytes
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._read_bytes = 0
+
+    async def read(self) -> bytes:
+        try:
+            async with asyncio.timeout(self._idle_timeout_seconds):
+                chunk = await anext(self._iterator)
+        except StopAsyncIteration:
+            return b""
+        except ClientDisconnect as exc:
+            raise TransferError("workspace_transfer_timeout") from exc
+        except TimeoutError as exc:
+            raise TransferError("workspace_transfer_timeout") from exc
+        if not isinstance(chunk, bytes):
+            raise TransferError("workspace_transfer_integrity_failed")
+        self._read_bytes += len(chunk)
+        if self._read_bytes > self._max_bytes:
+            raise TransferError("workspace_upload_too_large")
+        return chunk
+
+    async def aclose(self) -> None:
+        close = getattr(self._iterator, "aclose", None)
+        if close is not None:
+            await close()
 
 
 @router.get(
@@ -107,13 +223,24 @@ def require_server_device(
 )
 async def download_file(
     path: str,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
     admission: KeyedDirectionalAdmission = Depends(get_rest_transfer_admission),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
+    if openoctopus_device != "server":
+        return await _download_device(
+            path,
+            openoctopus_device=openoctopus_device,
+            user=user,
+            db=db,
+            registry=registry,
+            admission=admission,
+            settings=settings,
+        )
     ticket = await service.authorize_download(db, user_id=user.id, path=path)
     await db.commit()
     lease = await _acquire_transfer(admission, user.id, "download", settings)
@@ -155,6 +282,111 @@ async def download_file(
         raise
 
 
+async def _download_device(
+    path: str,
+    *,
+    openoctopus_device: str,
+    user: User,
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    admission: KeyedDirectionalAdmission,
+    settings: Settings,
+) -> StreamingResponse:
+    handle = await _owned_device_handle(
+        db,
+        user=user,
+        device_name=openoctopus_device,
+        registry=registry,
+    )
+    lease = await _acquire_transfer(admission, user.id, "download", settings)
+    try:
+        metadata_future: asyncio.Future[_RelayMetadata] = (
+            asyncio.get_running_loop().create_future()
+        )
+        async def make_sink(begin: TransferBeginFrame) -> _RelaySink:
+            if (
+                begin.purpose != "http_relay"
+                or begin.src_path != path
+                or begin.total_bytes is None
+                or begin.dst_path is not None
+            ):
+                raise TransferError("workspace_transfer_integrity_failed")
+            sink = _RelaySink(idle_timeout_seconds=settings.rest_transfer_idle_timeout_seconds)
+            if not metadata_future.done():
+                metadata_future.set_result(_RelayMetadata(begin=begin, sink=sink))
+            return sink
+
+        transfer_task = asyncio.create_task(
+            registry.transfers.start_client_to_server(
+                handle=handle,
+                user_id=user.id,
+                src_path=path,
+                dst_path=None,
+                sink_factory=make_sink,
+                purpose="http_relay",
+            )
+        )
+        try:
+            metadata = await _wait_for_relay_metadata(
+                metadata_future,
+                transfer_task,
+                timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            await _cancel_transfer(transfer_task, None)
+            raise
+        except BaseException as exc:
+            await _cancel_transfer(transfer_task, None)
+            _raise_device_transfer(exc, settings)
+
+        async def close_relay() -> None:
+            try:
+                await _cancel_transfer(transfer_task, metadata.sink)
+            finally:
+                await lease.aclose()
+
+        async def body() -> AsyncIterator[bytes]:
+            while True:
+                try:
+                    async with asyncio.timeout(settings.rest_transfer_idle_timeout_seconds):
+                        chunk = await metadata.sink.queue.get()
+                except TimeoutError:
+                    await _cancel_transfer(transfer_task, metadata.sink)
+                    return
+                if chunk is None:
+                    try:
+                        async with asyncio.timeout(settings.rest_transfer_idle_timeout_seconds):
+                            await asyncio.shield(transfer_task)
+                    except TimeoutError:
+                        await _cancel_transfer(transfer_task, metadata.sink)
+                        raise TransferError("workspace_transfer_timeout") from None
+                    return
+                yield chunk
+
+        headers: dict[str, str] = {
+            "Content-Disposition": _content_disposition(path),
+            "X-Content-Type-Options": "nosniff",
+        }
+        try:
+            if metadata.begin.total_bytes is not None:
+                headers["Content-Length"] = str(metadata.begin.total_bytes)
+            if metadata.begin.etag is not None:
+                headers["ETag"] = _quote_etag(metadata.begin.etag)
+            return _ClosingStreamingResponse(
+                body(),
+                closer=close_relay,
+                send_timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
+                media_type=_safe_device_mime(metadata.begin.mime),
+                headers=headers,
+            )
+        except BaseException:
+            await _cancel_transfer(transfer_task, metadata.sink)
+            raise
+    except BaseException:
+        await lease.aclose()
+        raise
+
+
 @router.put(
     "/files/{path:path}",
     response_model=FileMutationResponse,
@@ -172,10 +404,11 @@ async def upload_file(
     path: str,
     request: Request,
     response: Response,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
     admission: KeyedDirectionalAdmission = Depends(get_rest_transfer_admission),
     settings: Settings = Depends(get_settings),
     if_match_header: Annotated[str | None, Header(alias="If-Match")] = None,
@@ -186,6 +419,20 @@ async def upload_file(
     ):
         raise _invalid("Workspace uploads require application/octet-stream")
     if_match, if_none_match = _conditions(if_match_header, if_none_match_header)
+    if openoctopus_device != "server":
+        return await _upload_device(
+            path,
+            request=request,
+            response=response,
+            openoctopus_device=openoctopus_device,
+            user=user,
+            db=db,
+            registry=registry,
+            admission=admission,
+            settings=settings,
+            if_match=if_match,
+            if_none_match=if_none_match,
+        )
     ticket = await service.authorize_upload(db, user_id=user.id, path=path)
     await db.commit()
     try:
@@ -214,6 +461,73 @@ async def upload_file(
     return _mutation_response(response, path=path, metadata=metadata)
 
 
+async def _upload_device(
+    path: str,
+    *,
+    request: Request,
+    response: Response,
+    openoctopus_device: str,
+    user: User,
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    admission: KeyedDirectionalAdmission,
+    settings: Settings,
+    if_match: str | None,
+    if_none_match: bool,
+) -> FileMutationResponse:
+    handle = await _owned_device_handle(
+        db,
+        user=user,
+        device_name=openoctopus_device,
+        registry=registry,
+    )
+    content_length = _content_length(request)
+    if content_length is not None and content_length > _DEVICE_UPLOAD_MAX_BYTES:
+        raise _too_large()
+    lease = await _acquire_transfer(admission, user.id, "upload", settings)
+    source: _RequestBodySource | None = None
+    try:
+        source = _RequestBodySource(
+            request,
+            max_bytes=_DEVICE_UPLOAD_MAX_BYTES,
+            idle_timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
+        )
+        result = await registry.transfers.start_server_to_client(
+            handle=handle,
+            user_id=user.id,
+            src_path=None,
+            dst_path=path,
+            source=source,
+            total_bytes=content_length,
+            purpose="workspace_upload",
+            if_match=if_match,
+            if_none_match=if_none_match,
+        )
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        _raise_device_transfer(exc, settings)
+    finally:
+        # TransferManager owns normal cleanup; this is idempotent and covers
+        # admission/rejection paths before it has installed the slot.
+        if source is not None:
+            await _close_request_source(source)
+        await lease.aclose()
+    etag = getattr(result, "etag", None)
+    created = getattr(result, "created", None)
+    size = getattr(result, "size", getattr(result, "bytes_transferred", None))
+    if not isinstance(etag, str) or not isinstance(created, bool) or not isinstance(size, int):
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+            "Workspace device did not return committed file metadata",
+        )
+    return _mutation_response(
+        response,
+        path=path,
+        metadata=_DeviceMutationMetadata(size=size, etag=etag, created=created),
+    )
+
+
 @router.patch(
     "/files/{path:path}",
     response_model=FileMutationResponse,
@@ -223,13 +537,35 @@ async def edit_file(
     path: str,
     body: FileEditRequest,
     response: Response,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
     if_match_header: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> FileMutationResponse:
     if_match = _parse_if_match(if_match_header)
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="edit_file",
+            path=path,
+            old_text=body.old_text,
+            new_text=body.new_text,
+            replace_all=body.replace_all,
+            occurrence=body.occurrence,
+            line_hint=body.line_hint,
+            expected_replacements=body.expected_replacements,
+            if_match=if_match,
+        )
+        result = await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        assert isinstance(result, DeviceFileMutationResult)
+        return _mutation_response(response, path=path, metadata=result, replacements=result.replacements)
     metadata, replacements = await service.edit_text(
         db,
         user_id=user.id,
@@ -254,12 +590,27 @@ async def edit_file(
 @router.delete("/files/{path:path}", status_code=204)
 async def delete_file(
     path: str,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
     if_match_header: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> Response:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="delete_file",
+            path=path,
+            if_match=_parse_if_match(if_match_header),
+        )
+        await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        return Response(status_code=204)
     await service.delete_file(
         db,
         user_id=user.id,
@@ -273,11 +624,22 @@ async def delete_file(
 @router.delete("/folders/{path:path}", status_code=204)
 async def delete_folder(
     path: str,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> Response:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(operation="delete_folder", path=path)
+        await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        return Response(status_code=204)
     await service.delete_folder(db, user_id=user.id, path=path)
     await db.commit()
     return Response(status_code=204)
@@ -286,11 +648,35 @@ async def delete_folder(
 @router.post("/patch", response_model=StructuredPatchResponse)
 async def apply_workspace_patch(
     body: StructuredPatchRequest,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="apply_patch",
+            edits=[
+                DevicePatchEdit(
+                    path=edit.path,
+                    action=edit.action,
+                    old_text=edit.old_text,
+                    new_text=edit.new_text,
+                )
+                for edit in body.edits
+            ],
+            dry_run=body.dry_run,
+        )
+        result = await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        assert isinstance(result, DevicePatchResult)
+        return result.model_dump()
     edits = tuple(
         PatchEdit(
             path=edit.path,
@@ -330,11 +716,29 @@ async def list_directory(
     recursive: bool = False,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="list_dir",
+            path=path,
+            recursive=recursive,
+            limit=limit,
+            offset=offset,
+        )
+        result = await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        assert isinstance(result, DeviceDirectoryPageResult)
+        return result.model_dump()
     if recursive:
         recursive_page = await service.list_recursive(
             db,
@@ -376,11 +780,33 @@ async def find_workspace_files(
     sort: Literal["path", "modified"] = "path",
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="find_files",
+            path=path,
+            query=query,
+            glob=glob,
+            type=file_type,
+            include_dirs=include_dirs,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+        result = await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        assert isinstance(result, DeviceDirectoryPageResult)
+        return result.model_dump()
     page = await service.find_files(
         db,
         user_id=user.id,
@@ -415,11 +841,36 @@ async def grep_workspace_files(
     context_after: Annotated[int, Query(ge=0, le=20)] = 0,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
-    _: None = Depends(require_server_device),
+    openoctopus_device: str = Query(..., min_length=1, max_length=64),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
 ) -> dict[str, Any]:
+    if openoctopus_device != "server":
+        action = DeviceWorkspaceAction(
+            operation="grep",
+            path=path,
+            pattern=pattern,
+            glob=glob,
+            type=file_type,
+            case_insensitive=case_insensitive,
+            fixed_strings=fixed_strings,
+            output_mode=output_mode,
+            context_before=context_before,
+            context_after=context_after,
+            limit=limit,
+            offset=offset,
+        )
+        result = await dispatch_workspace_action(
+            db,
+            user=user,
+            device_name=openoctopus_device,
+            action=action,
+            registry=registry,
+        )
+        assert isinstance(result, DeviceGrepPageResult)
+        return result.model_dump()
     page = await service.grep(
         db,
         user_id=user.id,
@@ -444,6 +895,33 @@ async def grep_workspace_files(
     }
 
 
+@router.post(
+    "/transfer",
+    response_model=TransferResponse,
+    response_model_exclude_none=True,
+)
+async def transfer_workspace_file(
+    body: FileTransferRequest,
+    user: User = Depends(get_current_user),
+    engine: AsyncEngine = Depends(get_engine),
+    service: WorkspaceService = Depends(get_workspace_service),
+    registry: DeviceRegistry = Depends(get_device_registry),
+    settings: Settings = Depends(get_settings),
+) -> TransferResponse:
+    """Run the shared single-file transfer machine for a REST caller."""
+
+    tool = FileTransferTool(engine, service, registry)
+    try:
+        outcome = await tool.transfer(body, user_id=user.id)
+    except Exception as exc:
+        _raise_device_transfer(exc, settings)
+    return TransferResponse(
+        bytes_transferred=outcome.bytes_transferred,
+        sha256=outcome.sha256,
+        warnings=list(outcome.warnings),
+    )
+
+
 async def _acquire_transfer(
     admission: KeyedDirectionalAdmission,
     user_id: UUID,
@@ -454,6 +932,123 @@ async def _acquire_transfer(
         return await admission.acquire(user_id, direction)
     except AdmissionTimeoutError as exc:
         raise _transfer_busy(settings) from exc
+
+
+async def _owned_device_handle(
+    db: AsyncSession,
+    *,
+    user: User,
+    device_name: str,
+    registry: DeviceRegistry,
+) -> object:
+    device_id = await db.scalar(
+        select(Device.id).where(Device.user_id == user.id, Device.name == device_name)
+    )
+    await db.close()
+    if not isinstance(device_id, UUID):
+        # Use one response for a missing or another user's name.  The server
+        # must not turn the device table into a cross-user oracle.
+        raise WorkspaceError(
+            ErrorCode.TOOL_DEVICE_UNREACHABLE,
+            "Workspace device is unavailable",
+        )
+    handle = await registry.get_handle(
+        device_id,
+        user_id=user.id,
+        expected_device_name=device_name,
+    )
+    if handle is None:
+        raise WorkspaceError(
+            ErrorCode.TOOL_DEVICE_UNREACHABLE,
+            "Workspace device is unavailable",
+        )
+    return handle
+
+
+async def _wait_for_relay_metadata(
+    metadata: asyncio.Future[_RelayMetadata],
+    transfer: asyncio.Task[object],
+    *,
+    timeout_seconds: float,
+) -> _RelayMetadata:
+    metadata_wait: asyncio.Future[_RelayMetadata] = metadata
+    try:
+        done, _ = await asyncio.wait(
+            {cast(asyncio.Future[object], metadata_wait), cast(asyncio.Future[object], transfer)},
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        if not metadata_wait.done():
+            metadata_wait.cancel()
+            await asyncio.gather(metadata_wait, return_exceptions=True)
+    if not done:
+        raise TransferError("workspace_transfer_timeout")
+    if cast(asyncio.Future[object], metadata_wait) in done:
+        return metadata_wait.result()
+    # Awaiting the task propagates a pre-header failure, while avoiding an
+    # unobserved exception if the manager completed before its begin frame.
+    await transfer
+    raise TransferError("workspace_transfer_timeout")
+
+
+async def _cancel_transfer(
+    transfer: asyncio.Task[object],
+    sink: _RelaySink | None,
+) -> None:
+    if sink is not None:
+        await sink.abort()
+    if not transfer.done():
+        transfer.cancel()
+    await asyncio.gather(transfer, return_exceptions=True)
+
+
+async def _close_request_source(source: _RequestBodySource) -> None:
+    try:
+        await source.aclose()
+    except Exception:
+        pass
+
+
+def _raise_device_transfer(exc: BaseException, settings: Settings) -> NoReturn:
+    if isinstance(exc, WorkspaceError):
+        raise exc
+    raw_code: object = getattr(exc, "code", None)
+    code = raw_code.value if isinstance(raw_code, ErrorCode) else raw_code
+    if not isinstance(code, str):
+        if isinstance(exc, (DeviceUnavailableError, ConnectionError)):
+            code = ErrorCode.TOOL_DEVICE_UNREACHABLE.value
+        elif isinstance(exc, DeviceBusyError):
+            code = ErrorCode.TOOL_DEVICE_BUSY.value
+        elif isinstance(exc, TimeoutError):
+            code = ErrorCode.WORKSPACE_TRANSFER_TIMEOUT.value
+        else:
+            code = ErrorCode.WORKSPACE_STORAGE_ERROR.value
+    if code in {"workspace_transfer_busy", ErrorCode.TOOL_DEVICE_BUSY.value}:
+        raise _device_busy(settings) from exc
+    if code in {"peer_disconnected", ErrorCode.TOOL_DEVICE_UNREACHABLE.value}:
+        raise WorkspaceError(
+            ErrorCode.TOOL_DEVICE_UNREACHABLE,
+            "Workspace device is unavailable",
+        ) from exc
+    if code in {
+        ErrorCode.WORKSPACE_TRANSFER_TIMEOUT.value,
+        "cancelled",
+    }:
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_TRANSFER_TIMEOUT,
+            "Workspace transfer timed out",
+        ) from exc
+    if code == ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED.value:
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+            "Workspace transfer integrity verification failed",
+        ) from exc
+    try:
+        error_code = ErrorCode(code)
+    except ValueError:
+        error_code = ErrorCode.WORKSPACE_STORAGE_ERROR
+    raise WorkspaceError(error_code, "Workspace device rejected the transfer") from exc
 
 
 async def _idle_upload_chunks(
@@ -480,6 +1075,14 @@ def _transfer_busy(settings: Settings) -> WorkspaceError:
     return WorkspaceError(
         ErrorCode.WORKSPACE_TRANSFER_BUSY,
         "Workspace transfer capacity is busy; retry later",
+        headers={"Retry-After": str(math.ceil(settings.rest_transfer_queue_timeout_seconds))},
+    )
+
+
+def _device_busy(settings: Settings) -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.TOOL_DEVICE_BUSY,
+        "Workspace device is busy; retry later",
         headers={"Retry-After": str(math.ceil(settings.rest_transfer_queue_timeout_seconds))},
     )
 
@@ -533,6 +1136,26 @@ def _content_disposition(path: str) -> str:
         fallback = "download"
     encoded = quote(filename, safe="")
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def _safe_device_mime(mime: str | None) -> str:
+    if not isinstance(mime, str):
+        return "application/octet-stream"
+    normalized = mime.strip().lower()
+    safe = {
+        "application/json",
+        "application/pdf",
+        "application/zip",
+        "application/octet-stream",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "text/csv",
+        "text/markdown",
+        "text/plain",
+    }
+    return normalized if normalized in safe else "application/octet-stream"
 
 
 def _virtual_entry_path(request_path: str, relative_path: str) -> str:

@@ -54,7 +54,7 @@ from openctopus_server.workspace.skills import (
     is_under_skills,
     validate_skill_manifest,
 )
-from openctopus_server.workspace.storage import ObjectStream, StoredObject
+from openctopus_server.workspace.storage import ObjectStream, ObjectUpload, StoredObject
 from openctopus_server.workspace.text_edit import apply_text_edit
 
 REST_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
@@ -123,6 +123,24 @@ class AuthorizedWorkspaceFile:
     target: WorkspaceTarget
     relative_path: str
     metadata: FileMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class TransferPathTicket:
+    """Authorized workspace identity retained after the DB transaction closes."""
+
+    user_id: UUID
+    display_path: str
+    target: WorkspaceTarget
+    relative_path: str
+    quota_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceTransferResult:
+    bytes_transferred: int
+    sha256: str
+    warnings: tuple[str, ...] = ()
 
 
 class WorkspaceService:
@@ -759,6 +777,124 @@ class WorkspaceService:
             display_path=path,
         )
 
+    async def authorize_transfer_source(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        path: str,
+    ) -> TransferPathTicket:
+        resolved = await self._preflight(db, user_id=user_id, path=path)
+        return TransferPathTicket(
+            user_id=user_id,
+            display_path=path,
+            target=resolved.target,
+            relative_path=resolved.relative_path,
+            quota_bytes=resolved.quota_bytes,
+        )
+
+    async def authorize_transfer_destination(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        path: str,
+    ) -> TransferPathTicket:
+        resolved = await self._preflight(db, user_id=user_id, path=path)
+        return TransferPathTicket(
+            user_id=user_id,
+            display_path=path,
+            target=resolved.target,
+            relative_path=resolved.relative_path,
+            quota_bytes=resolved.quota_bytes,
+        )
+
+    async def open_transfer_source(self, ticket: TransferPathTicket) -> ObjectStream:
+        return await self._fs.open_stream(ticket.target, ticket.relative_path)
+
+    async def delete_transfer_source(
+        self,
+        ticket: TransferPathTicket,
+        *,
+        if_match: str | None = None,
+    ) -> None:
+        try:
+            await self._fs.delete_file(
+                ticket.target,
+                ticket.relative_path,
+                if_match=if_match,
+            )
+        finally:
+            self._invalidate_skills(ticket.user_id, ticket.display_path)
+
+    async def begin_transfer_upload(
+        self,
+        ticket: TransferPathTicket,
+        *,
+        size: int,
+    ) -> ObjectUpload:
+        sink, _temporary_object = await self._fs.begin_transfer_upload(
+            ticket.target,
+            ticket.relative_path,
+            size=size,
+            quota_bytes=ticket.quota_bytes,
+        )
+        return sink
+
+    async def commit_transfer_upload(
+        self,
+        ticket: TransferPathTicket,
+        sink: ObjectUpload,
+        *,
+        size: int,
+        sha256: str,
+    ) -> None:
+        del sha256
+        try:
+            await self._fs.commit_uploaded_object(
+                ticket.target,
+                ticket.relative_path,
+                sink.object_name,
+                size=size,
+                quota_bytes=ticket.quota_bytes,
+            )
+        finally:
+            self._invalidate_skills(ticket.user_id, ticket.display_path)
+
+    async def transfer_server_to_server(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        src_path: str,
+        dst_path: str,
+        mode: str,
+    ) -> WorkspaceTransferResult:
+        source = await self.authorize_transfer_source(db, user_id=user_id, path=src_path)
+        destination = await self.authorize_transfer_destination(
+            db,
+            user_id=user_id,
+            path=dst_path,
+        )
+        await db.commit()
+        # Authorization is complete.  Do not retain a PostgreSQL connection
+        # while the transfer streams through object storage or waits for the
+        # source-delete cleanup.
+        await db.close()
+        try:
+            transferred, digest, warnings = await self._fs.transfer_server_to_server(
+                source.target,
+                source.relative_path,
+                destination.target,
+                destination.relative_path,
+                quota_bytes=destination.quota_bytes,
+                mode=mode,
+            )
+            return WorkspaceTransferResult(transferred, digest, warnings)
+        finally:
+            self._invalidate_skills(user_id, src_path)
+            self._invalidate_skills(user_id, dst_path)
+
     def collect_upload(
         self,
         chunks: AsyncIterator[bytes],
@@ -821,6 +957,24 @@ class WorkspaceService:
                 quota_bytes=ticket.quota_bytes,
                 if_match=if_match,
                 if_none_match=if_none_match,
+            )
+        finally:
+            self._invalidate_skills(ticket.user_id, ticket.display_path)
+
+    async def commit_authorized_upload_object(
+        self,
+        ticket: UploadTicket,
+        temporary_object: str,
+        *,
+        size: int,
+    ) -> FileMetadata:
+        try:
+            return await self._fs.commit_uploaded_object(
+                ticket.target,
+                ticket.relative_path,
+                temporary_object,
+                size=size,
+                quota_bytes=ticket.quota_bytes,
             )
         finally:
             self._invalidate_skills(ticket.user_id, ticket.display_path)

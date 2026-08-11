@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import secrets
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -9,12 +10,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache, partial
 from io import BytesIO
+from threading import Event
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
 import urllib3
 from minio import Minio
+from minio.commonconfig import CopySource
 
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.config import Settings, get_settings
@@ -22,9 +25,11 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 
 STARTUP_PROBE_KEY = "_openoctopus/startup-probe"
+TRANSFER_TEMP_PREFIX = "_openoctopus-transfers/"
 _PROBE_BYTES = 32
 MAX_LIST_PAGE_SIZE = 1000
 STREAM_CHUNK_SIZE = 64 * 1024
+UPLOAD_QUEUE_CHUNKS = 4
 _PRESIGNED_GET_LIFETIME = timedelta(minutes=5)
 _ASYNC_RETRY_STATUSES = frozenset({500, 502, 503, 504})
 _ASYNC_REQUEST_ATTEMPTS = 3
@@ -155,6 +160,7 @@ class ObjectStream:
                 pass
         if failure is not None:
             raise failure from None
+
         raise AssertionError("unreachable object stream read state")
 
     async def aclose(self) -> None:
@@ -177,6 +183,221 @@ class ObjectStream:
             self._storage._semaphore.release()
         if failure is not None:
             raise failure from None
+
+
+class ObjectUpload:
+    """A bounded, RustFS-backed upload sink.
+
+    MinIO's synchronous multipart writer runs in the storage executor and
+    consumes a four-chunk queue.  The server never stages upload bytes on its
+    local filesystem or retains the complete object in memory.
+    """
+
+    _END = object()
+
+    def __init__(
+        self,
+        storage: ObjectStorage,
+        object_name: str,
+        *,
+        length: int | None,
+    ) -> None:
+        self._storage = storage
+        self.object_name = object_name
+        self.length = length
+        self._queue: queue.Queue[bytes | object] = queue.Queue(maxsize=UPLOAD_QUEUE_CHUNKS)
+        self._written = 0
+        self._closed = False
+        self._end_enqueued = False
+        self._cancelled = Event()
+        self._worker = asyncio.create_task(self._upload())
+
+    @property
+    def written(self) -> int:
+        return self._written
+
+    async def write(self, chunk: bytes) -> None:
+        if self._closed:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_STORAGE_ERROR,
+                "Object upload is already closed",
+            )
+        if not isinstance(chunk, bytes) or len(chunk) > STREAM_CHUNK_SIZE:
+            raise ValueError("object upload chunks must be at most 64 KiB")
+        if not chunk:
+            return
+        if self.length is not None and self._written + len(chunk) > self.length:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                "Object upload length exceeded its declaration",
+            )
+        try:
+            await self._enqueue(chunk)
+        except asyncio.CancelledError:
+            self._closed = True
+            self._cancelled.set()
+            raise
+        self._written += len(chunk)
+
+    async def finish(self) -> ObjectMetadata:
+        if self._closed:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_STORAGE_ERROR,
+                "Object upload is already closed",
+            )
+        self._closed = True
+        try:
+            if not self._worker.done():
+                await self._enqueue(self._END)
+                self._end_enqueued = True
+            metadata = await _await_upload_worker(self._worker)
+        except asyncio.CancelledError:
+            self._cancelled.set()
+            raise
+        except BaseException:
+            self._cancelled.set()
+            if self.length is None or self._written == self.length:
+                await self._delete_safely()
+                raise
+            await self._delete_for_length_mismatch()
+            raise self._length_mismatch_error() from None
+        if self.length is not None and self._written != self.length:
+            await self._delete_for_length_mismatch()
+            raise self._length_mismatch_error()
+        return metadata
+
+    async def abort(self) -> None:
+        self._closed = True
+        self._cancelled.set()
+        worker = self._worker
+        cancelled = False
+        try:
+            await _await_upload_worker(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            pass
+        await self._delete_safely()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _delete_safely(self) -> None:
+        try:
+            await self._storage.delete(self.object_name)
+        except Exception:
+            pass
+
+    async def _delete_for_length_mismatch(self) -> None:
+        try:
+            await self._storage.delete(self.object_name)
+        except WorkspaceError as exc:
+            if exc.code is not ErrorCode.WORKSPACE_NOT_FOUND:
+                raise
+
+    def _length_mismatch_error(self) -> WorkspaceError:
+        return WorkspaceError(
+            ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+            "Object upload length did not match its declaration",
+        )
+
+    async def _enqueue(self, value: bytes | object) -> None:
+        while True:
+            if self._worker.done():
+                await _await_upload_worker(self._worker)
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_STORAGE_ERROR,
+                    "Object upload completed before accepting all bytes",
+                )
+            try:
+                self._queue.put_nowait(value)
+                return
+            except queue.Full:
+                done, _ = await asyncio.wait((self._worker,), timeout=0.01)
+                if done:
+                    await _await_upload_worker(self._worker)
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_STORAGE_ERROR,
+                        "Object upload completed before accepting all bytes",
+                    )
+
+    async def _upload(self) -> ObjectMetadata:
+        def put() -> ObjectMetadata:
+            result = self._storage.client.put_object(
+                self._storage.bucket,
+                self.object_name,
+                _QueueReader(self._queue, self._cancelled),
+                self.length if self.length is not None else -1,
+                part_size=5 * 1024 * 1024,
+                num_parallel_uploads=1,
+            )
+            etag = getattr(result, "etag", None)
+            if not isinstance(etag, str) or not etag:
+                raise ValueError("object upload response is missing an ETag")
+            return ObjectMetadata(
+                object_name=self.object_name,
+                size=self._written,
+                etag=etag,
+                modified=None,
+            )
+
+        return await self._storage.execute(put)
+
+
+class _QueueReader:
+    def __init__(
+        self,
+        values: queue.Queue[bytes | object],
+        cancelled: Event | None = None,
+    ) -> None:
+        self._values = values
+        self._cancelled = cancelled if cancelled is not None else Event()
+        self._ended = False
+        self._pending = b""
+
+    def read(self, size: int = -1) -> bytes:
+        if not isinstance(size, int):
+            raise TypeError("object upload read size must be an integer")
+        if self._ended or size == 0:
+            return b""
+        if self._cancelled.is_set():
+            self._ended = True
+            return b""
+        if size < 0:
+            chunks = bytearray()
+            if self._pending:
+                chunks.extend(self._pending)
+                self._pending = b""
+            while True:
+                value = self._next_value()
+                if value is ObjectUpload._END:
+                    self._ended = True
+                    return bytes(chunks)
+                if not isinstance(value, bytes):
+                    raise ValueError("object upload queue contained an invalid chunk")
+                chunks.extend(value)
+
+        bounded_value: bytes | object = self._pending
+        self._pending = b""
+        if not bounded_value:
+            bounded_value = self._next_value()
+        if bounded_value is ObjectUpload._END:
+            self._ended = True
+            return b""
+        if not isinstance(bounded_value, bytes):
+            raise ValueError("object upload queue contained an invalid chunk")
+        if len(bounded_value) > size:
+            self._pending = bounded_value[size:]
+            return bounded_value[:size]
+        return bounded_value
+
+    def _next_value(self) -> bytes | object:
+        while True:
+            if self._cancelled.is_set():
+                return ObjectUpload._END
+            try:
+                return self._values.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
 
 class ObjectStorage:
@@ -215,6 +436,7 @@ class ObjectStorage:
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._uploads: set[ObjectUpload] = set()
 
     async def execute(self, operation: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         return await self._execute(
@@ -293,6 +515,18 @@ class ObjectStorage:
 
     async def open_stream(self, object_name: str) -> ObjectStream:
         return await self._open_async_stream(object_name)
+
+    def begin_upload(self, object_name: str, *, length: int | None = None) -> ObjectUpload:
+        """Create a bounded stream into an internal RustFS object."""
+        if self._closing:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
+                "Object storage is unavailable",
+            )
+        upload = ObjectUpload(self, object_name, length=length)
+        self._uploads.add(upload)
+        upload._worker.add_done_callback(lambda _worker: self._uploads.discard(upload))
+        return upload
 
     async def _open_async_stream(
         self,
@@ -543,6 +777,48 @@ class ObjectStorage:
 
         return await self.execute(put_and_validate)
 
+    async def promote_if_absent(
+        self,
+        source_name: str,
+        destination_name: str,
+        *,
+        size: int,
+    ) -> ObjectMetadata:
+        """Copy an uploaded temporary object to a new destination.
+
+        Workspace mutation locks serialize this check with supported OO writes;
+        RustFS' conditional-copy primitive, when available, is an additional
+        defense against an external writer.
+        """
+        try:
+            await self.stat(destination_name)
+        except WorkspaceError as exc:
+            if exc.code is not ErrorCode.WORKSPACE_NOT_FOUND:
+                raise
+        else:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace file already exists",
+            )
+
+        def copy() -> ObjectMetadata:
+            result = self.client.copy_object(
+                self.bucket,
+                destination_name,
+                CopySource(self.bucket, source_name),
+            )
+            etag = getattr(result, "etag", None)
+            if not isinstance(etag, str) or not etag:
+                raise ValueError("object copy response is missing an ETag")
+            return ObjectMetadata(
+                object_name=destination_name,
+                size=size,
+                etag=etag,
+                modified=None,
+            )
+
+        return await self.execute(copy)
+
     async def delete(self, object_name: str) -> None:
         await self.execute(self.client.remove_object, self.bucket, object_name)
 
@@ -582,6 +858,23 @@ class ObjectStorage:
                     await self.delete(STARTUP_PROBE_KEY)
                 except WorkspaceError:
                     pass
+
+    async def recover_transfer_uploads(self) -> int:
+        """Remove transfer temporaries left by a previous server process."""
+
+        removed = 0
+        start_after: str | None = None
+        while True:
+            page = await self.list_page(
+                TRANSFER_TEMP_PREFIX,
+                start_after=start_after,
+            )
+            for item in page.items:
+                await self.delete(item.object_name)
+                removed += 1
+            if page.next_start_after is None:
+                return removed
+            start_after = page.next_start_after
 
     async def check_health(self) -> None:
         async with self._health_lock:
@@ -632,6 +925,11 @@ class ObjectStorage:
             health_worker = self._health_worker
         if health_worker is not None:
             await _wait_for_worker(health_worker)
+        if self._uploads:
+            await asyncio.gather(
+                *(upload.abort() for upload in tuple(self._uploads)),
+                return_exceptions=True,
+            )
         if self._cancelled_workers:
             await asyncio.gather(*self._cancelled_workers, return_exceptions=True)
         if self._async_client is not None:
@@ -657,6 +955,10 @@ async def _wait_for_worker(worker: asyncio.Future[Any]) -> None:
             worker.exception()
         except BaseException:
             pass
+
+
+async def _await_upload_worker(worker: asyncio.Future[ObjectMetadata]) -> ObjectMetadata:
+    return await await_future_cancellation_safe(worker)
 
 
 async def _close_async_response_safely(response: httpx.Response) -> None:

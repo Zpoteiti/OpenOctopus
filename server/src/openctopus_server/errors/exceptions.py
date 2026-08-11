@@ -22,6 +22,10 @@ class WorkspaceError(OpenOctopusError):
         self.headers = dict(headers) if headers is not None else None
 
 
+class DeviceError(OpenOctopusError):
+    pass
+
+
 class ToolError(OpenOctopusError):
     pass
 

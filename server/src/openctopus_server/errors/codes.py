@@ -2,6 +2,10 @@ from enum import StrEnum
 
 
 class ErrorCode(StrEnum):
+    # Device
+    DEVICE_NOT_FOUND = "device_not_found"
+    DEVICE_INVALID_REQUEST = "device_invalid_request"
+    DEVICE_NAME_TAKEN = "device_name_taken"
     # Workspace
     WORKSPACE_NOT_FOUND = "workspace_not_found"
     WORKSPACE_PERMISSION_DENIED = "workspace_permission_denied"
@@ -18,6 +22,7 @@ class ErrorCode(StrEnum):
     WORKSPACE_STORAGE_ERROR = "workspace_storage_error"
     WORKSPACE_TRANSFER_BUSY = "workspace_transfer_busy"
     WORKSPACE_TRANSFER_TIMEOUT = "workspace_transfer_timeout"
+    WORKSPACE_TRANSFER_INTEGRITY_FAILED = "workspace_transfer_integrity_failed"
     WORKSPACE_INVALID_REQUEST = "workspace_invalid_request"
     WORKSPACE_REF_CONFLICT = "workspace_ref_conflict"
     # Tool
@@ -40,6 +45,7 @@ class ErrorCode(StrEnum):
     TOOL_CWD_OUTSIDE_WORKSPACE = "tool_cwd_outside_workspace"
     TOOL_PATH_OUTSIDE_WORKSPACE = "tool_path_outside_workspace"
     TOOL_DEVICE_UNREACHABLE = "tool_device_unreachable"
+    TOOL_DEVICE_BUSY = "tool_device_busy"
     TOOL_CHANNEL_NOT_CONFIGURED = "tool_channel_not_configured"
     TOOL_UNSUPPORTED_MEDIA = "tool_unsupported_media"
     TOOL_DELIVERY_FAILED = "tool_delivery_failed"

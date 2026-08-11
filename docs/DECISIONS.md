@@ -1676,7 +1676,11 @@ stays small while adapter payloads stay understandable.
 
 ### ADR-091 · Device identity: `token` is PK, `(user_id, name)` is UNIQUE, user-initiated regenerate only
 
-**Status:** accepted
+**Status:** accepted (superseded for Py5 by ADR-131)
+**Py5 clarification:** ADR-131 replaces the historical plaintext-token PK
+shape with immutable `devices.id` plus unique 32-byte `token_hash` and
+`token_hint`. The remaining pairing, naming, and explicit-regeneration
+semantics continue to apply unless ADR-131 says otherwise.
 **Context:** Devices need an internal identifier (for handshake auth + row identity) and an external reference (for URLs, tool routing, system-prompt device enum). Early idea was "device id = device token" so only one field exists. But if the token is the identifier, `PATCH /api/devices/{token}/config` embeds the auth secret in URL paths, which end up in access logs, reverse-proxy traces, browser history, and debugging tools. That's a token-leak hazard even for self-hosted deployments.
 **Decision:**
 - **`devices.token`** — random secret with the `openoctopus_dev_` prefix. Primary key of the row. Acts as the canonical internal device identifier (for direct lookups, future FK references, etc.). Stored in plaintext (it IS the credential, not a credential wrapper).
@@ -2211,7 +2215,8 @@ The client never tries to drain in-flight work on shutdown. On SIGTERM, SIGINT, 
 
 1. Stop the worker queue from accepting new items (cancellation token flipped).
 2. For each in-flight `tool_call` ID: send `tool_result(is_error=true, code='client_shutting_down', content='Client process is shutting down.')` over WS before closing; the server normalizes this raw text before persistence/provider replay.
-3. For each in-flight transfer slot: send `transfer_end(id, ok=false, error='client_shutting_down')`.
+3. For each in-flight transfer slot: send
+   `transfer_end(id, ack=false, ok=false, code='client_shutting_down')`.
 4. Forceful kill on all MCP subprocesses and the in-flight `exec` subprocess (per ADR-105 teardown — `Child::start_kill()` cross-platform).
 5. Close WS with code 1001 ("going away").
 6. Exit zero.
@@ -3494,6 +3499,50 @@ without holding database connections or Agent materialization capacity.
 Document fidelity is delegated to one pinned conversion library while OO keeps
 the security and resource boundary. Py4 remains single-worker; horizontal scale
 still requires a command/routing and distributed-admission design.
+
+---
+
+### ADR-131 · Py5 Python client, minimal device contract, and single-file transfers
+
+**Status:** accepted (2026-08-10)
+
+**Context:** The Py5 Python/PyInstaller feasibility spike established a
+standalone client boundary, but the forward device documents still described
+the earlier Rust client, plaintext token primary key, shell/MCP configuration,
+and ambiguous transfer handshake. Py5 needs a small executable contract before
+implementation.
+
+**Decision:**
+
+- The Py5 client is Python 3.12 packaged as a PyInstaller one-folder bundle;
+  the server package is not imported by the client. Linux x86-64 is the current
+  merge-gate platform. Native Windows and macOS frozen verification is deferred
+  until those runners are available.
+- Py5 persists only `workspace_path`, `sandbox_mode`, and `ssrf_denylist` for a
+  device. Shell timeout, environment/command policy, and MCP configuration are
+  deferred with their implementing milestones and are not sent in `hello_ack`.
+- Devices have an immutable UUID `id`; bearer tokens are returned once at
+  create/regenerate, stored only as a unique 32-byte SHA-256 `token_hash` plus
+  a non-secret `token_hint`, and compared by hashing the `Authorization`
+  bearer value. Tokens never appear in URLs, logs, or child-process
+  environments.
+- Py5 transfers one regular file at a time between the server and a paired
+  device. Folder transfer, client-to-client bridging, range, resume, and
+  compression remain deferred. A transfer uses
+  an optional `transfer_request` (requester to sender), `transfer_begin`
+  (sender opens and describes the byte source), `transfer_ready` (receiver has
+  reserved its destination or consumer), binary chunks, and two
+  `transfer_end` frames distinguished by `ack`; the receiver's `ack=true`
+  terminal frame is the final acknowledgement.
+- Device `message` delivery references are provider-hidden and use a union of
+  durable `workspace_file` and online-only `device_file` shapes. A device file
+  is relayed live to the browser and is never staged in RustFS.
+
+**Consequences:** Py5 has no speculative server-side device configuration and
+no token recovery path. The protocol is explicit about who may send bytes and
+has a clean extension point for later transfer modes. The existing future
+shell/MCP and folder sections remain documentation for later milestones, not
+Py5 implementation requirements.
 
 ---
 

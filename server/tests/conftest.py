@@ -14,6 +14,7 @@ from openctopus_server.chat.runner import get_context_admission
 from openctopus_server.config import get_settings
 from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
+from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.main import create_app
 from openctopus_server.tools.registry import get_content_converter, get_web_fetch_admission
 from openctopus_server.workspace.fs import _workspace_fs_for_storage
@@ -25,6 +26,7 @@ def _clear_settings_and_engine_cache():
     """Ensure singleton caches are cleared around every test."""
     get_settings.cache_clear()
     get_engine.cache_clear()
+    get_device_registry.cache_clear()
     get_object_storage.cache_clear()
     get_rest_transfer_admission.cache_clear()
     get_context_admission.cache_clear()
@@ -39,6 +41,7 @@ def _clear_settings_and_engine_cache():
     get_content_converter.cache_clear()
     get_web_fetch_admission.cache_clear()
     get_engine.cache_clear()
+    get_device_registry.cache_clear()
     get_settings.cache_clear()
 
 

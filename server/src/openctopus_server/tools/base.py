@@ -31,8 +31,22 @@ class WorkspaceFileDeliveryRef:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceFileDeliveryRef:
+    path: str
+    openoctopus_device: str
+    filename: str
+    mime: str
+    size: int | None = None
+    type: Literal["device_file"] = "device_file"
+    online_only: Literal[True] = True
+
+
+type DeliveryRef = WorkspaceFileDeliveryRef | DeviceFileDeliveryRef
+
+
+@dataclass(frozen=True, slots=True)
 class MessageDeliveryEffect:
-    delivery_refs: tuple[WorkspaceFileDeliveryRef, ...]
+    delivery_refs: tuple[DeliveryRef, ...]
 
 
 @dataclass(frozen=True, slots=True)

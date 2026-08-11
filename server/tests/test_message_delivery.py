@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from openctopus_server.chat.compaction import commit_stage_two, stage_two_source_ids
 from openctopus_server.chat.context import project_message_rows
 from openctopus_server.chat.runner import ChatRuntime
-from openctopus_server.db.models import Message, Session, SystemConfig, User
+from openctopus_server.db.models import Device, Message, Session, SystemConfig, User
 from openctopus_server.dto.message import MessageResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
@@ -116,6 +116,55 @@ def test_message_response_rejects_incomplete_workspace_delivery_refs() -> None:
         )
 
 
+def test_message_response_accepts_device_delivery_ref_without_size() -> None:
+    response = MessageResponse(
+        id=uuid4(),
+        session_id=uuid4(),
+        role="assistant",
+        message_kind="assistant",
+        content=[],
+        delivery_refs=[
+            {
+                "tool_use_id": "message-device",
+                "type": "device_file",
+                "openoctopus_device": "laptop",
+                "path": "reports/final.pdf",
+                "filename": "final.pdf",
+                "mime": "application/pdf",
+                "online_only": True,
+            }
+        ],
+        is_compacted=False,
+        created_at=datetime.now(UTC),
+    )
+
+    assert response.delivery_refs[0].type == "device_file"
+
+
+def test_message_response_rejects_server_as_device_delivery_ref() -> None:
+    with pytest.raises(ValidationError):
+        MessageResponse(
+            id=uuid4(),
+            session_id=uuid4(),
+            role="assistant",
+            message_kind="assistant",
+            content=[],
+            delivery_refs=[
+                {
+                    "tool_use_id": "message-device",
+                    "type": "device_file",
+                    "openoctopus_device": "server",
+                    "path": "report.pdf",
+                    "filename": "report.pdf",
+                    "mime": "application/pdf",
+                    "online_only": True,
+                }
+            ],
+            is_compacted=False,
+            created_at=datetime.now(UTC),
+        )
+
+
 async def _configure_provider(engine: AsyncEngine) -> None:
     async with AsyncSession(engine, expire_on_commit=False) as db:
         db.add_all(
@@ -132,6 +181,8 @@ def _message_use(
     tool_use_id: str,
     content: str,
     media: list[str],
+    *,
+    device: str = "server",
 ) -> dict[str, Any]:
     return {
         "type": "tool_use",
@@ -140,7 +191,7 @@ def _message_use(
         "input": {
             "content": content,
             "media": media,
-            DEVICE_FIELD_NAME: "server",
+            DEVICE_FIELD_NAME: device,
         },
     }
 
@@ -298,6 +349,78 @@ async def test_two_message_calls_attach_correlated_refs_and_replay_only_provider
                 "size": 202,
                 "online_only": False,
             },
+        ]
+    finally:
+        await runtime.close()
+
+
+async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace(
+    user_client,
+    test_app,
+    pg_engine: AsyncEngine,
+) -> None:
+    await _configure_provider(pg_engine)
+    user_id = await _user_id(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Device(
+                user_id=user_id,
+                name="laptop",
+                token_hash=b"d" * 32,
+                token_hint="openoctopus_dev_...device",
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            )
+        )
+        await db.commit()
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[
+                    _message_use(
+                        "message-device",
+                        "Device file",
+                        ["reports/final.pdf"],
+                        device="laptop",
+                    )
+                ]
+            ),
+            _ProviderStep(content=[{"type": "text", "text": "Delivered."}]),
+        ]
+    )
+    workspace, workspace_fs = _workspace_service({})
+    runtime = _install_runtime(test_app, pg_engine, provider, workspace)
+    session_id = uuid4()
+    try:
+        response = await _post(user_client, session_id)
+
+        assert response.status_code == 200
+        message_schema = next(
+            schema for schema in provider.calls[0]["tools"] if schema["name"] == "message"
+        )
+        assert message_schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
+            "server",
+            "laptop",
+        ]
+        assert "delivery_refs" not in json.dumps(provider.calls)
+        workspace_fs.stat.assert_not_awaited()
+        history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+        assistant = next(
+            message
+            for message in history["messages"]
+            if message["message_kind"] == "assistant" and message["delivery_refs"]
+        )
+        assert assistant["delivery_refs"] == [
+            {
+                "tool_use_id": "message-device",
+                "type": "device_file",
+                "openoctopus_device": "laptop",
+                "path": "reports/final.pdf",
+                "filename": "final.pdf",
+                "mime": "application/pdf",
+                "online_only": True,
+            }
         ]
     finally:
         await runtime.close()

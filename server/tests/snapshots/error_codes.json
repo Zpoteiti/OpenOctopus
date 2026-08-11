@@ -5,6 +5,9 @@
   "AUTH_LAST_ADMIN_REQUIRED": "auth_last_admin_required",
   "AUTH_UNAUTHORIZED": "auth_unauthorized",
   "CONFIG_VALIDATION_FAILED": "config_validation_failed",
+  "DEVICE_INVALID_REQUEST": "device_invalid_request",
+  "DEVICE_NAME_TAKEN": "device_name_taken",
+  "DEVICE_NOT_FOUND": "device_not_found",
   "INVALID_CURSOR": "invalid_cursor",
   "INVALID_MESSAGE_CONTENT": "invalid_message_content",
   "MCP_SCHEMA_COLLISION": "mcp_schema_collision",
@@ -35,6 +38,7 @@
   "TOOL_DB_ERROR": "tool_db_error",
   "TOOL_DELIVERY_FAILED": "tool_delivery_failed",
   "TOOL_DEVICE_UNREACHABLE": "tool_device_unreachable",
+  "TOOL_DEVICE_BUSY": "tool_device_busy",
   "TOOL_ENV_NOT_ALLOWED": "tool_env_not_allowed",
   "TOOL_EXEC_TIMEOUT": "tool_exec_timeout",
   "TOOL_INVALID_ARGS": "tool_invalid_args",
@@ -68,5 +72,6 @@
   "WORKSPACE_SYMLINK_ESCAPE": "workspace_symlink_escape",
   "WORKSPACE_TRANSFER_BUSY": "workspace_transfer_busy",
   "WORKSPACE_TRANSFER_TIMEOUT": "workspace_transfer_timeout",
+  "WORKSPACE_TRANSFER_INTEGRITY_FAILED": "workspace_transfer_integrity_failed",
   "WORKSPACE_UPLOAD_TOO_LARGE": "workspace_upload_too_large"
 }

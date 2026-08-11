@@ -7,10 +7,11 @@ import pytest
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from openctopus_server.db.models import Session, User, Workspace, WorkspaceMember
+from openctopus_server.db.models import Device, Session, User, Workspace, WorkspaceMember
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.tools.base import (
+    DeviceFileDeliveryRef,
     MessageDeliveryEffect,
     ToolContext,
     WorkspaceFileDeliveryRef,
@@ -83,7 +84,7 @@ def test_message_schema_is_restricted_to_current_web_server_delivery(pg_engine) 
             "media": {
                 "type": "array",
                 "description": "Optional workspace files to attach.",
-                "items": {"type": "string", "minLength": 1},
+                "items": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "maxItems": 10,
                 "uniqueItems": True,
                 "default": [],
@@ -92,6 +93,18 @@ def test_message_schema_is_restricted_to_current_web_server_delivery(pg_engine) 
         "required": ["content"],
         "additionalProperties": False,
     }
+
+
+def test_message_schema_includes_paired_device_names(pg_engine) -> None:
+    tool = MessageTool(pg_engine, AsyncMock(spec=WorkspaceService))
+
+    schema = ToolRegistry((tool,)).get_tool_schemas(device_names=("laptop", "desktop"))[0]
+
+    assert schema["input_schema"]["properties"]["openoctopus_device"]["enum"] == [
+        "server",
+        "laptop",
+        "desktop",
+    ]
 
 
 async def test_message_content_only_returns_internal_success_marker(pg_engine) -> None:
@@ -173,6 +186,82 @@ async def test_message_builds_trusted_refs_without_reading_media(pg_engine) -> N
     ]
 
 
+async def test_message_builds_device_refs_without_opening_the_device(pg_engine) -> None:
+    service = AsyncMock(spec=WorkspaceService)
+    ctx = await _web_ctx(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Device(
+                user_id=ctx.user_id,
+                name="laptop",
+                token_hash=b"x" * 32,
+                token_hint="openoctopus_dev_...token",
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            )
+        )
+        await db.commit()
+    registry = ToolRegistry((MessageTool(pg_engine, service),))
+
+    result = await registry.execute(
+        name="message",
+        args={
+            "content": "File attached.",
+            "openoctopus_device": "laptop",
+            "media": ["reports/final.pdf"],
+        },
+        ctx=ctx,
+    )
+
+    assert result.side_effect == MessageDeliveryEffect(
+        delivery_refs=(
+            DeviceFileDeliveryRef(
+                path="reports/final.pdf",
+                openoctopus_device="laptop",
+                filename="final.pdf",
+                mime="application/pdf",
+            ),
+        )
+    )
+    service.resolve_delivery_file.assert_not_awaited()
+
+
+async def test_message_does_not_accept_another_users_device(pg_engine) -> None:
+    owner = await _web_ctx(pg_engine)
+    requester = await _web_ctx(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Device(
+                user_id=owner.user_id,
+                name="laptop",
+                token_hash=b"y" * 32,
+                token_hint="openoctopus_dev_...other",
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            )
+        )
+        await db.commit()
+    service = AsyncMock(spec=WorkspaceService)
+    registry = ToolRegistry((MessageTool(pg_engine, service),))
+
+    result = await registry.execute(
+        name="message",
+        args={
+            "content": "Do not attach.",
+            "openoctopus_device": "laptop",
+            "media": ["secret.txt"],
+        },
+        ctx=requester,
+    )
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert result.side_effect is None
+    service.resolve_delivery_file.assert_not_awaited()
+
+
 async def test_message_rejects_invalid_inputs_before_workspace_access(pg_engine) -> None:
     service = AsyncMock(spec=WorkspaceService)
     registry = ToolRegistry((MessageTool(pg_engine, service),))
@@ -180,8 +269,9 @@ async def test_message_rejects_invalid_inputs_before_workspace_access(pg_engine)
         {"content": "   "},
         {"content": "x" * 16_001},
         {"content": "x" + " " * 16_000},
-        {"content": "x", "openoctopus_device": "laptop"},
+        {"content": "x", "openoctopus_device": "Not Canonical"},
         {"content": "x", "media": ["a.txt", "a.txt"]},
+        {"content": "x", "media": ["x" * 4097]},
         {"content": "x", "media": [f"{index}.txt" for index in range(11)]},
         {"content": "x", "delivery_refs": []},
     )

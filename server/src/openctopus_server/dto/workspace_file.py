@@ -88,6 +88,14 @@ class StructuredPatchResponse(BaseModel):
     committed: int
 
 
+class TransferResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bytes_transferred: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    warnings: list[str] = Field(max_length=8)
+
+
 class GrepContextLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

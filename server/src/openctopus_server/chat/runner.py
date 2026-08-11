@@ -35,7 +35,9 @@ from openctopus_server.chat.stream import StreamSubscriber
 from openctopus_server.chat.token_estimator import estimate_request_tokens
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.config import get_settings
-from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun
+from openctopus_server.db.models import Device, Message, PendingMessage, Session, TurnRun
+from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.provider.anthropic import (
     AnthropicProvider,
@@ -58,7 +60,11 @@ from openctopus_server.services.messages import (
     promote_pending_for_turn,
     reserve_pending_turn,
 )
-from openctopus_server.tools.base import MessageDeliveryEffect, ToolContext
+from openctopus_server.tools.base import (
+    MessageDeliveryEffect,
+    ToolContext,
+    WorkspaceFileDeliveryRef,
+)
 from openctopus_server.tools.registry import ToolRegistry, build_py3_registry
 from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.skills import get_skills_cache
@@ -106,6 +112,7 @@ class _PreparedTurn:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
     user_id: UUID
+    device_targets: dict[str, UUID]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +120,7 @@ class _CompletedProviderTurn:
     turn: TurnStart
     assistant: Message
     user_id: UUID
+    device_targets: dict[str, UUID]
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +139,7 @@ class ChatRuntime:
         provider_factory: ProviderFactory | None = None,
         tool_registry: ToolRegistry | None = None,
         workspace_service: WorkspaceService | None = None,
+        device_registry: DeviceRegistry | None = None,
         context_admission: KeyedAdmission | None = None,
         request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
     ) -> None:
@@ -139,6 +148,7 @@ class ChatRuntime:
         self.limiter = ProviderLimiter()
         self.tool_registry = tool_registry or build_py3_registry()
         self.workspace_service = workspace_service
+        self.device_registry = device_registry or get_device_registry()
         self.context_admission = context_admission or get_context_admission()
         self._estimate_request_tokens = request_token_estimator
         self.skills_cache = get_skills_cache()
@@ -462,6 +472,8 @@ class ChatRuntime:
                         user_id=completed.user_id,
                         session_id=turn.session_id,
                     ),
+                    device_targets=completed.device_targets,
+                    device_registry=self.device_registry,
                 )
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
@@ -476,21 +488,25 @@ class ChatRuntime:
                 assistant_message_id: UUID | None = None
                 if isinstance(delivery_effect, MessageDeliveryEffect):
                     assistant_message_id = assistant.id
-                    delivery_refs = [
-                        {
+                    delivery_refs = []
+                    for ref in delivery_effect.delivery_refs:
+                        rendered_ref: dict[str, Any] = {
                             "tool_use_id": tool_id,
                             "type": ref.type,
                             "openoctopus_device": ref.openoctopus_device,
                             "path": ref.path,
-                            "workspace_id": str(ref.workspace_id),
-                            "workspace_relative_path": ref.workspace_relative_path,
                             "filename": ref.filename,
                             "mime": ref.mime,
-                            "size": ref.size,
                             "online_only": ref.online_only,
                         }
-                        for ref in delivery_effect.delivery_refs
-                    ]
+                        if ref.size is not None:
+                            rendered_ref["size"] = ref.size
+                        if isinstance(ref, WorkspaceFileDeliveryRef):
+                            rendered_ref["workspace_id"] = str(ref.workspace_id)
+                            rendered_ref["workspace_relative_path"] = (
+                                ref.workspace_relative_path
+                            )
+                        delivery_refs.append(rendered_ref)
                 async with AsyncSession(self.engine, expire_on_commit=False) as db:
                     updated_assistant, result_message = await persist_tool_result(
                         db,
@@ -630,6 +646,7 @@ class ChatRuntime:
                     content = result.content
                     fingerprint = result.fingerprint
                     prepared_user_id = prepared.user_id
+                    prepared_device_targets = prepared.device_targets
                     del prepared, provider, result
                 except Exception as exc:
                     try:
@@ -660,6 +677,7 @@ class ChatRuntime:
             turn=turn,
             assistant=assistant,
             user_id=prepared_user_id,
+            device_targets=prepared_device_targets,
         )
 
     async def _session_owner_id(self, session_id: UUID) -> UUID:
@@ -688,7 +706,6 @@ class ChatRuntime:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             await repair_unpaired_tool_uses(db, session_id=turn.session_id)
 
-        registry_schemas = self.tool_registry.get_tool_schemas()
         compacted = False
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             config = await load_provider_config(db)
@@ -747,6 +764,22 @@ class ChatRuntime:
                 add_compaction_continuation=False,
             )
             user_id = session.user_id
+            device_targets: dict[str, UUID] = {
+                name: device_id
+                for name, device_id in (
+                    await db.execute(
+                        select(Device.name, Device.id)
+                        .where(Device.user_id == user_id)
+                        .order_by(Device.created_at, Device.id)
+                    )
+                )
+                .tuples()
+                .all()
+            }
+
+        registry_schemas = self.tool_registry.get_tool_schemas(
+            device_names=device_targets.keys()
+        )
 
         should_compact = False
         if config.max_context_tokens is not None and config.compaction_threshold_tokens is not None:
@@ -831,6 +864,7 @@ class ChatRuntime:
             messages=provider_messages,
             tools=registry_schemas,
             user_id=user_id,
+            device_targets=device_targets,
         )
 
     async def _estimate_tokens(

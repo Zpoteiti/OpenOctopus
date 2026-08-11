@@ -919,6 +919,76 @@ async def test_read_with_metadata_uses_etag_from_the_get_response() -> None:
     assert client.stat_calls == stat_calls_before_read
 
 
+async def test_server_move_uses_open_source_etag_for_conditional_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_etag = "source-v1"
+    delete_calls: list[str | None] = []
+
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        async def read(self) -> bytes:
+            nonlocal current_etag
+            if current_etag == "source-v1":
+                current_etag = "source-v2"
+                return b"payload"
+            return b""
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        async def write(self, chunk: bytes) -> None:
+            assert chunk == b"payload"
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            pass
+
+    fs = WorkspaceFS(AsyncMock())
+    source = Source()
+    sink = Sink()
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", AsyncMock(return_value=(sink, "temp")))
+    commit = AsyncMock()
+    monkeypatch.setattr(fs, "commit_uploaded_object", commit)
+
+    async def conditional_delete(
+        _target: WorkspaceTarget,
+        _path: str,
+        *,
+        if_match: str | None = None,
+    ) -> None:
+        delete_calls.append(if_match)
+        if if_match != current_etag:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace file changed after it was read",
+            )
+
+    monkeypatch.setattr(fs, "delete_file", conditional_delete)
+    target = WorkspaceTarget.personal(uuid4())
+
+    transferred, digest, warnings = await fs.transfer_server_to_server(
+        target,
+        "source.txt",
+        target,
+        "destination.txt",
+        quota_bytes=100,
+        mode="move",
+    )
+
+    assert transferred == 7
+    assert digest
+    assert warnings == ("source_delete_failed",)
+    assert delete_calls == ["source-v1"]
+    commit.assert_awaited_once()
+
+
 async def test_list_dir_returns_public_metadata_without_reading_file_contents() -> None:
     client = _MemoryMinio()
     fs = _fs(client)
