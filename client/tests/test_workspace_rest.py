@@ -378,8 +378,7 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
     assert _json(result)["sha256"] == hashlib.sha256(b"after").hexdigest()
 
 
-@pytest.mark.asyncio
-async def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
+def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.bin"
@@ -408,25 +407,28 @@ async def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
     monkeypatch.setattr(os, "read", slow_read)
     monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
 
-    task = asyncio.create_task(
-        dispatcher.execute(
-            INTERNAL_WORKSPACE_ACTION,
-            {
-                "operation": "transfer_local",
-                "path": "source.bin",
-                "dst_path": "destination.bin",
-                "mode": "move",
-            },
+    async def exercise() -> ToolOutput:
+        task = asyncio.create_task(
+            dispatcher.execute(
+                INTERNAL_WORKSPACE_ACTION,
+                {
+                    "operation": "transfer_local",
+                    "path": "source.bin",
+                    "dst_path": "destination.bin",
+                    "mode": "move",
+                },
+            )
         )
-    )
-    assert await asyncio.to_thread(rename_completed.wait, 1)
-    await asyncio.sleep(0.05)
-    assert task.done() is False
-    task.cancel()
-    await asyncio.sleep(0)
-    assert task.done() is False
-    release_hash.set()
-    result = await asyncio.wait_for(task, timeout=1)
+        assert await asyncio.to_thread(rename_completed.wait, 1)
+        await asyncio.sleep(0.05)
+        assert task.done() is False
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        release_hash.set()
+        return await asyncio.wait_for(task, timeout=1)
+
+    result = asyncio.run(exercise())
 
     assert result.is_error is False
     assert source.exists() is False
@@ -475,34 +477,37 @@ def test_rest_and_transfer_etags_use_the_same_opaque_stat_fingerprint(tmp_path: 
     assert dispatcher_module._stat_fingerprint(source) == transfer_module._stat_fingerprint(source)
 
 
-@pytest.mark.asyncio
-async def test_workspace_rest_local_transfer_cancellation_cleans_temporary_file(
+def test_workspace_rest_local_transfer_cancellation_cleans_temporary_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "source.bin").write_bytes(b"payload")
     dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
-    started = asyncio.Event()
 
-    async def blocked_stream(source_fd: int, destination_fd: int) -> tuple[int, str]:
-        del source_fd, destination_fd
-        started.set()
-        await asyncio.sleep(60)
-        raise AssertionError("cancelled transfer resumed")
+    async def exercise() -> None:
+        started = asyncio.Event()
 
-    monkeypatch.setattr(dispatcher_module, "_stream_fd", blocked_stream)
-    task = asyncio.create_task(
-        dispatcher.execute(
-            "__workspace_rest__",
-            {
-                "operation": "transfer_local",
-                "path": "source.bin",
-                "dst_path": "destination.bin",
-            },
+        async def blocked_stream(source_fd: int, destination_fd: int) -> tuple[int, str]:
+            del source_fd, destination_fd
+            started.set()
+            await asyncio.sleep(60)
+            raise AssertionError("cancelled transfer resumed")
+
+        monkeypatch.setattr(dispatcher_module, "_stream_fd", blocked_stream)
+        task = asyncio.create_task(
+            dispatcher.execute(
+                "__workspace_rest__",
+                {
+                    "operation": "transfer_local",
+                    "path": "source.bin",
+                    "dst_path": "destination.bin",
+                },
+            )
         )
-    )
-    await asyncio.wait_for(started.wait(), timeout=1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
     assert not (tmp_path / "destination.bin").exists()
-    assert not list(tmp_path.glob(".destination.bin.openoctopus-*") )
+    assert not list(tmp_path.glob(".destination.bin.openoctopus-*"))
