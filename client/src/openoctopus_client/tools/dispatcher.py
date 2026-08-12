@@ -21,7 +21,7 @@ from typing import Any, Literal, cast
 
 import httpx
 import pathspec
-import regex  # type: ignore[import-untyped]
+import regex
 from pydantic import BaseModel
 
 from openoctopus_client.document_convert import (
@@ -550,9 +550,10 @@ class ClientToolDispatcher:
                 )
             )
         ]
-        filtered.sort(
-            key=(lambda item: item[0]) if action.sort == "path" else lambda item: -item[1]
-        )
+        if action.sort == "path":
+            filtered.sort(key=lambda item: item[0])
+        else:
+            filtered.sort(key=lambda item: item[1], reverse=True)
         values = [
             _directory_entry(
                 action.path,
@@ -1016,7 +1017,10 @@ class ClientToolDispatcher:
                 or (not item[2] and PurePosixPath(item[0]).suffix.lower() in _TYPES[file_type])
             )
         ]
-        filtered.sort(key=(lambda item: item[0]) if sort == "path" else lambda item: -item[1])
+        if sort == "path":
+            filtered.sort(key=lambda item: item[0])
+        else:
+            filtered.sort(key=lambda item: item[1], reverse=True)
         result = filtered[offset:] if head == 0 else filtered[offset : offset + head]
         lines = [f"{item[0]}{'/' if item[2] else ''}" for item in result]
         if len(filtered) > offset + len(result):

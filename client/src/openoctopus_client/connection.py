@@ -33,6 +33,9 @@ from openoctopus_client.protocol import (
     ToolCall,
     ToolResult,
     TransferBegin,
+    TransferEnd,
+    TransferProgress,
+    TransferReady,
     TransferRequest,
     decode_server_frame,
     encode_frame,
@@ -531,13 +534,16 @@ class ClientRuntime:
                                 else None,
                             )
                         )
-                elif frame.type in {
-                    "transfer_request",
-                    "transfer_begin",
-                    "transfer_ready",
-                    "transfer_progress",
-                    "transfer_end",
-                }:
+                elif isinstance(
+                    frame,
+                    (
+                        TransferRequest,
+                        TransferBegin,
+                        TransferReady,
+                        TransferProgress,
+                        TransferEnd,
+                    ),
+                ):
                     if transfer_manager is None:
                         raise ProtocolError("Transfer arrived before device configuration")
                     await transfer_manager.handle_control(frame)
