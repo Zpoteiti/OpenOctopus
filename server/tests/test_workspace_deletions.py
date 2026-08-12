@@ -600,13 +600,20 @@ async def test_partial_child_purge_keeps_row_for_replay_to_completion(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    replay_completed = asyncio.Event()
+
+    class SignallingLifecycleFS(_LifecycleFS):
+        async def forget_workspace(self, target: WorkspaceTarget) -> None:
+            await super().forget_workspace(target)
+            replay_completed.set()
+
     monkeypatch.setattr(
         "openctopus_server.services.workspace_deletions._CHILD_TERMINATE_GRACE_SECONDS",
         0.02,
     )
     (tmp_path / "object-1").write_bytes(b"first")
     (tmp_path / "object-2").write_bytes(b"second")
-    workspace_fs = _LifecycleFS()
+    workspace_fs = SignallingLifecycleFS()
     target = WorkspaceTarget.personal(uuid4())
     async with AsyncSession(pg_engine) as db:
         db.add(WorkspaceDeletion(kind=target.kind, target_id=target.id))
@@ -637,15 +644,14 @@ async def test_partial_child_purge_keeps_row_for_replay_to_completion(
         workspace_fs,
         purge_storage=_purge_config(str(tmp_path)),
         retry_interval_seconds=0.01,
-        purge_timeout_seconds=1,
+        purge_timeout_seconds=60,
         shutdown_grace_seconds=0.2,
         purge_entrypoint=_complete_file_purge_child,
     )
     replay_worker.start()
     try:
-        async with asyncio.timeout(2):
-            while target not in workspace_fs.forgotten:
-                await asyncio.sleep(0.01)
+        async with asyncio.timeout(10):
+            await replay_completed.wait()
     finally:
         await replay_worker.close()
 

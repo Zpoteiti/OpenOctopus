@@ -281,7 +281,10 @@ async def _stop_client(
     expected_returncode: int,
     secret: str | None = None,
 ) -> None:
-    if process.returncode is None:
+    # A non-zero expected code must come from the client itself.  Sending
+    # SIGTERM here would race the permanent-error exit that this helper is
+    # supposed to observe.
+    if process.returncode is None and expected_returncode == 0:
         process.send_signal(signal.SIGTERM)
     try:
         await asyncio.wait_for(process.wait(), timeout=8)
@@ -336,6 +339,19 @@ async def _assert_old_token_is_unauthorized(server_url: str, token: str) -> None
         assert exc.rcvd.code == 4401
     else:
         raise AssertionError("rotated device token unexpectedly opened a socket")
+
+
+async def test_stop_client_observes_an_expected_natural_failure() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(0.2); raise SystemExit(1)",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    await _stop_client(process, expected_returncode=1)
 
 
 async def test_real_postgres_source_client_device_lifecycle(
