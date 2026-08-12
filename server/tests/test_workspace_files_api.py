@@ -21,7 +21,7 @@ from openctopus_server.admission import KeyedDirectionalAdmission
 from openctopus_server.api.workspace_files import get_rest_transfer_admission
 from openctopus_server.config import get_settings
 from openctopus_server.db.engine import get_engine
-from openctopus_server.db.models import Session, User, Workspace, WorkspaceMember
+from openctopus_server.db.models import Device, Session, User, Workspace, WorkspaceMember
 from openctopus_server.tools.base import MessageDeliveryEffect, ToolContext
 from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.registry import ToolRegistry
@@ -236,6 +236,38 @@ async def test_file_routes_report_an_unavailable_paired_device(user_client, work
         "/api/workspace/files/a.txt",
         params={"openoctopus_device": "laptop"},
     )
+    _assert_standard_error(response, 409, "tool_device_unreachable")
+
+
+async def test_device_download_ref_rejects_a_reused_device_name(
+    workspace_api,
+    pg_engine,
+) -> None:
+    client, _storage, user_id = workspace_api
+    captured_device_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Device(
+                id=uuid4(),
+                user_id=user_id,
+                name="laptop",
+                token_hash=b"r" * 32,
+                token_hint="openoctopus_dev_...replacement",
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            )
+        )
+        await db.commit()
+
+    response = await client.get(
+        "/api/workspace/files/reports/final.pdf",
+        params={
+            "openoctopus_device": "laptop",
+            "openoctopus_device_id": str(captured_device_id),
+        },
+    )
+
     _assert_standard_error(response, 409, "tool_device_unreachable")
 
 

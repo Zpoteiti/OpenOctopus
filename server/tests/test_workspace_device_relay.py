@@ -11,6 +11,7 @@ from starlette.requests import Request
 from openctopus_server.admission import KeyedDirectionalAdmission
 from openctopus_server.api.workspace_files import download_file, upload_file
 from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
+from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
 from openctopus_server.devices.transfer import (
     TransferBusyError,
     TransferError,
@@ -93,8 +94,12 @@ class _Registry:
         self.transfers = transfers
         self.handle = handle
 
-    async def get_handle(self, *_args: object, **_kwargs: object) -> object | None:
-        return self.handle
+    async def get_route_snapshot(
+        self, device_id: UUID, *_args: object, **_kwargs: object
+    ) -> DeviceRouteSnapshot | None:
+        if self.handle is None:
+            return None
+        return DeviceRouteSnapshot(ConnectionHandle(device_id, 1), 0, "laptop")
 
 
 def _settings() -> SimpleNamespace:

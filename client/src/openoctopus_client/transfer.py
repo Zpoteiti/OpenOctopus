@@ -217,14 +217,19 @@ class TransferManager:
             return
         self._snapshot = snapshot
 
-    async def handle_control(self, frame: TransferFrame) -> None:
+    async def handle_control(
+        self,
+        frame: TransferFrame,
+        *,
+        start_snapshot: TransferConfigSnapshot | None = None,
+    ) -> None:
         self._purge_tombstones()
         if self._closed:
             raise TransferProtocolError("Transfer manager is closed")
         if isinstance(frame, TransferRequest):
-            await self._accept_request(frame)
+            await self._accept_request(frame, start_snapshot or self._snapshot)
         elif isinstance(frame, TransferBegin):
-            await self._accept_begin(frame)
+            await self._accept_begin(frame, start_snapshot or self._snapshot)
         elif isinstance(frame, TransferReady):
             self._accept_ready(frame)
         elif isinstance(frame, TransferEnd):
@@ -238,6 +243,15 @@ class TransferManager:
         """Compatibility alias used by small transport adapters and tests."""
 
         await self.handle_control(frame)
+
+    def reject_busy_start(self, frame: TransferRequest | TransferBegin) -> None:
+        """Reject a bounded config-ordered start queue overflow."""
+
+        self._purge_tombstones()
+        if self._closed:
+            raise TransferProtocolError("Transfer manager is closed")
+        self._ensure_new_slot(frame.id)
+        self._send_terminal_rejection(frame.id, "tool_device_busy")
 
     async def handle_binary(self, payload: bytes) -> None:
         slot_id, chunk = decode_binary_chunk(payload)
@@ -337,12 +351,15 @@ class TransferManager:
     async def close(self) -> None:
         await self.shutdown()
 
-    async def _accept_request(self, request: TransferRequest) -> None:
+    async def _accept_request(
+        self,
+        request: TransferRequest,
+        snapshot: TransferConfigSnapshot,
+    ) -> None:
         self._ensure_new_slot(request.id)
         if len(self._slots) >= MAX_ACTIVE_TRANSFER_SLOTS:
             self._send_terminal_rejection(request.id, "tool_device_busy")
             return
-        snapshot = self._snapshot
         slot = _Slot(
             slot_id=request.id,
             role="sender",
@@ -354,7 +371,11 @@ class TransferManager:
         self._slots[request.id] = slot
         slot.task = self._spawn(self._send_requested(slot))
 
-    async def _accept_begin(self, begin: TransferBegin) -> None:
+    async def _accept_begin(
+        self,
+        begin: TransferBegin,
+        snapshot: TransferConfigSnapshot,
+    ) -> None:
         self._ensure_new_slot(begin.id)
         if len(self._slots) >= MAX_ACTIVE_TRANSFER_SLOTS:
             self._send_terminal_rejection(begin.id, "tool_device_busy")
@@ -365,7 +386,7 @@ class TransferManager:
             slot_id=begin.id,
             role="receiver",
             purpose=begin.purpose,
-            snapshot=self._snapshot,
+            snapshot=snapshot,
             state="BEGUN",
             begin=begin,
             inbound=asyncio.Queue(maxsize=TRANSFER_CHUNKS_PER_SLOT),

@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.api import devices as devices_api
 from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import Device
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.services import devices
+from openctopus_server.services.devices import DeviceSnapshot
 
 
 class _FakeDeviceRegistry:
@@ -185,6 +190,12 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
     assert no_op_response.status_code == 200
     assert no_op_response.json() == patched
 
+    empty_body_no_op = await _request_as(
+        async_client, owner, "PATCH", "/api/devices/desk-pc/config"
+    )
+    assert empty_body_no_op.status_code == 200
+    assert empty_body_no_op.json() == patched
+
     rotation_response = await _request_as(
         async_client, owner, "POST", "/api/devices/desk-pc/regenerate-token"
     )
@@ -346,3 +357,148 @@ async def test_device_rest_projects_registry_state_after_commits(
     deleted_response = await _request_as(async_client, owner, "DELETE", "/api/devices/laptop")
     assert deleted_response.status_code == 204
     assert registry.removed == [device_id]
+
+
+@pytest.mark.parametrize("operation", ["rotate", "delete"])
+@pytest.mark.parametrize("cancellation_boundary", ["commit", "db_close", "registry"])
+async def test_post_commit_device_invalidation_finishes_before_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    cancellation_boundary: str,
+) -> None:
+    device_id = UUID("0198e2c8-592a-7000-8000-000000000001")
+    user_id = UUID("0198e2c8-592a-7000-8000-000000000002")
+    snapshot = DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="openoctopus_dev_...token",
+        workspace_path="~/workspace",
+        sandbox_mode=True,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+    invalidation_started = asyncio.Event()
+    release_invalidation = asyncio.Event()
+    invalidation_finished = asyncio.Event()
+    commit_started = asyncio.Event()
+    db_close_started = asyncio.Event()
+
+    class _BlockingRegistry:
+        async def revoke(self, target: UUID) -> bool:
+            assert target == device_id
+            invalidation_started.set()
+            if cancellation_boundary == "registry":
+                await release_invalidation.wait()
+            invalidation_finished.set()
+            return True
+
+        async def remove_device(self, target: UUID) -> bool:
+            return await self.revoke(target)
+
+    registry = _BlockingRegistry()
+    db = AsyncMock(spec=AsyncSession)
+
+    async def close_db() -> None:
+        db_close_started.set()
+        if cancellation_boundary == "db_close":
+            await release_invalidation.wait()
+
+    db.close.side_effect = close_db
+    user = SimpleNamespace(id=user_id)
+
+    async def regenerate_token(*args: object, **kwargs: object) -> tuple[DeviceSnapshot, str]:
+        del args, kwargs
+        if cancellation_boundary == "commit":
+            commit_started.set()
+            await release_invalidation.wait()
+        return snapshot, "openoctopus_dev_new-token"
+
+    async def delete(*args: object, **kwargs: object) -> DeviceSnapshot:
+        del args, kwargs
+        if cancellation_boundary == "commit":
+            commit_started.set()
+            await release_invalidation.wait()
+        return snapshot
+
+    if operation == "rotate":
+        monkeypatch.setattr(
+            devices_api.devices,
+            "regenerate_token",
+            regenerate_token,
+        )
+        request = asyncio.create_task(
+            devices_api.regenerate_device_token(
+                "laptop",
+                user=user,  # type: ignore[arg-type]
+                db=db,
+                registry=registry,  # type: ignore[arg-type]
+            )
+        )
+    else:
+        monkeypatch.setattr(
+            devices_api.devices,
+            "delete",
+            delete,
+        )
+        request = asyncio.create_task(
+            devices_api.delete_device(
+                "laptop",
+                user=user,  # type: ignore[arg-type]
+                db=db,
+                registry=registry,  # type: ignore[arg-type]
+            )
+        )
+
+    boundary_started = {
+        "commit": commit_started,
+        "db_close": db_close_started,
+        "registry": invalidation_started,
+    }[cancellation_boundary]
+    await asyncio.wait_for(boundary_started.wait(), timeout=1)
+    request.cancel()
+    await asyncio.sleep(0)
+    assert request.done() is False
+
+    release_invalidation.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request, timeout=1)
+    assert invalidation_finished.is_set()
+    db.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("operation", ["rotate", "delete"])
+async def test_failed_device_mutation_does_not_invalidate(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    user_id = UUID("0198e2c8-592a-7000-8000-000000000002")
+    registry = AsyncMock()
+    db = AsyncMock(spec=AsyncSession)
+    user = SimpleNamespace(id=user_id)
+    mutation = "regenerate_token" if operation == "rotate" else "delete"
+    monkeypatch.setattr(
+        devices_api.devices,
+        mutation,
+        AsyncMock(side_effect=RuntimeError("commit failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        if operation == "rotate":
+            await devices_api.regenerate_device_token(
+                "laptop",
+                user=user,  # type: ignore[arg-type]
+                db=db,
+                registry=registry,
+            )
+        else:
+            await devices_api.delete_device(
+                "laptop",
+                user=user,  # type: ignore[arg-type]
+                db=db,
+                registry=registry,
+            )
+
+    registry.revoke.assert_not_awaited()
+    registry.remove_device.assert_not_awaited()
+    db.close.assert_not_awaited()

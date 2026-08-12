@@ -70,6 +70,7 @@ class DeviceFileDeliveryRefResponse(BaseModel):
 
     tool_use_id: str = Field(min_length=1)
     type: Literal["device_file"]
+    device_id: UUID
     openoctopus_device: str = Field(
         min_length=1,
         max_length=64,

@@ -47,9 +47,8 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "LINE_NUM|CONTENT. Images return visual content for analysis. Supports PDF, "
             "DOCX, XLSX, PPTX documents. Use find_files/list_dir first when the path is "
             "uncertain. Read the relevant range before editing so replacements or patches "
-            "are based on current content. Use offset and limit for large text files. Use "
-            "force=true to re-read content even if unchanged. Reads exceeding ~128K chars "
-            "are truncated."
+            "are based on current content. Use offset and limit for large text files. Reads "
+            "exceeding ~128K chars are truncated."
         ),
         "input_schema": _input_schema(
             {
@@ -70,13 +69,6 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "Page range for PDF files, e.g. '1-5' "
                         "(default: first 20 pages, max 20 pages)"
                     ),
-                },
-                "force": {
-                    "type": "boolean",
-                    "description": (
-                        "Bypass same-file read deduplication and return content again."
-                    ),
-                    "default": False,
                 },
             },
             required=("path",),
@@ -440,7 +432,6 @@ class _ReadFileArgs(_Args):
     offset: int = Field(1, ge=1)
     limit: int = Field(2000, ge=1)
     pages: str | None = None
-    force: bool = False
 
 
 class _WriteFileArgs(_Args):

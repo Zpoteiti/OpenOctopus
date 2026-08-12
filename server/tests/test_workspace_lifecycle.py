@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import User, Workspace, WorkspaceMember
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import AuthError
 from openctopus_server.services import users
@@ -75,7 +76,9 @@ async def test_account_deletion_purges_personal_workspace_prefix(
         await db.commit()
         user_id = user.id
 
-        await users.delete_user(db, user, workspace_fs=workspace_fs)
+        await users.delete_user(
+            db, user, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+        )
 
         assert await db.get(User, user_id) is None
 
@@ -140,7 +143,9 @@ async def test_deleting_creator_preserves_shared_workspace_for_remaining_member(
         await db.commit()
         creator_id = creator.id
 
-        await users.delete_user(db, creator, workspace_fs=workspace_fs)
+        await users.delete_user(
+            db, creator, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+        )
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         persisted = await db.get(Workspace, workspace_id)
@@ -176,7 +181,9 @@ async def test_deleting_last_member_account_purges_orphaned_shared_workspace(
         await db.commit()
         creator_id = creator.id
 
-        await users.delete_user(db, creator, workspace_fs=workspace_fs)
+        await users.delete_user(
+            db, creator, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+        )
 
         assert await db.get(Workspace, workspace_id) is None
 
@@ -251,7 +258,9 @@ async def test_concurrent_admin_deletions_preserve_one_admin(
         async with AsyncSession(pg_engine, expire_on_commit=False) as db:
             user = await db.get(User, user_id)
             assert user is not None
-            await users.delete_user(db, user, workspace_fs=workspace_fs)
+            await users.delete_user(
+                db, user, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+            )
 
     results = await asyncio.gather(
         remove(first.id),

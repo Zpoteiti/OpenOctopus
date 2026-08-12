@@ -52,6 +52,17 @@ class _FakeWebSocket:
         self.closes.append((code, reason))
 
 
+@dataclass
+class _BlockingSendWebSocket(_FakeWebSocket):
+    send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_send: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.send_started.set()
+        await self.release_send.wait()
+        self.sent.append(payload)
+
+
 def _snapshot() -> DeviceSnapshot:
     return DeviceSnapshot(
         id=uuid4(),
@@ -128,6 +139,48 @@ async def test_handshake_rechecks_token_registers_and_acks_only_active_config(
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
 
 
+async def test_handshake_generation_is_not_routable_before_hello_ack_is_written(
+    monkeypatch: Any,
+) -> None:
+    snapshot = _snapshot()
+    disconnect = asyncio.Event()
+    websocket = _BlockingSendWebSocket(
+        headers={"authorization": "Bearer token"},
+        incoming=[{"type": "websocket.receive", "text": _hello()}],
+        disconnect=disconnect,
+    )
+    monkeypatch.setattr(
+        device_ws,
+        "_find_device_by_token",
+        AsyncMock(return_value=snapshot),
+    )
+    registry = DeviceRegistry()
+    serving = asyncio.create_task(
+        device_ws.serve_device_socket(websocket, registry, object())  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
+
+    assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool(
+            device_id=snapshot.id,
+            user_id=snapshot.user_id,
+            name="list_dir",
+            args={},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+
+    websocket.release_send.set()
+    for _ in range(100):
+        if await registry.is_online(snapshot.id, user_id=snapshot.user_id):
+            break
+        await asyncio.sleep(0)
+    assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is True
+    disconnect.set()
+    await asyncio.wait_for(serving, timeout=1)
+
+
 async def test_config_patch_cannot_be_missed_during_handshake_registration(
     monkeypatch: Any,
 ) -> None:
@@ -145,6 +198,7 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
             device_name: str,
             transport: DeviceTransport,
             expected_revocation_epoch: int | None = None,
+            ready: bool = True,
         ) -> ConnectionHandle | None:
             self.register_started.set()
             await self.release_register.wait()
@@ -154,6 +208,7 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
                 device_name=device_name,
                 transport=transport,
                 expected_revocation_epoch=expected_revocation_epoch,
+                ready=ready,
             )
 
     snapshot = replace(_snapshot(), sandbox_mode=False)

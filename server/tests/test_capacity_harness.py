@@ -43,6 +43,7 @@ async def test_source_capacity_harness_smoke() -> None:
 
     assert result["ok"] is True
     assert result["network_exercised"] is False
+    assert result["transfers_exercised"] is False
     assert result["authenticated_connections"] == 8
     assert result["independent_sessions"] == 8
     assert result["cross_user_result_errors"] == 0

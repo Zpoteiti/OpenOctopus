@@ -852,6 +852,16 @@ paths:
     get:
       tags: [Workspace Files]
       summary: Read workspace file contents
+      parameters:
+        - name: openoctopus_device_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: |
+            Optional immutable device identity from a `device_file` delivery
+            reference. When supplied, both this id and `openoctopus_device`
+            must still identify the same owned device; rename, deletion, or
+            name reuse returns `tool_device_unreachable`.
       description: |
         For `openoctopus_device=server`, authorizes through `WorkspaceService`
         and streams RustFS object bytes. For a paired device, opens an
@@ -1382,6 +1392,7 @@ paths:
         rejected. The existing device token remains valid across rename.
         Deferred fields are rejected rather than silently stored.
       requestBody:
+        required: false
         content:
           application/json:
             schema:
@@ -2486,13 +2497,17 @@ components:
             online_only: { type: boolean, enum: [false] }
         - type: object
           additionalProperties: false
-          required: [tool_use_id, type, openoctopus_device, path, filename, mime, online_only]
+          required: [tool_use_id, type, device_id, openoctopus_device, path, filename, mime, online_only]
           properties:
             tool_use_id: { type: string }
             type: { type: string, enum: [device_file] }
+            device_id:
+              type: string
+              format: uuid
+              description: Immutable paired-device identity used to fence later relay downloads.
             openoctopus_device:
               type: string
-              description: Paired device name used by the live relay route.
+              description: Paired device name captured with device_id for the live relay route.
             path: { type: string }
             filename: { type: string }
             mime: { type: string }

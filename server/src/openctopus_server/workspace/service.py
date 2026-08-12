@@ -25,6 +25,7 @@ from openctopus_server.workspace.fs import (
     DirectoryPage,
     FileMetadata,
     FileTransform,
+    UploadCommittedAfterCancellation,
     WorkspaceFS,
     WorkspaceTarget,
     get_workspace_fs,
@@ -254,8 +255,7 @@ class WorkspaceService:
         limit: int,
         pages: str | None,
         parser: DocumentParser,
-        unchanged_etag: Callable[[str], bool],
-    ) -> ToolFileRead | None:
+    ) -> ToolFileRead:
         is_document = ticket.suffix in {".pdf", ".docx", ".xlsx", ".pptx"}
         if is_document:
             async with parser.admit(user_id) as conversion:
@@ -263,11 +263,8 @@ class WorkspaceService:
                     ticket,
                     offset=offset,
                     limit=limit,
-                    unchanged_etag=unchanged_etag,
                     document=True,
                 )
-                if materialized is None:
-                    return None
                 if isinstance(materialized.content, str):
                     return ToolFileRead(
                         etag=materialized.etag,
@@ -288,11 +285,8 @@ class WorkspaceService:
             ticket,
             offset=offset,
             limit=limit,
-            unchanged_etag=unchanged_etag,
             document=False,
         )
-        if materialized is None:
-            return None
         if isinstance(materialized.content, str):
             return ToolFileRead(
                 etag=materialized.etag,
@@ -319,16 +313,13 @@ class WorkspaceService:
         *,
         offset: int,
         limit: int,
-        unchanged_etag: Callable[[str], bool],
         document: bool,
-    ) -> _MaterializedToolFile | None:
+    ) -> _MaterializedToolFile:
         try:
             async with asyncio.timeout(TOOL_MATERIALIZATION_TIMEOUT_SECONDS):
                 async with self._fs.materialization_slot():
                     stream = await self._fs.open_stream(ticket.target, ticket.relative_path)
                     try:
-                        if unchanged_etag(stream.etag):
-                            return None
                         if stream.size > MAX_EDIT_BYTES:
                             if document:
                                 raise WorkspaceError(
@@ -848,16 +839,20 @@ class WorkspaceService:
         *,
         size: int,
         sha256: str,
-    ) -> None:
+    ) -> bool:
         del sha256
         try:
-            await self._fs.commit_uploaded_object(
-                ticket.target,
-                ticket.relative_path,
-                sink.object_name,
-                size=size,
-                quota_bytes=ticket.quota_bytes,
-            )
+            try:
+                await self._fs.commit_uploaded_object(
+                    ticket.target,
+                    ticket.relative_path,
+                    sink.object_name,
+                    size=size,
+                    quota_bytes=ticket.quota_bytes,
+                )
+            except UploadCommittedAfterCancellation:
+                return True
+            return False
         finally:
             self._invalidate_skills(ticket.user_id, ticket.display_path)
 
@@ -887,6 +882,7 @@ class WorkspaceService:
                 source.relative_path,
                 destination.target,
                 destination.relative_path,
+                user_id=user_id,
                 quota_bytes=destination.quota_bytes,
                 mode=mode,
             )

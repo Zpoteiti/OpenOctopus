@@ -506,6 +506,8 @@ class ChatRuntime:
                             rendered_ref["workspace_relative_path"] = (
                                 ref.workspace_relative_path
                             )
+                        else:
+                            rendered_ref["device_id"] = str(ref.device_id)
                         delivery_refs.append(rendered_ref)
                 async with AsyncSession(self.engine, expire_on_commit=False) as db:
                     updated_assistant, result_message = await persist_tool_result(

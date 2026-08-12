@@ -13,7 +13,9 @@ from uuid import UUID
 
 from fastapi import Depends
 
+from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.config import get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.locks import KeyedLockManager
@@ -38,6 +40,10 @@ class FileMetadata:
     size: int
     etag: str
     created: bool = False
+
+
+class UploadCommittedAfterCancellation(asyncio.CancelledError):
+    """The destination was published before caller cancellation took effect."""
 
 
 @dataclass(frozen=True)
@@ -86,11 +92,26 @@ class WorkspaceFS:
         materialization_concurrency: int = 4,
         heavy_operation_concurrency: int = 4,
         file_operation_concurrency: int = 4,
+        server_transfer_max_concurrency_per_user: int = 2,
+        server_transfer_queue_timeout_seconds: float = 5.0,
     ) -> None:
         self._storage = storage
         self._materializations = asyncio.Semaphore(materialization_concurrency)
         self._heavy_operations = asyncio.Semaphore(heavy_operation_concurrency)
         self._file_operations = asyncio.Semaphore(file_operation_concurrency)
+        connection_limit = getattr(storage, "max_connections", None)
+        if not isinstance(connection_limit, int) or connection_limit < 2:
+            connection_limit = 8
+        server_transfer_capacity = max(1, connection_limit // 2)
+        self._server_transfers = KeyedAdmission(
+            global_limit=server_transfer_capacity,
+            per_key_limit=min(
+                server_transfer_max_concurrency_per_user,
+                server_transfer_capacity,
+            ),
+            timeout_seconds=server_transfer_queue_timeout_seconds,
+        )
+        self._transfer_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._mutation_locks = KeyedLockManager()
         self._retired_targets: set[WorkspaceTarget] = set()
 
@@ -221,6 +242,33 @@ class WorkspaceFS:
         destination_target: WorkspaceTarget,
         destination_path: str,
         *,
+        user_id: UUID,
+        quota_bytes: int,
+        mode: str,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        try:
+            async with self._server_transfers.slot(user_id):
+                return await self._transfer_server_to_server(
+                    source_target,
+                    source_path,
+                    destination_target,
+                    destination_path,
+                    quota_bytes=quota_bytes,
+                    mode=mode,
+                )
+        except AdmissionTimeoutError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_BUSY,
+                "Workspace transfer capacity is busy; retry later",
+            ) from exc
+
+    async def _transfer_server_to_server(
+        self,
+        source_target: WorkspaceTarget,
+        source_path: str,
+        destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
         quota_bytes: int,
         mode: str,
     ) -> tuple[int, str, tuple[str, ...]]:
@@ -246,13 +294,19 @@ class WorkspaceFS:
                 transferred += len(chunk)
                 await sink.write(chunk)
             await sink.finish()
-            await self.commit_uploaded_object(
-                destination_target,
-                destination_path,
-                temporary_object,
-                size=transferred,
-                quota_bytes=quota_bytes,
-            )
+            try:
+                await self.commit_uploaded_object(
+                    destination_target,
+                    destination_path,
+                    temporary_object,
+                    size=transferred,
+                    quota_bytes=quota_bytes,
+                )
+            except UploadCommittedAfterCancellation:
+                # Publication is the irreversible success point. Continue to
+                # report its true result and, for a move, conditionally remove
+                # the source instead of entering the pre-commit abort path.
+                pass
         except BaseException:
             await sink.abort()
             raise
@@ -615,18 +669,21 @@ class WorkspaceFS:
                     ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
                     "Workspace quota would be exceeded",
                 )
-            uploaded = await self._storage.promote_if_absent(
-                temporary_object,
-                object_name,
-                size=size,
+            publish = asyncio.create_task(
+                self._storage.promote_if_absent(
+                    temporary_object,
+                    object_name,
+                    size=size,
+                )
             )
-            try:
-                await self._storage.delete(temporary_object)
-            except Exception:
-                # The destination is already verified; leaving both copies is
-                # safer than deleting the destination after a cleanup error.
-                pass
-            return FileMetadata(size=size, etag=uploaded.etag, created=True)
+            uploaded, cancelled = await _await_irreversible_result(publish)
+            cleanup = asyncio.create_task(self._delete_transfer_temporary(temporary_object))
+            self._transfer_cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._transfer_cleanup_tasks.discard)
+            metadata = FileMetadata(size=size, etag=uploaded.etag, created=True)
+            if cancelled:
+                raise UploadCommittedAfterCancellation
+            return metadata
 
     async def _write(
         self,
@@ -1074,10 +1131,35 @@ class WorkspaceFS:
                 "Workspace was not found",
             )
 
+    async def _delete_transfer_temporary(self, object_name: str) -> None:
+        try:
+            await self._storage.delete(object_name)
+        except Exception:
+            # Startup recovery removes leftovers. The published destination is
+            # already verified and must remain successful after cleanup errors.
+            pass
+
 
 async def _run_transform(transform: Callable[[bytes], bytes], current: bytes) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
     return await await_future_cancellation_safe(worker)
+
+
+async def _await_irreversible_result[T](future: asyncio.Future[T]) -> tuple[T, bool]:
+    """Resolve a started publish and report cancellation after a successful result."""
+
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+        return result, cancelled
 
 
 async def _run_optional_transform(
@@ -1188,7 +1270,16 @@ def _too_large_to_edit() -> WorkspaceError:
 
 @lru_cache
 def _workspace_fs_for_storage(storage: ObjectStorage) -> WorkspaceFS:
-    return WorkspaceFS(storage)
+    settings = get_settings()
+    return WorkspaceFS(
+        storage,
+        server_transfer_max_concurrency_per_user=(
+            settings.rest_transfer_max_concurrency_per_user
+        ),
+        server_transfer_queue_timeout_seconds=(
+            settings.rest_transfer_queue_timeout_seconds
+        ),
+    )
 
 
 def get_workspace_fs(

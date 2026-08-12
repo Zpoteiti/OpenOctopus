@@ -17,11 +17,18 @@ Bearer token is authenticated by the production PostgreSQL
 tasks in one process—not 500 PyInstaller processes, and not provider/Agent
 turns. The JSON report states those limits explicitly.
 
-The script raises the `RLIMIT_NOFILE` soft limit only up to the hard limit when
-needed, records RSS/fd/task/queue metrics, and deletes only the exact rows it
-created in `finally`. It never truncates existing tables. The ordinary
+The script also runs one bounded server-to-client transfer per connection while
+heartbeats remain active. It raises the `RLIMIT_NOFILE` soft limit only up to the
+hard limit when needed, records RSS/fd/task/queue/transfer high-water metrics,
+measures actual online connections before shutdown and after cleanup, and deletes
+only the exact rows it created in `finally`. It never truncates existing tables. The ordinary
 `device_capacity_harness.py` remains the faster in-memory registry probe; its
 `network_exercised` value stays `false`.
+
+The ordinary CI runs the eight-connection opt-in smoke. The 500-connection merge
+gate is the `Device Capacity 500 Gate` workflow, started manually either with
+`workflow_dispatch` or by applying the `capacity-500` label to a PR. Its JSON
+artifact must be retained with the PR evidence before merge.
 
 The real PostgreSQL smoke test is opt-in:
 

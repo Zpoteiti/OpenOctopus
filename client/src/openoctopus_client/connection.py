@@ -32,20 +32,27 @@ from openoctopus_client.protocol import (
     ProtocolError,
     ToolCall,
     ToolResult,
+    TransferBegin,
+    TransferRequest,
     decode_server_frame,
     encode_frame,
 )
 from openoctopus_client.tools import ClientToolDispatcher, ToolOutput
 from openoctopus_client.tools.locks import PathLocks
-from openoctopus_client.transfer import TransferConfigSnapshot, TransferManager
+from openoctopus_client.transfer import (
+    MAX_ACTIVE_TRANSFER_SLOTS,
+    TransferConfigSnapshot,
+    TransferManager,
+)
 from openoctopus_client.writer import SerializedWriter, TextWebSocket, WriterOverflowError
 
 LOGGER = logging.getLogger(__name__)
 _TOOL_QUEUE_MAX = 64
 _TOOL_QUEUE_BYTES_MAX = 32 * 1024 * 1024
+_CONFIG_UPDATE_BACKLOG_MAX = 16
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _HELLO_ACK_TIMEOUT_SECONDS = 10.0
-_RETRYABLE_CLOSE_CODES = frozenset({1000, 1001, 1013, 4000, 4408})
+_RETRYABLE_CLOSE_CODES = frozenset({1000, 1001, 1006, 1013, 4000, 4408})
 
 
 class ClosableWebSocket(TextWebSocket, Protocol):
@@ -56,6 +63,38 @@ class ClosableWebSocket(TextWebSocket, Protocol):
 
 class ToolDispatcher(Protocol):
     async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput: ...
+
+
+class _RetryableConfigError(RuntimeError):
+    """A local device configuration could not be prepared safely."""
+
+
+class _ConfigBoundDispatcher:
+    """Bind a tool call to the configuration generation visible on receipt."""
+
+    def __init__(self, prepared: asyncio.Task[_PreparedConfig]) -> None:
+        self._prepared = prepared
+        self._resolved: ToolDispatcher | None = None
+
+    async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput:
+        dispatcher = (await asyncio.shield(self._prepared)).dispatcher
+        self._resolved = dispatcher
+        return await dispatcher.execute(name, args)
+
+    def has_pending_blocking(self) -> bool:
+        return self._resolved is not None and _dispatcher_has_pending_blocking(self._resolved)
+
+    async def wait_for_pending_blocking(self) -> None:
+        if self._resolved is not None:
+            await _wait_for_dispatcher_blocking(self._resolved)
+
+
+@dataclass(frozen=True)
+class _PreparedConfig:
+    workspace: Path
+    dispatcher: ToolDispatcher
+    config: DeviceConfig
+    device_name: str
 
 
 @dataclass(frozen=True)
@@ -124,6 +163,14 @@ class _ToolWorker:
                 # cleanup path a second time.
                 stopped = True
         if stopped:
+            if timeout is None:
+                await asyncio.gather(
+                    *(
+                        _wait_for_dispatcher_blocking(dispatcher)
+                        for dispatcher in self._dispatchers
+                    ),
+                    return_exceptions=True,
+                )
             stopped = not any(
                 _dispatcher_has_pending_blocking(dispatcher) for dispatcher in self._dispatchers
             )
@@ -140,6 +187,7 @@ class _ToolWorker:
                 try:
                     result = await self._runtime._run_tool(request.call, request.dispatcher)
                     self._writer.enqueue_normal(encode_frame(result))
+                    await _wait_for_dispatcher_blocking(request.dispatcher)
                 finally:
                     self._retained_bytes -= request.retained_bytes
                     self._queue.task_done()
@@ -182,7 +230,8 @@ class ClientRuntime:
         self._device_name: str | None = None
         self._tools: ToolDispatcher | None = None
         self._transfer_manager: TransferManager | None = None
-        self._config_tasks: set[asyncio.Task[Path]] = set()
+        self._config_tasks: set[asyncio.Task[Any]] = set()
+        self._config_generation = 0
         self._hard_exit = hard_exit
         self._shutdown_watchdog_lock = threading.Lock()
         self._shutdown_watchdog: threading.Timer | None = None
@@ -292,12 +341,16 @@ class ClientRuntime:
             return await self.run_connection(websocket)
 
     async def run_connection(self, websocket: ClosableWebSocket) -> CloseDisposition:
+        self._config_generation += 1
+        config_generation = self._config_generation
         writer = SerializedWriter()
         writer_task = asyncio.create_task(writer.run(websocket))
         worker = _ToolWorker(self, writer)
         worker_failure_task = asyncio.create_task(_wait_for_worker_failure(worker.failed))
         transfer_manager: TransferManager | None = None
         transfer_failure_task: asyncio.Task[str | bytes | None] | None = None
+        config_update_tasks: list[asyncio.Task[_PreparedConfig]] = []
+        config_bound_transfer_tasks: list[asyncio.Task[None]] = []
         receive_task: asyncio.Task[str | bytes | None] | None = None
         stopping_task = asyncio.create_task(self._stopping.wait())
         hello = self._hello_factory()
@@ -342,6 +395,8 @@ class ClientRuntime:
                 }
                 if transfer_failure_task is not None:
                     wait_set.add(transfer_failure_task)
+                wait_set.update(config_update_tasks)
+                wait_set.update(config_bound_transfer_tasks)
                 timeout = None
                 if not acknowledged:
                     timeout = max(0.0, hello_deadline - asyncio.get_running_loop().time())
@@ -377,6 +432,23 @@ class ClientRuntime:
                     except asyncio.CancelledError:
                         pass
                     transfer_failure_task.result()
+                completed_updates = [task for task in config_update_tasks if task in done]
+                completed_transfers = [
+                    task for task in config_bound_transfer_tasks if task in done
+                ]
+                if completed_updates or completed_transfers:
+                    for update_task in completed_updates:
+                        update_task.result()
+                        config_update_tasks.remove(update_task)
+                    for transfer_task in completed_transfers:
+                        transfer_task.result()
+                        config_bound_transfer_tasks.remove(transfer_task)
+                    if receive_task not in done:
+                        receive_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await receive_task
+                        receive_task = None
+                        continue
                 payload = receive_task.result()
                 receive_task = None
                 if payload is None:
@@ -390,7 +462,11 @@ class ClientRuntime:
                 if not acknowledged:
                     if not isinstance(frame, HelloAck) or frame.id != hello.id:
                         raise ProtocolError("Expected matching hello acknowledgement")
-                    await self._install_config(frame.device_name, frame.config)
+                    await self._install_config(
+                        frame.device_name,
+                        frame.config,
+                        generation=config_generation,
+                    )
                     assert self._active_config is not None
                     transfer_manager = TransferManager(
                         TransferConfigSnapshot.from_values(
@@ -411,25 +487,50 @@ class ClientRuntime:
                 if isinstance(frame, Ping):
                     writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
                 elif isinstance(frame, ConfigUpdate):
-                    await self._install_config(frame.device_name, frame.config)
-                    if transfer_manager is not None and self._active_config is not None:
-                        transfer_manager.update_config(
-                            TransferConfigSnapshot.from_values(
-                                Path(self._active_config.workspace_path),
-                                sandbox_mode=frame.config.sandbox_mode,
-                                ssrf_denylist=frame.config.ssrf_denylist,
-                                device_name=frame.device_name,
-                            )
+                    if len(config_update_tasks) >= _CONFIG_UPDATE_BACKLOG_MAX:
+                        raise _RetryableConfigError("Device configuration backlog is full")
+                    config_update_tasks.append(
+                        self._schedule_config_update(
+                            frame.device_name,
+                            frame.config,
+                            generation=config_generation,
+                            previous=config_update_tasks[-1]
+                            if config_update_tasks
+                            else None,
+                            transfer_manager=transfer_manager,
                         )
+                    )
                 elif isinstance(frame, ToolCall):
                     if self._tools is None:
                         raise ProtocolError("Tool call arrived before device configuration")
-                    if not worker.enqueue(frame, self._tools):
+                    dispatcher: ToolDispatcher = self._tools
+                    if config_update_tasks:
+                        dispatcher = _ConfigBoundDispatcher(config_update_tasks[-1])
+                    if not worker.enqueue(frame, dispatcher):
                         writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
                 elif isinstance(frame, ErrorFrame):
                     # Server errors are already correlated and safe to ignore here;
                     # untrusted details never become client logs.
                     continue
+                elif (
+                    isinstance(frame, (TransferRequest, TransferBegin))
+                    and config_update_tasks
+                ):
+                    if transfer_manager is None:
+                        raise ProtocolError("Transfer arrived before device configuration")
+                    if len(config_bound_transfer_tasks) >= MAX_ACTIVE_TRANSFER_SLOTS:
+                        transfer_manager.reject_busy_start(frame)
+                    else:
+                        config_bound_transfer_tasks.append(
+                            self._schedule_config_bound_transfer(
+                                transfer_manager,
+                                frame,
+                                prepared=config_update_tasks[-1],
+                                previous=config_bound_transfer_tasks[-1]
+                                if config_bound_transfer_tasks
+                                else None,
+                            )
+                        )
                 elif frame.type in {
                     "transfer_request",
                     "transfer_begin",
@@ -458,6 +559,16 @@ class ClientRuntime:
             shutdown_requested = True
             return CloseDisposition.SHUTDOWN
         finally:
+            for config_update_task in config_update_tasks:
+                if not config_update_task.done():
+                    config_update_task.cancel()
+            for transfer_task in config_bound_transfer_tasks:
+                if not transfer_task.done():
+                    transfer_task.cancel()
+            if config_bound_transfer_tasks:
+                await asyncio.gather(*config_bound_transfer_tasks, return_exceptions=True)
+            if self._config_generation == config_generation:
+                self._config_generation += 1
             shutdown_requested = shutdown_requested or self._stopping.is_set()
             stopping_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -496,10 +607,10 @@ class ClientRuntime:
                     transfer_shutdown_task, _SHUTDOWN_GRACE_SECONDS
                 )
             worker_stopped = await worker.stop(
-                timeout=_SHUTDOWN_GRACE_SECONDS
+                timeout=_SHUTDOWN_GRACE_SECONDS if shutdown_requested else None
             )
             config_stopped = await self._wait_for_config_tasks(
-                timeout=_SHUTDOWN_GRACE_SECONDS
+                timeout=_SHUTDOWN_GRACE_SECONDS if shutdown_requested else None
             )
             if shutdown_requested and (
                 not transfer_stopped or not worker_stopped or not config_stopped
@@ -537,20 +648,107 @@ class ClientRuntime:
             operating_system=cast(Literal["linux", "darwin", "windows"], operating_system),
         )
 
-    async def _install_config(self, device_name: str, config: DeviceConfig) -> None:
-        task = asyncio.create_task(asyncio.to_thread(_prepare_workspace, config.workspace_path))
+    async def _install_config(
+        self,
+        device_name: str,
+        config: DeviceConfig,
+        *,
+        generation: int | None = None,
+    ) -> ToolDispatcher:
+        expected_generation = generation
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                _prepare_config_candidate,
+                self._tool_dispatcher_factory,
+                device_name,
+                config,
+            )
+        )
+        self._track_config_task(task)
+        try:
+            prepared = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _RetryableConfigError(
+                "Device workspace configuration could not be prepared"
+            ) from None
+        if expected_generation is not None and expected_generation != self._config_generation:
+            raise asyncio.CancelledError
+        return self._activate_prepared_config(prepared).dispatcher
+
+    def _schedule_config_update(
+        self,
+        device_name: str,
+        config: DeviceConfig,
+        *,
+        generation: int,
+        previous: asyncio.Task[_PreparedConfig] | None,
+        transfer_manager: TransferManager | None,
+    ) -> asyncio.Task[_PreparedConfig]:
+        async def install() -> _PreparedConfig:
+            if previous is not None:
+                await asyncio.shield(previous)
+            prepare_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _prepare_config_candidate,
+                    self._tool_dispatcher_factory,
+                    device_name,
+                    config,
+                )
+            )
+            self._track_config_task(prepare_task)
+            try:
+                prepared = await asyncio.shield(prepare_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise _RetryableConfigError(
+                    "Device workspace configuration could not be prepared"
+                ) from None
+            if generation != self._config_generation:
+                raise asyncio.CancelledError
+            self._activate_prepared_config(prepared)
+            if transfer_manager is not None:
+                transfer_manager.update_config(_transfer_snapshot(prepared))
+            return prepared
+
+        task = asyncio.create_task(install())
+        self._track_config_task(task)
+        return task
+
+    @staticmethod
+    def _schedule_config_bound_transfer(
+        transfer_manager: TransferManager,
+        frame: TransferRequest | TransferBegin,
+        *,
+        prepared: asyncio.Task[_PreparedConfig],
+        previous: asyncio.Task[None] | None,
+    ) -> asyncio.Task[None]:
+        async def dispatch() -> None:
+            if previous is not None:
+                await asyncio.shield(previous)
+            installed = await asyncio.shield(prepared)
+            await transfer_manager.handle_control(
+                frame,
+                start_snapshot=_transfer_snapshot(installed),
+            )
+
+        return asyncio.create_task(dispatch())
+
+    def _activate_prepared_config(self, prepared: _PreparedConfig) -> _PreparedConfig:
+        self._active_config = prepared.config.model_copy(
+            update={"workspace_path": str(prepared.workspace)}
+        )
+        self._device_name = prepared.device_name
+        self._tools = prepared.dispatcher
+        return prepared
+
+    def _track_config_task(self, task: asyncio.Task[Any]) -> None:
         self._config_tasks.add(task)
         task.add_done_callback(self._config_task_done)
-        workspace = await asyncio.shield(task)
-        self._active_config = config.model_copy(update={"workspace_path": str(workspace)})
-        self._device_name = device_name
-        self._tools = self._tool_dispatcher_factory(
-            workspace,
-            config.sandbox_mode,
-            config.ssrf_denylist,
-        )
 
-    def _config_task_done(self, task: asyncio.Task[Path]) -> None:
+    def _config_task_done(self, task: asyncio.Task[Any]) -> None:
         self._config_tasks.discard(task)
         if not task.cancelled():
             with contextlib.suppress(BaseException):
@@ -631,6 +829,34 @@ def _prepare_workspace(value: str) -> Path:
     return workspace
 
 
+def _prepare_config_candidate(
+    factory: Callable[[Path, bool, list[str]], ToolDispatcher],
+    device_name: str,
+    config: DeviceConfig,
+) -> _PreparedConfig:
+    workspace = _prepare_workspace(config.workspace_path)
+    dispatcher = factory(
+        workspace,
+        config.sandbox_mode,
+        config.ssrf_denylist,
+    )
+    return _PreparedConfig(
+        workspace=workspace,
+        dispatcher=dispatcher,
+        config=config,
+        device_name=device_name,
+    )
+
+
+def _transfer_snapshot(prepared: _PreparedConfig) -> TransferConfigSnapshot:
+    return TransferConfigSnapshot.from_values(
+        prepared.workspace,
+        sandbox_mode=prepared.config.sandbox_mode,
+        ssrf_denylist=prepared.config.ssrf_denylist,
+        device_name=prepared.device_name,
+    )
+
+
 async def _wait_for_worker_failure(failure: asyncio.Future[None]) -> str | bytes | None:
     await failure
     raise AssertionError("Tool worker finished without a failure")
@@ -644,6 +870,12 @@ async def _wait_for_transfer_failure(failure: asyncio.Future[None]) -> str | byt
 def _dispatcher_has_pending_blocking(dispatcher: ToolDispatcher) -> bool:
     checker = getattr(dispatcher, "has_pending_blocking", None)
     return bool(checker()) if callable(checker) else False
+
+
+async def _wait_for_dispatcher_blocking(dispatcher: ToolDispatcher) -> None:
+    waiter = getattr(dispatcher, "wait_for_pending_blocking", None)
+    if callable(waiter):
+        await waiter()
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -716,7 +948,7 @@ def reconnect_disposition_from_exception(exc: BaseException) -> ReconnectDisposi
             http_status=status if isinstance(status, int) else None,
             close_code=close_code if isinstance(close_code, int) else None,
         )
-    if isinstance(exc, OSError):
+    if isinstance(exc, (OSError, _RetryableConfigError)):
         return ReconnectDisposition.RETRY
     return ReconnectDisposition.PERMANENT_CONFIG
 

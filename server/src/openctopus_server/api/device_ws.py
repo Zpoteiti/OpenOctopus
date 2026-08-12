@@ -35,6 +35,7 @@ from openctopus_server.devices.protocol import (
     parse_client_frame,
 )
 from openctopus_server.devices.registry import (
+    UNAUTHORIZED_CLOSE_REASON,
     ConnectionHandle,
     DeviceProtocolError,
     DeviceRegistry,
@@ -49,7 +50,6 @@ HELLO_TIMEOUT_SECONDS = 10.0
 PING_INTERVAL_SECONDS = 30.0
 LIVENESS_TIMEOUT_SECONDS = 70.0
 
-_UNAUTHORIZED_REASON = '{"code":"unauthorized"}'
 _VERSION_REASON = '{"code":"version_unsupported","protocol_version":"1"}'
 
 
@@ -347,7 +347,7 @@ async def serve_device_socket(
     transport = WebSocketTransport(websocket)
     token = _bearer_token(websocket)
     if token is None:
-        await transport.close(4401, _UNAUTHORIZED_REASON)
+        await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
         return
 
     try:
@@ -356,7 +356,7 @@ async def serve_device_socket(
         await transport.close(1013, '{"code":"io_error"}')
         return
     if device is None:
-        await transport.close(4401, _UNAUTHORIZED_REASON)
+        await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
         return
     registration_epoch = await registry.registration_epoch(device.id)
 
@@ -388,7 +388,7 @@ async def serve_device_socket(
                 await transport.close(1013, '{"code":"io_error"}')
                 return
             if device is None:
-                await transport.close(4401, _UNAUTHORIZED_REASON)
+                await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
                 return
 
             handle = await registry.register(
@@ -397,9 +397,10 @@ async def serve_device_socket(
                 device_name=device.name,
                 transport=transport,
                 expected_revocation_epoch=registration_epoch,
+                ready=False,
             )
             if handle is None:
-                await transport.close(4401, _UNAUTHORIZED_REASON)
+                await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
                 return
             ack = HelloAckFrame(
                 id=hello.id,
@@ -410,7 +411,7 @@ async def serve_device_socket(
                     ssrf_denylist=device.ssrf_denylist,
                 ),
             )
-            if not await registry.send_text(handle, ack.model_dump_json()):
+            if not await registry.activate(handle, ack.model_dump_json()):
                 return
         stop_event = asyncio.Event()
         heartbeat = asyncio.create_task(

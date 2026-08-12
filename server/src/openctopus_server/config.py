@@ -6,6 +6,8 @@ from typing import Annotated
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from openctopus_server.devices.protocol import MAX_TOOL_CALL_RESERVATION_BYTES
+
 _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
@@ -67,9 +69,11 @@ class Settings(BaseSettings):
     # Device pending-call admission — all required
     device_pending_calls_max: Annotated[int, Field(ge=64, le=65536)]
     device_pending_calls_max_per_user: Annotated[int, Field(ge=1, le=1024)]
-    device_pending_bytes_max: Annotated[int, Field(ge=16 * 1024 * 1024, le=1024 * 1024 * 1024)]
+    device_pending_bytes_max: Annotated[
+        int, Field(gt=MAX_TOOL_CALL_RESERVATION_BYTES, le=1024 * 1024 * 1024)
+    ]
     device_pending_bytes_max_per_user: Annotated[
-        int, Field(ge=1024 * 1024, le=256 * 1024 * 1024)
+        int, Field(ge=MAX_TOOL_CALL_RESERVATION_BYTES, le=256 * 1024 * 1024)
     ]
 
     # Device transfer admission — all required

@@ -10,6 +10,7 @@ import pytest
 
 import openctopus_server.tools.file_transfer as file_transfer_module
 from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
+from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
 from openctopus_server.devices.transfer import TransferError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext
@@ -97,7 +98,7 @@ async def test_same_client_dispatches_one_private_local_action_without_transfer_
     registry = _SameClientRegistry()
     tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
 
-    async def resolve(_: UUID, name: str) -> UUID:
+    async def resolve(_: UUID, name: str, _expected: UUID | None = None) -> UUID:
         assert name == "laptop"
         return device_id
 
@@ -161,7 +162,7 @@ async def test_client_to_server_move_uses_private_conditional_source_delete(
     registry = _ClientToServerRegistry()
     tool = FileTransferTool(object(), workspace, registry)  # type: ignore[arg-type]
 
-    async def resolve(_: UUID, name: str) -> UUID:
+    async def resolve(_: UUID, name: str, _expected: UUID | None = None) -> UUID:
         assert name == "laptop"
         return device_id
 
@@ -190,6 +191,8 @@ async def test_client_to_server_move_uses_private_conditional_source_delete(
     )
 
     assert outcome.warnings == ()
+    assert registry.route is not None
+    assert registry.route.handle.device_id == device_id
     assert registry.delete_call == (
         device_id,
         "__workspace_rest__",
@@ -260,6 +263,66 @@ async def test_remote_transfer_maps_unknown_error_to_storage_error(
     assert result.code is ErrorCode.WORKSPACE_STORAGE_ERROR
 
 
+@pytest.mark.asyncio
+async def test_native_transfer_timeout_maps_to_stable_timeout_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = FileTransferTool(None, None, None)
+    monkeypatch.setattr(tool, "transfer", AsyncMock(side_effect=TimeoutError))
+
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "server",
+            "src_path": "a.txt",
+            "openoctopus_dst_device": "server",
+            "dst_path": "b.txt",
+        },
+        _ctx(),
+    )
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.WORKSPACE_TRANSFER_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_intrinsic_device_transfer_rejects_a_reused_provider_turn_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_device_id = uuid4()
+    registry = _NoIoRegistry()
+    tool = FileTransferTool(object(), _NoIoWorkspace(), registry)  # type: ignore[arg-type]
+
+    async def resolve(
+        _user_id: UUID,
+        name: str,
+        expected_device_id: UUID | None,
+    ) -> UUID:
+        assert name == "laptop"
+        assert expected_device_id == original_device_id
+        raise file_transfer_module.DeviceUnavailableError("captured device was replaced")
+
+    monkeypatch.setattr(tool, "_device_id", resolve)
+    ctx = ToolContext(
+        user_id=uuid4(),
+        session_id=uuid4(),
+        device_targets={"laptop": original_device_id},
+    )
+
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "laptop",
+            "src_path": "a.txt",
+            "openoctopus_dst_device": "server",
+            "dst_path": "b.txt",
+        },
+        ctx,
+    )
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert registry.calls == []
+
+
 @dataclass
 class _Workspace:
     calls: list[tuple[str, str, str]] | None = None
@@ -295,30 +358,31 @@ class _SameClientRegistry:
         self.calls: list[tuple[object, str, dict[str, object], str]] = []
         self.transfers = object()
 
-    async def get_handle(
+    async def get_route_snapshot(
         self,
         device_id: UUID,
         *,
         user_id: UUID,
         expected_device_name: str | None = None,
-    ) -> object:
+    ) -> DeviceRouteSnapshot:
         del user_id
         assert expected_device_name == "laptop"
-        return SimpleNamespace(device_id=device_id, generation=1)
+        return DeviceRouteSnapshot(ConnectionHandle(device_id, 1), 0)
 
-    async def dispatch_tool(
+    async def dispatch_tool_on_snapshot(
         self,
         *,
-        device_id: UUID,
+        route: DeviceRouteSnapshot,
         user_id: UUID,
+        expected_device_name: str,
         name: str,
         args: dict[str, object],
         max_result_bytes: int,
         timeout_seconds: float,
-        expected_device_name: str | None = None,
     ) -> object:
         del user_id, max_result_bytes, timeout_seconds
         assert expected_device_name == "laptop"
+        device_id = route.handle.device_id
         self.calls.append((device_id, name, args, expected_device_name))
         return SimpleNamespace(
             is_error=False,
@@ -358,19 +422,23 @@ class _ClientToServerRegistry:
     def __init__(self) -> None:
         self.transfers = self
         self.delete_call: tuple[UUID, str, dict[str, object]] | None = None
+        self.route: DeviceRouteSnapshot | None = None
 
-    async def get_handle(
+    async def get_route_snapshot(
         self,
         device_id: UUID,
         *,
         user_id: UUID,
-        expected_device_name: str | None = None,
-    ) -> object:
+        expected_device_name: str,
+    ) -> DeviceRouteSnapshot:
         del user_id
         assert expected_device_name == "laptop"
-        return SimpleNamespace(device_id=device_id, generation=1)
+        return DeviceRouteSnapshot(ConnectionHandle(device_id, 1), 0)
 
     async def start_client_to_server(self, **kwargs: object) -> _TransferResult:
+        route = kwargs.get("route")
+        assert isinstance(route, DeviceRouteSnapshot)
+        self.route = route
         begin = TransferBeginFrame(
             id=new_uuid7(),
             direction="client_to_server",
@@ -388,19 +456,20 @@ class _ClientToServerRegistry:
         await delete_source()
         return _TransferResult(7, "a" * 64, ())
 
-    async def dispatch_tool(
+    async def dispatch_tool_on_snapshot(
         self,
         *,
-        device_id: UUID,
+        route: DeviceRouteSnapshot,
         user_id: UUID,
+        expected_device_name: str,
         name: str,
         args: dict[str, object],
         max_result_bytes: int,
         timeout_seconds: float,
-        expected_device_name: str | None = None,
     ) -> object:
         del user_id, max_result_bytes, timeout_seconds
         assert expected_device_name == "laptop"
+        device_id = route.handle.device_id
         self.delete_call = (device_id, name, args)
         return SimpleNamespace(is_error=False, code=None)
 

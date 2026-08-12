@@ -33,6 +33,7 @@ from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
     DeviceBusyError,
     DeviceRegistry,
+    DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
 from openctopus_server.devices.transfer import TransferError
@@ -224,6 +225,7 @@ class _RequestBodySource:
 async def download_file(
     path: str,
     openoctopus_device: str = Query(..., min_length=1, max_length=64),
+    openoctopus_device_id: UUID | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
@@ -235,6 +237,7 @@ async def download_file(
         return await _download_device(
             path,
             openoctopus_device=openoctopus_device,
+            expected_device_id=openoctopus_device_id,
             user=user,
             db=db,
             registry=registry,
@@ -286,16 +289,18 @@ async def _download_device(
     path: str,
     *,
     openoctopus_device: str,
+    expected_device_id: UUID | None,
     user: User,
     db: AsyncSession,
     registry: DeviceRegistry,
     admission: KeyedDirectionalAdmission,
     settings: Settings,
 ) -> StreamingResponse:
-    handle = await _owned_device_handle(
+    route = await _owned_device_route(
         db,
         user=user,
         device_name=openoctopus_device,
+        expected_device_id=expected_device_id,
         registry=registry,
     )
     lease = await _acquire_transfer(admission, user.id, "download", settings)
@@ -318,7 +323,8 @@ async def _download_device(
 
         transfer_task = asyncio.create_task(
             registry.transfers.start_client_to_server(
-                handle=handle,
+                handle=route.handle,
+                route=route,
                 user_id=user.id,
                 src_path=path,
                 dst_path=None,
@@ -475,7 +481,7 @@ async def _upload_device(
     if_match: str | None,
     if_none_match: bool,
 ) -> FileMutationResponse:
-    handle = await _owned_device_handle(
+    route = await _owned_device_route(
         db,
         user=user,
         device_name=openoctopus_device,
@@ -493,7 +499,8 @@ async def _upload_device(
             idle_timeout_seconds=settings.rest_transfer_idle_timeout_seconds,
         )
         result = await registry.transfers.start_server_to_client(
-            handle=handle,
+            handle=route.handle,
+            route=route,
             user_id=user.id,
             src_path=None,
             dst_path=path,
@@ -934,16 +941,18 @@ async def _acquire_transfer(
         raise _transfer_busy(settings) from exc
 
 
-async def _owned_device_handle(
+async def _owned_device_route(
     db: AsyncSession,
     *,
     user: User,
     device_name: str,
+    expected_device_id: UUID | None = None,
     registry: DeviceRegistry,
-) -> object:
-    device_id = await db.scalar(
-        select(Device.id).where(Device.user_id == user.id, Device.name == device_name)
-    )
+) -> DeviceRouteSnapshot:
+    query = select(Device.id).where(Device.user_id == user.id, Device.name == device_name)
+    if expected_device_id is not None:
+        query = query.where(Device.id == expected_device_id)
+    device_id = await db.scalar(query)
     await db.close()
     if not isinstance(device_id, UUID):
         # Use one response for a missing or another user's name.  The server
@@ -952,17 +961,17 @@ async def _owned_device_handle(
             ErrorCode.TOOL_DEVICE_UNREACHABLE,
             "Workspace device is unavailable",
         )
-    handle = await registry.get_handle(
+    route = await registry.get_route_snapshot(
         device_id,
         user_id=user.id,
         expected_device_name=device_name,
     )
-    if handle is None:
+    if route is None:
         raise WorkspaceError(
             ErrorCode.TOOL_DEVICE_UNREACHABLE,
             "Workspace device is unavailable",
         )
-    return handle
+    return route
 
 
 async def _wait_for_relay_metadata(

@@ -400,6 +400,23 @@ async def test_intrinsic_device_tool_extends_marked_device_enum() -> None:
     ]
 
 
+async def test_intrinsic_tool_receives_the_provider_turn_device_snapshot() -> None:
+    tool = _IntrinsicDeviceTool()
+    registry = ToolRegistry((tool,))
+    device_id = uuid4()
+
+    result = await registry.execute(
+        name="echo",
+        args={"value": "hello", DEVICE_FIELD_NAME: "laptop"},
+        ctx=_ctx(),
+        device_targets={"laptop": device_id},
+    )
+
+    assert result.is_error is False
+    assert tool.received_ctx is not None
+    assert tool.received_ctx.device_targets == {"laptop": device_id}
+
+
 async def test_registry_discards_side_effects_from_error_results() -> None:
     registry = ToolRegistry((_ErrorWithSideEffectTool(),))
 

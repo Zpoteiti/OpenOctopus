@@ -165,13 +165,16 @@ class _MetricsSampler:
         interval_seconds: float,
         queue_high_water: Callable[[], int],
         pending_count: Callable[[], int],
+        transfer_count: Callable[[], int] | None = None,
     ) -> None:
         self._interval_seconds = interval_seconds
         self._queue_high_water = queue_high_water
         self._pending_count = pending_count
+        self._transfer_count = transfer_count or (lambda: 0)
         self.samples: list[_ProcessSample] = []
         self.peak_queue_high_water = 0
         self.peak_pending_count = 0
+        self.peak_transfer_count = 0
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -191,6 +194,7 @@ class _MetricsSampler:
         self.samples.append(_process_sample())
         self.peak_queue_high_water = max(self.peak_queue_high_water, self._queue_high_water())
         self.peak_pending_count = max(self.peak_pending_count, self._pending_count())
+        self.peak_transfer_count = max(self.peak_transfer_count, self._transfer_count())
 
     async def _run(self) -> None:
         while True:
@@ -764,9 +768,10 @@ async def run_harness(config: HarnessConfig = HarnessConfig()) -> dict[str, obje
         "mode": harness.config.mode,
         "transport": "in_memory_device_transport",
         "network_exercised": False,
+        "transfers_exercised": False,
         "authentication": "synthetic_bearer_token_registry_lookup",
         "limitations": [
-            "Does not exercise FastAPI WebSocket framing, PostgreSQL token lookup, or a packaged client.",
+            "Does not exercise FastAPI WebSocket framing, PostgreSQL token lookup, binary transfers, or a packaged client.",
             "Run a real WebSocket/client E2E separately before making network-capacity claims.",
         ],
         "connections": harness.config.connections,

@@ -19,6 +19,9 @@ from pydantic import (
 
 PROTOCOL_VERSION = "1"
 MAX_TEXT_FRAME_BYTES = 12 * 1024 * 1024
+# Pending-call admission reserves both the largest legal request frame and the
+# largest legal result frame.  Configuration must permit at least one such call.
+MAX_TOOL_CALL_RESERVATION_BYTES = 2 * MAX_TEXT_FRAME_BYTES
 MAX_BINARY_CHUNK_BYTES = 64 * 1024
 TRANSFER_PURPOSES = ("file_transfer", "workspace_upload", "http_relay")
 

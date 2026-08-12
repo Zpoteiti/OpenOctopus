@@ -74,6 +74,34 @@ class TerminalDropTransport(Transport):
 
 
 @dataclass
+class SuccessAckDropTransport(Transport):
+    async def send_text(self, handle: object, payload: str) -> bool:
+        self.text.append((handle, payload))
+        self.text_event.set()
+        frame = parse_server_frame(payload)
+        return not (
+            isinstance(frame, TransferEndFrame)
+            and frame.ack
+            and frame.ok
+        )
+
+
+@dataclass
+class BlockingFailureTransport(Transport):
+    failure_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_failure: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, handle: object, payload: str) -> bool:
+        self.text.append((handle, payload))
+        self.text_event.set()
+        frame = parse_server_frame(payload)
+        if isinstance(frame, TransferEndFrame) and not frame.ack and not frame.ok:
+            self.failure_started.set()
+            await self.release_failure.wait()
+        return True
+
+
+@dataclass
 class Source:
     chunks: list[bytes]
     etag: str | None = None
@@ -114,6 +142,23 @@ class StalledSink:
 
     async def finish(self) -> None:
         raise AssertionError("a stalled sink must not finish")
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+
+@dataclass
+class FinishStalledSink:
+    chunks: list[bytes] = field(default_factory=list)
+    finish_started: asyncio.Event = field(default_factory=asyncio.Event)
+    aborted: bool = False
+
+    async def write(self, chunk: bytes) -> None:
+        self.chunks.append(chunk)
+
+    async def finish(self) -> None:
+        self.finish_started.set()
+        await asyncio.Future()
 
     async def abort(self) -> None:
         self.aborted = True
@@ -265,6 +310,83 @@ async def test_server_to_client_source_factory_waits_for_admission_and_cleans_up
     assert manager.active_slots == 0
 
 
+async def test_server_to_client_closes_source_factory_result_after_disconnect() -> None:
+    transport = Transport()
+    manager = _manager(transport, idle_timeout_seconds=0.05)
+    handle = Handle(uuid4(), 1)
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    source = Source([])
+
+    async def source_factory() -> Source:
+        factory_started.set()
+        try:
+            await release_factory.wait()
+        except asyncio.CancelledError:
+            await release_factory.wait()
+        return source
+
+    task = asyncio.create_task(
+        manager.start_server_to_client(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="from.txt",
+            dst_path="to.txt",
+            source_factory=source_factory,
+            total_bytes=0,
+        )
+    )
+    await factory_started.wait()
+
+    await asyncio.wait_for(manager.disconnect(handle), timeout=0.2)
+    with pytest.raises(TransferDisconnectedError):
+        await asyncio.wait_for(task, timeout=0.2)
+    assert source.closed is False
+
+    release_factory.set()
+    async with asyncio.timeout(0.2):
+        while not source.closed:
+            await asyncio.sleep(0)
+    assert transport.text == []
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+
+
+async def test_server_to_client_source_factory_is_idle_timed_out() -> None:
+    manager = _manager(Transport(), idle_timeout_seconds=0.02)
+    source = Source([])
+    release_factory = asyncio.Event()
+
+    async def source_factory() -> Source:
+        try:
+            await release_factory.wait()
+        except asyncio.CancelledError:
+            await release_factory.wait()
+        return source
+
+    task = asyncio.create_task(
+        manager.start_server_to_client(
+            handle=Handle(uuid4(), 1),
+            user_id=uuid4(),
+            src_path="from.txt",
+            dst_path="to.txt",
+            source_factory=source_factory,
+            total_bytes=0,
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    assert task.done()
+    with pytest.raises(TimeoutError):
+        await task
+    release_factory.set()
+    async with asyncio.timeout(0.2):
+        while not source.closed:
+            await asyncio.sleep(0)
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+
+
 async def test_server_to_client_streams_chunks_then_waits_for_ack_and_moves_source() -> None:
     transport = Transport()
     manager = _manager(transport)
@@ -321,6 +443,65 @@ async def test_server_to_client_streams_chunks_then_waits_for_ack_and_moves_sour
     assert result.warnings == ()
     assert deleted is True
     assert source.closed is True
+    assert manager.active_slots == 0
+
+
+async def test_server_to_client_fence_during_move_cleanup_keeps_committed_success() -> None:
+    transport = Transport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 1)
+    delete_started = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    async def delete_source() -> None:
+        delete_started.set()
+        await release_delete.wait()
+
+    task = asyncio.create_task(
+        manager.start_server_to_client(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            source=Source([b"payload"], etag="source-v1"),
+            total_bytes=7,
+            mode="move",
+            delete_source=delete_source,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    begin = parse_server_frame(transport.text[0][1])
+    assert isinstance(begin, TransferBeginFrame)
+    await manager.handle_frame(handle, TransferReadyFrame(id=begin.id))
+    while not any(
+        isinstance(frame := parse_server_frame(payload), TransferEndFrame) and not frame.ack
+        for _, payload in transport.text
+    ):
+        await asyncio.sleep(0)
+    end = next(
+        frame
+        for _, payload in transport.text
+        if isinstance(frame := parse_server_frame(payload), TransferEndFrame) and not frame.ack
+    )
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=begin.id,
+            ack=True,
+            ok=True,
+            bytes_sent=end.bytes_sent,
+            sha256=end.sha256,
+        ),
+    )
+    await delete_started.wait()
+
+    manager.fence_handle(handle)
+    release_delete.set()
+
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert result.warnings == ("source_delete_failed",)
     assert manager.active_slots == 0
 
 
@@ -830,6 +1011,270 @@ async def test_client_to_server_streams_into_bounded_sink_and_verifies_digest() 
     assert sink.finished is True
     assert sink.aborted is False
     assert manager.active_slots == 0
+
+
+async def test_client_to_server_ack_loss_after_commit_returns_success_and_keeps_move_source() -> None:
+    transport = SuccessAckDropTransport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+    sink = Sink()
+    committed = False
+    source_deleted = False
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> None:
+        nonlocal committed
+        committed = True
+
+    async def delete_source() -> None:
+        nonlocal source_deleted
+        source_deleted = True
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+            delete_source=delete_source,
+            mode="move",
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"payload").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=7,
+            etag="source-v1",
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_binary(handle, slot_id.bytes + b"payload")
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=7, sha256=digest),
+    )
+
+    result = await asyncio.wait_for(task, timeout=0.2)
+
+    assert committed is True
+    assert source_deleted is False
+    assert result.warnings == ("transfer_ack_failed", "source_delete_failed")
+    assert sink.aborted is False
+    assert manager.active_slots == 0
+
+
+async def test_client_to_server_cancellation_during_publish_commits_before_propagating() -> None:
+    transport = Transport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+    sink = Sink()
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+    published = False
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> bool:
+        nonlocal published
+        publish_started.set()
+        cancelled = False
+        try:
+            await release_publish.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            await release_publish.wait()
+        published = True
+        return cancelled
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"payload").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=7,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_binary(handle, slot_id.bytes + b"payload")
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=7, sha256=digest),
+    )
+    await publish_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    release_publish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert published is True
+    assert sink.aborted is False
+    assert not any(
+        isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+        and not frame.ack
+        and not frame.ok
+        for _, payload in transport.text
+    )
+    assert manager.active_slots == 0
+
+
+async def test_committed_finish_cleanup_survives_worker_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = Transport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+    sink = Sink()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_cleanup = manager._cleanup
+
+    async def blocked_cleanup(
+        slot: object,
+        *,
+        skip_worker: bool = False,
+    ) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await original_cleanup(slot, skip_worker=skip_worker)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(manager, "_cleanup", blocked_cleanup)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=0,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=0, sha256=digest),
+    )
+    await cleanup_started.wait()
+    slot = next(iter(manager._slots.values()))
+    assert slot.worker is not None
+    slot.worker.cancel()
+    release_cleanup.set()
+
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result.sha256 == digest
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+
+
+async def test_client_to_server_failure_tombstone_exists_before_failure_send_completes() -> None:
+    transport = BlockingFailureTransport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+
+    async def fail_sink(_: TransferBeginFrame) -> TransferSink:
+        raise TransferError("workspace_storage_unavailable")
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=fail_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=7,
+        ),
+    )
+    await transport.failure_started.wait()
+    matching_ack = TransferEndFrame(
+        id=slot_id,
+        ack=True,
+        ok=False,
+        code="workspace_storage_unavailable",
+    )
+
+    await manager.handle_binary(handle, slot_id.bytes + b"already-queued")
+    await manager.handle_frame(handle, matching_ack)
+    transport.release_failure.set()
+
+    with pytest.raises(TransferError, match="workspace_storage_unavailable"):
+        await task
+    with pytest.raises(TransferProtocolError):
+        await manager.handle_binary(handle, slot_id.bytes + b"after-ack")
 
 
 async def test_server_failure_tombstone_accepts_matching_ack_and_rejects_conflict() -> None:
@@ -1393,6 +1838,115 @@ async def test_client_to_server_sink_write_is_idle_timed_out() -> None:
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(task, timeout=1)
+    assert sink.aborted is True
+    assert manager.active_slots == 0
+
+
+async def test_client_to_server_sink_finish_is_idle_timed_out() -> None:
+    transport = Transport()
+    manager = _manager(transport, idle_timeout_seconds=0.02)
+    handle = Handle(uuid4(), 1)
+    sink = FinishStalledSink()
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"x").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=1,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_binary(handle, slot_id.bytes + b"x")
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=1, sha256=digest),
+    )
+    await sink.finish_started.wait()
+
+    await asyncio.sleep(0.05)
+    assert task.done()
+    with pytest.raises(TimeoutError):
+        await task
+    assert sink.aborted is True
+    assert manager.active_slots == 0
+
+
+async def test_client_to_server_commit_is_idle_timed_out_before_publish() -> None:
+    transport = Transport()
+    manager = _manager(transport, idle_timeout_seconds=0.02)
+    handle = Handle(uuid4(), 1)
+    sink = Sink()
+    commit_started = asyncio.Event()
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> None:
+        commit_started.set()
+        await asyncio.Future()
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"x").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=1,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_binary(handle, slot_id.bytes + b"x")
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=1, sha256=digest),
+    )
+    await commit_started.wait()
+
+    await asyncio.sleep(0.05)
+    assert task.done()
+    with pytest.raises(TimeoutError):
+        await task
     assert sink.aborted is True
     assert manager.active_slots == 0
 

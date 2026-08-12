@@ -23,11 +23,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import resource
 import socket
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -52,6 +54,10 @@ from openctopus_server.devices.protocol import (
     PongFrame,
     ToolCallFrame,
     ToolResultFrame,
+    TransferBeginFrame,
+    TransferEndFrame,
+    TransferReadyFrame,
+    decode_binary_chunk,
     new_uuid7,
     parse_server_frame,
 )
@@ -72,6 +78,10 @@ _DEFAULT_PING_INTERVAL = 0.5
 _DEFAULT_LIVENESS_TIMEOUT = 10.0
 _DEFAULT_SAMPLE_INTERVAL = 0.01
 _MAX_TEXT_FRAME_BYTES = 12 * 1024 * 1024
+_TRANSFER_BYTES = 64 * 1024
+_TRANSFER_CHUNK_BYTES = 8 * 1024
+_TRANSFER_CHUNK_DELAY = 0.025
+_TRANSFER_MAX_CONCURRENCY = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +128,41 @@ class _Outcome:
     error: Exception | None
 
 
+@dataclass(slots=True)
+class _InboundTransfer:
+    transfer_id: UUID
+    expected_bytes: int
+    expected_sha256: str | None
+    received_bytes: int = 0
+    digest: Any = None
+
+    def __post_init__(self) -> None:
+        self.digest = hashlib.sha256()
+
+
+@dataclass(slots=True)
+class _MemorySource:
+    payload: bytes
+    offset: int = 0
+    closed: bool = False
+
+    @property
+    def size(self) -> int:
+        return len(self.payload)
+
+    async def read(self) -> bytes:
+        await asyncio.sleep(_TRANSFER_CHUNK_DELAY)
+        if self.offset >= len(self.payload):
+            return b""
+        end = min(self.offset + _TRANSFER_CHUNK_BYTES, len(self.payload))
+        chunk = self.payload[self.offset:end]
+        self.offset = end
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class _SourcePeer:
     """Bounded source-protocol peer used instead of a client subprocess."""
 
@@ -132,6 +177,11 @@ class _SourcePeer:
         self.ping_count = 0
         self.pong_count = 0
         self.error: str | None = None
+        self.unexpected_disconnect = False
+        self._normal_close_started = False
+        self._inbound_transfer: _InboundTransfer | None = None
+        self.transfer_count = 0
+        self.transfer_bytes_received = 0
         self.send_lock = asyncio.Lock()
 
     async def connect(self, base_url: str, timeout: float) -> None:
@@ -149,6 +199,7 @@ class _SourcePeer:
         self.worker = asyncio.create_task(self.write_results())
 
     async def close(self) -> None:
+        self._normal_close_started = True
         if self.websocket is not None:
             with contextlib.suppress(Exception):
                 await self.websocket.close()
@@ -162,9 +213,9 @@ class _SourcePeer:
         assert self.websocket is not None
         try:
             async for raw in self.websocket:
-                if not isinstance(raw, str):
-                    self.error = "unexpected binary frame"
-                    return
+                if isinstance(raw, bytes):
+                    await self._receive_binary(raw)
+                    continue
                 frame = parse_server_frame(raw)
                 if isinstance(frame, PingFrame):
                     self.ping_count += 1
@@ -173,12 +224,80 @@ class _SourcePeer:
                 elif isinstance(frame, ToolCallFrame):
                     await self.queue.put(frame)
                     self.queue_high_water = max(self.queue_high_water, self.queue.qsize())
-        except ConnectionClosed:
+                elif isinstance(frame, TransferBeginFrame):
+                    await self._begin_transfer(frame)
+                elif isinstance(frame, TransferEndFrame):
+                    await self._end_transfer(frame)
+        except ConnectionClosed as exc:
+            if not self._normal_close_started:
+                close_code = exc.rcvd.code if exc.rcvd is not None else 1006
+                self.unexpected_disconnect = True
+                self.error = f"connection closed unexpectedly: {close_code}"
             return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
+        else:
+            if not self._normal_close_started:
+                self.unexpected_disconnect = True
+                self.error = "connection ended before harness shutdown"
+
+    async def _begin_transfer(self, frame: TransferBeginFrame) -> None:
+        if (
+            frame.direction != "server_to_client"
+            or frame.total_bytes is None
+            or self._inbound_transfer is not None
+        ):
+            raise RuntimeError("invalid capacity transfer begin")
+        self._inbound_transfer = _InboundTransfer(
+            transfer_id=frame.id,
+            expected_bytes=frame.total_bytes,
+            expected_sha256=frame.sha256,
+        )
+        await self.send(TransferReadyFrame(id=frame.id).model_dump_json())
+
+    async def _receive_binary(self, raw: bytes) -> None:
+        transfer_id, chunk = decode_binary_chunk(raw)
+        transfer = self._inbound_transfer
+        if transfer is None or transfer.transfer_id != transfer_id:
+            raise RuntimeError("binary chunk did not match an active transfer")
+        transfer.received_bytes += len(chunk)
+        transfer.digest.update(chunk)
+
+    async def _end_transfer(self, frame: TransferEndFrame) -> None:
+        transfer = self._inbound_transfer
+        if frame.ack or transfer is None or transfer.transfer_id != frame.id:
+            raise RuntimeError("invalid capacity transfer end")
+        digest = transfer.digest.hexdigest()
+        ok = (
+            frame.ok
+            and frame.bytes_sent == transfer.received_bytes == transfer.expected_bytes
+            and frame.sha256 == digest
+            and (transfer.expected_sha256 is None or transfer.expected_sha256 == digest)
+        )
+        if not ok:
+            await self.send(
+                TransferEndFrame(
+                    id=frame.id,
+                    ack=True,
+                    ok=False,
+                    code="workspace_transfer_integrity_failed",
+                ).model_dump_json()
+            )
+            raise RuntimeError("capacity transfer integrity mismatch")
+        await self.send(
+            TransferEndFrame(
+                id=frame.id,
+                ack=True,
+                ok=True,
+                bytes_sent=transfer.received_bytes,
+                sha256=digest,
+            ).model_dump_json()
+        )
+        self.transfer_count += 1
+        self.transfer_bytes_received += transfer.received_bytes
+        self._inbound_transfer = None
 
     async def write_results(self) -> None:
         while True:
@@ -350,6 +469,21 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+async def _run_transfer_batch[T](
+    count: int,
+    *,
+    max_concurrency: int,
+    transfer: Callable[[int], Awaitable[T]],
+) -> list[T]:
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def one(index: int) -> T:
+        async with semaphore:
+            return await transfer(index)
+
+    return list(await asyncio.gather(*(one(index) for index in range(count))))
+
+
 async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfig()) -> dict[str, object]:
     """Run one real network/PG pass and return JSON-compatible evidence."""
 
@@ -362,6 +496,7 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         pending_calls_max_per_user=_DEFAULT_PENDING_PER_USER,
         pending_bytes_max=max(config.connections * 8192, 1 << 20),
         pending_bytes_max_per_user=max(_DEFAULT_PENDING_PER_USER * 8192, 1 << 20),
+        transfer_max_concurrency=_TRANSFER_MAX_CONCURRENCY,
     )
     rows: _Rows | None = None
     peers: list[_SourcePeer] = []
@@ -376,6 +511,8 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
     latencies: list[float] = []
     errors: Counter[str] = Counter()
     dispatch_baseline = baseline
+    online_connections_before_shutdown = 0
+    live_peer_readers_before_shutdown = 0
     started = time.perf_counter()
     original_heartbeat = device_ws._heartbeat
 
@@ -400,6 +537,7 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         _DEFAULT_SAMPLE_INTERVAL,
         lambda: max((peer.queue_high_water for peer in peers), default=0),
         lambda: registry.pending_count,
+        lambda: registry.transfers.active_slots,
     )
     try:
         rows = await _create_rows(engine, config)
@@ -434,8 +572,41 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
                     timeout=max(_DEFAULT_LIVENESS_TIMEOUT * 4, 2.0),
                 )
 
-        bulk = await asyncio.gather(
-            *(asyncio.create_task(one(index)) for index in range(config.sessions or 0))
+        transfer_payload = b"openoctopus-capacity-transfer\n" * (
+            _TRANSFER_BYTES // len(b"openoctopus-capacity-transfer\n") + 1
+        )
+        transfer_payload = transfer_payload[:_TRANSFER_BYTES]
+        transfer_digest = hashlib.sha256(transfer_payload).hexdigest()
+
+        async def one_transfer(index: int) -> object:
+            identity = rows.identities[index]
+            route = await registry.get_route_snapshot(
+                identity.device_id,
+                user_id=identity.user_id,
+                expected_device_name=identity.device_name,
+            )
+            if route is None:
+                raise DeviceUnavailableError("capacity device disconnected before transfer")
+            return await registry.transfers.start_server_to_client(
+                handle=route.handle,
+                route=route,
+                user_id=identity.user_id,
+                src_path=f"capacity/source-{index}.bin",
+                dst_path=f"capacity/destination-{index}.bin",
+                source=_MemorySource(transfer_payload),
+                total_bytes=len(transfer_payload),
+                sha256=transfer_digest,
+                src_device="server",
+                dst_device=identity.device_name,
+            )
+
+        bulk, _ = await asyncio.gather(
+            asyncio.gather(*(one(index) for index in range(config.sessions or 0))),
+            _run_transfer_batch(
+                len(rows.identities),
+                max_concurrency=_TRANSFER_MAX_CONCURRENCY,
+                transfer=one_transfer,
+            ),
         )
         for index, outcome in enumerate(bulk):
             if outcome.error is not None:
@@ -467,6 +638,17 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
                 errors[type(wrong.error).__name__] += 1
 
         await asyncio.sleep(max(_DEFAULT_PING_INTERVAL * 6, 0.5))
+        online_connections_before_shutdown = sum(
+            await asyncio.gather(
+                *(
+                    registry.is_online(identity.device_id, user_id=identity.user_id)
+                    for identity in rows.identities
+                )
+            )
+        )
+        live_peer_readers_before_shutdown = sum(
+            peer.reader is not None and not peer.reader.done() for peer in peers
+        )
     except Exception as exc:
         failure = f"{type(exc).__name__}: {exc}"
         cross_user_rejected = False
@@ -481,6 +663,14 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         await engine.dispose()
         get_engine.cache_clear()
 
+    online_connections_after_cleanup = sum(
+        await asyncio.gather(
+            *(
+                registry.is_online(identity.device_id, user_id=identity.user_id)
+                for identity in (rows.identities if rows is not None else ())
+            )
+        )
+    )
     after = _process_sample()
     elapsed = time.perf_counter() - started
     successful = sum(outcome.error is None for outcome in bulk)
@@ -497,9 +687,14 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
     ping_count = sum(peer.ping_count for peer in peers)
     pong_count = sum(peer.pong_count for peer in peers)
     heartbeat_peers = sum(peer.pong_count > 0 for peer in peers)
+    successful_transfers = sum(peer.transfer_count for peer in peers)
+    transfer_bytes_received = sum(peer.transfer_bytes_received for peer in peers)
     in_flight_pings = ping_count - pong_count
     checks: dict[str, bool] = {
-        "authenticated_connections": len(peers) == config.connections and all(peer.error is None for peer in peers),
+        "authenticated_connections": len(peers) == config.connections
+        and online_connections_before_shutdown == config.connections
+        and live_peer_readers_before_shutdown == config.connections
+        and all(peer.error is None and not peer.unexpected_disconnect for peer in peers),
         "postgres_token_hash_lookup": auth_hashes,
         "minimum_users": rows is not None
         and len(rows.user_ids) >= (100 if config.connections >= 500 else (2 if config.connections > 1 else 1)),
@@ -513,6 +708,9 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         # edge to at most one ping per peer.
         "ping_pong_under_load": heartbeat_peers == len(peers)
         and 0 <= in_flight_pings <= len(peers),
+        "transfer_under_load": successful_transfers == config.connections
+        and transfer_bytes_received == config.connections * _TRANSFER_BYTES
+        and sampler.peak_transfer_count > 0,
         "bulk_calls_complete_or_documented": successful == len(bulk) or documented,
         "registry_pending_and_transfers_clean": registry.pending_count == 0
         and registry.transfers.active_slots == 0
@@ -529,16 +727,18 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         "mode": config.mode,
         "transport": "real_fastapi_uvicorn_websocket",
         "network_exercised": True,
+        "transfers_exercised": True,
         "authentication": "PostgreSQL devices.token_hash lookup in /ws/device",
         "client_kind": "lightweight source-protocol peers; not PyInstaller bundles",
         "provider_turns_exercised": False,
         "limitations": [
-            "Peers implement hello, ping/pong, and bounded read_file only.",
+            "Peers implement hello, ping/pong, bounded read_file, and bounded server-to-client transfer.",
             "No frozen client processes or provider turns are part of this evidence.",
-            "FIFO, transfer, and busy/unreachable edge probes remain covered by the in-memory harness.",
+            "FIFO and busy/unreachable edge probes remain covered by the in-memory harness.",
         ],
         "connections": config.connections,
-        "authenticated_connections": len(peers),
+        "authenticated_connections": online_connections_before_shutdown,
+        "live_peer_readers_before_shutdown": live_peer_readers_before_shutdown,
         "users": len(rows.user_ids) if rows is not None else 0,
         "independent_sessions": config.sessions,
         "successful_bulk_dispatches": successful,
@@ -548,6 +748,8 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         "ping_count": ping_count,
         "pong_count": pong_count,
         "heartbeat_peers": heartbeat_peers,
+        "successful_transfers": successful_transfers,
+        "transfer_bytes_received": transfer_bytes_received,
         "in_flight_pings_at_shutdown": in_flight_pings,
         "peer_errors": [peer.error for peer in peers if peer.error is not None],
         "metrics": {
@@ -557,12 +759,16 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
             "peak_task_count": sampler.peak_task_count,
             "process_metrics_source": "procfs_and_resource",
             "registry_pending_high_water": sampler.peak_pending_count, "source_peer_queue_high_water": sampler.peak_queue_high_water,
+            "transfer_active_high_water": sampler.peak_transfer_count,
+            "transfer_bytes_received": transfer_bytes_received,
+            "online_connections_before_shutdown": online_connections_before_shutdown,
+            "online_connections_after_cleanup": online_connections_after_cleanup,
             "source_peer_queue_capacity": _DEFAULT_QUEUE_CAPACITY, "rss_before_bytes": baseline.rss_bytes,
             "rss_before_dispatch_bytes": dispatch_baseline.rss_bytes, "rss_after_cleanup_bytes": after.rss_bytes,
             "rss_growth_after_cleanup_bytes": rss_growth,
             "rss_plateau": rss_plateau,
             "baseline": {"rss_bytes": baseline.rss_bytes, "fd_count": baseline.fd_count, "task_count": baseline.task_count},
-            "after_cleanup": {"rss_bytes": after.rss_bytes, "fd_count": after.fd_count, "task_count": after.task_count, "connections": 0, "pending_calls": registry.pending_count, "transfer_slots": registry.transfers.active_slots, "transfer_waiters": registry.transfers._admission.waiting_count},  # noqa: SLF001
+            "after_cleanup": {"rss_bytes": after.rss_bytes, "fd_count": after.fd_count, "task_count": after.task_count, "connections": online_connections_after_cleanup, "pending_calls": registry.pending_count, "transfer_slots": registry.transfers.active_slots, "transfer_waiters": registry.transfers._admission.waiting_count},  # noqa: SLF001
             "rlimit_nofile": nofile,
         },
         "checks": checks,

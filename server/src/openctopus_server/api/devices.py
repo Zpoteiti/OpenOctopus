@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.auth.dependencies import get_current_user
 from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
@@ -56,23 +58,24 @@ async def create_device(
 @router.patch("/{name}/config", response_model=DeviceResponse)
 async def patch_device(
     name: str,
-    body: DevicePatchRequest,
+    body: DevicePatchRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     registry: DeviceRegistry = Depends(get_device_registry),
 ) -> DeviceResponse:
+    patch = body or DevicePatchRequest()
     async with _config_update_guard(registry, user.id, name):
         snapshot = await devices.patch(
             db,
             user_id=user.id,
             name=name,
-            fields=set(body.model_fields_set),
-            new_name=body.name,
-            workspace_path=body.workspace_path,
-            sandbox_mode=body.sandbox_mode,
-            ssrf_denylist=body.ssrf_denylist,
+            fields=set(patch.model_fields_set),
+            new_name=patch.name,
+            workspace_path=patch.workspace_path,
+            sandbox_mode=patch.sandbox_mode,
+            ssrf_denylist=patch.ssrf_denylist,
         )
-        if body.model_fields_set:
+        if patch.model_fields_set:
             # The commit above ended the DB transaction.  Close the session
             # before any potentially slow device transport await.
             await db.close()
@@ -96,8 +99,15 @@ async def regenerate_device_token(
     db: AsyncSession = Depends(get_db),
     registry: DeviceRegistry = Depends(get_device_registry),
 ) -> DeviceTokenResponse:
-    snapshot, token = await devices.regenerate_token(db, user_id=user.id, name=name)
-    await registry.revoke(snapshot.id)
+    mutation = asyncio.create_task(
+        _regenerate_token_and_invalidate(
+            db,
+            registry,
+            user_id=user.id,
+            name=name,
+        )
+    )
+    snapshot, token = await await_future_cancellation_safe(mutation)
     return DeviceTokenResponse(token=token, device=await _response(snapshot, registry))
 
 
@@ -108,8 +118,15 @@ async def delete_device(
     db: AsyncSession = Depends(get_db),
     registry: DeviceRegistry = Depends(get_device_registry),
 ) -> Response:
-    snapshot = await devices.delete(db, user_id=user.id, name=name)
-    await registry.remove_device(snapshot.id)
+    mutation = asyncio.create_task(
+        _delete_and_invalidate(
+            db,
+            registry,
+            user_id=user.id,
+            name=name,
+        )
+    )
+    await await_future_cancellation_safe(mutation)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -124,6 +141,41 @@ async def _response(snapshot: devices.DeviceSnapshot, registry: DeviceRegistry) 
         online=await registry.is_online(snapshot.id, user_id=snapshot.user_id),
         created_at=snapshot.created_at,
     )
+
+
+async def _after_commit[T](
+    db: AsyncSession,
+    invalidate: Callable[[], Awaitable[T]],
+) -> T:
+    try:
+        await db.close()
+    finally:
+        result = await invalidate()
+    return result
+
+
+async def _regenerate_token_and_invalidate(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    user_id: UUID,
+    name: str,
+) -> tuple[devices.DeviceSnapshot, str]:
+    snapshot, token = await devices.regenerate_token(db, user_id=user_id, name=name)
+    await _after_commit(db, lambda: registry.revoke(snapshot.id))
+    return snapshot, token
+
+
+async def _delete_and_invalidate(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    user_id: UUID,
+    name: str,
+) -> devices.DeviceSnapshot:
+    snapshot = await devices.delete(db, user_id=user_id, name=name)
+    await _after_commit(db, lambda: registry.remove_device(snapshot.id))
+    return snapshot
 
 
 @asynccontextmanager

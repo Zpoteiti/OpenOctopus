@@ -12,6 +12,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import User, Workspace, WorkspaceMember
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.services import users
@@ -132,7 +133,6 @@ async def test_document_admission_precedes_storage_and_outlives_materialization(
         limit=2000,
         pages=None,
         parser=_Parser(),  # type: ignore[arg-type]
-        unchanged_etag=lambda etag: False,
     )
 
     assert result is not None and result.content == "converted"
@@ -185,7 +185,6 @@ async def test_document_exact_materialization_limit_reaches_parser(suffix: str) 
         limit=2000,
         pages=None,
         parser=_Parser(),  # type: ignore[arg-type]
-        unchanged_etag=lambda etag: False,
     )
 
     assert result is not None and result.content == "converted"
@@ -230,7 +229,6 @@ async def test_oversized_document_is_rejected_before_parser(suffix: str) -> None
             limit=2000,
             pages=None,
             parser=_Parser(),  # type: ignore[arg-type]
-            unchanged_etag=lambda etag: False,
         )
 
     assert caught.value.code == ErrorCode.WORKSPACE_FILE_TOO_LARGE_TO_EDIT
@@ -353,6 +351,7 @@ async def test_authorized_operation_releases_database_lock_before_storage(
                 deletion_db,
                 target,
                 workspace_fs=workspace_fs,
+                device_registry=DeviceRegistry(),
             )
 
     deleting = asyncio.create_task(delete_account())

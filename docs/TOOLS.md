@@ -125,7 +125,7 @@ returned as Anthropic `image` blocks.
 ```json
 {
   "name": "read_file",
-  "description": "Read a file (text, image, or document). Text output format: LINE_NUM|CONTENT. Images return visual content for analysis. Supports PDF, DOCX, XLSX, PPTX documents. Use find_files/list_dir first when the path is uncertain. Read the relevant range before editing so replacements or patches are based on current content. Use offset and limit for large text files. Use force=true to re-read content even if unchanged. Reads exceeding ~128K chars are truncated.",
+  "description": "Read a file (text, image, or document). Text output format: LINE_NUM|CONTENT. Images return visual content for analysis. Supports PDF, DOCX, XLSX, PPTX documents. Use find_files/list_dir first when the path is uncertain. Read the relevant range before editing so replacements or patches are based on current content. Use offset and limit for large text files. Reads exceeding ~128K chars are truncated.",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -146,11 +146,6 @@ returned as Anthropic `image` blocks.
       "pages": {
         "type": "string",
         "description": "Page number or inclusive range for PDF files, e.g. '1-5' (default: first 20 pages, max 20 pages)"
-      },
-      "force": {
-        "type": "boolean",
-        "description": "Bypass same-file read deduplication and return content again.",
-        "default": false
       }
     },
     "required": ["path"]
@@ -158,7 +153,7 @@ returned as Anthropic `image` blocks.
 }
 ```
 
-**Mechanism (nanobot-aligned):**
+**Mechanism:**
 - Path resolution follows ADR-043 and ADR-108: relative paths resolve to the target device's personal workspace root; absolute paths are used as-is. Server-side, absolute paths in the `name@suffix` form are required for shared workspaces.
 - **Default text response:** `limit=2000` lines, output prefixed `LINE_NUM| <line>`. Tail includes `(Showing lines X-Y of Z. Use offset=X+1 to continue.)` — self-documenting pagination.
 - **128k char hard cap** applied on top of line-based limit; safety net for pathological line lengths.
@@ -180,7 +175,8 @@ returned as Anthropic `image` blocks.
   archive recursion, or remote-document fetch is enabled in Py5.
 - **Images** (detected by mime/magic bytes): returned as `text + image` content blocks, not plain text. The image block shape is Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
 - **Detection fallback:** if image magic-byte detection is inconclusive, try the normal text path. If the file is not readable text and not a supported document type, return an error instead of embedding arbitrary binary bytes into text.
-- **Dedup:** if the file's revision + `offset` + `limit` are unchanged since the last read, return `[File unchanged since last read: path]` instead of full content — saves tokens on idempotent re-reads. Server RustFS files use their opaque ETag as the revision; clients may use `mtime` plus size.
+- Repeated reads always return the requested content. `read_file` has no hidden
+  session cache or unchanged-result sentinel.
 - Tool results are normalized by the shared helper per ADR-095 before reaching the LLM: the first `tool_result.content` block is the server warning text block, followed by the raw text/image result blocks.
 
 **Timeout:** Non-document reads keep the 30s internal timeout. Document reads use
@@ -882,8 +878,12 @@ web session. Py5 does not expose channel, chat, or button arguments.
   `delivery_refs`.
 - For a paired device, the tool verifies that the name is paired but does not
   open or stage bytes. It records an online-only `device_file` reference with
-  the device name, path, filename, and MIME hint. The frontend later downloads
-  it through the Workspace Files HTTP relay; that click can fail with
+  the immutable device ID, captured device name, path, filename, and MIME hint.
+  The ID and the whole sidecar remain Provider-hidden. The frontend later
+  downloads it through the Workspace Files HTTP relay, which requires the ID to
+  still belong to the user and its current name to equal the captured name.
+  Device rename, deletion, and later reuse of the same name therefore fail
+  closed instead of redirecting an old ref. A click can also fail with
   `tool_device_unreachable`, `workspace_not_found`, or a path-policy error.
 - The provider-visible transcript remains the assistant message containing the
   `message` tool use plus its matching persisted `tool_result`, which records

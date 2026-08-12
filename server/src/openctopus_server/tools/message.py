@@ -168,25 +168,29 @@ class MessageTool(Tool):
         if not parsed.media:
             return ()
         if parsed.openoctopus_device != "server":
-            exists = await db.scalar(
+            expected_id = (
+                ctx.device_targets.get(parsed.openoctopus_device)
+                if ctx.device_targets is not None
+                else None
+            )
+            if ctx.device_targets is not None and expected_id is None:
+                return _device_unreachable()
+            query = (
                 select(Device.id).where(
                     Device.user_id == ctx.user_id,
                     Device.name == parsed.openoctopus_device,
                 )
             )
-            if exists is None:
-                return ToolResult(
-                    content=(
-                        f"[{ErrorCode.TOOL_DEVICE_UNREACHABLE.value}] "
-                        "Tool install site is unavailable"
-                    ),
-                    is_error=True,
-                    code=ErrorCode.TOOL_DEVICE_UNREACHABLE,
-                )
+            if expected_id is not None:
+                query = query.where(Device.id == expected_id)
+            device_id = await db.scalar(query)
+            if device_id is None:
+                return _device_unreachable()
             try:
                 return tuple(
                     DeviceFileDeliveryRef(
                         path=path,
+                        device_id=device_id,
                         openoctopus_device=parsed.openoctopus_device,
                         filename=_device_filename(path),
                         mime=_mime_type(path),
@@ -248,3 +252,14 @@ def _device_filename(path: str) -> str:
     if filename in {"", ".", ".."}:
         raise ValueError("invalid device path")
     return filename
+
+
+def _device_unreachable() -> ToolResult:
+    return ToolResult(
+        content=(
+            f"[{ErrorCode.TOOL_DEVICE_UNREACHABLE.value}] "
+            "Tool install site is unavailable"
+        ),
+        is_error=True,
+        code=ErrorCode.TOOL_DEVICE_UNREACHABLE,
+    )

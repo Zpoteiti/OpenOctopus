@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -33,6 +34,7 @@ class WorkspaceFileDeliveryRef:
 @dataclass(frozen=True, slots=True)
 class DeviceFileDeliveryRef:
     path: str
+    device_id: UUID
     openoctopus_device: str
     filename: str
     mime: str
@@ -62,6 +64,7 @@ class ToolContext:
     user_id: UUID
     session_id: UUID
     openoctopus_device: str | None = None
+    device_targets: Mapping[str, UUID] | None = None
 
 
 class Tool(ABC):

@@ -531,7 +531,7 @@ remains authoritative when it is opened.
 For a workspace document, the DB-free `read_for_tool(ticket, ...)` acquires
 conversion admission before any ETag/stat/open operation. Once admitted, one
 30-second materialization stage opens the RustFS stream, obtains its size/ETag,
-performs the unchanged-read cache check, and, when needed, collects the body. A
+and collects the body. A
 queue timeout therefore performs no object-store operation. The request keeps its
 conversion permit through materialization, subprocess conversion, output receipt,
 and child reap. The generic workspace materialization slot wraps only

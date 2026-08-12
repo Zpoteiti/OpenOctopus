@@ -117,6 +117,7 @@ def test_message_response_rejects_incomplete_workspace_delivery_refs() -> None:
 
 
 def test_message_response_accepts_device_delivery_ref_without_size() -> None:
+    device_id = uuid4()
     response = MessageResponse(
         id=uuid4(),
         session_id=uuid4(),
@@ -127,6 +128,7 @@ def test_message_response_accepts_device_delivery_ref_without_size() -> None:
             {
                 "tool_use_id": "message-device",
                 "type": "device_file",
+                "device_id": str(device_id),
                 "openoctopus_device": "laptop",
                 "path": "reports/final.pdf",
                 "filename": "final.pdf",
@@ -362,8 +364,7 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
     await _configure_provider(pg_engine)
     user_id = await _user_id(pg_engine)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        db.add(
-            Device(
+        device = Device(
                 user_id=user_id,
                 name="laptop",
                 token_hash=b"d" * 32,
@@ -372,8 +373,9 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
                 sandbox_mode=True,
                 ssrf_denylist=[],
             )
-        )
+        db.add(device)
         await db.commit()
+        device_id = device.id
     provider = _ScriptedProvider(
         [
             _ProviderStep(
@@ -415,6 +417,7 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
             {
                 "tool_use_id": "message-device",
                 "type": "device_file",
+                "device_id": str(device_id),
                 "openoctopus_device": "laptop",
                 "path": "reports/final.pdf",
                 "filename": "final.pdf",

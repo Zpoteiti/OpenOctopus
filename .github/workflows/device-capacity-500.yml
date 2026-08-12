@@ -1,0 +1,89 @@
+name: Device Capacity 500 Gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+concurrency:
+  group: device-capacity-500-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  capacity-500:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'capacity-500'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: server
+
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: openoctopus
+          POSTGRES_PASSWORD: octopus
+          POSTGRES_DB: openoctopus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Create environment file
+        run: cp .env.example .env
+
+      - name: Create test database schema
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from openctopus_server.db.base import Base
+          from openctopus_server.db.engine import get_engine
+
+
+          async def main() -> None:
+              engine = get_engine()
+              async with engine.begin() as connection:
+                  await connection.run_sync(Base.metadata.create_all)
+              await engine.dispose()
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Run 500-connection gate
+        run: |
+          set -o pipefail
+          python scripts/device_network_capacity_harness.py \
+            --connections 500 \
+            --users 100 \
+            --sessions 500 \
+            --dispatch-concurrency 64 \
+            | tee device-capacity-500.json
+
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-capacity-500-${{ github.run_id }}
+          path: server/device-capacity-500.json
+          if-no-files-found: error
+          retention-days: 30

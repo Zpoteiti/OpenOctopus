@@ -3536,7 +3536,9 @@ implementation.
   terminal frame is the final acknowledgement.
 - Device `message` delivery references are provider-hidden and use a union of
   durable `workspace_file` and online-only `device_file` shapes. A device file
-  is relayed live to the browser and is never staged in RustFS.
+  is relayed live to the browser and is never staged in RustFS. Its ref captures
+  the immutable provider-hidden device ID plus name; relay validates both, so
+  rename, deletion, and later same-name reuse fail closed.
 
 **Consequences:** Py5 has no speculative server-side device configuration and
 no token recovery path. The protocol is explicit about who may send bytes and

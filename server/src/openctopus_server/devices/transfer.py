@@ -71,9 +71,34 @@ class TransferState(StrEnum):
 
 
 class TransferTransport(Protocol):
-    async def send_text(self, handle: Any, payload: str) -> bool: ...
+    async def send_text(
+        self,
+        handle: Any,
+        payload: str,
+        *,
+        expected_device_name: str | None = None,
+        expected_config_epoch: int | None = None,
+    ) -> bool: ...
 
-    async def send_binary(self, handle: Any, payload: bytes) -> bool: ...
+    async def send_binary(
+        self,
+        handle: Any,
+        payload: bytes,
+        *,
+        expected_device_name: str | None = None,
+        expected_config_epoch: int | None = None,
+    ) -> bool: ...
+
+
+class TransferRoute(Protocol):
+    @property
+    def handle(self) -> object: ...
+
+    @property
+    def config_epoch(self) -> int: ...
+
+    @property
+    def device_name(self) -> str: ...
 
 
 class TransferSource(Protocol):
@@ -92,7 +117,7 @@ class TransferSink(Protocol):
 
 DeleteSource = Callable[[], Awaitable[None]]
 SinkFactory = Callable[[TransferBeginFrame], Awaitable[TransferSink]]
-CommitSink = Callable[[TransferSink, TransferBeginFrame, int, str], Awaitable[None]]
+CommitSink = Callable[[TransferSink, TransferBeginFrame, int, str], Awaitable[bool | None]]
 SourceFactory = Callable[[], Awaitable[TransferSource]]
 
 
@@ -309,6 +334,7 @@ class FairTransferAdmission:
 @dataclass(slots=True)
 class _TransferSlot:
     handle: object
+    route: TransferRoute | None
     device_id: UUID
     generation: int
     user_id: UUID
@@ -328,6 +354,8 @@ class _TransferSlot:
     ack_future: asyncio.Future[TransferEndFrame] | None = None
     completion: asyncio.Future[TransferResult] | None = None
     worker: asyncio.Task[None] | None = None
+    source_factory_task: asyncio.Task[TransferSource] | None = None
+    abort_event: asyncio.Event = field(default_factory=asyncio.Event)
     delete_source: DeleteSource | None = None
     source_etag: str | None = None
     commit_sink: CommitSink | None = None
@@ -338,6 +366,11 @@ class _TransferSlot:
     digest: Any = field(default_factory=hashlib.sha256)
     last_progress: int = 0
     terminal_ack: TransferEndFrame | None = None
+    committed_result: TransferResult | None = None
+    commit_resolution: asyncio.Future[bool] | None = None
+    success_ack_delivered: bool = False
+    fenced: bool = False
+    finish_task: asyncio.Task[None] | None = None
 
 
 class TransferManager:
@@ -362,6 +395,7 @@ class TransferManager:
             tuple[UUID, int, UUID], tuple[float, TransferEndFrame | None]
         ] = {}
         self._acknowledged_failure_tombstones: set[tuple[UUID, int, UUID]] = set()
+        self._source_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
 
     @property
@@ -372,10 +406,34 @@ class TransferManager:
     def slot_ids(self) -> tuple[UUID, ...]:
         return tuple(slot.slot_id for slot in self._slots.values())
 
+    def fence_handle(self, handle: object) -> None:
+        """Synchronously prevent a retired generation from making more progress."""
+
+        for slot in tuple(self._slots.values()):
+            if _same_handle(slot.handle, handle):
+                self._fence_slot(slot)
+
+    def fence_route(self, route: TransferRoute) -> None:
+        """Synchronously prevent an old configuration snapshot from progressing."""
+
+        for slot in tuple(self._slots.values()):
+            if slot.route == route:
+                self._fence_slot(slot)
+
+    @staticmethod
+    def _fence_slot(slot: _TransferSlot) -> None:
+        if slot.fenced:
+            return
+        slot.fenced = True
+        slot.abort_event.set()
+        if slot.worker is not None and not slot.worker.done():
+            slot.worker.cancel()
+
     async def start_server_to_client(
         self,
         *,
         handle: object,
+        route: TransferRoute | None = None,
         user_id: UUID,
         src_path: str | None,
         dst_path: str,
@@ -403,6 +461,7 @@ class TransferManager:
         lease = await self._admission.acquire(user_id)
         slot = await self._new_slot(
             handle=handle,
+            route=route,
             user_id=user_id,
             lease=lease,
             direction="server_to_client",
@@ -415,7 +474,7 @@ class TransferManager:
         )
         try:
             if source_factory is not None:
-                created_source = await source_factory()
+                created_source = await self._prepare_source(slot, source_factory)
                 slot.source = created_source
                 slot.source_etag = _source_etag(created_source)
                 if total_bytes is None:
@@ -464,6 +523,7 @@ class TransferManager:
         self,
         *,
         handle: object,
+        route: TransferRoute | None = None,
         user_id: UUID,
         src_path: str,
         dst_path: str | None,
@@ -478,6 +538,7 @@ class TransferManager:
         lease = await self._admission.acquire(user_id)
         slot = await self._new_slot(
             handle=handle,
+            route=route,
             user_id=user_id,
             lease=lease,
             direction="client_to_server",
@@ -496,7 +557,7 @@ class TransferManager:
                 src_path=src_path,
                 dst_path=dst_path,
             )
-            if not await self._send_text(handle, request.model_dump_json()):
+            if not await self._send_text(handle, request.model_dump_json(), route=slot.route):
                 raise TransferDisconnectedError("device connection was replaced")
             return await asyncio.shield(slot.completion)
         except asyncio.CancelledError:
@@ -583,7 +644,11 @@ class TransferManager:
         assert slot.ready_future is not None
         assert slot.ack_future is not None
         try:
-            if not await self._send_text(slot.handle, slot.begin.model_dump_json()):
+            if not await self._send_text(
+                slot.handle,
+                slot.begin.model_dump_json(),
+                route=slot.route,
+            ):
                 raise TransferDisconnectedError("device connection was replaced")
             async with asyncio.timeout(self._idle_timeout_seconds):
                 await asyncio.shield(slot.ready_future)
@@ -616,7 +681,7 @@ class TransferManager:
                 sha256=digest,
             )
             slot.state = TransferState.SENDER_ENDED
-            if not await self._send_text(slot.handle, end.model_dump_json()):
+            if not await self._send_text(slot.handle, end.model_dump_json(), route=slot.route):
                 raise TransferDisconnectedError("device connection was replaced")
             async with asyncio.timeout(self._idle_timeout_seconds):
                 ack = await asyncio.shield(slot.ack_future)
@@ -633,6 +698,15 @@ class TransferManager:
                 raise TransferProtocolError(
                     "transfer metadata is only valid for workspace_upload"
                 )
+            slot.committed_result = self._result_for_slot(
+                slot,
+                digest=digest,
+                warnings=(),
+                etag=ack.etag if slot.purpose == "workspace_upload" else None,
+                created=ack.created if slot.purpose == "workspace_upload" else None,
+            )
+            slot.success_ack_delivered = True
+            slot.state = TransferState.COMMITTED
             warnings: list[str] = []
             if slot.mode == "move":
                 if slot.delete_source is None or slot.source_etag is None:
@@ -649,7 +723,7 @@ class TransferManager:
                 etag=ack.etag if slot.purpose == "workspace_upload" else None,
                 created=ack.created if slot.purpose == "workspace_upload" else None,
             )
-            slot.state = TransferState.COMMITTED
+            slot.committed_result = result
             await self._finish(slot, result)
         except asyncio.CancelledError:
             await self._abort(slot, "cancelled", send_frame=False)
@@ -712,7 +786,7 @@ class TransferManager:
             slot.sink = sink
             slot.state = TransferState.READY
             ready = TransferReadyFrame(id=slot.slot_id)
-            if not await self._send_text(slot.handle, ready.model_dump_json()):
+            if not await self._send_text(slot.handle, ready.model_dump_json(), route=slot.route):
                 await self._abort(slot, "peer_disconnected", send_frame=False)
                 return
             assert slot.sink is not None
@@ -737,9 +811,33 @@ class TransferManager:
                 raise TransferIntegrityError("sender digest did not match")
             if slot.begin.total_bytes != slot.bytes_seen:
                 raise TransferIntegrityError("declared file size did not match")
-            await slot.sink.finish()
+            async with asyncio.timeout(self._idle_timeout_seconds):
+                await slot.sink.finish()
+            cancel_after_commit = False
             if slot.commit_sink is not None:
-                await slot.commit_sink(slot.sink, slot.begin, slot.bytes_seen, digest)
+                resolution = asyncio.get_running_loop().create_future()
+                slot.commit_resolution = resolution
+                try:
+                    async with asyncio.timeout(self._idle_timeout_seconds):
+                        cancel_after_commit = bool(
+                            await slot.commit_sink(
+                                slot.sink,
+                                slot.begin,
+                                slot.bytes_seen,
+                                digest,
+                            )
+                        )
+                except BaseException:
+                    resolution.set_result(False)
+                    raise
+            slot.committed_result = self._result_for_slot(
+                slot,
+                digest=digest,
+                warnings=(),
+                etag=slot.begin.etag if slot.purpose == "http_relay" else None,
+            )
+            if slot.commit_resolution is not None:
+                slot.commit_resolution.set_result(True)
             ack = TransferEndFrame(
                 id=slot.slot_id,
                 ack=True,
@@ -747,16 +845,26 @@ class TransferManager:
                 bytes_sent=slot.bytes_seen,
                 sha256=digest,
             )
-            if not await self._send_text(slot.handle, ack.model_dump_json()):
-                raise TransferDisconnectedError("device connection was replaced")
-            # The destination is committed and the sender has received its
-            # terminal ACK.  A later disconnect must not roll that commit
-            # back while the optional move cleanup is still running.
-            # A client sender retains its source path lock until this ACK.
-            # Remote source deletion for move must therefore happen after the
-            # ACK, otherwise delete_file waits on the transfer that waits here.
+            try:
+                async with asyncio.timeout(self._idle_timeout_seconds):
+                    ack_delivered = await self._send_text(
+                        slot.handle,
+                        ack.model_dump_json(),
+                        route=slot.route,
+                    )
+            except Exception:
+                ack_delivered = False
+            slot.success_ack_delivered = ack_delivered
+            # The destination commit is the irreversible success point.  ACK
+            # loss cannot roll it back or turn it into a reported failure.  A
+            # move deletes its source only after confirmed ACK delivery because
+            # the client retains the source path lock until it observes that ACK.
             warnings: list[str] = []
-            if slot.mode == "move":
+            if not ack_delivered:
+                warnings.append("transfer_ack_failed")
+                if slot.mode == "move":
+                    warnings.append("source_delete_failed")
+            elif slot.mode == "move":
                 if slot.delete_source is None or slot.source_etag is None:
                     warnings.append("source_delete_failed")
                 else:
@@ -772,6 +880,10 @@ class TransferManager:
             )
             slot.state = TransferState.COMMITTED
             await self._finish(slot, result)
+            if cancel_after_commit:
+                current = asyncio.current_task()
+                if current is not None:
+                    asyncio.get_running_loop().call_soon(current.cancel)
         except asyncio.CancelledError:
             await self._abort(slot, "cancelled", send_frame=False)
         except BaseException as exc:
@@ -786,6 +898,7 @@ class TransferManager:
                             ok=False,
                             code=code,
                         ).model_dump_json(),
+                        route=slot.route,
                     )
                 except Exception:
                     pass
@@ -821,6 +934,7 @@ class TransferManager:
                     await self._send_text(
                         slot.handle,
                         frame.model_copy(update={"ack": True}).model_dump_json(),
+                        route=slot.route,
                     )
                 except Exception:
                     pass
@@ -851,7 +965,7 @@ class TransferManager:
                 raise TransferProtocolError("peer terminal frame arrived in an invalid state")
             code = frame.code or "transfer_rejected"
             ack = frame.model_copy(update={"ack": True})
-            await self._send_text(slot.handle, ack.model_dump_json())
+            await self._send_text(slot.handle, ack.model_dump_json(), route=slot.route)
             await self._abort(
                 slot,
                 code,
@@ -869,6 +983,7 @@ class TransferManager:
         self,
         *,
         handle: object,
+        route: TransferRoute | None,
         user_id: UUID,
         lease: TransferLease,
         direction: TransferDirection,
@@ -885,6 +1000,7 @@ class TransferManager:
             device_id, generation = _handle_identity(handle)
             slot = _TransferSlot(
                 handle=handle,
+                route=route,
                 device_id=device_id,
                 generation=generation,
                 user_id=user_id,
@@ -922,6 +1038,8 @@ class TransferManager:
             self._expire_tombstones_locked()
             slot = self._slots.get(key)
             if slot is not None:
+                if slot.fenced:
+                    raise TransferDisconnectedError("device route was replaced")
                 return slot
             if key in self._tombstones and terminal:
                 raise TransferProtocolError(
@@ -931,9 +1049,22 @@ class TransferManager:
         raise TransferProtocolError("unknown transfer slot", code="protocol_transfer_unknown_id")
 
     async def _finish(self, slot: _TransferSlot, result: TransferResult) -> None:
-        await self._cleanup(slot)
-        if slot.completion is not None and not slot.completion.done():
-            slot.completion.set_result(result)
+        if slot.finish_task is None:
+            async def finish() -> None:
+                await self._cleanup(slot, skip_worker=True)
+                if slot.completion is not None and not slot.completion.done():
+                    slot.completion.set_result(result)
+
+            slot.finish_task = asyncio.create_task(finish())
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(slot.finish_task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _result_for_slot(
@@ -976,14 +1107,71 @@ class TransferManager:
         send_frame: bool,
         error: BaseException | None = None,
     ) -> None:
-        if slot.state in {TransferState.COMMITTED, TransferState.ABORTED}:
+        resolution = slot.commit_resolution
+        current = asyncio.current_task()
+        if (
+            resolution is not None
+            and not resolution.done()
+            and slot.worker is not None
+            and slot.worker is not current
+        ):
+            slot.worker.cancel()
+            while not resolution.done():
+                try:
+                    await asyncio.shield(resolution)
+                except asyncio.CancelledError:
+                    continue
+            await self._abort(slot, code, send_frame=send_frame, error=error)
             return
-        slot.state = TransferState.ABORTED
-        if send_frame:
+        terminal = (
+            TransferEndFrame(id=slot.slot_id, ack=False, ok=False, code=code)
+            if send_frame
+            else None
+        )
+        key = (slot.device_id, slot.generation, slot.slot_id)
+        committed_result: TransferResult | None = None
+        async with self._lock:
+            if slot.state is TransferState.ABORTED:
+                return
+            if slot.committed_result is not None:
+                warnings = list(slot.committed_result.warnings)
+                if not slot.success_ack_delivered:
+                    warnings.append("transfer_ack_failed")
+                if slot.mode == "move":
+                    warnings.append("source_delete_failed")
+                committed_result = TransferResult(
+                    bytes_transferred=slot.committed_result.bytes_transferred,
+                    sha256=slot.committed_result.sha256,
+                    warnings=tuple(warnings),
+                    etag=slot.committed_result.etag,
+                    created=slot.committed_result.created,
+                )
+                slot.state = TransferState.COMMITTED
+                slot.abort_event.set()
+            else:
+                slot.state = TransferState.ABORTED
+                slot.abort_event.set()
+                if terminal is not None:
+                    slot.terminal_ack = terminal.model_copy(update={"ack": True})
+                self._remember_tombstone_locked(
+                    key,
+                    (
+                        time.monotonic() + self._tombstone_ttl_seconds,
+                        slot.terminal_ack,
+                    ),
+                )
+        if committed_result is not None:
+            if slot.worker is not current and slot.worker is not None and not slot.worker.done():
+                slot.worker.cancel()
+            await self._finish(slot, committed_result)
+            return
+        if terminal is not None:
             try:
-                terminal = TransferEndFrame(id=slot.slot_id, ack=False, ok=False, code=code)
-                slot.terminal_ack = terminal.model_copy(update={"ack": True})
-                await self._send_text(slot.handle, terminal.model_dump_json())
+                await self._send_text(
+                    slot.handle,
+                    terminal.model_dump_json(),
+                    route=slot.route,
+                )
             except Exception:
                 pass
         await self._cleanup(slot)
@@ -996,9 +1184,19 @@ class TransferManager:
             # does not report an unhandled completion future.
             slot.completion.exception()
 
-    async def _cleanup(self, slot: _TransferSlot) -> None:
+    async def _cleanup(
+        self,
+        slot: _TransferSlot,
+        *,
+        skip_worker: bool = False,
+    ) -> None:
         current = asyncio.current_task()
-        if slot.worker is not None and slot.worker is not current and not slot.worker.done():
+        if (
+            not skip_worker
+            and slot.worker is not None
+            and slot.worker is not current
+            and not slot.worker.done()
+        ):
             slot.worker.cancel()
             await asyncio.gather(slot.worker, return_exceptions=True)
         if slot.source is not None:
@@ -1017,13 +1215,78 @@ class TransferManager:
         key = (slot.device_id, slot.generation, slot.slot_id)
         async with self._lock:
             self._slots.pop(key, None)
-            self._remember_tombstone_locked(
-                key,
-                (
-                    time.monotonic() + self._tombstone_ttl_seconds,
-                    slot.terminal_ack,
-                ),
+            if key not in self._tombstones:
+                self._remember_tombstone_locked(
+                    key,
+                    (
+                        time.monotonic() + self._tombstone_ttl_seconds,
+                        slot.terminal_ack,
+                    ),
+                )
+
+    async def _prepare_source(
+        self,
+        slot: _TransferSlot,
+        source_factory: SourceFactory,
+    ) -> TransferSource:
+        task = asyncio.ensure_future(source_factory())
+        slot.source_factory_task = task
+        abort_waiter = asyncio.create_task(slot.abort_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (task, abort_waiter),
+                timeout=self._idle_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+        except asyncio.CancelledError:
+            slot.source_factory_task = None
+            self._retire_source_factory(task)
+            raise
+        finally:
+            abort_waiter.cancel()
+        if slot.abort_event.is_set():
+            slot.source_factory_task = None
+            self._retire_source_factory(task)
+            raise TransferDisconnectedError("device connection was replaced")
+        if not done:
+            slot.source_factory_task = None
+            self._retire_source_factory(task)
+            raise TimeoutError
+        slot.source_factory_task = None
+        try:
+            source = task.result()
+        except asyncio.CancelledError:
+            if slot.state is TransferState.ABORTED:
+                raise TransferDisconnectedError("device connection was replaced") from None
+            raise
+        if slot.state is not TransferState.BEGUN:
+            try:
+                await source.aclose()
+            except Exception:
+                pass
+            raise TransferDisconnectedError("device connection was replaced")
+        return source
+
+    def _retire_source_factory(self, task: asyncio.Task[TransferSource]) -> None:
+        task.cancel()
+
+        def close_result(done: asyncio.Task[TransferSource]) -> None:
+            try:
+                source = done.result()
+            except BaseException:
+                return
+            cleanup = asyncio.create_task(self._close_source(source))
+            self._source_cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._source_cleanup_tasks.discard)
+
+        task.add_done_callback(close_result)
+
+    @staticmethod
+    async def _close_source(source: TransferSource) -> None:
+        try:
+            await source.aclose()
+        except Exception:
+            pass
 
     def _remember_tombstone_locked(
         self,
@@ -1038,14 +1301,37 @@ class TransferManager:
             self._tombstones.pop(evicted)
             self._acknowledged_failure_tombstones.discard(evicted)
 
-    async def _send_text(self, handle: object, payload: str) -> bool:
-        result = await self._transport.send_text(handle, payload)
+    async def _send_text(
+        self,
+        handle: object,
+        payload: str,
+        *,
+        route: TransferRoute | None,
+    ) -> bool:
+        if route is None:
+            result = await self._transport.send_text(handle, payload)
+        else:
+            result = await self._transport.send_text(
+                handle,
+                payload,
+                expected_device_name=route.device_name,
+                expected_config_epoch=route.config_epoch,
+            )
         return result is not False
 
     async def _send_binary(self, handle: object, slot_id: UUID, payload: bytes) -> bool:
         if len(payload) > MAX_BINARY_CHUNK_BYTES:
             raise TransferProtocolError("transfer chunk exceeds 64 KiB")
-        result = await self._transport.send_binary(handle, slot_id.bytes + payload)
+        slot = await self._get_slot(handle, slot_id)
+        if slot.route is None:
+            result = await self._transport.send_binary(handle, slot_id.bytes + payload)
+        else:
+            result = await self._transport.send_binary(
+                handle,
+                slot_id.bytes + payload,
+                expected_device_name=slot.route.device_name,
+                expected_config_epoch=slot.route.config_epoch,
+            )
         return result is not False
 
     def _decode_binary(self, payload: bytes) -> tuple[UUID, bytes]:

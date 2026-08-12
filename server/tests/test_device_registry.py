@@ -57,6 +57,18 @@ class BlockingTransport(FakeTransport):
 
 
 @dataclass
+class AmbiguousConfigTransport(FakeTransport):
+    deliver_before_block: bool = False
+    send_started: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        if self.deliver_before_block:
+            self.sent_text.append(payload)
+        self.send_started.set()
+        await asyncio.Future()
+
+
+@dataclass
 class RecordingSink:
     chunks: list[bytes] = field(default_factory=list)
     finished: bool = False
@@ -264,6 +276,38 @@ async def test_replaced_generation_cannot_send_a_late_tool_call() -> None:
     assert old_transport.sent_text == []
 
 
+async def test_unready_registration_is_not_online_or_routable_until_activation() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        ready=False,
+    )
+
+    assert handle is not None
+    assert await registry.is_online(device_id, user_id=user_id) is False
+    assert await registry.get_handle(device_id, user_id=user_id) is None
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="list_dir",
+            args={},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+
+    assert await registry.activate(handle, "hello_ack") is True
+    assert transport.sent_text == ["hello_ack"]
+    assert await registry.is_online(device_id, user_id=user_id) is True
+
+
 async def test_replacement_waits_for_an_admitted_tool_call_send_boundary() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
@@ -357,6 +401,50 @@ async def test_config_push_updates_the_current_connection_name() -> None:
     assert len(transport.sent_text) == 1
 
 
+async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    assert handle is not None
+    route = await registry.get_route_snapshot(
+        device_id,
+        user_id=user_id,
+        expected_device_name="laptop",
+    )
+    assert route is not None
+
+    assert await registry.push_config(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        config=DeviceConfigFrame(
+            workspace_path="~/different-workspace",
+            sandbox_mode=True,
+            ssrf_denylist=[],
+        ),
+    )
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool_on_snapshot(
+            route=route,
+            user_id=user_id,
+            expected_device_name="laptop",
+            name="delete_file",
+            args={"path": "source.txt"},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "config_update"
+    ]
+
+
 async def test_config_push_send_failure_marks_the_device_offline() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
@@ -379,6 +467,42 @@ async def test_config_push_send_failure_marks_the_device_offline() -> None:
         ),
     ) is False
     assert await registry.is_online(device_id, user_id=user_id) is False
+
+
+@pytest.mark.parametrize("deliver_before_block", [False, True])
+async def test_cancelled_config_push_retires_the_ambiguous_generation(
+    deliver_before_block: bool,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = AmbiguousConfigTransport(deliver_before_block=deliver_before_block)
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="old-name",
+        transport=transport,
+    )
+    update = asyncio.create_task(
+        registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="new-name",
+            config=DeviceConfigFrame(
+                workspace_path="~/new-workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            ),
+        )
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+
+    update.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(update, timeout=1)
+
+    assert await registry.is_online(device_id, user_id=user_id) is False
+    assert await registry.send_text(handle, "late") is False
 
 
 async def test_config_update_precedes_new_name_dispatch_and_blocks_stale_name() -> None:
@@ -470,7 +594,95 @@ async def test_revoke_serializes_with_replacement_and_revokes_the_current_genera
     assert await replacement is not None
     assert await revocation is True
     assert await registry.is_online(device_id, user_id=user_id) is False
-    assert new_transport.closes == [(4401, "unauthorized")]
+    assert new_transport.closes == [(4401, '{"code":"unauthorized"}')]
+
+
+async def test_cancelled_replacement_retires_its_published_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    old_transport = FakeTransport()
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=old_transport,
+    )
+    retirement_started = asyncio.Event()
+    release_retirement = asyncio.Event()
+    original_retire = registry._retire
+
+    async def blocked_retire(connection: object, **kwargs: object) -> None:
+        if getattr(connection, "handle", None) == old_handle:
+            retirement_started.set()
+            await release_retirement.wait()
+        await original_retire(connection, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "_retire", blocked_retire)
+    replacement_transport = FakeTransport()
+    replacement = asyncio.create_task(
+        registry.register(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            transport=replacement_transport,
+        )
+    )
+    await asyncio.wait_for(retirement_started.wait(), timeout=1)
+
+    replacement.cancel()
+    await asyncio.sleep(0)
+    assert replacement.done() is False
+    release_retirement.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(replacement, timeout=1)
+
+    assert await registry.is_online(device_id, user_id=user_id) is False
+
+
+async def test_remove_device_waits_for_every_retiring_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    retirement_started = asyncio.Event()
+    release_retirement = asyncio.Event()
+    original_retire = registry._retire
+
+    async def blocked_retire(connection: object, **kwargs: object) -> None:
+        if getattr(connection, "handle", None) == old_handle:
+            retirement_started.set()
+            await release_retirement.wait()
+        await original_retire(connection, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "_retire", blocked_retire)
+    replacement = asyncio.create_task(
+        registry.register(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+    )
+    await asyncio.wait_for(retirement_started.wait(), timeout=1)
+
+    removal = asyncio.create_task(registry.remove_device(device_id))
+    await asyncio.sleep(0)
+    assert removal.done() is False
+
+    release_retirement.set()
+    assert await replacement is not None
+    assert await removal is True
+    assert await registry.is_online(device_id, user_id=user_id) is False
 
 
 async def test_replacement_waits_for_an_in_flight_binary_transfer_frame() -> None:
@@ -595,6 +807,162 @@ async def test_stale_generation_terminal_frame_cannot_commit_during_replacement(
     await replacement
     with pytest.raises(Exception):
         await transfer
+
+
+async def test_terminal_past_registry_check_cannot_commit_after_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    assert old_handle is not None
+    route = await registry.get_route_snapshot(
+        device_id,
+        user_id=user_id,
+        expected_device_name="laptop",
+    )
+    assert route is not None
+    sink = RecordingSink()
+    transfer = asyncio.create_task(
+        registry.transfers.start_client_to_server(
+            handle=old_handle,
+            route=route,
+            user_id=user_id,
+            src_path="source.txt",
+            dst_path="destination.txt",
+            sink_factory=lambda _frame: _sink(sink),
+        )
+    )
+    request = await _wait_for_sent(transport)
+    slot_id = UUID(str(request["id"]))
+    await registry.handle_transfer_frame(
+        old_handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.txt",
+            dst_path="destination.txt",
+            total_bytes=0,
+        ),
+    )
+    while not any(
+        json.loads(payload)["type"] == "transfer_ready" for payload in transport.sent_text
+    ):
+        await asyncio.sleep(0)
+
+    frame_entered = asyncio.Event()
+    release_frame = asyncio.Event()
+    original_handle_frame = registry.transfers.handle_frame
+
+    async def blocked_handle_frame(handle: object, frame: object) -> None:
+        if isinstance(frame, TransferEndFrame) and frame.ok and not frame.ack:
+            frame_entered.set()
+            await release_frame.wait()
+        await original_handle_frame(handle, frame)
+
+    monkeypatch.setattr(registry.transfers, "handle_frame", blocked_handle_frame)
+    terminal = asyncio.create_task(
+        registry.handle_transfer_frame(
+            old_handle,
+            TransferEndFrame(
+                id=slot_id,
+                ack=False,
+                ok=True,
+                bytes_sent=0,
+                sha256=hashlib.sha256(b"").hexdigest(),
+            ),
+        )
+    )
+    await frame_entered.wait()
+
+    replacement = asyncio.create_task(
+        registry.register(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+    )
+    while await registry.get_handle(device_id, user_id=user_id) == old_handle:
+        await asyncio.sleep(0)
+    release_frame.set()
+
+    await asyncio.gather(terminal, return_exceptions=True)
+    assert await replacement is not None
+    with pytest.raises(Exception):
+        await transfer
+    assert sink.finished is False
+
+
+async def test_config_epoch_change_aborts_active_route_before_finish() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    assert handle is not None
+    route = await registry.get_route_snapshot(
+        device_id,
+        user_id=user_id,
+        expected_device_name="laptop",
+    )
+    assert route is not None
+    sink = RecordingSink()
+    transfer = asyncio.create_task(
+        registry.transfers.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path="source.txt",
+            dst_path="destination.txt",
+            sink_factory=lambda _frame: _sink(sink),
+        )
+    )
+    request = await _wait_for_sent(transport)
+    slot_id = UUID(str(request["id"]))
+    await registry.handle_transfer_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.txt",
+            dst_path="destination.txt",
+            total_bytes=0,
+        ),
+    )
+    while not any(
+        json.loads(payload)["type"] == "transfer_ready" for payload in transport.sent_text
+    ):
+        await asyncio.sleep(0)
+
+    assert await registry.push_config(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        config=DeviceConfigFrame(
+            workspace_path="~/different-workspace",
+            sandbox_mode=True,
+            ssrf_denylist=[],
+        ),
+    )
+
+    with pytest.raises(Exception):
+        await transfer
+    assert sink.finished is False
 
 
 async def test_stale_generation_binary_frame_cannot_write_during_replacement(
@@ -728,7 +1096,7 @@ async def _sink(sink: RecordingSink) -> RecordingSink:
     return sink
 
 
-async def test_close_waits_for_an_in_flight_inbound_transfer_operation(
+async def test_close_does_not_wait_for_inbound_transfer_backpressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = DeviceRegistry()
@@ -752,13 +1120,11 @@ async def test_close_waits_for_an_in_flight_inbound_transfer_operation(
     await asyncio.wait_for(inbound_started.wait(), timeout=1)
 
     shutdown = asyncio.create_task(registry.close())
-    await asyncio.sleep(0)
-    assert shutdown.done() is False
+    await asyncio.wait_for(shutdown, timeout=0.2)
+    assert await registry.is_online(device_id, user_id=user_id) is False
 
     release_inbound.set()
-    assert await inbound is True
-    await shutdown
-    assert await registry.is_online(device_id, user_id=user_id) is False
+    assert await inbound is False
 
 
 async def test_disconnect_and_timeout_remove_pending_calls() -> None:
@@ -792,7 +1158,15 @@ async def test_disconnect_and_timeout_remove_pending_calls() -> None:
         content="late",
         is_error=False,
     )
-    assert await registry.resolve_tool_result(handle, late) is False
+    assert await registry.resolve_tool_result(handle, late) is True
+    assert await registry.resolve_tool_result(handle, late) is True
+    assert (
+        await registry.resolve_tool_result(
+            handle,
+            late.model_copy(update={"id": new_uuid7()}),
+        )
+        is False
+    )
 
     transport.sent.clear()
     pending = asyncio.create_task(
@@ -968,7 +1342,7 @@ async def test_revoke_closes_current_and_allows_later_generation() -> None:
     )
 
     assert await registry.revoke(device_id) is True
-    assert transport.closes == [(4401, "unauthorized")]
+    assert transport.closes == [(4401, '{"code":"unauthorized"}')]
     assert await registry.is_online(device_id, user_id=user_id) is False
 
     second = await registry.register(
@@ -1014,6 +1388,51 @@ async def test_close_serializes_with_registration_already_waiting() -> None:
     await shutdown
 
     assert await registry.is_online(device_id, user_id=user_id) is False
+
+
+async def test_close_waits_for_a_replaced_generation_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    retirement_started = asyncio.Event()
+    release_retirement = asyncio.Event()
+    current_retired = asyncio.Event()
+    original_retire = registry._retire
+
+    async def blocked_retire(connection: object, **kwargs: object) -> None:
+        if getattr(connection, "handle", None) == old_handle:
+            retirement_started.set()
+            await release_retirement.wait()
+        await original_retire(connection, **kwargs)  # type: ignore[arg-type]
+        if getattr(connection, "handle", None) != old_handle:
+            current_retired.set()
+
+    monkeypatch.setattr(registry, "_retire", blocked_retire)
+    replacement = asyncio.create_task(
+        registry.register(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+    )
+    await asyncio.wait_for(retirement_started.wait(), timeout=1)
+
+    shutdown = asyncio.create_task(registry.close())
+    await asyncio.wait_for(current_retired.wait(), timeout=1)
+    assert shutdown.done() is False
+
+    release_retirement.set()
+    await asyncio.wait_for(shutdown, timeout=1)
+    assert await replacement is not None
 
 
 async def test_pong_is_generation_scoped() -> None:

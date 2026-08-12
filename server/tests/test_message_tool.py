@@ -190,8 +190,7 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
     service = AsyncMock(spec=WorkspaceService)
     ctx = await _web_ctx(pg_engine)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        db.add(
-            Device(
+        device = Device(
                 user_id=ctx.user_id,
                 name="laptop",
                 token_hash=b"x" * 32,
@@ -200,8 +199,9 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
                 sandbox_mode=True,
                 ssrf_denylist=[],
             )
-        )
+        db.add(device)
         await db.commit()
+        device_id = device.id
     registry = ToolRegistry((MessageTool(pg_engine, service),))
 
     result = await registry.execute(
@@ -218,6 +218,7 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
         delivery_refs=(
             DeviceFileDeliveryRef(
                 path="reports/final.pdf",
+                device_id=device_id,
                 openoctopus_device="laptop",
                 filename="final.pdf",
                 mime="application/pdf",
@@ -225,6 +226,45 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
         )
     )
     service.resolve_delivery_file.assert_not_awaited()
+
+
+async def test_message_rejects_a_reused_device_name_from_provider_turn_snapshot(
+    pg_engine,
+) -> None:
+    service = AsyncMock(spec=WorkspaceService)
+    ctx = await _web_ctx(pg_engine)
+    captured_device_id = uuid4()
+    replacement_device_id = uuid4()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(
+            Device(
+                id=replacement_device_id,
+                user_id=ctx.user_id,
+                name="laptop",
+                token_hash=b"z" * 32,
+                token_hint="openoctopus_dev_...replacement",
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            )
+        )
+        await db.commit()
+    registry = ToolRegistry((MessageTool(pg_engine, service),))
+
+    result = await registry.execute(
+        name="message",
+        args={
+            "content": "Do not attach replacement file.",
+            "openoctopus_device": "laptop",
+            "media": ["reports/final.pdf"],
+        },
+        ctx=ctx,
+        device_targets={"laptop": captured_device_id},
+    )
+
+    assert result.is_error is True
+    assert result.code == ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert result.side_effect is None
 
 
 async def test_message_does_not_accept_another_users_device(pg_engine) -> None:

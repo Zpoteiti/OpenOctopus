@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -23,12 +22,10 @@ class WorkspaceToolDispatcher:
         service: WorkspaceService,
         *,
         document_parser: DocumentParser,
-        read_cache_entries: int = 512,
     ) -> None:
         self._engine = engine
         self._service = service
         self._parser = document_parser
-        self._read_cache = _ReadCache(read_cache_entries)
 
     async def __call__(
         self,
@@ -105,17 +102,12 @@ class WorkspaceToolDispatcher:
         offset = cast(int, args["offset"])
         limit = cast(int, args["limit"])
         pages = cast(str | None, args["pages"])
-        force = cast(bool, args["force"])
         ticket = await self._service.authorize_tool_read(
             db,
             user_id=ctx.user_id,
             path=path,
         )
         await db.commit()
-
-        def unchanged_etag(etag: str) -> bool:
-            probe_key = (ctx.session_id, path, etag, offset, limit, pages)
-            return not force and self._read_cache.seen(probe_key)
 
         result = await self._service.read_for_tool(
             ticket,
@@ -124,12 +116,7 @@ class WorkspaceToolDispatcher:
             limit=limit,
             pages=pages,
             parser=self._parser,
-            unchanged_etag=unchanged_etag,
         )
-        if result is None:
-            return ToolResult(content=f"[File unchanged since last read: {path}]")
-        key = (ctx.session_id, path, result.etag, offset, limit, pages)
-        self._read_cache.put(key)
         return ToolResult(content=result.content)
 
     async def _apply_patch(
@@ -305,24 +292,6 @@ class WorkspaceToolDispatcher:
         )
         await db.commit()
         return ToolResult(content=f"Edited notebook {args['path']} ({metadata.size} bytes).")
-
-
-class _ReadCache:
-    def __init__(self, max_entries: int) -> None:
-        self._max_entries = max_entries
-        self._entries: OrderedDict[tuple[object, ...], None] = OrderedDict()
-
-    def seen(self, key: tuple[object, ...]) -> bool:
-        if key not in self._entries:
-            return False
-        self._entries.move_to_end(key)
-        return True
-
-    def put(self, key: tuple[object, ...]) -> None:
-        self._entries[key] = None
-        self._entries.move_to_end(key)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
 
 
 def _virtual_path(request_path: str, relative_path: str) -> str:

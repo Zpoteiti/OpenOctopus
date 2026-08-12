@@ -231,6 +231,8 @@ class ToolRegistry:
                     max_output_chars=tool.max_output_chars(),
                 )
             routed_ctx = replace(ctx, openoctopus_device=device)
+        elif tool.routing_mode is ToolRoutingMode.INTRINSIC_DEVICE:
+            routed_ctx = replace(ctx, device_targets=device_targets)
 
         try:
             result = await tool.execute(routed_args, routed_ctx)

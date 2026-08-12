@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,8 +13,9 @@ import pytest
 import openoctopus_client.tools.dispatcher as dispatcher_module
 import openoctopus_client.transfer as transfer_module
 from openoctopus_client.tools import ClientToolDispatcher
-from openoctopus_client.tools.common import ToolOutput
+from openoctopus_client.tools.common import ToolFailure, ToolOutput
 from openoctopus_client.tools.locks import PathLocks
+from openoctopus_client.tools.workspace_rest import INTERNAL_WORKSPACE_ACTION
 
 
 class _RecordingLocks(PathLocks):
@@ -86,6 +88,88 @@ def test_workspace_rest_patch_delete_and_search_are_structured(tmp_path: Path) -
     (tmp_path / "folder").mkdir()
     deleted = _run(dispatcher, operation="delete_folder", path="folder")
     assert _json(deleted) == {"deleted": True}
+
+
+def test_workspace_rest_grep_preserves_lookahead_for_next_offset(tmp_path: Path) -> None:
+    (tmp_path / "matches.txt").write_text("hit one\nhit two\nhit three\n", encoding="utf-8")
+    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+
+    first = _json(
+        _run(
+            dispatcher,
+            operation="grep",
+            path=".",
+            pattern="hit",
+            output_mode="content",
+            limit=2,
+        )
+    )
+    second = _json(
+        _run(
+            dispatcher,
+            operation="grep",
+            path=".",
+            pattern="hit",
+            output_mode="content",
+            limit=2,
+            offset=2,
+        )
+    )
+
+    assert [item["line_number"] for item in first["items"]] == [1, 2]
+    assert first["next_offset"] == 2
+    assert first["truncated"] is False
+    assert [item["line_number"] for item in second["items"]] == [3]
+    assert second["next_offset"] is None
+    assert second["truncated"] is False
+
+
+@pytest.mark.parametrize("operation", ["list_dir", "find_files"])
+def test_workspace_rest_scan_cap_keeps_pages_within_the_retained_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    entries = [(f"directory-{index:05d}", 0.0, True) for index in range(10_000)]
+    monkeypatch.setattr(dispatcher, "_walk", lambda _root: entries)
+    extra = {"recursive": True} if operation == "list_dir" else {"include_dirs": True}
+
+    first = _json(
+        _run(
+            dispatcher,
+            operation=operation,
+            path=".",
+            limit=100,
+            offset=0,
+            **extra,
+        )
+    )
+    second = _json(
+        _run(
+            dispatcher,
+            operation=operation,
+            path=".",
+            limit=100,
+            offset=100,
+            **extra,
+        )
+    )
+    last = _json(
+        _run(
+            dispatcher,
+            operation=operation,
+            path=".",
+            limit=100,
+            offset=9_900,
+            **extra,
+        )
+    )
+
+    assert first["truncated"] is True
+    assert first["next_offset"] == 100
+    assert second["next_offset"] == 200
+    assert last["next_offset"] is None
 
 
 def test_workspace_rest_rejects_deleting_the_workspace_root(tmp_path: Path) -> None:
@@ -235,22 +319,17 @@ def test_workspace_rest_local_transfer_detects_external_source_change(
     assert not list(tmp_path.glob(".destination.bin.openoctopus-*") )
 
 
-def test_workspace_rest_local_move_retains_source_if_it_changes_after_commit(
+def test_workspace_rest_local_move_uses_native_rename_without_hard_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
     dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
-    calls = 0
-
-    def change_after_commit(
-        _path: Path, _descriptor: int, _initial: tuple[int, int, int, int, int]
-    ) -> bool:
-        nonlocal calls
-        calls += 1
-        return calls == 1
-
-    monkeypatch.setattr(dispatcher_module, "_source_unchanged", change_after_commit)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_link_transfer_no_replace",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("move used hard link")),
+    )
     result = _run(
         dispatcher,
         operation="transfer_local",
@@ -260,10 +339,133 @@ def test_workspace_rest_local_move_retains_source_if_it_changes_after_commit(
     )
 
     assert result.is_error is False
-    payload = _json(result)
-    assert payload["warnings"] == ["source_delete_failed"]
-    assert source.read_bytes() == b"payload"
+    assert _json(result)["warnings"] == []
+    assert source.exists() is False
     assert (tmp_path / "destination.bin").read_bytes() == b"payload"
+
+
+def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"before")
+    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    native_rename = dispatcher_module._rename_transfer_no_replace
+
+    def change_then_rename(
+        source_path: Path, destination_path: Path, source_fd: int
+    ) -> None:
+        source.write_bytes(b"after")
+        native_rename(source_path, destination_path, source_fd)
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_rename_transfer_no_replace",
+        change_then_rename,
+    )
+
+    result = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="destination.bin",
+        mode="move",
+    )
+
+    assert result.is_error is False
+    assert destination.read_bytes() == b"after"
+    assert _json(result)["sha256"] == hashlib.sha256(b"after").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    source.write_bytes(b"payload")
+    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    native_rename = dispatcher_module._rename_transfer_no_replace
+    rename_completed = threading.Event()
+    release_hash = threading.Event()
+
+    def rename_then_signal(
+        source_path: Path, destination_path: Path, source_fd: int
+    ) -> None:
+        source.write_bytes(b"updated")
+        native_rename(source_path, destination_path, source_fd)
+        rename_completed.set()
+
+    original_read = os.read
+
+    def slow_read(descriptor: int, size: int) -> bytes:
+        if rename_completed.is_set():
+            release_hash.wait(timeout=2)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(dispatcher_module, "_rename_transfer_no_replace", rename_then_signal)
+    monkeypatch.setattr(os, "read", slow_read)
+    monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
+
+    task = asyncio.create_task(
+        dispatcher.execute(
+            INTERNAL_WORKSPACE_ACTION,
+            {
+                "operation": "transfer_local",
+                "path": "source.bin",
+                "dst_path": "destination.bin",
+                "mode": "move",
+            },
+        )
+    )
+    assert await asyncio.to_thread(rename_completed.wait, 1)
+    await asyncio.sleep(0.05)
+    assert task.done() is False
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    release_hash.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result.is_error is False
+    assert source.exists() is False
+    assert destination.read_bytes() == b"updated"
+    assert _json(result)["sha256"] == hashlib.sha256(b"updated").hexdigest()
+
+
+def test_workspace_rest_local_move_cross_volume_failure_leaves_both_paths_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+
+    def reject_cross_volume(
+        source_path: Path, destination_path: Path, source_fd: int
+    ) -> None:
+        del source_path, destination_path, source_fd
+        raise ToolFailure(
+            "workspace_storage_unavailable",
+            "Same-volume exclusive move is required",
+        )
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_rename_transfer_no_replace",
+        reject_cross_volume,
+    )
+    result = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="destination.bin",
+        mode="move",
+    )
+
+    assert result.code == "workspace_storage_unavailable"
+    assert source.read_bytes() == b"payload"
+    assert (tmp_path / "destination.bin").exists() is False
 
 
 def test_rest_and_transfer_etags_use_the_same_opaque_stat_fingerprint(tmp_path: Path) -> None:

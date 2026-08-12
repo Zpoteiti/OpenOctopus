@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes
 import errno
 import fnmatch
 import hashlib
+import heapq
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -92,7 +95,7 @@ _IMAGE_TYPES = {
     b"RIFF": "image/webp",
 }
 _TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
-    "read_file": frozenset({"path", "offset", "limit", "pages", "force"}),
+    "read_file": frozenset({"path", "offset", "limit", "pages"}),
     "write_file": frozenset({"path", "content"}),
     "edit_file": frozenset(
         {
@@ -157,6 +160,16 @@ class ClientToolDispatcher:
 
         return any(not task.done() for task in self._blocking_tasks)
 
+    async def wait_for_pending_blocking(self) -> None:
+        """Wait until a timed-out worker thread finishes before the next FIFO call."""
+
+        pending = tuple(task for task in self._blocking_tasks if not task.done())
+        if pending:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
+
     async def _run_blocking[T](
         self, function: Callable[..., T], *args: Any, **kwargs: Any
     ) -> T:
@@ -164,6 +177,9 @@ class ClientToolDispatcher:
 
     async def _run_mutation(self, function: Any, *args: Any, **kwargs: Any) -> Any:
         return await _run_mutation(function, *args, tracker=self._blocking_tasks, **kwargs)
+
+    async def _resolve_path(self, path: str, *, directory: bool | None) -> Path:
+        return await self._run_blocking(self._paths.resolve, path, directory=directory)
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput:
         try:
@@ -175,8 +191,15 @@ class ClientToolDispatcher:
             return fail(code, message)
         except ToolFailure as exc:
             return fail(exc.code, exc.message)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            return fail("tool_invalid_args", _safe_message(exc))
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                return fail("workspace_permission_denied", "Workspace path is unavailable")
+            return fail(
+                "workspace_storage_unavailable",
+                "Workspace filesystem operation failed",
+            )
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return fail("tool_invalid_args", "Tool arguments are invalid")
 
     async def _execute(self, name: str, args: dict[str, Any]) -> ToolOutput:
         if name == INTERNAL_WORKSPACE_ACTION:
@@ -226,7 +249,7 @@ class ClientToolDispatcher:
     async def _workspace_rest_edit(self, action: WorkspaceRestAction) -> ToolOutput:
         assert action.path is not None
         assert action.old_text is not None and action.new_text is not None
-        target = self._paths.resolve(action.path, directory=False)
+        target = await self._resolve_path(action.path, directory=False)
         async with self._locks.hold(str(target)):
             initial = await self._run_blocking(
                 _capture_regular, target, REST_MAX_TEXT_EDIT_BYTES
@@ -272,7 +295,7 @@ class ClientToolDispatcher:
         assert action.edits is not None
         targets: list[tuple[str, Path, Literal["replace", "add"], str | None, str]] = []
         for item in action.edits:
-            target = self._paths.resolve(item.path, directory=False)
+            target = await self._resolve_path(item.path, directory=False)
             old = item.old_text
             new = item.new_text
             assert new is not None
@@ -359,7 +382,7 @@ class ClientToolDispatcher:
         self, action: WorkspaceRestAction, *, directory: bool
     ) -> ToolOutput:
         assert action.path is not None
-        target = self._paths.resolve(action.path, directory=directory)
+        target = await self._resolve_path(action.path, directory=directory)
         if directory:
             _reject_protected_directory_delete(target, self._paths.root)
         async with self._locks.hold(str(target)):
@@ -380,18 +403,18 @@ class ClientToolDispatcher:
         self, action: WorkspaceRestAction
     ) -> ToolOutput:
         assert action.path is not None and action.dst_path is not None
-        source = self._paths.resolve(action.path, directory=False)
-        destination = self._paths.resolve(action.dst_path, directory=None)
+        source = await self._resolve_path(action.path, directory=False)
+        destination = await self._resolve_path(action.dst_path, directory=None)
         if source == destination:
             raise ToolFailure(
                 "workspace_invalid_request", "Transfer source and destination must differ"
             )
         async with self._locks.hold(str(source), str(destination)):
-            source_fd, initial = await _open_transfer_source(source)
+            source_fd, initial = await self._run_blocking(_open_transfer_source, source)
             try:
-                _check_transfer_destination(destination)
-                self._paths.prepare_parent(destination)
-                if not destination.parent.is_dir():
+                await self._run_blocking(_check_transfer_destination, destination)
+                await self._run_blocking(self._paths.prepare_parent, destination)
+                if not await self._run_blocking(destination.parent.is_dir):
                     raise ToolFailure(
                         "tool_not_a_directory", "Destination parent is not a directory"
                     )
@@ -421,7 +444,9 @@ class ClientToolDispatcher:
         source_fd: int,
         initial: tuple[int, int, int, int, int],
     ) -> WorkspaceTransferLocalResult:
-        temporary_fd, temporary = await _create_transfer_temp(destination.parent, destination.name)
+        temporary_fd, temporary = await self._run_blocking(
+            _create_transfer_temp, destination.parent, destination.name
+        )
         committed = False
         try:
             bytes_transferred, digest = await _stream_fd(
@@ -431,7 +456,9 @@ class ClientToolDispatcher:
             await self._run_mutation(os.fsync, temporary_fd)
             await self._run_mutation(os.close, temporary_fd)
             temporary_fd = -1
-            if not _source_unchanged(source, source_fd, initial):
+            if not await self._run_blocking(
+                _source_unchanged, source, source_fd, initial
+            ):
                 raise ToolFailure("workspace_file_changed", "Source changed during transfer")
             await _commit_transfer_no_replace(temporary, destination)
             committed = True
@@ -445,7 +472,7 @@ class ClientToolDispatcher:
                     await self._run_mutation(os.close, temporary_fd)
             if not committed:
                 with contextlib.suppress(OSError):
-                    temporary.unlink(missing_ok=True)
+                    await self._run_mutation(temporary.unlink, missing_ok=True)
 
     async def _move_local(
         self,
@@ -455,57 +482,26 @@ class ClientToolDispatcher:
         initial: tuple[int, int, int, int, int],
     ) -> WorkspaceTransferLocalResult:
         bytes_transferred, digest = await _hash_fd(source_fd)
-        if not _source_unchanged(source, source_fd, initial):
+        if not await self._run_blocking(_source_unchanged, source, source_fd, initial):
             raise ToolFailure("workspace_file_changed", "Source changed during transfer")
-        try:
-            await self._run_mutation(_link_transfer_no_replace, source, destination)
-        except _TransferCrossDeviceError:
-            await self._run_mutation(os.lseek, source_fd, 0, os.SEEK_SET)
-            temporary_fd, temporary = await _create_transfer_temp(
-                destination.parent, destination.name
-            )
-            committed = False
-            try:
-                copied_bytes, copied_digest = await _stream_fd(source_fd, temporary_fd)
-                await self._run_mutation(os.fsync, temporary_fd)
-                await self._run_mutation(os.close, temporary_fd)
-                temporary_fd = -1
-                if (
-                    copied_bytes != bytes_transferred
-                    or copied_digest != digest
-                    or not _source_unchanged(source, source_fd, initial)
-                ):
-                    raise ToolFailure("workspace_file_changed", "Source changed during transfer")
-                await _commit_transfer_no_replace(temporary, destination)
-                committed = True
-            finally:
-                if temporary_fd >= 0:
-                    with contextlib.suppress(OSError):
-                        await self._run_mutation(os.close, temporary_fd)
-                if not committed:
-                    with contextlib.suppress(OSError):
-                        temporary.unlink(missing_ok=True)
-        warnings: list[str] = []
-        source_unchanged = _source_unchanged(source, source_fd, initial)
-        with contextlib.suppress(OSError):
-            await self._run_mutation(os.close, source_fd)
-        if not source_unchanged:
-            warnings.append("source_delete_failed")
-        else:
-            try:
-                await self._run_mutation(os.unlink, source)
-                await self._run_mutation(_fsync_directory, source.parent)
-            except OSError:
-                warnings.append("source_delete_failed")
+        bytes_transferred, digest = await _run_irreversible_mutation(
+            self._blocking_tasks,
+            _rename_verify_and_hash_fd,
+            source,
+            destination,
+            source_fd,
+            initial,
+            bytes_transferred,
+            digest,
+        )
         return WorkspaceTransferLocalResult(
             bytes_transferred=bytes_transferred,
             sha256=digest,
-            warnings=warnings,
         )
 
     async def _workspace_rest_list(self, action: WorkspaceRestAction) -> ToolOutput:
         assert action.path is not None
-        root = self._paths.resolve(action.path, directory=True)
+        root = await self._resolve_path(action.path, directory=True)
         entries, truncated = await self._run_blocking(
             self._workspace_list_entries, root, action.recursive
         )
@@ -521,7 +517,7 @@ class ClientToolDispatcher:
 
     async def _workspace_rest_find(self, action: WorkspaceRestAction) -> ToolOutput:
         assert action.path is not None
-        root = self._paths.resolve(action.path, directory=True)
+        root = await self._resolve_path(action.path, directory=True)
         if action.sort not in {"path", "modified"} or action.type not in {None, *_TYPES}:
             raise ToolFailure("tool_invalid_args", "Find filter is invalid")
         _validate_glob(action.glob)
@@ -579,7 +575,7 @@ class ClientToolDispatcher:
 
     async def _workspace_rest_grep(self, action: WorkspaceRestAction) -> ToolOutput:
         assert action.path is not None and action.pattern is not None
-        root = self._paths.resolve(action.path, directory=True)
+        root = await self._resolve_path(action.path, directory=True)
         if action.type not in {None, *_TYPES}:
             raise ToolFailure("tool_invalid_args", "Grep filter is invalid")
         _validate_glob(action.glob)
@@ -619,7 +615,8 @@ class ClientToolDispatcher:
                     raise
             return values, len(values) >= REST_MAX_SCAN_OBJECTS
         try:
-            children = sorted(
+            children = heapq.nsmallest(
+                REST_MAX_SCAN_OBJECTS + 1,
                 (item for item in root.iterdir() if item.name not in _NOISE),
                 key=lambda item: item.name,
             )
@@ -659,11 +656,12 @@ class ClientToolDispatcher:
         produced: list[WorkspaceGrepItem] = []
         retained_bytes = 0
         truncated = False
+        page_complete = False
 
         def append(value: WorkspaceGrepItem) -> bool:
-            nonlocal retained_bytes, truncated
-            if len(produced) >= action.offset + action.limit:
-                truncated = True
+            nonlocal retained_bytes, truncated, page_complete
+            if len(produced) >= action.offset + action.limit + 1:
+                page_complete = True
                 return False
             size = len(value.model_dump_json().encode("utf-8"))
             if retained_bytes + size > MAX_WORKSPACE_RESPONSE_BYTES:
@@ -674,7 +672,7 @@ class ClientToolDispatcher:
             return True
 
         for relative, _, is_directory in entries:
-            if truncated:
+            if truncated or page_complete:
                 break
             if is_directory or ignored.match_file(relative):
                 continue
@@ -758,7 +756,7 @@ class ClientToolDispatcher:
         offset = _int_arg(args, "offset", 1, minimum=1)
         limit = _int_arg(args, "limit", 2000, minimum=1)
         pages = _optional_str(args, "pages")
-        resolved = self._paths.resolve(path, directory=False)
+        resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
             if resolved.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx"}:
                 try:
@@ -810,7 +808,7 @@ class ClientToolDispatcher:
     async def _write_file(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
         content = _required_str(args, "content")
-        resolved = self._paths.resolve(path, directory=False)
+        resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
             await self._run_mutation(self._atomic_write, resolved, content.encode("utf-8"))
         return ToolOutput(f"Wrote {path} ({len(content.encode('utf-8'))} bytes).")
@@ -827,7 +825,7 @@ class ClientToolDispatcher:
             replace_all and (occurrence or line_hint)
         ):
             raise ToolFailure("tool_invalid_args", "Edit selectors are mutually exclusive")
-        resolved = self._paths.resolve(path, directory=False)
+        resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
             text: str | None
             initial = await self._run_blocking(_capture_regular, resolved, MAX_TEXT_EDIT_BYTES)
@@ -877,12 +875,19 @@ class ClientToolDispatcher:
             if action == "add" and new is None:
                 raise ToolFailure("tool_invalid_args", "add requires new_text")
             parsed.append(
-                (path, self._paths.resolve(path, directory=False), action, old, cast(str, new))
+                (
+                    path,
+                    await self._resolve_path(path, directory=False),
+                    action,
+                    old,
+                    cast(str, new),
+                )
             )
         if len({str(item[1]) for item in parsed}) != len(parsed):
             raise ToolFailure("tool_invalid_args", "Patch paths must be unique")
         async with self._locks.hold(*(str(item[1]) for item in parsed)):
             prepared: list[tuple[str, Path, str, int, FileFingerprint | None]] = []
+            total_bytes = 0
             for display, target, action, old, new in parsed:
                 initial = await self._run_blocking(_capture_regular, target, MAX_TEXT_EDIT_BYTES)
                 current = initial[0].decode("utf-8") if initial is not None else None
@@ -900,15 +905,13 @@ class ClientToolDispatcher:
                         line_hint=None,
                         expected_replacements=None,
                     )
+                total_bytes += len(updated.encode("utf-8"))
+                if total_bytes > MAX_TEXT_EDIT_BYTES:
+                    raise ToolFailure(
+                        "workspace_file_too_large_to_edit",
+                        "Patch content exceeds the 8 MiB edit limit",
+                    )
                 prepared.append((display, target, updated, count, initial[1] if initial else None))
-            if (
-                sum(len(updated.encode("utf-8")) for _, _, updated, _, _ in prepared)
-                > MAX_TEXT_EDIT_BYTES
-            ):
-                raise ToolFailure(
-                    "workspace_file_too_large_to_edit",
-                    "Patch content exceeds the 8 MiB edit limit",
-                )
             if not dry_run:
                 for _, target, _, _, expected in prepared:
                     if (
@@ -933,14 +936,14 @@ class ClientToolDispatcher:
 
     async def _delete_file(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
-        resolved = self._paths.resolve(path, directory=False)
+        resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
             await self._run_mutation(resolved.unlink)
         return ToolOutput(f"Deleted file {path}.")
 
     async def _delete_folder(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
-        resolved = self._paths.resolve(path, directory=True)
+        resolved = await self._resolve_path(path, directory=True)
         _reject_protected_directory_delete(resolved, self._paths.root)
         async with self._locks.hold(str(resolved)):
             await self._run_mutation(shutil.rmtree, resolved)
@@ -950,12 +953,13 @@ class ClientToolDispatcher:
         path = self._path_arg(args)
         recursive = _bool_arg(args, "recursive", False)
         limit = _int_arg(args, "max_entries", 200, minimum=1, maximum=1000)
-        root = self._paths.resolve(path, directory=True)
+        root = await self._resolve_path(path, directory=True)
         return await self._run_blocking(self._list_dir_sync, root, recursive, limit)
 
     def _list_dir_sync(self, root: Path, recursive: bool, limit: int) -> ToolOutput:
         if not recursive:
-            direct_entries = sorted(
+            direct_entries = heapq.nsmallest(
+                limit + 1,
                 (item for item in root.iterdir() if item.name not in _NOISE),
                 key=lambda item: item.name,
             )
@@ -975,7 +979,7 @@ class ClientToolDispatcher:
 
     async def _find_files(self, args: dict[str, Any]) -> ToolOutput:
         path = _optional_str(args, "path") or "."
-        root = self._paths.resolve(path, directory=True)
+        root = await self._resolve_path(path, directory=True)
         query = (_optional_str(args, "query") or "").casefold().split()
         glob = _optional_str(args, "glob")
         file_type = _optional_str(args, "type")
@@ -1023,7 +1027,9 @@ class ClientToolDispatcher:
         pattern = _required_str(args, "pattern")
         if len(pattern) > 4096:
             raise ToolFailure("tool_invalid_regex", "Regex pattern is invalid")
-        root = self._paths.resolve(_optional_str(args, "path") or ".", directory=True)
+        root = await self._resolve_path(
+            _optional_str(args, "path") or ".", directory=True
+        )
         glob = _optional_str(args, "glob")
         file_type = _optional_str(args, "type")
         mode = _optional_str(args, "output_mode") or "files_with_matches"
@@ -1072,23 +1078,24 @@ class ClientToolDispatcher:
         ignored = _gitignore(root)
         selected: list[str] = []
         result_index = 0
-        truncated = False
+        has_more = False
+        hard_truncated = False
         output_bytes = 0
 
         def add_result(value: str) -> bool:
             """Append one result only when it belongs to the requested page."""
 
-            nonlocal result_index, output_bytes, truncated
+            nonlocal result_index, output_bytes, has_more, hard_truncated
             if result_index < offset:
                 result_index += 1
                 return False
             if head and len(selected) >= head:
-                truncated = True
+                has_more = True
                 return True
             encoded_size = len(value.encode("utf-8"))
             separator_size = 1 if selected else 0
             if output_bytes + separator_size + encoded_size > MAX_RESPONSE_BYTES:
-                truncated = True
+                hard_truncated = True
                 return True
             selected.append(value)
             output_bytes += separator_size + encoded_size
@@ -1154,10 +1161,14 @@ class ClientToolDispatcher:
                         break
                 except (TimeoutError, regex.error) as exc:
                     raise ToolFailure("tool_invalid_regex", "Regex pattern is invalid") from exc
-                if truncated:
+                if has_more or hard_truncated:
                     break
-        if truncated:
-            selected.append(f"(truncated, showing {len(selected)} results)")
+        if hard_truncated:
+            selected.append(f"(truncated at response byte limit, showing {len(selected)} results)")
+        elif has_more:
+            selected.append(
+                f"(more results available; use offset={offset + len(selected)} to continue)"
+            )
         return ToolOutput("\n".join(selected) or "(no matches)")
 
     async def _notebook_edit(self, args: dict[str, Any]) -> ToolOutput:
@@ -1172,7 +1183,7 @@ class ClientToolDispatcher:
             raise ToolFailure("tool_invalid_args", "Notebook edit mode is invalid")
         if mode != "delete" and source is None:
             raise ToolFailure("tool_invalid_args", f"{mode} requires new_source")
-        target = self._paths.resolve(path, directory=False)
+        target = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(target)):
             initial = await self._run_blocking(_capture_regular, target, MAX_TEXT_EDIT_BYTES)
             updated = await self._run_blocking(
@@ -1475,11 +1486,23 @@ async def _run_mutation(
         raise
 
 
-class _TransferCrossDeviceError(Exception):
-    pass
+async def _run_irreversible_mutation[T](
+    tracker: set[asyncio.Task[Any]],
+    function: Callable[..., T],
+    *args: Any,
+) -> T:
+    """Return the true result once a no-rollback filesystem operation starts."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    _track_blocking_task(tracker, task)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
 
 
-async def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
+def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
     try:
         initial = os.lstat(path)
     except FileNotFoundError as exc:
@@ -1490,7 +1513,12 @@ async def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, i
         raise ToolFailure("workspace_symlink_escape", "Source path is a symbolic link")
     if not stat.S_ISREG(initial.st_mode):
         raise ToolFailure("workspace_blocked_path", "Source is not a regular file")
-    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_BINARY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_NONBLOCK", 0))
+    )
     descriptor: int | None = None
     try:
         descriptor = os.open(path, flags)
@@ -1503,7 +1531,7 @@ async def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, i
     except OSError as exc:
         if descriptor is not None:
             with contextlib.suppress(OSError):
-                await _run_mutation(os.close, descriptor)
+                os.close(descriptor)
         raise ToolFailure("workspace_permission_denied", "Source file is unavailable") from exc
     assert descriptor is not None
     if not stat.S_ISREG(opened.st_mode):
@@ -1518,7 +1546,7 @@ async def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, i
     return descriptor, identity
 
 
-async def _create_transfer_temp(parent: Path, name: str) -> tuple[int, Path]:
+def _create_transfer_temp(parent: Path, name: str) -> tuple[int, Path]:
     try:
         descriptor, raw_path = tempfile.mkstemp(
             prefix=f".{name}.openoctopus-", dir=parent
@@ -1592,21 +1620,188 @@ def _link_transfer_no_replace(source: Path, destination: Path) -> None:
     except FileExistsError as exc:
         raise ToolFailure("workspace_file_changed", "Destination already exists") from exc
     except OSError as exc:
-        if exc.errno == errno.EXDEV:
-            raise _TransferCrossDeviceError from exc
         raise ToolFailure(
             "workspace_storage_unavailable", "Atomic no-overwrite commit is unavailable"
         ) from exc
     _fsync_directory(destination.parent)
 
 
+def _rename_transfer_no_replace(
+    source: Path,
+    destination: Path,
+    source_fd: int,
+) -> None:
+    """Move one file with the platform's exclusive, same-volume rename primitive."""
+
+    if sys.platform.startswith("linux"):
+        try:
+            rename = ctypes.CDLL(None, use_errno=True).renameat2
+        except AttributeError as exc:
+            raise ToolFailure(
+                "workspace_storage_unavailable",
+                "Exclusive same-volume move is unavailable",
+            ) from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = rename(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            1,
+        )
+        if result != 0:
+            _raise_exclusive_move_error(ctypes.get_errno())
+    elif sys.platform == "darwin":
+        try:
+            rename = ctypes.CDLL(None, use_errno=True).renameatx_np
+        except AttributeError as exc:
+            raise ToolFailure(
+                "workspace_storage_unavailable",
+                "Exclusive same-volume move is unavailable",
+            ) from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = rename(
+            -2,
+            os.fsencode(source),
+            -2,
+            os.fsencode(destination),
+            0x00000004,
+        )
+        if result != 0:
+            _raise_exclusive_move_error(ctypes.get_errno())
+    elif os.name == "nt":
+        _rename_windows_handle_no_replace(source_fd, destination)
+    else:
+        raise ToolFailure(
+            "workspace_storage_unavailable",
+            "Exclusive same-volume move is unavailable",
+        )
+    with contextlib.suppress(OSError):
+        _fsync_directory(destination.parent)
+    if source.parent != destination.parent:
+        with contextlib.suppress(OSError):
+            _fsync_directory(source.parent)
+
+
+def _raise_exclusive_move_error(error: int) -> None:
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ToolFailure("workspace_file_changed", "Destination already exists")
+    if error == errno.EXDEV:
+        raise ToolFailure(
+            "workspace_storage_unavailable",
+            "Same-volume exclusive move is required",
+        )
+    if error in {
+        errno.EINVAL,
+        getattr(errno, "ENOSYS", -1),
+        getattr(errno, "ENOTSUP", -1),
+        getattr(errno, "EOPNOTSUPP", -1),
+    }:
+        raise ToolFailure(
+            "workspace_storage_unavailable",
+            "Exclusive same-volume move is unavailable",
+        )
+    raise ToolFailure(
+        "workspace_storage_unavailable",
+        "Workspace move could not be completed",
+    )
+
+
+def _rename_windows_handle_no_replace(source_fd: int, destination: Path) -> None:
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    encoded = str(destination).encode("utf-16-le")
+    file_name_offset = FileRenameInfo.file_name.offset
+    buffer = ctypes.create_string_buffer(file_name_offset + len(encoded))
+    info = ctypes.cast(buffer, ctypes.POINTER(FileRenameInfo)).contents
+    info.flags = 0
+    info.root_directory = None
+    info.file_name_length = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + file_name_offset, encoded, len(encoded))
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    set_file_information = kernel32.SetFileInformationByHandle
+    set_file_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    set_file_information.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_fd))  # type: ignore[attr-defined]
+    if not set_file_information(handle, 22, buffer, len(buffer)):
+        error = getattr(ctypes, "get_last_error")()
+        if error in {80, 183}:
+            raise ToolFailure("workspace_file_changed", "Destination already exists")
+        if error == 17:
+            raise ToolFailure(
+                "workspace_storage_unavailable",
+                "Same-volume exclusive move is required",
+            )
+        if error in {1, 50, 87}:
+            raise ToolFailure(
+                "workspace_storage_unavailable",
+                "Exclusive same-volume move is unavailable",
+            )
+        raise ToolFailure(
+            "workspace_storage_unavailable",
+            "Workspace move could not be completed",
+        )
+
+
+def _rename_verify_and_hash_fd(
+    source: Path,
+    destination: Path,
+    source_fd: int,
+    initial: tuple[int, int, int, int, int],
+    bytes_transferred: int,
+    digest: str,
+) -> tuple[int, str]:
+    """Rename exclusively and repair a digest only if the commit-race changed content."""
+
+    _rename_transfer_no_replace(source, destination, source_fd)
+    if _transfer_identity(os.fstat(source_fd)) == initial:
+        return bytes_transferred, digest
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    updated_digest = hashlib.sha256()
+    updated_bytes = 0
+    while chunk := os.read(source_fd, 64 * 1024):
+        updated_digest.update(chunk)
+        updated_bytes += len(chunk)
+    return updated_bytes, updated_digest.hexdigest()
+
+
 def _source_unchanged(
     path: Path, descriptor: int, initial: tuple[int, int, int, int, int]
 ) -> bool:
     try:
-        return _transfer_identity(os.fstat(descriptor))[:4] == initial[:4] and _transfer_identity(
+        return _transfer_identity(os.fstat(descriptor)) == initial and _transfer_identity(
             os.lstat(path)
-        )[:4] == initial[:4]
+        ) == initial
     except OSError:
         return False
 
@@ -1654,7 +1849,12 @@ def _read_regular_with_fingerprint(path: Path, limit: int) -> tuple[bytes, FileF
 
 
 def _read_regular_fd(path: Path, limit: int) -> tuple[bytes, os.stat_result]:
-    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_BINARY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_NONBLOCK", 0))
+    )
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError as exc:
@@ -1730,9 +1930,15 @@ def _apply_text_edit(
 def _matches(text: str, needle: str) -> list[tuple[int, int, int]]:
     result: list[tuple[int, int, int]] = []
     start = 0
+    line = 1
+    counted_to = 0
     while (index := text.find(needle, start)) >= 0:
-        result.append((index, index + len(needle), text.count("\n", 0, index) + 1))
+        line += text.count("\n", counted_to, index)
+        result.append((index, index + len(needle), line))
+        if len(result) > 1000:
+            raise ToolFailure("tool_ambiguous_edit", "Fuzzy match candidate limit exceeded")
         start = index + len(needle)
+        counted_to = index
     return result
 
 
@@ -1758,6 +1964,10 @@ def _trimmed_matches(text: str, needle: str) -> list[tuple[int, int, int]]:
                     index + 1,
                 )
             )
+            if len(result) > 1000:
+                raise ToolFailure(
+                    "tool_ambiguous_edit", "Fuzzy match candidate limit exceeded"
+                )
     return result
 
 
@@ -1904,7 +2114,7 @@ def _directory_page(
         items=page,
         limit=limit,
         offset=offset,
-        next_offset=None if truncated else offset + limit if len(values) > offset + limit else None,
+        next_offset=offset + limit if len(values) > offset + limit else None,
         truncated=truncated,
     )
 
@@ -2058,10 +2268,6 @@ def _optional_int(
     if name not in args or args[name] is None:
         return None
     return _int_arg(args, name, minimum=minimum, maximum=maximum)
-
-
-def _safe_message(exc: Exception) -> str:
-    return str(exc)[:512] or "Tool arguments are invalid"
 
 
 def _fsync_directory(path: Path) -> None:

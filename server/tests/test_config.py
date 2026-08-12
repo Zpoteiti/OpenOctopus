@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from openctopus_server.config import Settings, get_settings
+from openctopus_server.devices.protocol import MAX_TOOL_CALL_RESERVATION_BYTES
 
 REQUIRED_ENV_VARS = {
     "OPENOCTOPUS_DATABASE_URL": "postgresql+asyncpg://u:p@localhost/db",
@@ -90,6 +91,28 @@ def test_settings_rejects_empty_admin_token(monkeypatch, valid_env):
         Settings(_env_file=None)
 
 
+def test_pending_byte_limits_fit_one_maximum_legal_device_call(monkeypatch, valid_env):
+    monkeypatch.setenv(
+        "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER",
+        str(MAX_TOOL_CALL_RESERVATION_BYTES - 1),
+    )
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv(
+        "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER",
+        str(MAX_TOOL_CALL_RESERVATION_BYTES),
+    )
+    monkeypatch.setenv(
+        "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX",
+        str(MAX_TOOL_CALL_RESERVATION_BYTES + 1),
+    )
+
+    settings = Settings(_env_file=None)
+    assert settings.device_pending_bytes_max_per_user == MAX_TOOL_CALL_RESERVATION_BYTES
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_settings_rejects_blank_object_storage_region(monkeypatch, valid_env, value):
     monkeypatch.setenv("OPENOCTOPUS_OBJECT_STORAGE_REGION", value)
@@ -132,8 +155,14 @@ def test_settings_accepts_object_storage_connection_boundaries(monkeypatch, vali
         ("OPENOCTOPUS_CHAT_CONTEXT_QUEUE_TIMEOUT_SECONDS", "0"),
         ("OPENOCTOPUS_DEVICE_PENDING_CALLS_MAX", "63"),
         ("OPENOCTOPUS_DEVICE_PENDING_CALLS_MAX_PER_USER", "0"),
-        ("OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX", "16777215"),
-        ("OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER", "1048575"),
+        (
+            "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX",
+            str(MAX_TOOL_CALL_RESERVATION_BYTES),
+        ),
+        (
+            "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER",
+            str(MAX_TOOL_CALL_RESERVATION_BYTES - 1),
+        ),
         ("OPENOCTOPUS_DEVICE_TRANSFER_MAX_CONCURRENCY", "1"),
         ("OPENOCTOPUS_DEVICE_TRANSFER_MAX_CONCURRENCY_PER_USER", "0"),
         ("OPENOCTOPUS_DEVICE_TRANSFER_QUEUE_TIMEOUT_SECONDS", "0"),
@@ -185,8 +214,12 @@ def test_settings_rejects_out_of_range_capacity_values(
         ),
         (
             {
-                "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX": "16777216",
-                "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER": "16777216",
+                "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX": str(
+                    MAX_TOOL_CALL_RESERVATION_BYTES + 1
+                ),
+                "OPENOCTOPUS_DEVICE_PENDING_BYTES_MAX_PER_USER": str(
+                    MAX_TOOL_CALL_RESERVATION_BYTES + 1
+                ),
             },
             "per-user device pending bytes",
         ),

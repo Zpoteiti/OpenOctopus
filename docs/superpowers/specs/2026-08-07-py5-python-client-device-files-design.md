@@ -108,7 +108,8 @@ must not be mixed independently with this proposal.
 - Client-to-client transfer/bridge.
 - Recursive folder upload, download, copy, or move. Agents transfer individual
   files in Py5.
-- HTTP Range, transfer resume, resumable partials, deduplication, and compression.
+- HTTP Range, transfer resume, resumable partials, transfer-content
+  deduplication, and compression.
 - VLM, OCR, audio, video, Azure, YouTube, archive recursion, and remote-document
   conversion.
 - A frontend. Py5 supplies consistent APIs for a later frontend.
@@ -532,6 +533,13 @@ unlinking the temporary name. A platform/filesystem without a proven atomic
 no-replace operation returns a conflict/unsupported error; it never falls back
 to `os.replace`. Temporary names are random, hidden, and removed on all failures.
 
+Local move uses the platform-native exclusive no-replace rename primitive:
+Linux `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`, and a
+handle-based no-replace rename on Windows. It is zero-copy and same-volume only.
+Cross-volume moves and platforms/filesystems without that primitive fail
+explicitly without changing either source or destination; moves never use a
+hard-link or implicit copy fallback.
+
 For an external user/editor race, the client compares the source identity and a
 content/metadata fingerprint immediately before commit. A detected change
 returns `workspace_file_changed`. There is still an unavoidable final
@@ -778,6 +786,7 @@ sidecar ref on the existing assistant tool-use row:
 {
   "tool_use_id": "...",
   "type": "device_file",
+  "device_id": "0190d5a7-...",
   "openoctopus_device": "alice-laptop",
   "path": "reports/a.pdf",
   "filename": "a.pdf",
@@ -786,20 +795,28 @@ sidecar ref on the existing assistant tool-use row:
 }
 ```
 
-`size` is optional; sending a message never opens a relay merely to discover
-metadata. The ref is returned by message-history APIs but never appears in
-`messages.content` or a Provider request.
+`device_id` is the immutable owned-device identity captured when the ref is
+created; `openoctopus_device` is the captured name. `size` is optional; sending
+a message never opens a relay merely to discover metadata. The ref is returned
+by message-history APIs but never appears in `messages.content` or a Provider
+request.
 
 When a browser later calls the normal Workspace Files GET with the ref's device
 and path, the server:
 
-1. authenticates the browser and proves the device still belongs to that user;
+1. authenticates the browser, resolves the captured immutable `device_id`, and
+   proves it still belongs to that user and still has the captured
+   `openoctopus_device` name;
 2. acquires per-user/global transfer admission;
 3. sends `transfer_request(purpose="http_relay")`;
 4. waits for validated metadata before starting HTTP headers;
 5. forwards bounded chunks directly into the response;
 6. cancels the device slot on browser disconnect, idle timeout, or checksum
    failure.
+
+Relay never resolves by name alone. Renaming or deleting the captured device,
+or pairing a different device later under the same name, makes the old ref fail
+closed; it cannot silently retarget the download.
 
 The response uses `Content-Length` when known, a sanitized RFC-compatible
 `Content-Disposition`, `application/octet-stream` unless the client supplies a

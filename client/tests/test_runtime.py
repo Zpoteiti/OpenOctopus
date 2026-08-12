@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import os
 import threading
@@ -43,6 +45,7 @@ from openoctopus_client.protocol import (
 )
 from openoctopus_client.tools import ToolOutput
 from openoctopus_client.tools import dispatcher as dispatcher_module
+from openoctopus_client.tools.common import ToolFailure
 from openoctopus_client.writer import SerializedWriter, WriterOverflowError
 
 
@@ -247,6 +250,7 @@ def test_reconnect_policy_and_backoff_are_bounded_and_deterministic() -> None:
     assert reconnect_disposition(close_code=4401) == ReconnectDisposition.PERMANENT_AUTH
     assert reconnect_disposition(close_code=4409) == ReconnectDisposition.PERMANENT_CONFIG
     assert reconnect_disposition(close_code=4408) == ReconnectDisposition.RETRY
+    assert reconnect_disposition(close_code=1006) == ReconnectDisposition.RETRY
     assert reconnect_disposition(close_code=1002) == ReconnectDisposition.PERMANENT_CONFIG
     assert reconnect_disposition(close_code=1000) == ReconnectDisposition.RETRY
     assert reconnect_disposition(close_code=1001) == ReconnectDisposition.RETRY
@@ -268,10 +272,16 @@ def test_reconnect_helpers_handle_websocket_close_and_retry_after() -> None:
     class ClosedError(Exception):
         code = 4409
 
+    class AbnormalClosedError(Exception):
+        code = 1006
+
     assert reconnect_disposition_from_exception(UpgradeError()) == ReconnectDisposition.RETRY
     assert retry_after_from_exception(UpgradeError()) == 12.0
     assert (
         reconnect_disposition_from_exception(ClosedError()) == ReconnectDisposition.PERMANENT_CONFIG
+    )
+    assert reconnect_disposition_from_exception(AbnormalClosedError()) == (
+        ReconnectDisposition.RETRY
     )
     assert reconnect_disposition_from_exception(OSError("network down")) == (
         ReconnectDisposition.RETRY
@@ -1064,6 +1074,643 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
         assert result["content"] == "old"
         closed.set()
         assert await asyncio.wait_for(task, timeout=1) == CloseDisposition.RETRY
+
+    asyncio.run(exercise())
+
+
+def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old_config(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+        update_id = UUID("0190d5a7-0000-7000-8000-000000000002")
+        ping_id = UUID("0190d5a7-0000-7000-8000-000000000003")
+        call_id = UUID("0190d5a7-0000-7000-8000-000000000004")
+        update_started = threading.Event()
+        release_update = threading.Event()
+        observed_while_preparing: list[tuple[bool, bool]] = []
+        close_socket = asyncio.Event()
+
+        class Dispatcher:
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+            async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
+                del name, args
+                return ToolOutput(self.label)
+
+        def make_dispatcher(
+            workspace: Path, sandbox_mode: bool, denylist: list[str]
+        ) -> Dispatcher:
+            del sandbox_mode, denylist
+            if workspace.name == "new":
+                update_started.set()
+                release_update.wait(timeout=2)
+            return Dispatcher(workspace.name)
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.frames = iter(
+                    [
+                        HelloAck(
+                            id=hello_id,
+                            device_name="device",
+                            config=DeviceConfig(
+                                workspace_path=str(tmp_path / "old"),
+                                sandbox_mode=True,
+                                ssrf_denylist=[],
+                            ),
+                        ).model_dump_json(),
+                        ConfigUpdate(
+                            id=update_id,
+                            device_name="device",
+                            config=DeviceConfig(
+                                workspace_path=str(tmp_path / "new"),
+                                sandbox_mode=True,
+                                ssrf_denylist=[],
+                            ),
+                        ).model_dump_json(),
+                        Ping(id=ping_id).model_dump_json(),
+                        ToolCall(
+                            id=call_id,
+                            name="read_file",
+                            args={"path": "notes.txt"},
+                            max_result_bytes=4096,
+                        ).model_dump_json(),
+                    ]
+                )
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                self.sent.append(payload)
+
+            async def recv(self) -> str | None:
+                try:
+                    return next(self.frames)
+                except StopIteration:
+                    await close_socket.wait()
+                    return None
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        (tmp_path / "old").mkdir()
+        (tmp_path / "new").mkdir()
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            tool_dispatcher_factory=make_dispatcher,
+        )
+        task = asyncio.create_task(runtime.run_connection(socket))
+
+        def observe_and_release() -> None:
+            assert update_started.wait(timeout=1)
+            time.sleep(0.05)
+            frame_types = [json.loads(item)["type"] for item in socket.sent]
+            observed_while_preparing.append(
+                ("pong" in frame_types, "tool_result" in frame_types)
+            )
+            release_update.set()
+
+        observer = threading.Thread(target=observe_and_release)
+        observer.start()
+        try:
+            assert await asyncio.to_thread(update_started.wait, 1)
+            await asyncio.to_thread(observer.join, 1)
+            assert observed_while_preparing == [(True, False)]
+            for _ in range(100):
+                if any(json.loads(item)["type"] == "tool_result" for item in socket.sent):
+                    break
+                await asyncio.sleep(0.001)
+            result = next(
+                json.loads(item)
+                for item in socket.sent
+                if json.loads(item)["type"] == "tool_result"
+            )
+            assert result["content"] == "new"
+        finally:
+            release_update.set()
+            close_socket.set()
+            assert await asyncio.wait_for(task, timeout=1) == CloseDisposition.RETRY
+
+    asyncio.run(exercise())
+
+
+def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000101")
+        release_preparation = threading.Event()
+        all_updates_received = asyncio.Event()
+
+        class Dispatcher:
+            async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
+                del name, args
+                return ToolOutput("unused")
+
+        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
+            del sandbox_mode, denylist
+            if workspace.name != "initial":
+                release_preparation.wait(timeout=2)
+            return Dispatcher()
+
+        frames = [
+            HelloAck(
+                id=hello_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(tmp_path / "initial"),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json(),
+            *(
+                ConfigUpdate(
+                    id=UUID(f"0190d5a7-0000-7000-8000-{index:012x}"),
+                    device_name="device",
+                    config=DeviceConfig(
+                        workspace_path=str(tmp_path / f"update-{index}"),
+                        sandbox_mode=True,
+                        ssrf_denylist=[],
+                    ),
+                ).model_dump_json()
+                for index in range(1, 18)
+            ),
+        ]
+
+        class Socket:
+            def __init__(self) -> None:
+                self.index = 0
+
+            async def send(self, payload: str | bytes) -> None:
+                del payload
+
+            async def recv(self) -> str:
+                if self.index < len(frames):
+                    frame = frames[self.index]
+                    self.index += 1
+                    if self.index == len(frames):
+                        all_updates_received.set()
+                    return frame
+                await asyncio.Future()
+                raise AssertionError("unreachable")
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        (tmp_path / "initial").mkdir()
+        for index in range(1, 18):
+            (tmp_path / f"update-{index}").mkdir()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            tool_dispatcher_factory=make_dispatcher,
+        )
+        connection = asyncio.create_task(runtime.run_connection(Socket()))
+        try:
+            await asyncio.wait_for(all_updates_received.wait(), timeout=1)
+            release_preparation.set()
+            with pytest.raises(RuntimeError) as caught:
+                await asyncio.wait_for(connection, timeout=1)
+            assert reconnect_disposition_from_exception(caught.value) is ReconnectDisposition.RETRY
+        finally:
+            release_preparation.set()
+            if not connection.done():
+                connection.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await connection
+
+    asyncio.run(exercise())
+
+
+def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000111")
+        call_id = UUID("0190d5a7-0000-7000-8000-000000000112")
+        incoming: asyncio.Queue[str | None] = asyncio.Queue()
+        blocking_started = threading.Event()
+        release_blocking = threading.Event()
+        timeout_sent = asyncio.Event()
+
+        def blocking_read(path: Path, limit: int) -> bytes:
+            del path, limit
+            blocking_started.set()
+            release_blocking.wait(timeout=2)
+            return b"content\n"
+
+        class Socket:
+            async def send(self, payload: str | bytes) -> None:
+                if isinstance(payload, str):
+                    frame = json.loads(payload)
+                    if frame.get("type") == "tool_result" and frame.get("id") == str(call_id):
+                        timeout_sent.set()
+
+            async def recv(self) -> str | None:
+                return await incoming.get()
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
+        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+        )
+        connection = asyncio.create_task(runtime.run_connection(Socket()))
+        await incoming.put(
+            HelloAck(
+                id=hello_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(tmp_path),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json()
+        )
+        await incoming.put(
+            ToolCall(
+                id=call_id,
+                name="read_file",
+                args={"path": "notes.txt"},
+                max_result_bytes=4096,
+            ).model_dump_json()
+        )
+        try:
+            assert await asyncio.to_thread(blocking_started.wait, 1)
+            await asyncio.wait_for(timeout_sent.wait(), timeout=1)
+            await incoming.put(None)
+            await asyncio.sleep(0.05)
+            assert connection.done() is False
+
+            release_blocking.set()
+            assert await asyncio.wait_for(connection, timeout=1) is CloseDisposition.RETRY
+        finally:
+            release_blocking.set()
+            if not connection.done():
+                connection.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await connection
+
+    asyncio.run(exercise())
+
+
+def test_config_update_orders_following_transfer_request_without_blocking_ping(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000011")
+        update_id = UUID("0190d5a7-0000-7000-8000-000000000012")
+        ping_id = UUID("0190d5a7-0000-7000-8000-000000000013")
+        transfer_id = UUID("0190d5a7-0000-7000-8000-000000000014")
+        update_started = threading.Event()
+        release_update = threading.Event()
+        incoming: asyncio.Queue[str | None] = asyncio.Queue()
+
+        class Dispatcher:
+            async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
+                del name, args
+                return ToolOutput("unused")
+
+        def make_dispatcher(
+            workspace: Path, sandbox_mode: bool, denylist: list[str]
+        ) -> Dispatcher:
+            del sandbox_mode, denylist
+            if workspace.name == "new":
+                update_started.set()
+                release_update.wait(timeout=2)
+            return Dispatcher()
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                self.sent.append(payload)
+
+            async def recv(self) -> str | None:
+                return await incoming.get()
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        old_workspace = tmp_path / "old"
+        new_workspace = tmp_path / "new"
+        old_workspace.mkdir()
+        new_workspace.mkdir()
+        (new_workspace / "source.txt").write_text("new source", encoding="utf-8")
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            tool_dispatcher_factory=make_dispatcher,
+        )
+        connection = asyncio.create_task(runtime.run_connection(socket))
+        await incoming.put(
+            HelloAck(
+                id=hello_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(old_workspace),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json()
+        )
+        await incoming.put(
+            ConfigUpdate(
+                id=update_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(new_workspace),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json()
+        )
+        await incoming.put(Ping(id=ping_id).model_dump_json())
+        await incoming.put(
+            TransferRequest(
+                id=transfer_id,
+                purpose="file_transfer",
+                src_path="source.txt",
+                dst_path="copied.txt",
+            ).model_dump_json()
+        )
+
+        try:
+            assert await asyncio.to_thread(update_started.wait, 1)
+            for _ in range(100):
+                if any(json.loads(item)["type"] == "pong" for item in socket.sent):
+                    break
+                await asyncio.sleep(0.001)
+            frame_types = [json.loads(item)["type"] for item in socket.sent]
+            assert "pong" in frame_types
+            assert "transfer_begin" not in frame_types
+            assert "transfer_end" not in frame_types
+
+            release_update.set()
+            for _ in range(200):
+                if any(json.loads(item)["type"] == "transfer_begin" for item in socket.sent):
+                    break
+                await asyncio.sleep(0.001)
+            begin = next(
+                json.loads(item)
+                for item in socket.sent
+                if json.loads(item)["type"] == "transfer_begin"
+            )
+            assert begin["id"] == str(transfer_id)
+            assert begin["total_bytes"] == len(b"new source")
+        finally:
+            release_update.set()
+            await incoming.put(None)
+            assert await asyncio.wait_for(connection, timeout=1) == CloseDisposition.RETRY
+
+    asyncio.run(exercise())
+
+
+def test_config_update_orders_following_transfer_begin_to_new_workspace(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000021")
+        update_id = UUID("0190d5a7-0000-7000-8000-000000000022")
+        ping_id = UUID("0190d5a7-0000-7000-8000-000000000023")
+        transfer_id = UUID("0190d5a7-0000-7000-8000-000000000024")
+        update_started = threading.Event()
+        release_update = threading.Event()
+        incoming: asyncio.Queue[str | None] = asyncio.Queue()
+
+        class Dispatcher:
+            async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
+                del name, args
+                return ToolOutput("unused")
+
+        def make_dispatcher(
+            workspace: Path, sandbox_mode: bool, denylist: list[str]
+        ) -> Dispatcher:
+            del sandbox_mode, denylist
+            if workspace.name == "new":
+                update_started.set()
+                release_update.wait(timeout=2)
+            return Dispatcher()
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                self.sent.append(payload)
+
+            async def recv(self) -> str | None:
+                return await incoming.get()
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        old_workspace = tmp_path / "old"
+        new_workspace = tmp_path / "new"
+        old_workspace.mkdir()
+        new_workspace.mkdir()
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            tool_dispatcher_factory=make_dispatcher,
+        )
+        connection = asyncio.create_task(runtime.run_connection(socket))
+        await incoming.put(
+            HelloAck(
+                id=hello_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(old_workspace),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json()
+        )
+        await incoming.put(
+            ConfigUpdate(
+                id=update_id,
+                device_name="device",
+                config=DeviceConfig(
+                    workspace_path=str(new_workspace),
+                    sandbox_mode=True,
+                    ssrf_denylist=[],
+                ),
+            ).model_dump_json()
+        )
+        await incoming.put(Ping(id=ping_id).model_dump_json())
+        await incoming.put(
+            TransferBegin(
+                id=transfer_id,
+                direction="server_to_client",
+                purpose="file_transfer",
+                src_device="server",
+                src_path="source.txt",
+                dst_device="device",
+                dst_path="received.txt",
+                total_bytes=0,
+            ).model_dump_json()
+        )
+
+        try:
+            assert await asyncio.to_thread(update_started.wait, 1)
+            for _ in range(100):
+                if any(json.loads(item)["type"] == "pong" for item in socket.sent):
+                    break
+                await asyncio.sleep(0.001)
+            frame_types = [json.loads(item)["type"] for item in socket.sent]
+            assert "pong" in frame_types
+            assert "transfer_ready" not in frame_types
+
+            release_update.set()
+            for _ in range(200):
+                if any(json.loads(item)["type"] == "transfer_ready" for item in socket.sent):
+                    break
+                await asyncio.sleep(0.001)
+            assert any(json.loads(item)["type"] == "transfer_ready" for item in socket.sent)
+            await incoming.put(
+                TransferEnd(
+                    id=transfer_id,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=0,
+                    sha256=hashlib.sha256(b"").hexdigest(),
+                ).model_dump_json()
+            )
+            for _ in range(200):
+                if any(
+                    json.loads(item)["type"] == "transfer_end"
+                    and json.loads(item).get("ack") is True
+                    for item in socket.sent
+                ):
+                    break
+                await asyncio.sleep(0.001)
+            assert (new_workspace / "received.txt").read_bytes() == b""
+            assert not (old_workspace / "received.txt").exists()
+        finally:
+            release_update.set()
+            await incoming.put(None)
+            assert await asyncio.wait_for(connection, timeout=1) == CloseDisposition.RETRY
+
+    asyncio.run(exercise())
+
+
+def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -> None:
+    async def exercise() -> BaseException:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+
+        def reject(
+            workspace: Path, sandbox_mode: bool, denylist: list[str]
+        ) -> Any:
+            del workspace, sandbox_mode, denylist
+            raise ToolFailure(
+                "workspace_permission_denied",
+                f"cannot inspect {tmp_path / 'private-secret'}",
+            )
+
+        socket = _RecordingSocket(
+            [
+                HelloAck(
+                    id=hello_id,
+                    device_name="device",
+                    config=DeviceConfig(
+                        workspace_path=str(tmp_path),
+                        sandbox_mode=True,
+                        ssrf_denylist=[],
+                    ),
+                ).model_dump_json()
+            ]
+        )
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            tool_dispatcher_factory=reject,
+        )
+        try:
+            await runtime.run_connection(socket)
+        except BaseException as exc:
+            return exc
+        raise AssertionError("configuration preparation unexpectedly succeeded")
+
+    failure = asyncio.run(exercise())
+    assert reconnect_disposition_from_exception(failure) is ReconnectDisposition.RETRY
+    assert "private-secret" not in str(failure)
+
+
+def test_tool_worker_waits_for_timed_out_thread_before_dequeuing_next_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = 0
+        sent = asyncio.Event()
+
+        def blocking_read(path: Path, limit: int) -> bytes:
+            nonlocal calls
+            del path, limit
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+            return b"content\n"
+
+        class Writer:
+            def __init__(self) -> None:
+                self.frames: list[str] = []
+
+            def enqueue_normal(self, payload: str) -> None:
+                self.frames.append(payload)
+                sent.set()
+
+        monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
+        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
+        dispatcher = dispatcher_module.ClientToolDispatcher(
+            tmp_path, sandbox_mode=True, ssrf_denylist=[]
+        )
+        runtime = ClientRuntime(load_config(_environment()))
+        writer = Writer()
+        worker = _ToolWorker(runtime, cast(Any, writer))
+        first = ToolCall(
+            id=UUID("0190d5a7-0000-7000-8000-000000000002"),
+            name="read_file",
+            args={"path": "first.txt"},
+            max_result_bytes=4096,
+        )
+        second = ToolCall(
+            id=UUID("0190d5a7-0000-7000-8000-000000000003"),
+            name="read_file",
+            args={"path": "second.txt"},
+            max_result_bytes=4096,
+        )
+        assert worker.enqueue(first, dispatcher)
+        assert worker.enqueue(second, dispatcher)
+        try:
+            assert await asyncio.to_thread(first_started.wait, 1)
+            await asyncio.wait_for(sent.wait(), timeout=1)
+            assert json.loads(writer.frames[0])["code"] == "tool_exec_timeout"
+            await asyncio.sleep(0.05)
+            assert calls == 1
+            release_first.set()
+            for _ in range(100):
+                if len(writer.frames) == 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert len(writer.frames) == 2
+            assert calls == 2
+        finally:
+            release_first.set()
+            await worker.stop()
 
     asyncio.run(exercise())
 

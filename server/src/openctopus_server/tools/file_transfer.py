@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -14,6 +15,7 @@ from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
     ConnectionHandle,
     DeviceBusyError,
+    DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
 from openctopus_server.devices.transfer import (
@@ -204,7 +206,7 @@ class _TransferWorkspace(Protocol):
         *,
         size: int,
         sha256: str,
-    ) -> None: ...
+    ) -> bool: ...
 
 
 class _TransferRegistry(Protocol):
@@ -218,6 +220,14 @@ class _TransferRegistry(Protocol):
         expected_device_name: str | None = None,
     ) -> ConnectionHandle | None: ...
 
+    async def get_route_snapshot(
+        self,
+        device_id: UUID,
+        *,
+        user_id: UUID,
+        expected_device_name: str,
+    ) -> DeviceRouteSnapshot | None: ...
+
     async def dispatch_tool(
         self,
         *,
@@ -228,6 +238,18 @@ class _TransferRegistry(Protocol):
         max_result_bytes: int,
         timeout_seconds: float,
         expected_device_name: str | None = None,
+    ) -> Any: ...
+
+    async def dispatch_tool_on_snapshot(
+        self,
+        *,
+        route: DeviceRouteSnapshot,
+        user_id: UUID,
+        expected_device_name: str,
+        name: str,
+        args: dict[str, object],
+        max_result_bytes: int,
+        timeout_seconds: float,
     ) -> Any: ...
 
 
@@ -264,9 +286,15 @@ class FileTransferTool(Tool):
             return _error(ErrorCode.TOOL_INVALID_ARGS, f"Invalid file transfer arguments: {exc}")
 
         try:
-            outcome = await self.transfer(parsed, user_id=ctx.user_id)
+            outcome = await self.transfer(
+                parsed,
+                user_id=ctx.user_id,
+                device_targets=ctx.device_targets,
+            )
         except (DeviceBusyError, TransferBusyError):
             return _error(ErrorCode.TOOL_DEVICE_BUSY, "Device transfer capacity is exhausted")
+        except TimeoutError:
+            return _error(ErrorCode.WORKSPACE_TRANSFER_TIMEOUT, "File transfer timed out")
         except (DeviceUnavailableError, TransferDisconnectedError):
             return _error(ErrorCode.TOOL_DEVICE_UNREACHABLE, "The paired device is unavailable")
         except TransferIntegrityError:
@@ -299,6 +327,7 @@ class FileTransferTool(Tool):
         request: FileTransferRequest,
         *,
         user_id: UUID,
+        device_targets: Mapping[str, UUID] | None = None,
     ) -> FileTransferOutcome:
         """Run one validated transfer and return its machine outcome.
 
@@ -339,11 +368,11 @@ class FileTransferTool(Tool):
             request.openoctopus_src_device != "server"
             and request.openoctopus_dst_device == request.openoctopus_src_device
         ):
-            result = await self._client_to_client(request, user_id)
+            result = await self._client_to_client(request, user_id, device_targets)
         elif request.openoctopus_src_device == "server":
-            result = await self._server_to_client(request, user_id)
+            result = await self._server_to_client(request, user_id, device_targets)
         else:
-            result = await self._client_to_server(request, user_id)
+            result = await self._client_to_server(request, user_id, device_targets)
         return _coerce_transfer_outcome(result)
 
     async def _server_to_server(
@@ -373,16 +402,21 @@ class FileTransferTool(Tool):
         self,
         parsed: FileTransferRequest,
         user_id: UUID,
+        device_targets: Mapping[str, UUID] | None,
     ) -> Any:
         workspace = self._require_workspace()
         registry = self._require_registry()
-        device_id = await self._device_id(user_id, parsed.openoctopus_dst_device)
-        handle = await registry.get_handle(
+        device_id = await self._device_id_for_call(
+            user_id,
+            parsed.openoctopus_dst_device,
+            device_targets,
+        )
+        route = await registry.get_route_snapshot(
             device_id,
             user_id=user_id,
             expected_device_name=parsed.openoctopus_dst_device,
         )
-        if handle is None:
+        if route is None:
             raise DeviceUnavailableError("Destination device is offline")
         async with AsyncSession(self._require_engine(), expire_on_commit=False) as db:
             ticket = await workspace.authorize_transfer_source(
@@ -403,7 +437,8 @@ class FileTransferTool(Tool):
             await workspace.delete_transfer_source(ticket, if_match=source.etag)
 
         return await registry.transfers.start_server_to_client(
-            handle=handle,
+            handle=route.handle,
+            route=route,
             user_id=user_id,
             src_path=parsed.src_path,
             dst_path=parsed.dst_path,
@@ -418,16 +453,21 @@ class FileTransferTool(Tool):
         self,
         parsed: FileTransferRequest,
         user_id: UUID,
+        device_targets: Mapping[str, UUID] | None,
     ) -> Any:
         workspace = self._require_workspace()
         registry = self._require_registry()
-        device_id = await self._device_id(user_id, parsed.openoctopus_src_device)
-        handle = await registry.get_handle(
+        device_id = await self._device_id_for_call(
+            user_id,
+            parsed.openoctopus_src_device,
+            device_targets,
+        )
+        route = await registry.get_route_snapshot(
             device_id,
             user_id=user_id,
             expected_device_name=parsed.openoctopus_src_device,
         )
-        if handle is None:
+        if route is None:
             raise DeviceUnavailableError("Source device is offline")
         async with AsyncSession(self._require_engine(), expire_on_commit=False) as db:
             ticket = await workspace.authorize_transfer_destination(
@@ -447,8 +487,13 @@ class FileTransferTool(Tool):
             source_etag = begin.etag
             return await workspace.begin_transfer_upload(ticket, size=begin.total_bytes)
 
-        async def commit_sink(sink: Any, _begin: TransferBeginFrame, size: int, digest: str) -> None:
-            await workspace.commit_transfer_upload(
+        async def commit_sink(
+            sink: Any,
+            _begin: TransferBeginFrame,
+            size: int,
+            digest: str,
+        ) -> bool:
+            return await workspace.commit_transfer_upload(
                 ticket,
                 sink,
                 size=size,
@@ -458,9 +503,10 @@ class FileTransferTool(Tool):
         async def delete_source() -> None:
             if source_etag is None:
                 raise RuntimeError("client source fingerprint is missing")
-            result = await registry.dispatch_tool(
-                device_id=device_id,
+            result = await registry.dispatch_tool_on_snapshot(
+                route=route,
                 user_id=user_id,
+                expected_device_name=parsed.openoctopus_src_device,
                 name=INTERNAL_WORKSPACE_ACTION,
                 args={
                     "operation": "delete_file",
@@ -469,13 +515,13 @@ class FileTransferTool(Tool):
                 },
                 max_result_bytes=16 * 1024,
                 timeout_seconds=30,
-                expected_device_name=parsed.openoctopus_src_device,
             )
             if getattr(result, "is_error", False):
                 raise RuntimeError("client source deletion failed")
 
         return await registry.transfers.start_client_to_server(
-            handle=handle,
+            handle=route.handle,
+            route=route,
             user_id=user_id,
             src_path=parsed.src_path,
             dst_path=parsed.dst_path,
@@ -489,21 +535,27 @@ class FileTransferTool(Tool):
         self,
         parsed: FileTransferRequest,
         user_id: UUID,
+        device_targets: Mapping[str, UUID] | None,
     ) -> FileTransferOutcome:
         """Ask one paired client to perform a coordinated local transfer."""
 
         registry = self._require_registry()
-        device_id = await self._device_id(user_id, parsed.openoctopus_src_device)
-        handle = await registry.get_handle(
+        device_id = await self._device_id_for_call(
+            user_id,
+            parsed.openoctopus_src_device,
+            device_targets,
+        )
+        route = await registry.get_route_snapshot(
             device_id,
             user_id=user_id,
             expected_device_name=parsed.openoctopus_src_device,
         )
-        if handle is None:
+        if route is None:
             raise DeviceUnavailableError("Device is offline")
-        raw = await registry.dispatch_tool(
-            device_id=device_id,
+        raw = await registry.dispatch_tool_on_snapshot(
+            route=route,
             user_id=user_id,
+            expected_device_name=parsed.openoctopus_src_device,
             name=INTERNAL_WORKSPACE_ACTION,
             args={
                 "operation": "transfer_local",
@@ -513,7 +565,6 @@ class FileTransferTool(Tool):
             },
             max_result_bytes=64 * 1024,
             timeout_seconds=60.0,
-            expected_device_name=parsed.openoctopus_src_device,
         )
         if raw.is_error:
             _raise_transfer_client_error(raw.code)
@@ -539,12 +590,31 @@ class FileTransferTool(Tool):
             raise RuntimeError("Database engine is not configured")
         return self._engine
 
-    async def _device_id(self, user_id: UUID, name: str) -> UUID:
+    async def _device_id_for_call(
+        self,
+        user_id: UUID,
+        name: str,
+        device_targets: Mapping[str, UUID] | None,
+    ) -> UUID:
+        expected_device_id = None
+        if device_targets is not None:
+            expected_device_id = device_targets.get(name)
+            if expected_device_id is None:
+                raise DeviceUnavailableError("Paired device was not captured for this turn")
+        return await self._device_id(user_id, name, expected_device_id)
+
+    async def _device_id(
+        self,
+        user_id: UUID,
+        name: str,
+        expected_device_id: UUID | None = None,
+    ) -> UUID:
         assert self._engine is not None
         async with AsyncSession(self._engine, expire_on_commit=False) as db:
-            device_id = await db.scalar(
-                select(Device.id).where(Device.user_id == user_id, Device.name == name)
-            )
+            statement = select(Device.id).where(Device.user_id == user_id, Device.name == name)
+            if expected_device_id is not None:
+                statement = statement.where(Device.id == expected_device_id)
+            device_id = await db.scalar(statement)
         if device_id is None:
             raise DeviceUnavailableError("Paired device was not found")
         return device_id
