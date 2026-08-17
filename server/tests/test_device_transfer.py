@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from openctopus_server.devices.protocol import (
     TransferEndFrame,
     TransferReadyFrame,
     decode_binary_chunk,
+    new_uuid7,
     parse_server_frame,
 )
 from openctopus_server.devices.transfer import (
@@ -21,6 +23,8 @@ from openctopus_server.devices.transfer import (
     TransferError,
     TransferManager,
     TransferProtocolError,
+    TransferResult,
+    TransferRoute,
     TransferSink,
 )
 
@@ -84,6 +88,28 @@ class SuccessAckDropTransport(Transport):
             and frame.ack
             and frame.ok
         )
+
+
+@dataclass
+class BlockingSuccessAckTransport(Transport):
+    ack_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_ack: asyncio.Event = field(default_factory=asyncio.Event)
+    ack_completed: asyncio.Event = field(default_factory=asyncio.Event)
+    ack_cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, handle: object, payload: str) -> bool:
+        self.text.append((handle, payload))
+        self.text_event.set()
+        frame = parse_server_frame(payload)
+        if isinstance(frame, TransferEndFrame) and frame.ack and frame.ok:
+            self.ack_started.set()
+            try:
+                await self.release_ack.wait()
+            except asyncio.CancelledError:
+                self.ack_cancelled.set()
+                raise
+            self.ack_completed.set()
+        return True
 
 
 @dataclass
@@ -188,6 +214,51 @@ async def _wait_for_ready(transport: Transport, slot_id: UUID) -> None:
             if isinstance(frame, TransferReadyFrame) and frame.id == slot_id:
                 return
         await asyncio.sleep(0)
+
+
+async def _send_client_relay(
+    manager: TransferManager,
+    transport: Transport,
+    handle: Handle,
+    sink: TransferSink,
+    *,
+    route: TransferRoute | None = None,
+) -> tuple[asyncio.Task[TransferResult], UUID]:
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return sink
+
+    task = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=uuid4(),
+            src_path="source.bin",
+            dst_path=None,
+            sink_factory=make_sink,
+            purpose="http_relay",
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    slot_id = UUID(json.loads(transport.text[0][1])["id"])
+    digest = hashlib.sha256(b"payload").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="http_relay",
+            src_path="source.bin",
+            total_bytes=7,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    await manager.handle_binary(handle, slot_id.bytes + b"payload")
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=7, sha256=digest),
+    )
+    return task, slot_id
 
 
 async def test_admission_round_robins_users_and_releases_on_cancel() -> None:
@@ -649,7 +720,7 @@ async def test_server_tombstones_are_bounded_and_evict_oldest() -> None:
     first = (uuid4(), 1, uuid4())
     for index in range(TOMBSTONE_MAX_ENTRIES + 1):
         key = first if index == 0 else (uuid4(), 1, uuid4())
-        manager._remember_tombstone_locked(key, (0.0, None))
+        manager._remember_tombstone_locked(key, (0.0, None, False))
     assert len(manager._tombstones) == TOMBSTONE_MAX_ENTRIES
     assert first not in manager._tombstones
     await manager.close()
@@ -1079,6 +1150,113 @@ async def test_client_to_server_ack_loss_after_commit_returns_success_and_keeps_
     assert result.warnings == ("transfer_ack_failed", "source_delete_failed")
     assert sink.aborted is False
     assert manager.active_slots == 0
+
+
+async def test_client_to_server_committed_ack_survives_caller_cancellation() -> None:
+    transport = BlockingSuccessAckTransport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+    sink = Sink()
+    task, _ = await _send_client_relay(manager, transport, handle, sink)
+    await transport.ack_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert transport.ack_cancelled.is_set() is False
+    assert task.done() is False
+
+    transport.release_ack.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert transport.ack_completed.is_set() is True
+    assert sink.aborted is False
+    assert not any(
+        isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+        and not frame.ack
+        and not frame.ok
+        for _, payload in transport.text
+    )
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+
+
+async def test_committed_client_sender_accepts_only_its_late_timeout_until_tombstoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = Transport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 7)
+    route = SimpleNamespace(handle=handle, config_epoch=3, device_name="laptop")
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    sent_routes: list[object | None] = []
+    original_cleanup = manager._cleanup
+
+    async def blocked_cleanup(slot: object, *, skip_worker: bool = False) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await original_cleanup(slot, skip_worker=skip_worker)  # type: ignore[arg-type]
+
+    async def capture_send(
+        sent_handle: object,
+        payload: str,
+        *,
+        route: TransferRoute | None,
+    ) -> bool:
+        sent_routes.append(route)
+        return await transport.send_text(sent_handle, payload)
+
+    monkeypatch.setattr(manager, "_cleanup", blocked_cleanup)
+    monkeypatch.setattr(manager, "_send_text", capture_send)
+    task, slot_id = await _send_client_relay(
+        manager,
+        transport,
+        handle,
+        Sink(),
+        route=route,
+    )
+    await cleanup_started.wait()
+    late_timeout = TransferEndFrame(
+        id=slot_id,
+        ack=False,
+        ok=False,
+        code="workspace_transfer_timeout",
+    )
+
+    try:
+        await manager.handle_frame(handle, late_timeout)
+
+        assert parse_server_frame(transport.text[-1][1]) == late_timeout.model_copy(
+            update={"ack": True}
+        )
+        assert sent_routes[-1] is route
+        with pytest.raises(TransferProtocolError):
+            await manager.handle_frame(
+                handle,
+                late_timeout.model_copy(update={"code": "workspace_storage_unavailable"}),
+            )
+    finally:
+        release_cleanup.set()
+        await task
+
+    await manager.handle_frame(handle, late_timeout)
+    assert parse_server_frame(transport.text[-1][1]) == late_timeout.model_copy(
+        update={"ack": True}
+    )
+    assert sent_routes[-1] is None
+
+    with pytest.raises(TransferProtocolError):
+        await manager.handle_frame(
+            Handle(handle.device_id, handle.generation + 1),
+            late_timeout,
+        )
+    with pytest.raises(TransferProtocolError):
+        await manager.handle_frame(
+            handle,
+            late_timeout.model_copy(update={"id": new_uuid7()}),
+        )
 
 
 async def test_client_to_server_cancellation_during_publish_commits_before_propagating() -> None:

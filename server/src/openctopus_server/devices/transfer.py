@@ -392,7 +392,7 @@ class TransferManager:
         self._tombstone_ttl_seconds = tombstone_ttl_seconds
         self._slots: dict[tuple[UUID, int, UUID], _TransferSlot] = {}
         self._tombstones: dict[
-            tuple[UUID, int, UUID], tuple[float, TransferEndFrame | None]
+            tuple[UUID, int, UUID], tuple[float, TransferEndFrame | None, bool]
         ] = {}
         self._acknowledged_failure_tombstones: set[tuple[UUID, int, UUID]] = set()
         self._source_cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -909,6 +909,20 @@ class TransferManager:
     async def _handle_end(self, handle: object, frame: TransferEndFrame) -> None:
         if frame.ack and await self._matches_tombstone(handle, frame):
             return
+        matches_timeout, timeout_route = await self._matches_committed_sender_timeout(
+            handle,
+            frame,
+        )
+        if matches_timeout:
+            try:
+                await self._send_text(
+                    handle,
+                    frame.model_copy(update={"ack": True}).model_dump_json(),
+                    route=timeout_route,
+                )
+            except Exception:
+                pass
+            return
         slot = await self._get_slot(handle, frame.id, terminal=True)
         if frame.ack:
             if slot.direction != "server_to_client" or slot.state is not TransferState.SENDER_ENDED:
@@ -1130,6 +1144,7 @@ class TransferManager:
         )
         key = (slot.device_id, slot.generation, slot.slot_id)
         committed_result: TransferResult | None = None
+        committed_worker: asyncio.Task[None] | None = None
         async with self._lock:
             if slot.state is TransferState.ABORTED:
                 return
@@ -1148,6 +1163,8 @@ class TransferManager:
                 )
                 slot.state = TransferState.COMMITTED
                 slot.abort_event.set()
+                if slot.worker is not current and slot.worker is not None:
+                    committed_worker = slot.worker
             else:
                 slot.state = TransferState.ABORTED
                 slot.abort_event.set()
@@ -1158,12 +1175,20 @@ class TransferManager:
                     (
                         time.monotonic() + self._tombstone_ttl_seconds,
                         slot.terminal_ack,
+                        False,
                     ),
                 )
         if committed_result is not None:
-            if slot.worker is not current and slot.worker is not None and not slot.worker.done():
-                slot.worker.cancel()
+            cancelled = False
+            if committed_worker is not None:
+                while not committed_worker.done():
+                    try:
+                        await asyncio.shield(committed_worker)
+                    except asyncio.CancelledError:
+                        cancelled = True
             await self._finish(slot, committed_result)
+            if cancelled:
+                raise asyncio.CancelledError
             return
         if terminal is not None:
             try:
@@ -1221,6 +1246,8 @@ class TransferManager:
                     (
                         time.monotonic() + self._tombstone_ttl_seconds,
                         slot.terminal_ack,
+                        slot.direction == "client_to_server"
+                        and slot.committed_result is not None,
                     ),
                 )
 
@@ -1291,7 +1318,7 @@ class TransferManager:
     def _remember_tombstone_locked(
         self,
         key: tuple[UUID, int, UUID],
-        value: tuple[float, TransferEndFrame | None],
+        value: tuple[float, TransferEndFrame | None, bool],
     ) -> None:
         self._tombstones.pop(key, None)
         self._acknowledged_failure_tombstones.discard(key)
@@ -1342,7 +1369,7 @@ class TransferManager:
 
     def _expire_tombstones_locked(self) -> None:
         now = time.monotonic()
-        for key, (expires_at, _) in tuple(self._tombstones.items()):
+        for key, (expires_at, _, _) in tuple(self._tombstones.items()):
             if expires_at <= now:
                 self._tombstones.pop(key, None)
                 self._acknowledged_failure_tombstones.discard(key)
@@ -1355,7 +1382,7 @@ class TransferManager:
             tombstone = self._tombstones.get(key)
             if tombstone is None:
                 return False
-            _, expected = tombstone
+            _, expected, _ = tombstone
             if expected == frame:
                 self._acknowledged_failure_tombstones.add(key)
                 return True
@@ -1363,6 +1390,33 @@ class TransferManager:
             "late transfer terminal frame conflicts with a closed slot",
             code="protocol_transfer_unknown_id",
         )
+
+    async def _matches_committed_sender_timeout(
+        self,
+        handle: object,
+        frame: TransferEndFrame,
+    ) -> tuple[bool, TransferRoute | None]:
+        expected = TransferEndFrame(
+            id=frame.id,
+            ack=False,
+            ok=False,
+            code=TRANSFER_TIMEOUT_CODE,
+        )
+        if frame != expected:
+            return False, None
+        device_id, generation = _handle_identity(handle)
+        key = (device_id, generation, frame.id)
+        async with self._lock:
+            self._expire_tombstones_locked()
+            slot = self._slots.get(key)
+            if (
+                slot is not None
+                and slot.direction == "client_to_server"
+                and slot.committed_result is not None
+            ):
+                return True, slot.route
+            tombstone = self._tombstones.get(key)
+            return tombstone is not None and tombstone[2], None
 
     async def _is_failed_tombstone(self, handle: object, slot_id: UUID) -> bool:
         device_id, generation = _handle_identity(handle)
@@ -1372,7 +1426,7 @@ class TransferManager:
             tombstone = self._tombstones.get(key)
             if tombstone is None:
                 return False
-            _, expected_ack = tombstone
+            _, expected_ack, _ = tombstone
             return (
                 key not in self._acknowledged_failure_tombstones
                 and expected_ack is not None

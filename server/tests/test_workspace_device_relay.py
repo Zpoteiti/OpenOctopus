@@ -10,11 +10,20 @@ from starlette.requests import Request
 
 from openctopus_server.admission import KeyedDirectionalAdmission
 from openctopus_server.api.workspace_files import download_file, upload_file
-from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
+from openctopus_server.devices.protocol import (
+    TransferBeginFrame,
+    TransferEndFrame,
+    TransferReadyFrame,
+    TransferRequestFrame,
+    new_uuid7,
+    parse_server_frame,
+)
 from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
 from openctopus_server.devices.transfer import (
+    FairTransferAdmission,
     TransferBusyError,
     TransferError,
+    TransferManager,
     TransferResult,
 )
 from openctopus_server.errors.codes import ErrorCode
@@ -334,6 +343,140 @@ async def test_device_get_cancellation_cancels_pending_transfer() -> None:
     with pytest.raises(asyncio.CancelledError):
         await pending
     assert cancelled.is_set() is True
+
+
+async def test_device_get_disconnect_after_commit_accepts_late_client_timeout() -> None:
+    body_sent = asyncio.Event()
+
+    class BlockingAckTransport:
+        def __init__(self) -> None:
+            self.frames: list[object] = []
+            self.frame_sent = asyncio.Event()
+            self.success_ack_blocked = asyncio.Event()
+
+        async def send_text(
+            self,
+            _handle: object,
+            payload: str,
+            *,
+            expected_device_name: str | None = None,
+            expected_config_epoch: int | None = None,
+        ) -> bool:
+            del expected_device_name, expected_config_epoch
+            frame = parse_server_frame(payload)
+            self.frames.append(frame)
+            self.frame_sent.set()
+            if isinstance(frame, TransferEndFrame) and frame.ack and frame.ok:
+                # The transfer is committed immediately before this ACK send.
+                # Wait until ASGI has delivered the declared response bytes so
+                # the disconnect lands inside that post-commit ACK window.
+                await body_sent.wait()
+                self.success_ack_blocked.set()
+                await asyncio.Event().wait()
+            return True
+
+        async def send_binary(
+            self,
+            _handle: object,
+            _payload: bytes,
+            *,
+            expected_device_name: str | None = None,
+            expected_config_epoch: int | None = None,
+        ) -> bool:
+            del expected_device_name, expected_config_epoch
+            raise AssertionError("a client-to-server relay must not send binary data")
+
+    transport = BlockingAckTransport()
+    manager = TransferManager(
+        transport,
+        admission=FairTransferAdmission(
+            max_concurrency=2,
+            max_concurrency_per_user=1,
+            queue_timeout_seconds=0.1,
+        ),
+        idle_timeout_seconds=0.05,
+    )
+    device_id = uuid4()
+    handle = ConnectionHandle(device_id, 1)
+    response_task = asyncio.create_task(
+        download_file(
+            "reports/report.txt",
+            openoctopus_device="laptop",
+            user=SimpleNamespace(id=uuid4()),
+            db=_DB(device_id),  # type: ignore[arg-type]
+            service=None,  # type: ignore[arg-type]
+            registry=_Registry(manager),  # type: ignore[arg-type]
+            admission=_admission(),
+            settings=_settings(),  # type: ignore[arg-type]
+        )
+    )
+    while not any(isinstance(frame, TransferRequestFrame) for frame in transport.frames):
+        await transport.frame_sent.wait()
+        transport.frame_sent.clear()
+    request = next(frame for frame in transport.frames if isinstance(frame, TransferRequestFrame))
+    payload = b"x"
+    digest = hashlib.sha256(payload).hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=request.id,
+            direction="client_to_server",
+            purpose="http_relay",
+            src_path="reports/report.txt",
+            total_bytes=len(payload),
+        ),
+    )
+    while not any(
+        isinstance(frame, TransferReadyFrame) and frame.id == request.id
+        for frame in transport.frames
+    ):
+        await transport.frame_sent.wait()
+        transport.frame_sent.clear()
+    response = await asyncio.wait_for(response_task, timeout=1)
+
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        await transport.success_ack_blocked.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body") == payload:
+            body_sent.set()
+
+    stream = asyncio.create_task(
+        response(
+            {"type": "http", "asgi": {"spec_version": "2.3"}},  # type: ignore[arg-type]
+            receive,  # type: ignore[arg-type]
+            send,  # type: ignore[arg-type]
+        )
+    )
+    await manager.handle_binary(handle, request.id.bytes + payload)
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=request.id,
+            ack=False,
+            ok=True,
+            bytes_sent=len(payload),
+            sha256=digest,
+        ),
+    )
+    await asyncio.wait_for(transport.success_ack_blocked.wait(), timeout=1)
+    await asyncio.wait_for(stream, timeout=1)
+
+    assert any(message.get("body") == payload for message in sent)
+    assert manager.active_slots == 0
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=request.id,
+            ack=False,
+            ok=False,
+            code="workspace_transfer_timeout",
+        ),
+    )
 
 
 @pytest.mark.parametrize(

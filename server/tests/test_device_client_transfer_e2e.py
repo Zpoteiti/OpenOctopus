@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 from collections.abc import AsyncIterator, Iterator
 from io import BytesIO
@@ -403,6 +404,111 @@ async def test_real_file_transfer_and_device_workspace_relay(
                 fake_rustfs.copy_calls,
                 fake_rustfs.remove_calls,
             ) == writes_before_relay
+            await _wait_for_transfer_cleanup(registry)
+
+            device_id = UUID(created["device"]["id"])
+            route_before_disconnect = await registry.get_route_snapshot(
+                device_id,
+                user_id=user_id,
+                expected_device_name=device_name,
+            )
+            assert route_before_disconnect is not None
+            success_ack_blocked = asyncio.Event()
+            raw_http_closed = asyncio.Event()
+            ack_held_through_disconnect = asyncio.Event()
+            late_timeout_acknowledged = asyncio.Event()
+            block_next_success_ack = True
+            original_send_text = registry.send_text
+
+            async def hold_success_ack(
+                handle: Any,
+                payload: str,
+                **kwargs: Any,
+            ) -> bool:
+                nonlocal block_next_success_ack
+                frame = json.loads(payload)
+                is_transfer_end = isinstance(frame, dict) and frame.get("type") == "transfer_end"
+                if (
+                    block_next_success_ack
+                    and is_transfer_end
+                    and frame.get("ack") is True
+                    and frame.get("ok") is True
+                ):
+                    block_next_success_ack = False
+                    success_ack_blocked.set()
+                    await raw_http_closed.wait()
+                    ack_held_through_disconnect.set()
+                    await asyncio.Event().wait()
+                result = bool(await original_send_text(handle, payload, **kwargs))
+                if (
+                    is_transfer_end
+                    and frame.get("ack") is True
+                    and frame.get("ok") is False
+                    and frame.get("code") == "workspace_transfer_timeout"
+                ):
+                    late_timeout_acknowledged.set()
+                return result
+
+            with monkeypatch.context() as race_patch:
+                race_patch.setattr(registry, "send_text", hold_success_ack)
+                race_patch.setattr(registry.transfers, "_idle_timeout_seconds", 0.2)
+
+                host, port_text = server_url.removeprefix("http://").rsplit(":", 1)
+                reader, writer = await asyncio.open_connection(host, int(port_text))
+                try:
+                    target = (
+                        "/api/workspace/files/browser.bin"
+                        f"?openoctopus_device={device_name}"
+                    )
+                    request = (
+                        f"GET {target} HTTP/1.1\r\n"
+                        f"Host: {host}:{port_text}\r\n"
+                        f"Authorization: Bearer {jwt}\r\n"
+                        "Connection: close\r\n\r\n"
+                    )
+                    writer.write(request.encode("ascii"))
+                    await writer.drain()
+                    response_head = await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"),
+                        timeout=5,
+                    )
+                    header_lines = response_head.decode("latin-1").split("\r\n")
+                    assert header_lines[0].startswith("HTTP/1.1 200 ")
+                    response_headers = {
+                        name.strip().lower(): value.strip()
+                        for line in header_lines[1:]
+                        if ":" in line
+                        for name, value in (line.split(":", 1),)
+                    }
+                    content_length = int(response_headers["content-length"])
+                    assert content_length == len(replacement_bytes)
+                    assert await asyncio.wait_for(
+                        reader.readexactly(content_length),
+                        timeout=5,
+                    ) == replacement_bytes
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+                    raw_http_closed.set()
+
+                await asyncio.wait_for(success_ack_blocked.wait(), timeout=1)
+                await asyncio.wait_for(ack_held_through_disconnect.wait(), timeout=1)
+                await asyncio.wait_for(late_timeout_acknowledged.wait(), timeout=40)
+                assert process.returncode is None
+                route_after_timeout = await registry.get_route_snapshot(
+                    device_id,
+                    user_id=user_id,
+                    expected_device_name=device_name,
+                )
+                assert route_after_timeout is not None
+                assert route_after_timeout.handle == route_before_disconnect.handle
+
+            follow_up = await http_client.get(
+                "/api/workspace/files/browser.bin",
+                params={"openoctopus_device": device_name},
+            )
+            assert follow_up.status_code == 200, follow_up.text
+            assert follow_up.content == replacement_bytes
             await _wait_for_transfer_cleanup(registry)
 
             partial_started = asyncio.Event()
