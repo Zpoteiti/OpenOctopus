@@ -6,11 +6,9 @@ info:
     Python-main HTTP API contract for `openoctopus_server`. Pairs with
     [DECISIONS.md](DECISIONS.md) and [TOOLS.md](TOOLS.md).
 
-    **Current implementation status:** `python-main` is a rewrite branch. This
-    file is the target API contract for the Python implementation, not a record
-    of the archived Rust server's current route coverage. Historical milestone
-    labels such as M1b/M1c/M1d remain only where a route description is
-    explicitly documenting Rust-era provenance.
+    **Current implementation status:** `python-main` is the active server
+    contract. Historical milestone labels remain only where a route description
+    explicitly documents an earlier milestone.
 
     **Target design principle:** user-meaningful agent capabilities should have
     browser/programmatic REST entrances where the product needs them, and those
@@ -35,14 +33,14 @@ info:
     | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, limit, offset |
     | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
     | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
-    | `notebook_edit` | — | Agent-only in Py5; no REST equivalent |
+    | `notebook_edit` | — | Agent-only in Py6; no REST equivalent |
     | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args; REST requires explicit `mode` |
     | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
     | `message` | — | No REST parallel (browser composes via chat) |
-    | `exec` | — | Deferred Py6; no Py5 REST or WebSocket frame |
-    | `write_stdin` | — | Deferred Py6; no Py5 REST or WebSocket frame |
-    | `list_exec_sessions` | — | Deferred Py6; no Py5 REST or WebSocket frame |
+    | `exec` | — | Client-only Py6 tool; routed over device WebSocket, no REST |
+    | `write_stdin` | — | Client-only Py6 tool; routed over device WebSocket, no REST |
+    | `list_exec_sessions` | — | Client-only Py6 tool; routed over device WebSocket, no REST |
 
     **Auth model:**
 
@@ -60,7 +58,7 @@ info:
     - JSON bodies everywhere except file reads, which return raw file bytes
       with an appropriate `Content-Type`, and streaming message POST responses,
       which return newline-delimited JSON events.
-    - Py5 workspace collection routes return
+    - Py6 workspace collection routes return
       `{items, limit, offset, next_offset, truncated}`. `next_offset=null`
       means no ordinary next page; `truncated=true` means an internal safety
       ceiling stopped a complete scan. Other historical route families keep
@@ -124,7 +122,7 @@ tags:
   - name: Cron
     description: Scheduled agent invocations
   - name: Admin
-    description: Admin-only system config and user management; server-side MCP route is deferred and unavailable in Py5
+    description: Admin-only system config and user management; server-side MCP route is deferred and unavailable in Py6
 
 security:
   - cookieAuth: []
@@ -558,7 +556,7 @@ paths:
                     Required for the stable request shape, but Py2 and Py3
                     require this array to be empty. They accept text and direct
                     inline base64 images through `content`; workspace/device attachment
-                    references begin with the Py5 workspace-files milestone.
+                    references begin with the Py4 workspace-files milestone.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
               additionalProperties: false
@@ -834,7 +832,7 @@ paths:
   #
   /api/workspace/files/{path}:
     description: |
-      Py5 Workspace Files route. `openoctopus_device` is explicit: `server`
+      Py6 Workspace Files route. `openoctopus_device` is explicit: `server`
       selects the server workspace, while a paired device name routes to the
       live device WebSocket. All server and device paths use the same public
       response shapes; device paths are checked again by the client.
@@ -1331,6 +1329,18 @@ paths:
                     devices (`sandbox_mode=false`) created without an explicit
                     value store an empty array. Users remove entries to permit a
                     blocked internal target.
+                shell_timeout_max:
+                  type: integer
+                  minimum: 0
+                  maximum: 86400
+                  default: 600
+                  description: Maximum hard lifetime in seconds for client `exec`.
+                env_allowlist:
+                  type: array
+                  maxItems: 64
+                  uniqueItems: true
+                  items: { type: string, minLength: 1, maxLength: 128 }
+                  description: Exact parent environment names inherited by exec children; `OPENOCTOPUS_*` is always rejected.
       responses:
         '201':
           description: |
@@ -1340,8 +1350,8 @@ paths:
             `POST /api/devices/{name}/regenerate-token`.
             Client startup uses the token via the `OPENOCTOPUS_DEVICE_TOKEN` env
             var; the active device config (`workspace_path`, `sandbox_mode`,
-            `ssrf_denylist`) is fetched from the server's `hello_ack` frame at
-            the WebSocket handshake (see PROTOCOL.md, ADR-096 / ADR-097).
+            `ssrf_denylist`, `shell_timeout_max`, `env_allowlist`) is fetched
+            from the server's `hello_ack` frame at the WebSocket handshake.
           content:
             application/json:
               schema:
@@ -1354,7 +1364,7 @@ paths:
                     description: Bearer token with `openoctopus_dev_` prefix. The device sends it at WebSocket handshake. Shown once.
                   device: { $ref: '#/components/schemas/Device' }
         '400':
-          description: Invalid name after canonicalization or invalid active Py5 config.
+          description: Invalid name after canonicalization or invalid active Py6 config.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: |
@@ -1371,13 +1381,12 @@ paths:
         schema: { type: string }
     patch:
       tags: [Devices]
-      summary: Update active Py5 device config
+      summary: Update active Py6 device config
       description: |
-        Py5 accepts only `name`, `workspace_path`, `sandbox_mode`, and
-        `ssrf_denylist`. The active fields are pushed in a `config_update`
-        frame when the device is online. Shell timeout, environment/command
-        policy, and MCP configuration are deferred until their implementing
-        client milestones.
+        Py6 accepts `name`, `workspace_path`, `sandbox_mode`,
+        `ssrf_denylist`, `shell_timeout_max`, and `env_allowlist`. The active
+        fields are pushed in a `config_update` frame when the device is online.
+        There is no command denylist or MCP configuration in Py6.
 
         PATCH is a partial top-level update. Omitted fields keep their existing
         values. `ssrf_denylist`, when provided, replaces the entire stored
@@ -1390,7 +1399,7 @@ paths:
         it with the same device-name rules as `POST /api/devices`, then renames
         the device to that stored routing slug; `server` remains reserved and is
         rejected. The existing device token remains valid across rename.
-        Deferred fields are rejected rather than silently stored.
+        Unknown fields are rejected rather than silently stored.
       requestBody:
         required: false
         content:
@@ -1417,6 +1426,17 @@ paths:
                   maxItems: 256
                   items: { type: string, minLength: 1, maxLength: 512 }
                   description: Whole-field replacement client `web_fetch` denylist.
+                shell_timeout_max:
+                  type: integer
+                  minimum: 0
+                  maximum: 86400
+                  description: Maximum hard lifetime in seconds for client `exec`.
+                env_allowlist:
+                  type: array
+                  maxItems: 64
+                  uniqueItems: true
+                  items: { type: string, minLength: 1, maxLength: 128 }
+                  description: Exact parent environment names inherited by exec children; `OPENOCTOPUS_*` is always rejected.
                 workspace_path:
                   type: string
                   description: |
@@ -1427,7 +1447,7 @@ paths:
       responses:
         '200':
           description: |
-            Updated. The response is the active Py5 device DTO directly. If
+            Updated. The response is the active Py6 device DTO directly. If
             the committed config cannot be pushed because the socket races
             offline, the write remains committed and `online` is false.
           content:
@@ -1436,7 +1456,7 @@ paths:
         '400':
           description: |
             Invalid name after canonicalization, invalid config shape, or
-            invalid active device policy fields. Deferred fields are rejected.
+            invalid active device policy fields. Unknown fields are rejected.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
@@ -1457,8 +1477,9 @@ paths:
       description: |
         Deletes the device row. This is the state-3 complete wipe from ADR-110:
         the token immediately stops authenticating, any active WebSocket
-        connection is closed with 4401, in-flight tool calls on that connection
-        fail as `tool_device_unreachable`, and the device disappears from future
+        connection is closed with 4401. Calls not yet issued fail as
+        `tool_device_unreachable`; issued or ambiguous calls fail as
+        `tool_execution_outcome_unknown`. The device disappears from future
         `openoctopus_device` enums.
       responses:
         '204': { description: Removed. }
@@ -1478,10 +1499,10 @@ paths:
         Invalidates the old token, returns a new one exactly once, and
         preserves the existing device row, name, workspace path, sandbox mode,
         and SSRF policy. Any active
-        connection for the old token is closed with 4401; in-flight tool calls
-        on that connection fail as `tool_device_unreachable`. The device remains
-        paired but appears offline until the user restarts/reconfigures the
-        client with the new token.
+        connection for the old token is closed with 4401. Calls not yet issued
+        fail as `tool_device_unreachable`; issued or ambiguous calls fail as
+        `tool_execution_outcome_unknown`. The device remains paired but appears
+        offline until the user restarts/reconfigures the client with the new token.
       responses:
         '200':
           description: New token.
@@ -1903,11 +1924,11 @@ paths:
   /api/admin/server-mcp:
     description: |
       Deferred Py8 design only; this route is not implemented or exposed by
-      Py5. Py5 has no MCP dependency or persisted MCP configuration. The
-      following shape must not be used by a Py5 client or administrator.
+      Py6. Py6 has no MCP dependency or persisted MCP configuration. The
+      following shape must not be used by a Py6 client or administrator.
     get:
       tags: [Admin]
-      summary: Deferred Py8 route — not available in Py5
+      summary: Deferred Py8 route — not available in Py6
       description: |
         Py8 server-side MCP route.
 
@@ -1929,7 +1950,7 @@ paths:
                 items: { $ref: '#/components/schemas/McpServerConfig' }
     put:
       tags: [Admin]
-      summary: Deferred Py8 route — not available in Py5
+      summary: Deferred Py8 route — not available in Py6
       description: |
         Py8 server-side MCP route.
 
@@ -2056,6 +2077,7 @@ components:
             Stable error code from `openoctopus_server/errors/`.
             Examples: `device_not_found`, `device_invalid_request`,
             `tool_device_unreachable`, `tool_device_busy`,
+            `tool_execution_outcome_unknown`,
             `workspace_not_found`, `auth_forbidden`, `workspace_soft_locked`,
             `workspace_upload_too_large`, `workspace_invalid_skill_format`,
             `workspace_transfer_busy`, `workspace_transfer_timeout`,
@@ -2318,7 +2340,7 @@ components:
           required: [type, turn_id, message]
           description: |
             Idempotent durable message snapshot. The same message ID may appear
-            again after the Py5 `message` tool attaches provider-hidden
+            again after the Py6 `message` tool attaches provider-hidden
             `delivery_refs`; consumers upsert by message ID.
           properties:
             type: { type: string, enum: [message_persisted] }
@@ -2478,7 +2500,7 @@ components:
     MessageDeliveryRef:
       description: |
         Provider-hidden user delivery metadata. The agent/provider never
-        supplies or receives this shape. Py5 accepts a union of durable server
+        supplies or receives this shape. Py6 accepts a union of durable server
         workspace files and online-only paired-device files.
       oneOf:
         - type: object
@@ -2604,7 +2626,7 @@ components:
     Device:
       type: object
       additionalProperties: false
-      required: [id, name, sandbox_mode, workspace_path, ssrf_denylist, online, token_hint, created_at]
+      required: [id, name, sandbox_mode, workspace_path, ssrf_denylist, shell_timeout_max, env_allowlist, online, token_hint, created_at]
       properties:
         id:
           type: string
@@ -2631,6 +2653,17 @@ components:
           type: array
           maxItems: 256
           items: { type: string, minLength: 1, maxLength: 512 }
+        shell_timeout_max:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: Maximum hard lifetime in seconds for client `exec`.
+        env_allowlist:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 128 }
+          description: Exact environment names inherited by exec children.
         online:
           type: boolean
           description: |
@@ -2774,7 +2807,7 @@ components:
       additionalProperties: false
       required: [openoctopus_src_device, src_path, openoctopus_dst_device, dst_path, mode]
       description: |
-        Mirrors the Py5 `file_transfer` tool's args. At least one endpoint must
+        Mirrors the Py6 `file_transfer` tool's args. At least one endpoint must
         be `server`, unless both endpoints are the same paired device for a
         coordinated local transfer. Both paths must identify regular files.
         Different-device client-to-client bridging and folder transfer are
@@ -2932,9 +2965,9 @@ components:
       type: object
       required: [name, command]
       description: |
-        Non-normative future MCP server configuration. Py5 has no MCP
+        Non-normative future MCP server configuration. Py6 has no MCP
         dependency, route, device column, handshake frame, or persisted MCP
-        configuration. Do not add these fields to the Py5 API or device DTO;
+        configuration. Do not add these fields to the Py6 API or device DTO;
         a later milestone must define its own contract before implementation.
       properties:
         name:

@@ -15,6 +15,9 @@ def test_runtime_smoke_payload_includes_cli_and_child_process_metrics(tmp_path: 
         run_seconds=0.2,
         run_peak_rss=20,
         run_peak_processes=1,
+        exec_seconds=0.25,
+        exec_peak_rss=25,
+        exec_peak_processes=2,
         conversion_seconds=0.3,
         conversion_peak_rss=30,
         conversion_peak_processes=2,
@@ -26,6 +29,11 @@ def test_runtime_smoke_payload_includes_cli_and_child_process_metrics(tmp_path: 
             "seconds": 0.3,
             "sampled_process_tree_peak_processes": 2,
             "sampled_process_tree_peak_rss_bytes": 30,
+        },
+        "exec_backends": {
+            "seconds": 0.25,
+            "sampled_process_tree_peak_processes": 2,
+            "sampled_process_tree_peak_rss_bytes": 25,
         },
         "run_cli": {
             "seconds": 0.2,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the repeatable Py5 source-mode device capacity harness.
+"""Run the repeatable Py6 source-mode device capacity harness.
 
 This harness deliberately exercises the real :class:`DeviceRegistry`, but its
 device side is an in-memory transport.  It is therefore a server/registry

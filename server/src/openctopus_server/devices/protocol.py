@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-PROTOCOL_VERSION = "1"
+PROTOCOL_VERSION: Literal["2"] = "2"
 MAX_TEXT_FRAME_BYTES = 12 * 1024 * 1024
 # Pending-call admission reserves both the largest legal request frame and the
 # largest legal result frame.  Configuration must permit at least one such call.
@@ -57,8 +57,6 @@ class DeviceCapabilities(ProtocolModel):
         "receive",
     )
     http_relay: Literal[True] = True
-    exec: Literal[False] = False
-    mcp: Literal[False] = False
 
     @field_validator("file_transfer")
     @classmethod
@@ -67,14 +65,43 @@ class DeviceCapabilities(ProtocolModel):
         value: tuple[Literal["send", "receive"], Literal["send", "receive"]],
     ) -> tuple[Literal["send", "receive"], Literal["send", "receive"]]:
         if value != ("send", "receive"):
-            raise ValueError("Py5 clients must support send and receive")
+            raise ValueError("Py6 clients must support send and receive")
         return value
+
+
+class ShellMetadata(ProtocolModel):
+    default: str = Field(min_length=1, max_length=32)
+    available: list[str] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _validate_shells(self) -> ShellMetadata:
+        if len(self.available) != len(set(self.available)):
+            raise ValueError("shells.available must not contain duplicates")
+        if self.default not in self.available:
+            raise ValueError("shells.default must be listed in shells.available")
+        return self
 
 
 class DeviceConfigFrame(ProtocolModel):
     workspace_path: str = Field(min_length=1, max_length=4096)
     sandbox_mode: bool
     ssrf_denylist: list[str] = Field(max_length=256)
+    shell_timeout_max: int = Field(default=600, ge=0, le=86400)
+    env_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "PATH",
+            "HOME",
+            "LANG",
+            "TERM",
+            "SystemRoot",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+        ],
+        max_length=64,
+    )
 
     @field_validator("workspace_path")
     @classmethod
@@ -94,14 +121,32 @@ class DeviceConfigFrame(ProtocolModel):
             raise ValueError("ssrf_denylist entries must be non-blank and bounded")
         return value
 
+    @field_validator("env_allowlist")
+    @classmethod
+    def _validate_env_allowlist(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("env_allowlist entries must be unique")
+        for entry in value:
+            if (
+                not entry
+                or len(entry) > 128
+                or entry.strip() != entry
+                or any(ord(char) < 0x20 for char in entry)
+                or "=" in entry
+                or entry.upper().startswith("OPENOCTOPUS_")
+            ):
+                raise ValueError("env_allowlist contains an invalid variable name")
+        return value
+
 
 class HelloFrame(ProtocolModel):
     type: Literal["hello"] = "hello"
     id: Uuid7
-    version: Literal["1"]
+    version: Literal["2"]
     client_version: str = Field(min_length=1, max_length=64)
     os: Literal["linux", "darwin", "windows"]
     caps: DeviceCapabilities
+    shells: ShellMetadata
 
 
 class HelloAckFrame(ProtocolModel):
@@ -162,6 +207,16 @@ class ToolCallFrame(ProtocolModel):
     name: str = Field(min_length=1, max_length=128)
     args: dict[str, Any]
     max_result_bytes: int = Field(ge=1, le=MAX_TEXT_FRAME_BYTES)
+    chat_session_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _require_exec_owner(self) -> ToolCallFrame:
+        if (
+            self.name in {"exec", "write_stdin", "list_exec_sessions"}
+            and self.chat_session_id is None
+        ):
+            raise ValueError("client-only exec calls require chat_session_id")
+        return self
 
 
 class ToolResultFrame(ProtocolModel):
@@ -199,7 +254,7 @@ def _validate_transfer_path(value: str | None) -> str | None:
     return value
 
 
-# ETags are opaque protocol values.  The Py5 client currently emits a hashed
+# ETags are opaque protocol values.  The Py6 client currently emits a hashed
 # stat fingerprint, but the server only compares the value and does not parse
 # filesystem identity from it.
 OpaqueTag = Annotated[str, Field(min_length=1, max_length=512, strict=True)]
@@ -358,10 +413,7 @@ class TransferEndFrame(ProtocolModel):
 
 
 TransferClientFrame = Annotated[
-    TransferBeginFrame
-    | TransferReadyFrame
-    | TransferProgressFrame
-    | TransferEndFrame,
+    TransferBeginFrame | TransferReadyFrame | TransferProgressFrame | TransferEndFrame,
     Field(discriminator="type"),
 ]
 TransferServerFrame = Annotated[

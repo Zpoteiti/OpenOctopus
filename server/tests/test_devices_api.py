@@ -28,6 +28,7 @@ class _FakeDeviceRegistry:
         self.revoked: list[UUID] = []
         self.removed: list[UUID] = []
         self.config_updates: list[dict[str, Any]] = []
+        self.config_fences: list[UUID] = []
         self.entered: asyncio.Event | None = None
         self.release: asyncio.Event | None = None
 
@@ -46,6 +47,15 @@ class _FakeDeviceRegistry:
     async def push_config(self, **kwargs: Any) -> bool:
         self.config_updates.append(kwargs)
         return True
+
+    async def begin_config_update(self, *, device_id: UUID, user_id: UUID) -> bool:
+        del user_id
+        self.config_fences.append(device_id)
+        return True
+
+    async def abort_config_update(self, *, device_id: UUID, user_id: UUID) -> None:
+        del user_id
+        self.config_fences.remove(device_id)
 
     async def remove_device(self, device_id: UUID) -> bool:
         self.removed.append(device_id)
@@ -139,6 +149,8 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
             "fe80::/10",
             "ff00::/8",
         ],
+        "shell_timeout_max": 600,
+        "env_allowlist": list(devices.DEFAULT_ENV_ALLOWLIST),
         "online": False,
         "created_at": device["created_at"],
     }
@@ -247,7 +259,7 @@ async def test_device_names_are_canonical_per_user_and_unknown_config_is_rejecte
         owner,
         "POST",
         "/api/devices",
-        json={"name": "Second", "shell_timeout_max": 5},
+        json={"name": "Second", "command_denylist": []},
     )
     assert unknown.status_code == 400
     assert unknown.json() == {

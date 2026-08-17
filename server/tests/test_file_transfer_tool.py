@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -11,10 +13,14 @@ import pytest
 import openctopus_server.tools.file_transfer as file_transfer_module
 from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
 from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
-from openctopus_server.devices.transfer import TransferError
+from openctopus_server.devices.transfer import TransferError, TransferUnavailableError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext
-from openctopus_server.tools.file_transfer import FileTransferRequest, FileTransferTool
+from openctopus_server.tools.file_transfer import (
+    FileTransferOutcome,
+    FileTransferRequest,
+    FileTransferTool,
+)
 from openctopus_server.tools.registry import ToolRegistry
 from openctopus_server.workspace.fs import WorkspaceTarget
 from openctopus_server.workspace.service import TransferPathTicket
@@ -264,6 +270,71 @@ async def test_remote_transfer_maps_unknown_error_to_storage_error(
 
 
 @pytest.mark.asyncio
+async def test_preissue_transfer_fence_maps_to_device_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = FileTransferTool(None, None, None)
+    monkeypatch.setattr(
+        tool,
+        "transfer",
+        AsyncMock(side_effect=TransferUnavailableError("route was fenced before send")),
+    )
+
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "server",
+            "src_path": "a.txt",
+            "openoctopus_dst_device": "laptop",
+            "dst_path": "b.txt",
+        },
+        _ctx(),
+    )
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_registry_leaves_file_transfer_unissued_during_tool_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = FileTransferTool(None, None, None)
+    entered = asyncio.Event()
+    issued = asyncio.Event()
+    mark_issued = issued.set
+
+    async def preflight(
+        *_args: object,
+        on_issued: Callable[[], None] | None = None,
+        **_kwargs: object,
+    ) -> FileTransferOutcome:
+        assert on_issued is not None
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(tool, "transfer", preflight)
+    task = asyncio.create_task(
+        ToolRegistry((tool,)).execute(
+            name="file_transfer",
+            args={
+                "openoctopus_src_device": "server",
+                "src_path": "a.txt",
+                "openoctopus_dst_device": "server",
+                "dst_path": "b.txt",
+            },
+            ctx=_ctx(),
+            on_issued=mark_issued,
+        )
+    )
+    await entered.wait()
+    assert issued.is_set() is False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_native_transfer_timeout_maps_to_stable_timeout_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -338,8 +409,11 @@ class _Workspace:
         src_path: str,
         dst_path: str,
         mode: str,
+        on_issued: Callable[[], None] | None = None,
     ) -> Any:
         del db, user_id
+        if on_issued is not None:
+            on_issued()
         assert self.calls is not None
         self.calls.append((src_path, dst_path, mode))
         return _TransferResult(12, "a" * 64, ())
@@ -379,8 +453,11 @@ class _SameClientRegistry:
         args: dict[str, object],
         max_result_bytes: int,
         timeout_seconds: float,
+        on_issued: Callable[[], None] | None = None,
     ) -> object:
         del user_id, max_result_bytes, timeout_seconds
+        if on_issued is not None:
+            on_issued()
         assert expected_device_name == "laptop"
         device_id = route.handle.device_id
         self.calls.append((device_id, name, args, expected_device_name))

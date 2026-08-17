@@ -28,12 +28,12 @@ from openoctopus_client.connection import (
 )
 from openoctopus_client.protocol import (
     ConfigUpdate,
-    DeviceConfig,
     ErrorFrame,
     Hello,
     HelloAck,
     Ping,
     ProtocolError,
+    ShellMetadata,
     ToolCall,
     ToolResult,
     TransferBegin,
@@ -42,6 +42,9 @@ from openoctopus_client.protocol import (
     decode_server_frame,
     encode_binary_chunk,
     encode_frame,
+)
+from openoctopus_client.protocol import (
+    DeviceConfig as ProtocolDeviceConfig,
 )
 from openoctopus_client.tools import ToolOutput
 from openoctopus_client.tools import dispatcher as dispatcher_module
@@ -54,6 +57,40 @@ def _environment() -> dict[str, str]:
         "OPENOCTOPUS_SERVER_URL": "https://openoctopus.example:8443",
         "OPENOCTOPUS_DEVICE_TOKEN": "openoctopus_dev_secret-value",
     }
+
+
+_TEST_SHELLS = ShellMetadata(default="bash", available=["bash", "sh"])
+
+
+def _hello_with_id(
+    frame_id: UUID,
+    client_version: str,
+    operating_system: str,
+) -> Hello:
+    assert operating_system in {"linux", "darwin", "windows"}
+    return Hello.new_with_id(
+        frame_id,
+        client_version,
+        cast(Any, operating_system),
+        shells=_TEST_SHELLS,
+    )
+
+
+def _device_config(
+    *,
+    workspace_path: str,
+    sandbox_mode: bool,
+    ssrf_denylist: list[str],
+    shell_timeout_max: int = 600,
+    env_allowlist: list[str] | None = None,
+) -> ProtocolDeviceConfig:
+    return ProtocolDeviceConfig(
+        workspace_path=workspace_path,
+        sandbox_mode=sandbox_mode,
+        ssrf_denylist=ssrf_denylist,
+        shell_timeout_max=shell_timeout_max,
+        env_allowlist=env_allowlist or ["PATH", "HOME"],
+    )
 
 
 def test_load_config_consumes_secret_and_builds_device_websocket_url() -> None:
@@ -87,25 +124,28 @@ def test_load_config_rejects_invalid_values(field: str, value: str) -> None:
     assert "OPENOCTOPUS_DEVICE_TOKEN" not in environment
 
 
-def test_protocol_uses_active_py5_shapes_and_uuidv7_hello() -> None:
-    hello = Hello.new(client_version="0.0.1", operating_system="linux")
+def test_protocol_uses_active_py6_shapes_and_uuidv7_hello() -> None:
+    hello = Hello.new(
+        client_version="0.0.1",
+        operating_system="linux",
+        shells=_TEST_SHELLS,
+    )
     payload = json.loads(encode_frame(hello))
 
     assert hello.id.version == 7
     assert payload == {
         "caps": {
-            "exec": False,
             "file_transfer": ["send", "receive"],
             "http_relay": True,
-            "mcp": False,
             "shared_tools": True,
             "web_fetch": True,
         },
         "client_version": "0.0.1",
         "id": str(hello.id),
         "os": "linux",
+        "shells": {"available": ["bash", "sh"], "default": "bash"},
         "type": "hello",
-        "version": "1",
+        "version": "2",
     }
 
     acknowledgement = decode_server_frame(
@@ -118,6 +158,8 @@ def test_protocol_uses_active_py5_shapes_and_uuidv7_hello() -> None:
                     "workspace_path": "~/openoctopus/workspace",
                     "sandbox_mode": True,
                     "ssrf_denylist": ["127.0.0.0/8"],
+                    "shell_timeout_max": 600,
+                    "env_allowlist": ["PATH", "HOME"],
                 },
             }
         )
@@ -163,7 +205,7 @@ def test_protocol_requires_uuidv7_ids_and_result_credit() -> None:
     update = ConfigUpdate(
         id=call_id,
         device_name="alice-laptop",
-        config=DeviceConfig(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[]),
+        config=_device_config(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[]),
     )
     assert update.id == call_id
     with pytest.raises(ProtocolError):
@@ -186,11 +228,11 @@ def test_protocol_requires_uuidv7_ids_and_result_credit() -> None:
 def test_protocol_rejects_nul_config_and_invalid_transfer_purpose_fields() -> None:
     call_id = UUID("0190d5a7-0000-7000-8000-000000000002")
     with pytest.raises(ValueError, match="NUL"):
-        DeviceConfig(workspace_path="/tmp/work\x00space", sandbox_mode=True, ssrf_denylist=[])
+        _device_config(workspace_path="/tmp/work\x00space", sandbox_mode=True, ssrf_denylist=[])
     with pytest.raises(ValueError, match="blank"):
-        DeviceConfig(workspace_path="   ", sandbox_mode=True, ssrf_denylist=[])
+        _device_config(workspace_path="   ", sandbox_mode=True, ssrf_denylist=[])
     with pytest.raises(ValueError, match="blank"):
-        DeviceConfig(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[" \t"])
+        _device_config(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[" \t"])
     with pytest.raises(ValueError):
         TransferRequest(id=call_id, purpose="workspace_upload", src_path="source")
     with pytest.raises(ValueError):
@@ -233,9 +275,9 @@ def test_protocol_rejects_nul_config_and_invalid_transfer_purpose_fields() -> No
 
 def test_protocol_applies_peer_field_size_limits() -> None:
     call_id = UUID("0190d5a7-0000-7000-8000-000000000002")
-    Hello.new_with_id(call_id, "v" * 64, "linux")
+    _hello_with_id(call_id, "v" * 64, "linux")
     with pytest.raises(ValueError):
-        Hello.new_with_id(call_id, "v" * 65, "linux")
+        _hello_with_id(call_id, "v" * 65, "linux")
 
     ErrorFrame(id=call_id, code="bad", message="m" * 4096)
     with pytest.raises(ValueError):
@@ -248,6 +290,7 @@ def test_reconnect_policy_and_backoff_are_bounded_and_deterministic() -> None:
     assert reconnect_disposition(http_status=429) == ReconnectDisposition.RETRY
     assert reconnect_disposition(http_status=500) == ReconnectDisposition.RETRY
     assert reconnect_disposition(close_code=4401) == ReconnectDisposition.PERMANENT_AUTH
+    assert reconnect_disposition(close_code=4000) == ReconnectDisposition.PERMANENT_REPLACED
     assert reconnect_disposition(close_code=4409) == ReconnectDisposition.PERMANENT_CONFIG
     assert reconnect_disposition(close_code=4408) == ReconnectDisposition.RETRY
     assert reconnect_disposition(close_code=1006) == ReconnectDisposition.RETRY
@@ -294,22 +337,110 @@ def test_reconnect_helpers_handle_websocket_close_and_retry_after() -> None:
     )
 
 
-def test_runtime_closes_and_retries_after_a_malformed_server_frame() -> None:
-    async def exercise() -> tuple[CloseDisposition, list[tuple[int, str]], list[str]]:
+def test_replaced_client_exits_without_reporting_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ReplacedError(Exception):
+        code = 4000
+
+    async def exercise() -> int:
+        runtime = ClientRuntime(load_config(_environment()))
+
+        async def fail() -> CloseDisposition:
+            raise ReplacedError
+
+        monkeypatch.setattr(runtime, "_run_connection_attempt", fail)
+        return await runtime.run()
+
+    assert asyncio.run(exercise()) == 1
+    assert "replaced by a newer device connection" in caplog.text
+    assert "URL or protocol configuration" not in caplog.text
+
+
+def test_permanent_replacement_arms_watchdog_for_stuck_exec_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 0.05)
+
+    class ReplacedError(Exception):
+        code = 4000
+
+    class StuckExecManager:
+        async def shutdown(self) -> None:
+            await asyncio.Event().wait()
+
+    async def exercise() -> list[int]:
+        forced: list[int] = []
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            exec_session_manager=cast(Any, StuckExecManager()),
+            hard_exit=forced.append,
+        )
+
+        async def fail() -> CloseDisposition:
+            raise ReplacedError
+
+        monkeypatch.setattr(runtime, "_run_connection_attempt", fail)
+        assert await runtime.run() == 1
+        await asyncio.sleep(0.1)
+        runtime._cancel_shutdown_watchdog()
+        return forced
+
+    assert asyncio.run(exercise()) == [1]
+
+
+def test_runtime_closes_and_rejects_a_malformed_handshake_frame() -> None:
+    async def exercise() -> tuple[list[tuple[int, str]], list[str]]:
         hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
         socket = _RecordingSocket(['{"type":"not-a-server-frame"}'])
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+        )
+
+        with pytest.raises(ProtocolError):
+            await runtime.run_connection(socket)
+        return socket.closed, socket.sent
+
+    closed, sent = asyncio.run(exercise())
+    assert closed == [(1002, "protocol_error")]
+    assert json.loads(sent[-1])["type"] == "error"
+
+
+def test_runtime_retries_a_malformed_frame_after_handshake() -> None:
+    async def exercise() -> tuple[CloseDisposition, list[tuple[int, str]]]:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+        socket = _RecordingSocket(
+            [
+                json.dumps(
+                    {
+                        "type": "hello_ack",
+                        "id": str(hello_id),
+                        "device_name": "laptop",
+                        "config": {
+                            "workspace_path": "~/openoctopus/workspace",
+                            "sandbox_mode": True,
+                            "ssrf_denylist": [],
+                            "shell_timeout_max": 600,
+                            "env_allowlist": ["PATH", "HOME"],
+                        },
+                    }
+                ),
+                '{"type":"not-a-server-frame"}',
+            ]
+        )
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
 
         disposition = await runtime.run_connection(socket)
-        return disposition, socket.closed, socket.sent
+        return disposition, socket.closed
 
-    disposition, closed, sent = asyncio.run(exercise())
+    disposition, closed = asyncio.run(exercise())
     assert disposition is CloseDisposition.RETRY
     assert closed == [(1002, "protocol_error")]
-    assert json.loads(sent[-1])["type"] == "error"
 
 
 class _RecordingSocket:
@@ -399,7 +530,8 @@ def test_runtime_shutdown_cancels_a_writer_stuck_sending_hello(
 
 
 def test_remote_eof_cancels_a_writer_stuck_sending_control(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     async def exercise() -> CloseDisposition:
         hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
@@ -431,6 +563,8 @@ def test_remote_eof_cancels_a_writer_stuck_sending_control(
                                 "workspace_path": str(tmp_path),
                                 "sandbox_mode": True,
                                 "ssrf_denylist": [],
+                                "shell_timeout_max": 600,
+                                "env_allowlist": ["PATH", "HOME"],
                             },
                         }
                     )
@@ -444,7 +578,7 @@ def test_remote_eof_cancels_a_writer_stuck_sending_control(
 
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         return await runtime.run_connection(StuckSocket())
 
@@ -476,6 +610,8 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
                                 "workspace_path": str(tmp_path),
                                 "sandbox_mode": True,
                                 "ssrf_denylist": [],
+                                "shell_timeout_max": 600,
+                                "env_allowlist": ["PATH", "HOME"],
                             },
                         }
                     ),
@@ -506,7 +642,7 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=lambda workspace, sandbox_mode, denylist: FailingDispatcher(),
         )
         with pytest.raises(RuntimeError, match="dispatcher failed"):
@@ -517,7 +653,8 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
 
 
 def test_remote_disconnect_bounds_cleanup_when_binary_send_blocks(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_GRACE_SECONDS", 0.01)
     (tmp_path / "source.txt").write_bytes(b"source contents")
@@ -541,6 +678,8 @@ def test_remote_disconnect_bounds_cleanup_when_binary_send_blocks(
                                 "workspace_path": str(tmp_path),
                                 "sandbox_mode": True,
                                 "ssrf_denylist": [],
+                                "shell_timeout_max": 600,
+                                "env_allowlist": ["PATH", "HOME"],
                             },
                         }
                     ),
@@ -575,7 +714,7 @@ def test_remote_disconnect_bounds_cleanup_when_binary_send_blocks(
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=0.5)
         return disposition, socket.binary_send_started.is_set()
@@ -639,6 +778,8 @@ async def _run_fake_lifecycle(workspace: Path) -> tuple[_RecordingSocket, CloseD
                         "workspace_path": str(workspace),
                         "sandbox_mode": True,
                         "ssrf_denylist": [],
+                        "shell_timeout_max": 600,
+                        "env_allowlist": ["PATH", "HOME"],
                     },
                 }
             ),
@@ -658,7 +799,7 @@ async def _run_fake_lifecycle(workspace: Path) -> tuple[_RecordingSocket, CloseD
     config = load_config(_environment())
     runtime = ClientRuntime(
         config,
-        hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+        hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
     )
     disposition = await runtime.run_connection(socket)
     return socket, disposition
@@ -710,6 +851,8 @@ def test_runtime_answers_ping_while_receiver_reservation_is_slow(
                             "workspace_path": str(tmp_path),
                             "sandbox_mode": True,
                             "ssrf_denylist": [],
+                            "shell_timeout_max": 600,
+                            "env_allowlist": ["PATH", "HOME"],
                         },
                     }
                 ),
@@ -744,7 +887,7 @@ def test_runtime_answers_ping_while_receiver_reservation_is_slow(
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         try:
             disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=1)
@@ -794,6 +937,8 @@ def test_runtime_acknowledges_peer_failure_during_slow_receiver_reservation(
                             "workspace_path": str(tmp_path),
                             "sandbox_mode": True,
                             "ssrf_denylist": [],
+                            "shell_timeout_max": 600,
+                            "env_allowlist": ["PATH", "HOME"],
                         },
                     }
                 ),
@@ -834,7 +979,7 @@ def test_runtime_acknowledges_peer_failure_during_slow_receiver_reservation(
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         try:
             disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=1)
@@ -885,6 +1030,8 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
                                 "workspace_path": str(tmp_path),
                                 "sandbox_mode": True,
                                 "ssrf_denylist": [],
+                                "shell_timeout_max": 600,
+                                "env_allowlist": ["PATH", "HOME"],
                             },
                         }
                     ),
@@ -914,8 +1061,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
                 frame = self.frames.pop(0)
                 if isinstance(frame, bytes):
                     while not any(
-                        isinstance(sent, str)
-                        and json.loads(sent)["type"] == "transfer_ready"
+                        isinstance(sent, str) and json.loads(sent)["type"] == "transfer_ready"
                         for sent in self.sent
                     ):
                         await asyncio.sleep(0)
@@ -929,7 +1075,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         disposition = await runtime.run_connection(socket)
         return socket.sent, disposition
@@ -953,7 +1099,7 @@ def test_runtime_rejects_tool_output_that_exceeds_result_credit(tmp_path: Path) 
     asyncio.run(
         runtime._install_config(
             "device",
-            DeviceConfig(workspace_path=str(tmp_path), sandbox_mode=True, ssrf_denylist=[]),
+            _device_config(workspace_path=str(tmp_path), sandbox_mode=True, ssrf_denylist=[]),
         )
     )
     (tmp_path / "large.txt").write_text("x" * 1_000)
@@ -1000,6 +1146,8 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
                                     "workspace_path": str(tmp_path / "old"),
                                     "sandbox_mode": True,
                                     "ssrf_denylist": [],
+                                    "shell_timeout_max": 600,
+                                    "env_allowlist": ["PATH", "HOME"],
                                 },
                             }
                         ),
@@ -1022,6 +1170,8 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
                                     "workspace_path": str(tmp_path / "new"),
                                     "sandbox_mode": True,
                                     "ssrf_denylist": [],
+                                    "shell_timeout_max": 600,
+                                    "env_allowlist": ["PATH", "HOME"],
                                 },
                             }
                         ),
@@ -1045,7 +1195,7 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=lambda workspace, sandbox_mode, denylist: BlockingDispatcher(
                 workspace.name
             ),
@@ -1099,9 +1249,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                 del name, args
                 return ToolOutput(self.label)
 
-        def make_dispatcher(
-            workspace: Path, sandbox_mode: bool, denylist: list[str]
-        ) -> Dispatcher:
+        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
             del sandbox_mode, denylist
             if workspace.name == "new":
                 update_started.set()
@@ -1116,7 +1264,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                         HelloAck(
                             id=hello_id,
                             device_name="device",
-                            config=DeviceConfig(
+                            config=_device_config(
                                 workspace_path=str(tmp_path / "old"),
                                 sandbox_mode=True,
                                 ssrf_denylist=[],
@@ -1125,7 +1273,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                         ConfigUpdate(
                             id=update_id,
                             device_name="device",
-                            config=DeviceConfig(
+                            config=_device_config(
                                 workspace_path=str(tmp_path / "new"),
                                 sandbox_mode=True,
                                 ssrf_denylist=[],
@@ -1160,7 +1308,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
         task = asyncio.create_task(runtime.run_connection(socket))
@@ -1169,9 +1317,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
             assert update_started.wait(timeout=1)
             time.sleep(0.05)
             frame_types = [json.loads(item)["type"] for item in socket.sent]
-            observed_while_preparing.append(
-                ("pong" in frame_types, "tool_result" in frame_types)
-            )
+            observed_while_preparing.append(("pong" in frame_types, "tool_result" in frame_types))
             release_update.set()
 
         observer = threading.Thread(target=observe_and_release)
@@ -1219,7 +1365,7 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
             HelloAck(
                 id=hello_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(tmp_path / "initial"),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1229,7 +1375,7 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
                 ConfigUpdate(
                     id=UUID(f"0190d5a7-0000-7000-8000-{index:012x}"),
                     device_name="device",
-                    config=DeviceConfig(
+                    config=_device_config(
                         workspace_path=str(tmp_path / f"update-{index}"),
                         sandbox_mode=True,
                         ssrf_denylist=[],
@@ -1264,7 +1410,7 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
             (tmp_path / f"update-{index}").mkdir()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
         connection = asyncio.create_task(runtime.run_connection(Socket()))
@@ -1319,14 +1465,14 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
         monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         connection = asyncio.create_task(runtime.run_connection(Socket()))
         await incoming.put(
             HelloAck(
                 id=hello_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(tmp_path),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1377,9 +1523,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
                 del name, args
                 return ToolOutput("unused")
 
-        def make_dispatcher(
-            workspace: Path, sandbox_mode: bool, denylist: list[str]
-        ) -> Dispatcher:
+        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
             del sandbox_mode, denylist
             if workspace.name == "new":
                 update_started.set()
@@ -1408,7 +1552,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
         connection = asyncio.create_task(runtime.run_connection(socket))
@@ -1416,7 +1560,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
             HelloAck(
                 id=hello_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(old_workspace),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1427,7 +1571,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
             ConfigUpdate(
                 id=update_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(new_workspace),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1492,9 +1636,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
                 del name, args
                 return ToolOutput("unused")
 
-        def make_dispatcher(
-            workspace: Path, sandbox_mode: bool, denylist: list[str]
-        ) -> Dispatcher:
+        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
             del sandbox_mode, denylist
             if workspace.name == "new":
                 update_started.set()
@@ -1522,7 +1664,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
         socket = Socket()
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
         connection = asyncio.create_task(runtime.run_connection(socket))
@@ -1530,7 +1672,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
             HelloAck(
                 id=hello_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(old_workspace),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1541,7 +1683,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
             ConfigUpdate(
                 id=update_id,
                 device_name="device",
-                config=DeviceConfig(
+                config=_device_config(
                     workspace_path=str(new_workspace),
                     sandbox_mode=True,
                     ssrf_denylist=[],
@@ -1609,9 +1751,7 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
     async def exercise() -> BaseException:
         hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
 
-        def reject(
-            workspace: Path, sandbox_mode: bool, denylist: list[str]
-        ) -> Any:
+        def reject(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Any:
             del workspace, sandbox_mode, denylist
             raise ToolFailure(
                 "workspace_permission_denied",
@@ -1623,7 +1763,7 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
                 HelloAck(
                     id=hello_id,
                     device_name="device",
-                    config=DeviceConfig(
+                    config=_device_config(
                         workspace_path=str(tmp_path),
                         sandbox_mode=True,
                         ssrf_denylist=[],
@@ -1633,7 +1773,7 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
         )
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=reject,
         )
         try:
@@ -1746,7 +1886,7 @@ def test_tool_worker_bounds_waiting_calls_and_releases_retained_bytes() -> None:
 def test_shutdown_watchdog_bounds_a_blocking_filesystem_mutation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 0.05)
 
     async def exercise() -> None:
         started = threading.Event()
@@ -1798,7 +1938,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_mutation(
 def test_shutdown_watchdog_bounds_a_blocking_filesystem_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 0.05)
 
     async def exercise() -> None:
         started = threading.Event()
@@ -1850,7 +1990,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_read(
 def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 0.05)
 
     async def exercise() -> None:
         started = threading.Event()
@@ -1882,6 +2022,8 @@ def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
                             "workspace_path": "/tmp/workspace",
                             "sandbox_mode": True,
                             "ssrf_denylist": [],
+                            "shell_timeout_max": 600,
+                            "env_allowlist": ["PATH", "HOME"],
                         },
                     }
                 )
@@ -1889,7 +2031,7 @@ def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
         )
         runtime = ClientRuntime(
             load_config(_environment()),
-            hello_factory=lambda: Hello.new_with_id(hello_id, "0.0.1", "linux"),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             hard_exit=hard_exit,
         )
         connection = asyncio.create_task(runtime.run_connection(socket))
@@ -1912,7 +2054,7 @@ def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
 def test_incomplete_shutdown_keeps_the_hard_exit_watchdog_armed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_GRACE_SECONDS", 1.0)
+    monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 1.0)
 
     async def exercise() -> bool:
         runtime = ClientRuntime(load_config(_environment()), hard_exit=lambda _code: None)

@@ -154,6 +154,9 @@ def _runtime_smoke_payload(
     run_seconds: float,
     run_peak_rss: int,
     run_peak_processes: int,
+    exec_seconds: float,
+    exec_peak_rss: int,
+    exec_peak_processes: int,
     conversion_seconds: float,
     conversion_peak_rss: int,
     conversion_peak_processes: int,
@@ -169,6 +172,11 @@ def _runtime_smoke_payload(
             "seconds": round(run_seconds, 6),
             "sampled_process_tree_peak_processes": run_peak_processes,
             "sampled_process_tree_peak_rss_bytes": run_peak_rss,
+        },
+        "exec_backends": {
+            "seconds": round(exec_seconds, 6),
+            "sampled_process_tree_peak_processes": exec_peak_processes,
+            "sampled_process_tree_peak_rss_bytes": exec_peak_rss,
         },
         "conversion_child": {
             "seconds": round(conversion_seconds, 6),
@@ -211,6 +219,22 @@ def main() -> int:
                 f"stdout={run.completed.stdout!r}; stderr={run.completed.stderr!r}"
             )
 
+        exec_backends = _run(binary, "_exec-backend-smoke", psutil=psutil)
+        try:
+            exec_payload = json.loads(exec_backends.completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise SmokeError("exec backend smoke did not write JSON") from exc
+        if (
+            exec_backends.completed.returncode != 0
+            or exec_backends.completed.stderr
+            or not isinstance(exec_payload, dict)
+            or exec_payload.get("ok") is not True
+            or exec_payload.get("pipe") is not True
+            or exec_payload.get("tty") is not True
+            or "openoctopus-exec-smoke" in exec_backends.completed.stdout
+        ):
+            raise SmokeError("exec backend smoke failed")
+
         conversion = _run(binary, "_spike-convert", str(fixture), psutil=psutil)
         try:
             conversion_payload = json.loads(conversion.completed.stdout)
@@ -244,6 +268,9 @@ def main() -> int:
                     run_seconds=run.seconds,
                     run_peak_rss=run.peak_rss_bytes,
                     run_peak_processes=run.peak_processes,
+                    exec_seconds=exec_backends.seconds,
+                    exec_peak_rss=exec_backends.peak_rss_bytes,
+                    exec_peak_processes=exec_backends.peak_processes,
                     conversion_seconds=conversion.seconds,
                     conversion_peak_rss=conversion.peak_rss_bytes,
                     conversion_peak_processes=conversion.peak_processes,

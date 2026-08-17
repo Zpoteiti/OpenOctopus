@@ -24,28 +24,30 @@ additional handshake credentials.
 ### 1.2 Handshake
 
 After the WS upgrade succeeds, **the client sends `hello` first**. Every
-frame is validated with strict Py5 DTOs: unknown fields are rejected, not
-ignored.
+frame is validated with strict Protocol v2 DTOs: unknown fields are rejected,
+not ignored.
 
 ```jsonc
 {
   "type": "hello",
   "id": "0190d5a7-...",          // UUID v7, used to correlate hello_ack
-  "version": "1",                // protocol version
+  "version": "2",                // protocol version
   "client_version": "0.0.1",     // openoctopus_client package version
   "os": "linux",                 // "linux" | "darwin" | "windows"
-  "caps": {                       // the fixed Py5 capability set
+  "caps": {                       // fixed non-shell capabilities
     "shared_tools": true,
     "web_fetch": true,
     "file_transfer": ["send", "receive"],
-    "http_relay": true,
-    "exec": false,
-    "mcp": false
+    "http_relay": true
+  },
+  "shells": {
+    "default": "bash",
+    "available": ["bash", "sh", "zsh"]
   }
 }
 ```
 
-Server responds with `hello_ack` containing the active Py5 device config:
+Server responds with `hello_ack` containing the active Py6 device config:
 
 ```jsonc
 {
@@ -55,12 +57,22 @@ Server responds with `hello_ack` containing the active Py5 device config:
   "config": {
     "workspace_path": "~/openoctopus/workspace",
     "sandbox_mode": true,
-    "ssrf_denylist": ["127.0.0.0/8", "10.0.0.0/8"]
+    "ssrf_denylist": ["127.0.0.0/8", "10.0.0.0/8"],
+    "shell_timeout_max": 600,
+    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"]
   }
 }
 ```
 
 If the token is invalid or revoked, the server closes with WS code `4401` and a JSON close-reason payload `{"code":"unauthorized"}`. No `error` frame. The server rechecks the token after receiving `hello` and before `hello_ack`, so a token revoked during an in-flight handshake cannot become an online connection.
+
+Protocol v2 is strict: a v2 server receiving `version: "1"` closes with `4409`
+and `{"code":"version_unsupported","protocol_version":"2"}`. A v2 client
+receiving an incompatible handshake exits permanently; there is no version
+negotiation or v1 fallback. A client must provide both pipe and PTY/ConPTY
+backends; missing packaged PTY dependencies are a permanent startup failure,
+while a transient per-call PTY allocation failure returns
+`tool_pty_unavailable` without falling back to pipes.
 
 ### 1.3 Reconnect
 
@@ -71,15 +83,20 @@ reconnect sends `hello` with a new UUID v7. This applies to the initial
 connection as well.
 
 Retryable failures are DNS/TCP/TLS failures, HTTP 429 or 5xx upgrade responses,
-and unexpected WS closure codes `1000`, `1001`, `1013`, `4000`, or `4408`. Code `4000` is the
-duplicate-connection replacement closure and has reason `connection_replaced`.
+and unexpected WS closure codes `1000`, `1001`, `1006`, `1013`, or `4408`.
+Code `4000` is the duplicate-connection replacement closure and is permanent:
+the old client cleans up sessions and exits without reconnecting. Ordinary
+retryable disconnects and server restart preserve runtime-owned exec sessions.
 HTTP 401/403 and WS `4401` are permanent authentication failures: log a
 sanitized message and exit non-zero. Other HTTP 4xx responses and WS `4409`
 are permanent URL/protocol configuration failures: log a sanitized message and
 exit with status 78. In particular, the client does not retry a 4409 mismatch.
 
-In-flight tool calls at disconnect do not resume. The server fails them with
-`tool_device_unreachable` (see §3.4).
+In-flight calls that had not entered transport fail with
+`tool_device_unreachable`; calls that may have entered transport fail with
+`tool_execution_outcome_unknown`. The server never replays an exec or stdin
+call. Token rotation, device deletion, and 4401 permanently terminate local
+exec sessions.
 
 ### 1.4 Heartbeat
 
@@ -91,11 +108,12 @@ In-flight tool calls at disconnect do not resume. The server fails them with
 - Server sends `ping` every **30 seconds**, starting one full interval after `hello_ack`.
 - Client must respond with `pong` echoing the `ping.id` before the next
   `ping` deadline.
-- The client does not initiate application-level `ping` in v1. It is a
-  stateless executor; server-side online state is authoritative.
+- The client does not initiate application-level `ping` in v2; server-side
+  online state is authoritative.
 - After **2 missed pongs (~70s)** the server closes the connection (WS code
-  `4408`) and marks the device offline. Any in-flight tool calls fail with
-  `tool_device_unreachable` (§3.4).
+  `4408`) and marks the device offline. Calls rejected before issue fail with
+  `tool_device_unreachable`; issued calls use
+  `tool_execution_outcome_unknown` (§3.4).
 
 ---
 
@@ -120,7 +138,7 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 
 | `type` | Purpose | Carries |
 |---|---|---|
-| `hello_ack` | Handshake response | id (echoes hello), device_name, active Py5 config |
+| `hello_ack` | Handshake response | id (echoes hello), device_name, active Py6 config |
 | `tool_call` | Dispatch a tool to the device | id, name, args, max_result_bytes |
 | `config_update` | Push a device rename/config change (ADR-050) | id, current device_name, new config object |
 | `transfer_request` | Ask a device to send one regular file | id, purpose, src_path, dst_path? |
@@ -131,8 +149,9 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 | `ping` | Liveness probe | id |
 | `error` | Out-of-band error report | id?, code, message |
 
-`register_mcp`, `config_validate`, and shell/exec frames are not Py5 frames;
-the Py5 client does not advertise, accept, or persist them. The `error` frame
+`register_mcp`, `config_validate`, and shell/exec frames are not separate
+frames: Py6 shell operations reuse `tool_call`/`tool_result`. The Py6 client
+does not advertise dynamic tool schemas or MCP. The `error` frame
 is for protocol-level issues (malformed JSON, unknown frame type) that are not
 tied to a specific tool call. Tool failures travel as `tool_result` with
 `is_error: true` per ADR-031.
@@ -157,7 +176,10 @@ Server → client. Fired when the agent loop dispatches a tool whose `openoctopu
 }
 ```
 
-The client validates that `name` is one of the active shared file tools or `web_fetch`, enqueues the call in its device-local FIFO executor, and replies with `tool_result` when complete.
+The client validates that `name` is one of the active shared file tools,
+`web_fetch`, or the three Py6 client-only exec tools. For the exec tools the
+frame also carries provider-hidden `chat_session_id`; ordinary tools may omit
+it. The client replies with `tool_result` when complete.
 
 ### 3.2 `tool_result`
 
@@ -218,11 +240,14 @@ Raw string results become a following `text` block. Raw safe block arrays are
 appended after the warning in their original order. Base64 image data is never
 modified.
 
-### 3.3 Device-local FIFO dispatch
+### 3.3 Device-local dispatch
 
 The server may issue multiple `tool_call` frames before any `tool_result`
-arrives. The client queues them and executes one tool call at a time in FIFO
-order. Correlation is still by `id`.
+arrives. Existing non-shell tools retain the bounded, one-active-call FIFO.
+`exec`, `write_stdin`, and `list_exec_sessions` never wait behind an active or
+queued call: they are accepted immediately when the worker is free or return
+`tool_device_busy`. A yielded process no longer occupies the worker, but still
+occupies one exec-session slot. Correlation is always by `id`.
 
 This FIFO is per connected device, not global across the server. Sessions and
 users can still progress concurrently when they target different resources.
@@ -232,22 +257,49 @@ users can still progress concurrently when they target different resources.
 - **Client-side timeout** (the tool's own timeout fires): `tool_result(is_error=true, code=tool_exec_timeout)` (or whichever tool-specific code).
 - **Device policy rejection** (path outside workspace or SSRF deny hit):
   `tool_result(is_error=true, code=tool_path_outside_workspace | network_ssrf_blocked)`.
-- **Disconnect mid-call** (WS closed before `tool_result` arrives): the server
-  fails the call with `tool_device_unreachable` and server-authored diagnostic
-  text. The persisted/provider-facing content uses the normalized block-array
-  shape. There is no server-side retry.
-- **Heartbeat timeout** (2 missed pongs): same as disconnect mid-call — all
-  in-flight calls fail with `tool_device_unreachable`.
+- **Disconnect before issue**: the server returns `tool_device_unreachable`.
+- **Disconnect/send failure/result timeout after issue or at an ambiguous send
+  boundary**: the server returns `tool_execution_outcome_unknown`, installs a
+  generation-scoped late-result tombstone, and never retries automatically.
+  The persisted/provider-facing content uses the normalized block-array shape.
+- **Heartbeat timeout** (2 missed pongs): preflight calls are unreachable;
+  already-issued calls have unknown outcome.
 
-### 3.5 Deferred execution protocols
+### 3.5 Py6 client-only execution
 
-Py5 has no `exec`, `write_stdin`, `list_exec_sessions`, `register_mcp`, or
-`config_validate` frame. The client advertises `exec: false` and `mcp: false`,
-and the server rejects unknown frame types/fields. Shell sessions and MCP
-tools are later milestones; their future wire shapes, environment policy, and
-subprocess lifecycle are intentionally not specified here.
+`exec`, `write_stdin`, and `list_exec_sessions` are fixed `CLIENT_ONLY` tool
+names routed through the ordinary `tool_call`/`tool_result` frames. They are
+not extra WebSocket frame types and do not use dynamic `RegisterTools`. The
+server injects required `openoctopus_device` only for trusted paired devices
+(`sandbox_mode=false`); `server` is never an exec target. The client performs
+strict second validation and returns raw text result content; the server applies
+the normal provider-facing result normalization.
 
-### 3.6 `config_update` (Py5 active fields)
+`tool_call` for these names includes a required provider-hidden
+`chat_session_id` and an opaque client-generated UUIDv7 `session_id` is returned
+inside the result. Provider-visible tool args do not include the chat UUID,
+device UUID, policy epoch, or transport metadata. Sessions are chat-owned and
+survive ordinary reconnect/server restart, but not device revocation,
+replacement, shutdown, or policy change.
+
+`exec` defaults to closed-stdin pipes. `tty=true` selects POSIX PTY or Windows
+ConPTY and guarantees line-oriented interaction only; no full TUI, resize,
+screenshot, or secret input is supported. `write_stdin` polls unread output or
+writes PTY chars; in pipe mode only `chars="\u0003"` is an OS interrupt and
+ordinary text is rejected. `terminate=true` is the cross-platform forced
+termination operation. Pipe `wait_for` searches stdout/stderr independently;
+PTY searches the normalized merged stream, checking already unread output
+before waiting for new output. `wait_timeout_ms` without `wait_for` is invalid.
+Pipe SSH requires a preconfigured key and known_hosts with no prompt; first
+host-key confirmation requires `tty=true`. A PowerShell/REPL session is started
+by the command itself (for example `command: "pwsh"`), not by an empty command.
+
+PTY DSR compatibility replies are fixed: `CSI 5 n` → `ESC[0n`, `CSI 6 n` →
+`ESC[1;1R`, and `CSI ? 6 n` → `ESC[?1;1R`. Unknown terminal queries are ignored;
+only a real write/flush failure terminates the session. PTY output is a
+bounded normalized text stream with no cursor or screen-canvas state.
+
+### 3.6 `config_update` (Py6 active fields)
 
 Server → client. Pushed when a `PATCH /api/devices/{name}/config` succeeds
 (ADR-050). It always carries the current canonical `device_name`, matching
@@ -262,14 +314,17 @@ without requiring a reconnect.
   "config": {
     "sandbox_mode": false,
     "ssrf_denylist": [],
-    "workspace_path": "/home/alice/.openoctopus/"
+    "workspace_path": "/home/alice/.openoctopus/",
+    "shell_timeout_max": 600,
+    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"]
   }
 }
 ```
 
 Client hot-reloads. It updates its local `device_name` from the frame, then
-applies the config. In-flight tool calls finish under the **old** config;
-new calls use the new config.
+applies the config. Existing non-shell calls finish under their captured old
+config. A shell-policy change fences new exec calls, terminates sessions from
+the old policy, then activates the new policy; no process starts in between.
 Client does not ack — the next `tool_call` implicitly confirms the new config
 is in effect.
 
@@ -278,7 +333,7 @@ is in effect.
 ## 4. File transfer (Option A — binary frames)
 
 Python-main server implements `server -> server` `file_transfer`.
-Py5 implements `server -> client` and `client -> server` regular-file
+Py6 implements `server -> client` and `client -> server` regular-file
 streaming. When both endpoints are the same paired device, the server dispatches
 one coordinated local copy/move call; it does not send bytes over the server.
 Different client-to-client endpoints are rejected. Folder transfer, range, and
@@ -287,7 +342,7 @@ resume are not supported. Disconnected device targets surface
 
 ### 4.1 Slot lifecycle
 
-A Py5 transfer has one unambiguous state sequence:
+A Py6 transfer has one unambiguous state sequence:
 
 1. **Requester → sender:** optional `transfer_request` — asks the other side to
    open one regular-file source.
@@ -408,7 +463,7 @@ chunk for a known failure tombstone created from `transfer_end(ack=false,
 ok=false)` (or its matching failure acknowledgement), which may be discarded
 without writing it to another slot. Receivers stream chunks to a temporary
 destination/HTTP consumer and never collect a whole file in memory. There is
-no client-to-client bridge in Py5.
+no client-to-client bridge in Py6.
 
 ### 4.4 Verification
 
@@ -432,7 +487,7 @@ frames for that slot.
 ### 4.5 Device → device
 
 `file_transfer` between two different clients (for example,
-`alice-laptop` → `alice-phone`) is rejected with `tool_invalid_args`; Py5 does
+`alice-laptop` → `alice-phone`) is rejected with `tool_invalid_args`; Py6 does
 not implement a client-to-client bridge. When both device fields name the same
 paired client, the server sends an internal workspace action and the client
 performs a coordinated local regular-file copy or move.
@@ -444,7 +499,7 @@ The agent's cross-endpoint `file_transfer` tool blocks until the final
 client's coordinated operation. The tool returns success when `ok=true`, or
 surfaces the error per ADR-031 when `ok=false`.
 
-The current Py5 `message` tool is web-session only. With `media: [...]` and a
+The current Py6 `message` tool is web-session only. With `media: [...]` and a
 paired `openoctopus_device`, it writes an online-only device-file reference to
 the message sidecar; no bytes move at send time. When the browser later
 downloads the file through the Workspace Files `GET` route, the server opens a
@@ -453,7 +508,7 @@ with bounded buffering. This is not a durable `file_transfer`: there is no
 server destination path and no RustFS write. With `openoctopus_device="server"`,
 the tool authorizes and stats the file through `WorkspaceService` and emits a
 durable workspace-file reference. Third-party channel delivery is outside this
-milestone and has no Py5 wire contract.
+milestone and has no Py6 wire contract.
 
 ---
 
@@ -486,16 +541,16 @@ Standard WS close codes 1000–1015, plus OpenOctopus-specific:
 | `1000` | — | Normal close. A local shutdown exits; an unexpected close is treated as retryable. |
 | `1001` | — | Going away (server restart). Reconnect with backoff. |
 | `1013` | `{"code":"io_error"}` | Temporary server/backend unavailable during handshake. Reconnect with backoff. |
-| `4000` | `connection_replaced` | A newer connection replaced this generation. Reconnect with backoff. |
+| `4000` | `connection_replaced` | A newer connection replaced this generation. Old client terminates sessions and exits permanently. |
 | `4401` | `{"code":"unauthorized"}` | Token invalid / revoked. **Exit, do NOT retry**. |
 | `4408` | — | Heartbeat timeout. Reconnect with backoff. |
-| `4409` | `{"code":"version_unsupported","protocol_version":"1"}` | Protocol version mismatch. **Exit code 78, do NOT retry**. Details are sanitized before logging. |
+| `4409` | `{"code":"version_unsupported","protocol_version":"2"}` | Protocol version mismatch. **Exit code 78, do NOT retry**. Details are sanitized before logging. |
 
 ---
 
 ## 6. Versioning
 
-Protocol version is a single string in `hello.version`; v1 is the version
+Protocol version is a single string in `hello.version`; v2 is the version
 specified here. Every frame model uses strict validation and rejects unknown
 fields. A wire-incompatible field or frame change therefore requires a
 coordinated protocol-version change; do not assume additive unknown-field
@@ -528,3 +583,5 @@ tolerance. Protocol version is independent from the package version.
 - **ADR-100** — MCP `enabled` filter applies uniformly across the three surfaces.
 - **ADR-131** — Py5 Python client, minimal device config, hashed tokens, and
   single-file transfer handshake.
+- **ADR-132** — Py6 fixed client exec schemas, Protocol v2, PTY boundary, and
+  chat-owned process sessions.

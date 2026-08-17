@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import pathspec
-import regex  # type: ignore[import-untyped]
+import regex
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError

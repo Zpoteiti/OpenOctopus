@@ -15,6 +15,12 @@ from openoctopus_client.document_convert import (
     conversion_worker_main,
     convert_path,
 )
+from openoctopus_client.process import (
+    ProcessBackendError,
+    PtyUnavailableError,
+    frozen_backend_smoke,
+    validate_pty_backend,
+)
 
 
 def main() -> int:
@@ -26,18 +32,32 @@ def main() -> int:
     spike.add_argument("path", type=Path)
     spike.add_argument("--pages")
     commands.add_parser("_conversion-worker", help=argparse.SUPPRESS)
+    commands.add_parser("_exec-backend-smoke", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if arguments.command == "version":
         print(__version__)
         return 0
     if arguments.command == "_conversion-worker":
         return conversion_worker_main()
+    if arguments.command == "_exec-backend-smoke":
+        try:
+            payload = asyncio.run(frozen_backend_smoke())
+        except ProcessBackendError:
+            print(json.dumps({"code": "tool_exec_failed", "ok": False}, sort_keys=True))
+            return 1
+        print(json.dumps(payload, sort_keys=True))
+        return 0
     if arguments.command in {None, "run"}:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
         try:
             config = load_config()
         except ConfigurationError as exc:
             print(f"configuration error: {exc}", file=sys.stderr)
+            return 78
+        try:
+            validate_pty_backend()
+        except PtyUnavailableError:
+            print("backend error: PTY backend is unavailable", file=sys.stderr)
             return 78
         try:
             return asyncio.run(ClientRuntime(config).run())

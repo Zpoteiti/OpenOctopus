@@ -173,13 +173,16 @@ Hosts every workspace listed above. File tool calls with
 openoctopus_device="server" target a workspace by path prefix.
 
 ### laptop
-fs_policy: sandbox (Linux bwrap, rooted at /home/alice/.openoctopus/).
-exec available. Default timeout 60s, max 600s.
-No server-side quota — Alice manages her own disk.
+fs_policy: trusted (sandbox_mode=false).
+exec available: pipe by default, PTY with `tty=true`; default hard timeout 60s,
+device cap 600s. Long-running REPL/SSH commands must set an explicit timeout;
+`yield_time_ms` never extends the hard timeout. Password/2FA/passphrase input
+is unsupported. No server-side quota — Alice manages her own disk.
 
 ### phone
-fs_policy: unrestricted.
+fs_policy: trusted (sandbox_mode=false).
 Workspace root: /data/data/com.openoctopus/files/.
+exec available: pipe by default or line-oriented PTY with `tty=true`.
 Current connectivity is checked at tool execution time.
 
 ---
@@ -201,6 +204,11 @@ Current connectivity is checked at tool execution time.
     "files_with_matches" to scope before requesting full content.
   - Use offset/limit on read_file to page through large files
     instead of pulling all at once.
+- **Exec.** Prefer file tools for ordinary file reads and writes. For long-running
+  commands, yield and then use list_exec_sessions or write_stdin to poll. After
+  `tool_execution_outcome_unknown`, inspect the session or external state and do
+  not replay the command. Never request or enter passwords, 2FA codes, or
+  passphrases; ask the user to take over.
 - **Replying.** Plain text output delivers to the current session
   channel automatically. Use the `message` tool when you need to
   send files (media), inline buttons, or reach a different
@@ -336,8 +344,11 @@ the public DTO layer does not own a second grammar.
 ### Devices
 - Execution targets (where shell / file tools can run).
 - The server always appears. Clients appear if registered to this user.
-- Per-device attributes: stable name, fs_policy, workspace root, shell timeout
-  bounds, and declared capabilities.
+- Per-device attributes: stable name, `sandbox_mode`, workspace root,
+  `shell_timeout_max`, `env_allowlist`, and declared capabilities. Exec is
+  exposed only for paired devices with `sandbox_mode=false`; `server` is never
+  an exec target. It runs with the device user's OS privileges, not an OS
+  sandbox. `command_denylist` is not a Py6 control.
 - Online/offline state and last-seen timestamps are volatile, server-authoritative
   execution state. Tool dispatch checks them out of band and reports failure;
   they do not churn the system-prompt prefix.

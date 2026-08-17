@@ -67,7 +67,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: py5-client-linux-x64
+          name: py6-client-linux-x64
           path: |
             client/dist/openoctopus-client
             client/metrics
@@ -106,7 +106,7 @@ jobs:
       - name: Download frozen client bundle
         uses: actions/download-artifact@v4
         with:
-          name: py5-client-linux-x64
+          name: py6-client-linux-x64
           path: client
 
       - name: Install server dependencies
@@ -141,9 +141,11 @@ jobs:
         env:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           PY5_REAL_E2E: "1"
+          PY6_REAL_E2E: "1"
         run: |
           chmod +x "$OO_CLIENT_BIN"
           test -x "$OO_CLIENT_BIN"
           pytest -v \
             tests/test_device_client_e2e.py::test_real_chat_runtime_source_client_read_write_and_offline \
-            tests/test_device_client_transfer_e2e.py::test_real_file_transfer_and_device_workspace_relay
+            tests/test_device_client_transfer_e2e.py::test_real_file_transfer_and_device_workspace_relay \
+            tests/test_py6_client_exec_e2e.py::test_real_client_exec_pipe_tty_reconnect_and_chat_isolation

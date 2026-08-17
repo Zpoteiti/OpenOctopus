@@ -131,14 +131,32 @@ async def build_system_prompt(
         f"- Shared workspace: /{workspace.name}@{workspace.suffix}/ (read/write for all members)"
         for workspace in workspaces
     )
-    device_lines = ["- server — OpenOctopus server execution target"]
-    device_lines.extend(
-        (
+    device_lines = ["- server — OpenOctopus server tool target; exec: unavailable"]
+    for device in devices:
+        line = (
             f"- {device.name} — workspace_root: {device.workspace_path}; "
             f"sandbox_mode: {str(device.sandbox_mode).lower()}"
         )
-        for device in devices
-    )
+        if device.sandbox_mode:
+            device_lines.append(f"{line}; exec: unavailable")
+        else:
+            device_lines.append(
+                f"{line}; exec: available; shell_timeout_max: {device.shell_timeout_max} seconds"
+            )
+    if any(not device.sandbox_mode for device in devices):
+        device_lines.extend(
+            (
+                "- Exec on trusted devices defaults to pipes; use tty=true for line-oriented "
+                "interaction. It runs with host OS privileges and is not an OS sandbox.",
+                "- Prefer file tools for ordinary file reads and writes.",
+                "- For long-running commands, yield and then use list_exec_sessions or "
+                "write_stdin to poll.",
+                "- After tool_execution_outcome_unknown, inspect the session or external "
+                "state and do not replay the command.",
+                "- Never request or enter passwords, 2FA codes, or passphrases; ask the user "
+                "to take over.",
+            )
+        )
 
     return "\n\n".join(
         (

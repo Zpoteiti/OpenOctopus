@@ -10,6 +10,7 @@ dependencies = [
     "pypdf>=5.0",
     "regex>=2024.11,<2027",
     "websockets>=15,<18",
+    "pywinpty==3.0.5; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

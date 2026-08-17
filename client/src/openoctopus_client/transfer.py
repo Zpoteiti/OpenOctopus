@@ -140,7 +140,7 @@ class _Slot:
 
 
 class TransferManager:
-    """Bounded client-side implementation of the Py5 single-file wire flow.
+    """Bounded client-side implementation of the Py6 single-file wire flow.
 
     The reader calls :meth:`handle_control` and :meth:`handle_binary`; all
     filesystem work runs in per-slot tasks.  Four queued chunks per receiver

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -6,6 +7,7 @@ from uuid import UUID
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.chat.public_projection import message_response, pending_response
 from openctopus_server.chat.repair import synthetic_tool_result
 from openctopus_server.chat.runtime_context import build_runtime_block
@@ -18,6 +20,11 @@ from openctopus_server.provider.config import load_provider_config
 from openctopus_server.provider.wire_types import Effort
 
 _CANCEL_TEXT = "[user cancelled: tool was not executed because the user pressed stop]"
+_OUTCOME_UNKNOWN_TEXT = (
+    "[user cancelled: tool execution outcome is unknown because the server stopped "
+    "waiting before recording its result]"
+)
+_cancel_waiters: dict[UUID, set[asyncio.Future[None]]] = {}
 
 
 async def accept_message(
@@ -422,14 +429,27 @@ async def cancel_tool_batch(
     db: AsyncSession,
     *,
     turn: TurnStart,
-    remaining_tool_ids: list[str],
+    outcome_unknown_tool_ids: list[str],
+    cancelled_tool_ids: list[str],
 ) -> tuple[list[Message], Message]:
     try:
         await _advisory_lock(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
         now = datetime.now(UTC)
         result_rows: list[Message] = []
-        for index, tool_id in enumerate(remaining_tool_ids):
+        outcomes = [
+            (
+                tool_id,
+                ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value,
+                _OUTCOME_UNKNOWN_TEXT,
+            )
+            for tool_id in outcome_unknown_tool_ids
+        ]
+        outcomes.extend(
+            (tool_id, ErrorCode.USER_CANCELLED.value, _CANCEL_TEXT)
+            for tool_id in cancelled_tool_ids
+        )
+        for index, (tool_id, code, text_content) in enumerate(outcomes):
             row = Message(
                 id=uuid.uuid4(),
                 session_id=turn.session_id,
@@ -437,8 +457,8 @@ async def cancel_tool_batch(
                 content=[
                     synthetic_tool_result(
                         tool_id,
-                        code="user_cancelled",
-                        text=_CANCEL_TEXT,
+                        code=code,
+                        text=text_content,
                     )
                 ],
                 delivery_refs=[],
@@ -482,6 +502,22 @@ async def request_cancel(
     user_id: UUID,
     session_id: UUID,
 ) -> bool:
+    transition = asyncio.create_task(
+        _request_cancel_transition(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    )
+    return await await_future_cancellation_safe(transition)
+
+
+async def _request_cancel_transition(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    session_id: UUID,
+) -> bool:
     try:
         await _advisory_lock(db, session_id)
         session = (
@@ -501,12 +537,37 @@ async def request_cancel(
                 )
             )
         ).scalar_one_or_none()
-        session.cancel_requested = running is not None
+        cancel_requested = running is not None
+        session.cancel_requested = cancel_requested
         await db.commit()
-        return session.cancel_requested
+        if cancel_requested:
+            _notify_cancel_waiters(session_id)
+        return cancel_requested
     except Exception:
         await db.rollback()
         raise
+
+
+def register_cancel_waiter(session_id: UUID) -> asyncio.Future[None]:
+    waiter = asyncio.get_running_loop().create_future()
+    _cancel_waiters.setdefault(session_id, set()).add(waiter)
+    return waiter
+
+
+def discard_cancel_waiter(session_id: UUID, waiter: asyncio.Future[None]) -> None:
+    waiters = _cancel_waiters.get(session_id)
+    if waiters is not None:
+        waiters.discard(waiter)
+        if not waiters:
+            _cancel_waiters.pop(session_id, None)
+    if not waiter.done():
+        waiter.cancel()
+
+
+def _notify_cancel_waiters(session_id: UUID) -> None:
+    for waiter in tuple(_cancel_waiters.get(session_id, ())):
+        if not waiter.done():
+            waiter.set_result(None)
 
 
 async def get_messages_response(

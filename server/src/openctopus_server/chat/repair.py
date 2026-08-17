@@ -11,8 +11,8 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 
 _RESTART_TEXT = (
-    "[server restart: tool was not executed because the OpenOctopus server "
-    "restarted before completing this tool batch]"
+    "[server restart: tool execution outcome is unknown because the OpenOctopus "
+    "server restarted before recording its result]"
 )
 
 
@@ -53,7 +53,13 @@ async def repair_unpaired_tool_uses(
                 id=uuid.uuid4(),
                 session_id=session_id,
                 message_kind="synthetic_tool_result",
-                content=[synthetic_tool_result(tool_id, code="server_restart", text=_RESTART_TEXT)],
+                content=[
+                    synthetic_tool_result(
+                        tool_id,
+                        code=ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value,
+                        text=_RESTART_TEXT,
+                    )
+                ],
                 delivery_refs=[],
                 is_compacted=False,
                 created_at=created_at + timedelta(microseconds=index),

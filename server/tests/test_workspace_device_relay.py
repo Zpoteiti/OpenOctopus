@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -25,9 +26,11 @@ from openctopus_server.devices.transfer import (
     TransferError,
     TransferManager,
     TransferResult,
+    TransferUnavailableError,
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.errors.http import ERROR_STATUS
 
 
 class _DB:
@@ -361,8 +364,11 @@ async def test_device_get_disconnect_after_commit_accepts_late_client_timeout() 
             *,
             expected_device_name: str | None = None,
             expected_config_epoch: int | None = None,
+            on_issued: Callable[[], None] | None = None,
         ) -> bool:
             del expected_device_name, expected_config_epoch
+            if on_issued is not None:
+                on_issued()
             frame = parse_server_frame(payload)
             self.frames.append(frame)
             self.frame_sent.set()
@@ -483,6 +489,7 @@ async def test_device_get_disconnect_after_commit_accepts_late_client_timeout() 
     ("error", "status", "code"),
     [
         (TransferError("tool_device_busy"), 429, "tool_device_busy"),
+        (TransferUnavailableError("route fenced"), 409, "tool_device_unreachable"),
         (TransferError("workspace_transfer_timeout"), 408, "workspace_transfer_timeout"),
         (TransferError("workspace_transfer_integrity_failed"), 502, "workspace_transfer_integrity_failed"),
     ],
@@ -504,7 +511,13 @@ async def test_device_get_maps_preheader_transfer_failures(
             settings=_settings(),  # type: ignore[arg-type]
         )
     assert raised.value.code.value == code
-    assert {429: ErrorCode.TOOL_DEVICE_BUSY, 408: ErrorCode.WORKSPACE_TRANSFER_TIMEOUT, 502: ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED}[status] is raised.value.code
+    assert {
+        409: ErrorCode.TOOL_DEVICE_UNREACHABLE,
+        429: ErrorCode.TOOL_DEVICE_BUSY,
+        408: ErrorCode.WORKSPACE_TRANSFER_TIMEOUT,
+        502: ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+    }[status] is raised.value.code
+    assert ERROR_STATUS[raised.value.code] == status
 
 
 async def test_device_put_admission_failure_does_not_read_http_body() -> None:

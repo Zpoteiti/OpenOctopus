@@ -4,7 +4,7 @@ import hashlib
 import re
 import secrets
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
@@ -33,6 +33,18 @@ DEFAULT_SSRF_DENYLIST = (
     "fe80::/10",
     "ff00::/8",
 )
+DEFAULT_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "SystemRoot",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+)
 
 _DEVICE_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -47,6 +59,17 @@ class DeviceSnapshot:
     sandbox_mode: bool
     ssrf_denylist: list[str]
     created_at: datetime
+    shell_timeout_max: int = 600
+    env_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
+
+
+class DevicePatchCommitOutcomeUnknownError(Exception):
+    """Wrap a policy commit whose durable outcome cannot be established."""
+
+    def __init__(self, cause: BaseException, *, device_id: UUID) -> None:
+        super().__init__("Device policy commit outcome is unknown")
+        self.cause = cause
+        self.device_id = device_id
 
 
 def canonicalize_name(raw: str) -> str:
@@ -87,6 +110,13 @@ async def find_by_token(db: AsyncSession, token: str) -> DeviceSnapshot | None:
     return _snapshot(row) if row is not None else None
 
 
+async def owned_id(db: AsyncSession, *, user_id: UUID, name: str) -> UUID | None:
+    device_id = await db.scalar(
+        select(Device.id).where(Device.user_id == user_id, Device.name == name)
+    )
+    return device_id if isinstance(device_id, UUID) else None
+
+
 async def create(
     db: AsyncSession,
     *,
@@ -95,10 +125,14 @@ async def create(
     workspace_path: str,
     sandbox_mode: bool,
     ssrf_denylist: list[str] | None,
+    shell_timeout_max: int = 600,
+    env_allowlist: list[str] | None = None,
 ) -> tuple[DeviceSnapshot, str]:
     canonical_name = canonicalize_name(name)
     _validate_workspace_path(workspace_path)
     _validate_ssrf_denylist(ssrf_denylist)
+    _validate_shell_timeout_max(shell_timeout_max)
+    _validate_env_allowlist(env_allowlist)
     token = mint_token()
     device = Device(
         user_id=user_id,
@@ -108,6 +142,8 @@ async def create(
         workspace_path=workspace_path,
         sandbox_mode=sandbox_mode,
         ssrf_denylist=_initial_ssrf_denylist(sandbox_mode, ssrf_denylist),
+        shell_timeout_max=shell_timeout_max,
+        env_allowlist=_initial_env_allowlist(env_allowlist),
     )
     db.add(device)
     await _commit_or_name_conflict(db)
@@ -124,6 +160,8 @@ async def patch(
     workspace_path: str | None,
     sandbox_mode: bool | None,
     ssrf_denylist: list[str] | None,
+    shell_timeout_max: int | None = None,
+    env_allowlist: list[str] | None = None,
 ) -> DeviceSnapshot:
     device = await _owned_for_update(db, user_id=user_id, name=name)
     if "name" in fields:
@@ -144,7 +182,17 @@ async def patch(
             raise _invalid("SSRF denylist must be an array")
         _validate_ssrf_denylist(ssrf_denylist)
         device.ssrf_denylist = list(ssrf_denylist)
-    await _commit_or_name_conflict(db)
+    if "shell_timeout_max" in fields:
+        if shell_timeout_max is None:
+            raise _invalid("Shell timeout max must be an integer")
+        _validate_shell_timeout_max(shell_timeout_max)
+        device.shell_timeout_max = shell_timeout_max
+    if "env_allowlist" in fields:
+        if env_allowlist is None:
+            raise _invalid("Environment allowlist must be an array")
+        _validate_env_allowlist(env_allowlist)
+        device.env_allowlist = list(env_allowlist)
+    await _commit_patch_or_name_conflict(db, device_id=device.id)
     return _snapshot(device)
 
 
@@ -187,6 +235,16 @@ async def _commit_or_name_conflict(db: AsyncSession) -> None:
         raise DeviceError(ErrorCode.DEVICE_NAME_TAKEN, "Device name is already in use") from exc
 
 
+async def _commit_patch_or_name_conflict(db: AsyncSession, *, device_id: UUID) -> None:
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise DeviceError(ErrorCode.DEVICE_NAME_TAKEN, "Device name is already in use") from exc
+    except BaseException as exc:
+        raise DevicePatchCommitOutcomeUnknownError(exc, device_id=device_id) from exc
+
+
 def _initial_ssrf_denylist(sandbox_mode: bool, supplied: list[str] | None) -> list[str]:
     if supplied is not None:
         return list(supplied)
@@ -211,6 +269,34 @@ def _validate_ssrf_denylist(entries: list[str] | None) -> None:
         raise _invalid("SSRF denylist entries must be non-blank and bounded")
 
 
+def _validate_shell_timeout_max(value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 86400:
+        raise _invalid("Shell timeout max must be between 0 and 86400 seconds")
+
+
+def _validate_env_allowlist(entries: list[str] | None) -> None:
+    if entries is None:
+        return
+    if (
+        len(entries) > 64
+        or len(entries) != len(set(entries))
+        or any(
+            not entry
+            or len(entry) > 128
+            or entry.strip() != entry
+            or "=" in entry
+            or any(ord(char) < 0x20 for char in entry)
+            or entry.upper().startswith("OPENOCTOPUS_")
+            for entry in entries
+        )
+    ):
+        raise _invalid("Environment allowlist contains an invalid variable name")
+
+
+def _initial_env_allowlist(supplied: list[str] | None) -> list[str]:
+    return list(DEFAULT_ENV_ALLOWLIST if supplied is None else supplied)
+
+
 def _snapshot(device: Device) -> DeviceSnapshot:
     return DeviceSnapshot(
         id=device.id,
@@ -220,6 +306,8 @@ def _snapshot(device: Device) -> DeviceSnapshot:
         workspace_path=device.workspace_path,
         sandbox_mode=device.sandbox_mode,
         ssrf_denylist=list(device.ssrf_denylist),
+        shell_timeout_max=device.shell_timeout_max,
+        env_allowlist=list(device.env_allowlist),
         created_at=device.created_at,
     )
 
