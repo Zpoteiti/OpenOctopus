@@ -323,8 +323,9 @@ REPL、SSH shell 和其它长时间交互 session 必须显式传入足够大的
 - stdout/stderr 独立、持续并发 drain；结果不保证两者跨流相对顺序；
 - stdin 默认关闭；唯一的 `chars="\u0003"` 转为 OS interrupt，其它非空 chars
   返回 `tool_exec_stdin_closed`；
-- 适用于脚本、编译、测试、`git commit -m`、非交互包管理器、已配置 key 的
-  `ssh host command`；
+- 适用于脚本、编译、测试、`git commit -m`、非交互包管理器，以及已配置 key、
+  已存在匹配 known_hosts 且保证无 prompt 的 `ssh host command`；首次 host-key
+  确认或其它非秘密 SSH prompt 必须使用 `tty=true`；
 - 需要 REPL、TTY 检测、SSH shell 或行式交互 prompt 时用 `tty=true`；
 - 命令自行 `&`、`start`、daemonize 或逃逸 process group 不在契约内，cleanup
   best effort 并设置 `cleanup_incomplete`。
@@ -363,7 +364,8 @@ REPL、SSH shell 和其它长时间交互 session 必须显式传入足够大的
   `CSI ? 6 n` 精确回复 `ESC [ ? 1 ; 1 R`。它只避免行式程序等待 terminal response，
   不声称报告真实光标位置。response 通过 session 的串行 writer 直接写回 PTY，
   不进入 output ring。其它需要完整终端查询/屏幕状态的协议仍不支持；responder
-  失败时终止 session 并返回脱敏的 `tool_exec_failed`，不能让应用无限等待；
+  只在实际 response write/flush 失败或超时时终止 session 并返回脱敏的
+  `tool_exec_failed`，不能让应用无限等待；未知或未支持的 terminal query 直接忽略；
 - `chars` 发送文本或控制字符；`\u0003` 原样写入 PTY/ConPTY 输入通道，表示一次
   best-effort Ctrl-C 请求，但不保证前台程序产生中断或退出。POSIX PTY 通常把 `\u0004`
   解释为 Ctrl-D/EOT，但 Windows 不保证相同 EOF 语义，Agent 应发送所选 REPL/shell
@@ -372,7 +374,10 @@ REPL、SSH shell 和其它长时间交互 session 必须显式传入足够大的
   直接绑定真实 PTY，不先启动裸 shell 再把 command 当输入写入。POSIX 使用
   `bash/zsh [-l] -c`；PowerShell tty=true 使用 `-Command`，login=false 保留
   `-NoProfile` 但去掉 `-NonInteractive`，login=true 去掉 `-NoProfile`；cmd 使用
-  `/D /S /C`。PTY 使 command 的子程序看到 `isatty`；
+  `/D /S /C`。PTY 使 command 的子程序看到 `isatty`。交互目标始终是放在
+  `command` 中的 REPL 程序，例如 `command="python"`；若需要 PowerShell 自身 REPL，
+  使用 `shell="pwsh", command="pwsh"` 启动嵌套交互进程。空 command/直接启动裸
+  shell 不受支持；
 - 简单 REPL、SSH shell、TTY 检测和行式确认是支持目标；自动打开 Vim/nano 等
   编辑器和其它全屏 TUI 不是 acceptance gate；
 - `sudo -n`、SSH key、host-key 确认和非秘密 y/n prompt 属于支持边界。OO 无法可靠
@@ -416,7 +421,9 @@ wait_for 时使用 optional `wait_timeout_ms`，缺省 10000ms、上限 30000ms�
 同时显式提供，验证必须基于字段是否出现，而不是 Pydantic 注入的默认值。
 没有 `wait_for` 时显式传 `wait_timeout_ms` 返回 `tool_invalid_args`。
 Server 和 Client 都拒绝 UTF-8 编码超过 65,536 bytes 的 chars。wait_for 是
-substring，可跨 read chunk 匹配，不是 regex；deadline
+substring，可跨 read chunk 匹配，不是 regex。每次调用先检查已有未读内容，再等待
+新内容；pipe 分别在 stdout 与 stderr 中匹配，不能跨两个流拼接命中；PTY 在规范化的
+单一合并 output 中匹配。deadline
 到期只返回 running session。chars write/flush 最多 5s，部分写入后丢结果返回
 `tool_execution_outcome_unknown`，不自动重发。成功 poll 原子消费 unread output；
 终态首次 final poll 返回剩余内容并移除。`terminate=true` 本身等待有界终止、返回
@@ -623,6 +630,11 @@ shell `-c`/`-Command` 参数启动；不要先启动裸 shell 再把 command 当
 
 PTY 使 command 的 child 看到 `isatty`；`login=true` 可加载 profile、改变环境、
 产生副作用，不是安全模式。
+
+`tty=true` 仍然执行一个非空 `command`，不把所选 shell 本身变成跨调用共享的裸
+交互 shell。Agent 需要把目标 REPL 写进 command；PowerShell 自身交互使用嵌套的
+`shell="pwsh", command="pwsh"`。不同 `exec` 调用之间不共享该 REPL 的 cwd、变量或
+profile 状态。
 
 ### 11.2 environment、cwd、终止
 
