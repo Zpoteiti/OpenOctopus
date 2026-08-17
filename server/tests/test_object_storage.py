@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 from io import BytesIO
 from threading import Event, Lock
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -16,8 +18,11 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.storage import (
     STARTUP_PROBE_KEY,
+    TRANSFER_TEMP_PREFIX,
     ObjectStorage,
+    ObjectUpload,
     _PresignedGetTransport,
+    _QueueReader,
     build_object_storage,
 )
 
@@ -72,6 +77,14 @@ def _settings(**overrides: object) -> Settings:
         "chat_context_max_concurrency": 32,
         "chat_context_max_concurrency_per_user": 2,
         "chat_context_queue_timeout_seconds": 30,
+        "device_pending_calls_max": 4096,
+        "device_pending_calls_max_per_user": 64,
+        "device_pending_bytes_max": 256 * 1024 * 1024,
+        "device_pending_bytes_max_per_user": 32 * 1024 * 1024,
+        "device_transfer_max_concurrency": 32,
+        "device_transfer_max_concurrency_per_user": 2,
+        "device_transfer_queue_timeout_seconds": 5,
+        "device_transfer_idle_timeout_seconds": 30,
         "workspace_deletion_purge_timeout_seconds": 300,
         "workspace_deletion_shutdown_grace_seconds": 5,
     }
@@ -222,6 +235,37 @@ async def test_startup_probe_attempts_cleanup_after_read_failure() -> None:
     client.remove_object.assert_called_once_with("openoctopus", STARTUP_PROBE_KEY)
 
 
+async def test_startup_recovery_removes_only_transfer_temporaries() -> None:
+    client = Mock()
+    client.list_objects.return_value = [
+        SimpleNamespace(
+            object_name=f"{TRANSFER_TEMP_PREFIX}one",
+            size=3,
+            etag="one",
+        ),
+        SimpleNamespace(
+            object_name=f"{TRANSFER_TEMP_PREFIX}two",
+            size=4,
+            etag="two",
+        ),
+    ]
+    storage = object_storage_for_fake(client, "openoctopus", max_connections=2)
+
+    removed = await storage.recover_transfer_uploads()
+
+    assert removed == 2
+    client.list_objects.assert_called_once_with(
+        "openoctopus",
+        prefix=TRANSFER_TEMP_PREFIX,
+        recursive=True,
+        start_after=None,
+    )
+    assert client.remove_object.call_args_list == [
+        (("openoctopus", f"{TRANSFER_TEMP_PREFIX}one"),),
+        (("openoctopus", f"{TRANSFER_TEMP_PREFIX}two"),),
+    ]
+
+
 async def test_health_check_is_non_mutating() -> None:
     client = Mock()
     client.bucket_exists.return_value = True
@@ -359,6 +403,197 @@ async def test_write_disables_minio_parallel_uploads() -> None:
 
     client.put_object.assert_called_once()
     assert client.put_object.call_args.kwargs["num_parallel_uploads"] == 1
+
+
+async def test_stream_upload_writes_bounded_chunks_and_finishes() -> None:
+    client = Mock()
+    uploaded = bytearray()
+
+    def put_object(
+        bucket: str,
+        object_name: str,
+        stream: Any,
+        length: int,
+        **kwargs: Any,
+    ) -> SimpleNamespace:
+        assert bucket == "openoctopus"
+        assert object_name == "_temporary/upload"
+        assert length == -1
+        assert kwargs["num_parallel_uploads"] == 1
+        while chunk := stream.read(5 * 1024 * 1024):
+            uploaded.extend(chunk)
+        return SimpleNamespace(etag="stream-etag")
+
+    client.put_object.side_effect = put_object
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload")
+
+    await upload.write(b"first")
+    await upload.write(b"second")
+    metadata = await upload.finish()
+
+    assert bytes(uploaded) == b"firstsecond"
+    assert metadata.size == 11
+    assert metadata.etag == "stream-etag"
+    await storage.close()
+
+
+async def test_stream_upload_does_not_block_when_storage_worker_has_failed() -> None:
+    client = Mock()
+    client.put_object.side_effect = OSError("synthetic upload failure")
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload")
+    for _ in range(100):
+        if upload._worker.done():
+            break
+        await asyncio.sleep(0.001)
+    assert upload._worker.done()
+
+    with pytest.raises(WorkspaceError):
+        await asyncio.wait_for(upload.write(b"data"), timeout=0.2)
+
+    await upload.abort()
+    await storage.close()
+
+
+async def test_stream_upload_finish_cleans_up_after_worker_failure() -> None:
+    client = Mock()
+    client.put_object.side_effect = OSError("synthetic upload failure")
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload", length=4)
+    for _ in range(100):
+        if upload._worker.done():
+            break
+        await asyncio.sleep(0.001)
+
+    with pytest.raises(WorkspaceError):
+        await upload.finish()
+
+    client.remove_object.assert_called_once_with("openoctopus", "_temporary/upload")
+    await storage.close()
+
+
+async def test_stream_upload_checks_declared_length_when_worker_finishes_early() -> None:
+    client = Mock()
+
+    def put_object(
+        _bucket: str,
+        _object_name: str,
+        stream: Any,
+        _length: int,
+        **_kwargs: Any,
+    ) -> SimpleNamespace:
+        assert stream.read(4) == b"abc"
+        return SimpleNamespace(etag="stream-etag")
+
+    client.put_object.side_effect = put_object
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload", length=4)
+
+    await upload.write(b"abc")
+    for _ in range(100):
+        if upload._worker.done():
+            break
+        await asyncio.sleep(0.001)
+    with pytest.raises(WorkspaceError) as caught:
+        await upload.finish()
+
+    assert caught.value.code is ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE
+    client.remove_object.assert_called_once_with("openoctopus", "_temporary/upload")
+    await storage.close()
+
+
+def test_queue_reader_never_returns_more_than_requested() -> None:
+    values: queue.Queue[bytes | object] = queue.Queue()
+    values.put(b"abcdef")
+    reader = _QueueReader(values)
+
+    assert reader.read(2) == b"ab"
+    assert reader.read(2) == b"cd"
+    assert reader.read(8) == b"ef"
+
+
+def test_queue_reader_default_read_consumes_until_end() -> None:
+    values: queue.Queue[bytes | object] = queue.Queue()
+    values.put(b"ab")
+    values.put(b"cd")
+    values.put(ObjectUpload._END)
+    reader = _QueueReader(values)
+
+    assert reader.read() == b"abcd"
+
+
+async def test_stream_upload_rejects_declared_length_overrun_before_queueing() -> None:
+    client = Mock()
+    client.put_object.return_value = SimpleNamespace(etag="stream-etag")
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload", length=3)
+
+    await upload.write(b"abc")
+    with pytest.raises(WorkspaceError) as caught:
+        await upload.write(b"d")
+
+    assert caught.value.code is ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE
+    assert upload.written == 3
+    await upload.abort()
+    await storage.close()
+
+
+async def test_cancelled_upload_abort_cleans_up_and_propagates_cancellation() -> None:
+    started = Event()
+    release = Event()
+    client = Mock()
+
+    def put_object(_bucket: str, _name: str, _stream: Any, _length: int, **_kwargs: Any):
+        started.set()
+        release.wait()
+        return SimpleNamespace(etag="stream-etag")
+
+    client.put_object.side_effect = put_object
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    upload = storage.begin_upload("_temporary/upload")
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+
+    abort_task = asyncio.create_task(upload.abort())
+    await asyncio.sleep(0.01)
+    abort_task.cancel()
+    await asyncio.sleep(0.01)
+    assert not abort_task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await abort_task
+    client.remove_object.assert_called_once_with("openoctopus", "_temporary/upload")
+    await storage.close()
+
+
+async def test_storage_close_aborts_orphaned_stream_upload() -> None:
+    started = Event()
+    client = Mock()
+
+    def put_object(_bucket: str, _name: str, stream: Any, _length: int, **_kwargs: Any):
+        started.set()
+        while stream.read(5):
+            pass
+        return SimpleNamespace(etag="stream-etag")
+
+    client.put_object.side_effect = put_object
+    storage = ObjectStorage(client, "openoctopus", max_connections=1)
+    storage.begin_upload("_temporary/orphan")
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+
+    await asyncio.wait_for(storage.close(), timeout=1)
+    client.remove_object.assert_called_once_with("openoctopus", "_temporary/orphan")
+
+
+async def test_storage_close_rejects_new_stream_uploads() -> None:
+    storage = ObjectStorage(Mock(), "openoctopus", max_connections=1)
+    await storage.close()
+
+    with pytest.raises(WorkspaceError) as caught:
+        storage.begin_upload("_temporary/late")
+
+    assert caught.value.code is ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE
 
 
 @pytest.mark.parametrize(

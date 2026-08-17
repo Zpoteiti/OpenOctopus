@@ -33,7 +33,9 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 def _app_with_runtime() -> tuple[FastAPI, SimpleNamespace]:
     app = FastAPI()
+    device_registry = SimpleNamespace(close=AsyncMock())
     runtime = SimpleNamespace(runner_instance_id=uuid4(), close=AsyncMock())
+    runtime.device_registry = device_registry
     app.state.chat_runtime = runtime
     return app, runtime
 
@@ -48,13 +50,28 @@ def _engine() -> tuple[Mock, AsyncMock]:
     return engine, connection
 
 
+def _storage() -> Mock:
+    return Mock(
+        probe_startup=AsyncMock(),
+        recover_transfer_uploads=AsyncMock(),
+        close=AsyncMock(),
+    )
+
+
+def _deletion_worker() -> Mock:
+    return Mock(start=Mock(), close=AsyncMock())
+
+
 async def test_lifespan_runs_storage_probe_and_closes_storage(
     _startup_dependencies: SimpleNamespace,
 ) -> None:
     app, runtime = _app_with_runtime()
     engine, connection = _engine()
-    storage = Mock(probe_startup=AsyncMock(), close=AsyncMock())
-
+    storage = Mock(
+        probe_startup=AsyncMock(),
+        recover_transfer_uploads=AsyncMock(),
+        close=AsyncMock(),
+    )
     with (
         patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
@@ -67,12 +84,14 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
     ):
         async with _lifespan(app):
             storage.probe_startup.assert_awaited_once()
+            storage.recover_transfer_uploads.assert_awaited_once()
             _startup_dependencies.probe.assert_awaited_once()
             recover_deletions.assert_awaited_once()
 
     assert connection.execute.await_count == 2
     connection.run_sync.assert_awaited_once()
     runtime.close.assert_awaited_once()
+    runtime.device_registry.close.assert_awaited_once()
     storage.close.assert_awaited_once()
     engine.dispose.assert_awaited_once()
 
@@ -105,6 +124,22 @@ async def test_lifespan_fails_startup_when_storage_probe_fails() -> None:
 
     storage.probe_startup.assert_awaited_once()
     storage.close.assert_awaited_once()
+    engine.dispose.assert_awaited_once()
+
+
+async def test_lifespan_disposes_database_when_bootstrap_fails() -> None:
+    app, _ = _app_with_runtime()
+    engine, _ = _engine()
+    engine.begin.side_effect = RuntimeError("database unavailable")
+
+    with (
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
+        patch("openctopus_server.main.get_engine", return_value=engine),
+        pytest.raises(SystemExit),
+    ):
+        async with _lifespan(app):
+            pytest.fail("lifespan should not start")
+
     engine.dispose.assert_awaited_once()
 
 
@@ -160,8 +195,11 @@ async def test_lifespan_cancels_a_probe_after_the_outer_timeout() -> None:
 async def test_lifespan_cleans_resources_when_turn_recovery_fails() -> None:
     app, runtime = _app_with_runtime()
     engine, _ = _engine()
-    storage = Mock(probe_startup=AsyncMock(), close=AsyncMock())
-
+    storage = Mock(
+        probe_startup=AsyncMock(),
+        recover_transfer_uploads=AsyncMock(),
+        close=AsyncMock(),
+    )
     with (
         patch("openctopus_server.main.get_settings", return_value=_settings()),
         patch("openctopus_server.main.get_engine", return_value=engine),
@@ -181,6 +219,102 @@ async def test_lifespan_cleans_resources_when_turn_recovery_fails() -> None:
             pytest.fail("lifespan should not start")
 
     runtime.close.assert_awaited_once()
+    runtime.device_registry.close.assert_awaited_once()
+    storage.close.assert_awaited_once()
+    engine.dispose.assert_awaited_once()
+
+
+async def test_lifespan_cleans_resources_when_workspace_service_fails() -> None:
+    app = FastAPI()
+    engine, _ = _engine()
+    storage = _storage()
+    worker = _deletion_worker()
+
+    with (
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
+        patch("openctopus_server.main.get_engine", return_value=engine),
+        patch("openctopus_server.main.get_object_storage", return_value=storage),
+        patch("openctopus_server.main.WorkspaceDeletionWorker", return_value=worker),
+        patch(
+            "openctopus_server.main.recover_workspace_deletions",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "openctopus_server.main.WorkspaceService",
+            side_effect=RuntimeError("workspace service failed"),
+        ),
+        pytest.raises(RuntimeError, match="workspace service failed"),
+    ):
+        async with _lifespan(app):
+            pytest.fail("lifespan should not start")
+
+    worker.start.assert_called_once()
+    worker.close.assert_awaited_once()
+    storage.close.assert_awaited_once()
+    engine.dispose.assert_awaited_once()
+
+
+async def test_lifespan_cleans_resources_when_registry_build_fails() -> None:
+    app = FastAPI()
+    engine, _ = _engine()
+    storage = _storage()
+    worker = _deletion_worker()
+    registry = SimpleNamespace(close=AsyncMock())
+
+    with (
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
+        patch("openctopus_server.main.get_engine", return_value=engine),
+        patch("openctopus_server.main.get_object_storage", return_value=storage),
+        patch("openctopus_server.main.WorkspaceDeletionWorker", return_value=worker),
+        patch("openctopus_server.main.get_device_registry", return_value=registry),
+        patch(
+            "openctopus_server.main.recover_workspace_deletions",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "openctopus_server.main.build_py4_registry",
+            side_effect=RuntimeError("tool registry failed"),
+        ),
+        pytest.raises(RuntimeError, match="tool registry failed"),
+    ):
+        async with _lifespan(app):
+            pytest.fail("lifespan should not start")
+
+    worker.close.assert_awaited_once()
+    registry.close.assert_awaited_once()
+    storage.close.assert_awaited_once()
+    engine.dispose.assert_awaited_once()
+
+
+async def test_lifespan_cleans_resources_when_runtime_construction_fails() -> None:
+    app = FastAPI()
+    engine, _ = _engine()
+    storage = _storage()
+    worker = _deletion_worker()
+    registry = SimpleNamespace(close=AsyncMock())
+
+    with (
+        patch("openctopus_server.main.get_settings", return_value=_settings()),
+        patch("openctopus_server.main.get_engine", return_value=engine),
+        patch("openctopus_server.main.get_object_storage", return_value=storage),
+        patch("openctopus_server.main.WorkspaceDeletionWorker", return_value=worker),
+        patch("openctopus_server.main.get_device_registry", return_value=registry),
+        patch(
+            "openctopus_server.main.recover_workspace_deletions",
+            new_callable=AsyncMock,
+        ),
+        patch("openctopus_server.main.build_py4_registry", return_value=Mock()),
+        patch(
+            "openctopus_server.main.ChatRuntime",
+            side_effect=RuntimeError("runtime failed"),
+        ),
+        pytest.raises(RuntimeError, match="runtime failed"),
+    ):
+        async with _lifespan(app):
+            pytest.fail("lifespan should not start")
+
+    worker.close.assert_awaited_once()
+    registry.close.assert_awaited_once()
     storage.close.assert_awaited_once()
     engine.dispose.assert_awaited_once()
 

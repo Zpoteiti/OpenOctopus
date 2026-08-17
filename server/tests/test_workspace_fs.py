@@ -16,11 +16,16 @@ from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
     FileTransform,
+    UploadCommittedAfterCancellation,
     WorkspaceFS,
     WorkspaceTarget,
 )
 from openctopus_server.workspace.locks import KeyedLockManager
-from openctopus_server.workspace.storage import ObjectStorage, normalize_storage_error
+from openctopus_server.workspace.storage import (
+    ObjectMetadata,
+    ObjectStorage,
+    normalize_storage_error,
+)
 
 
 async def test_download_waiting_for_storage_capacity_does_not_block_workspace_retirement() -> None:
@@ -917,6 +922,296 @@ async def test_read_with_metadata_uses_etag_from_the_get_response() -> None:
     assert stored.data == b"contents"
     assert stored.etag == written.etag
     assert client.stat_calls == stat_calls_before_read
+
+
+async def test_server_move_uses_open_source_etag_for_conditional_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_etag = "source-v1"
+    delete_calls: list[str | None] = []
+
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        async def read(self) -> bytes:
+            nonlocal current_etag
+            if current_etag == "source-v1":
+                current_etag = "source-v2"
+                return b"payload"
+            return b""
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        async def write(self, chunk: bytes) -> None:
+            assert chunk == b"payload"
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            pass
+
+    fs = WorkspaceFS(AsyncMock())
+    source = Source()
+    sink = Sink()
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", AsyncMock(return_value=(sink, "temp")))
+    commit = AsyncMock()
+    monkeypatch.setattr(fs, "commit_uploaded_object", commit)
+
+    async def conditional_delete(
+        _target: WorkspaceTarget,
+        _path: str,
+        *,
+        if_match: str | None = None,
+    ) -> None:
+        delete_calls.append(if_match)
+        if if_match != current_etag:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace file changed after it was read",
+            )
+
+    monkeypatch.setattr(fs, "delete_file", conditional_delete)
+    target = WorkspaceTarget.personal(uuid4())
+
+    transferred, digest, warnings = await fs.transfer_server_to_server(
+        target,
+        "source.txt",
+        target,
+        "destination.txt",
+        user_id=uuid4(),
+        quota_bytes=100,
+        mode="move",
+    )
+
+    assert transferred == 7
+    assert digest
+    assert warnings == ("source_delete_failed",)
+    assert delete_calls == ["source-v1"]
+    commit.assert_awaited_once()
+
+
+async def test_server_move_finishes_after_publish_observes_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        def __init__(self) -> None:
+            self._read = False
+
+        async def read(self) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            return b"payload"
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        def __init__(self) -> None:
+            self.aborted = False
+
+        async def write(self, chunk: bytes) -> None:
+            assert chunk == b"payload"
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            self.aborted = True
+
+    fs = WorkspaceFS(AsyncMock())
+    source = Source()
+    sink = Sink()
+    delete = AsyncMock()
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", AsyncMock(return_value=(sink, "temp")))
+    monkeypatch.setattr(
+        fs,
+        "commit_uploaded_object",
+        AsyncMock(side_effect=UploadCommittedAfterCancellation),
+    )
+    monkeypatch.setattr(fs, "delete_file", delete)
+    target = WorkspaceTarget.personal(uuid4())
+
+    transferred, digest, warnings = await fs.transfer_server_to_server(
+        target,
+        "source.txt",
+        target,
+        "destination.txt",
+        user_id=uuid4(),
+        quota_bytes=100,
+        mode="move",
+    )
+
+    assert transferred == 7
+    assert digest
+    assert warnings == ()
+    assert sink.aborted is False
+    delete.assert_awaited_once_with(target, "source.txt", if_match="source-v1")
+
+
+async def test_server_to_server_admission_reserves_two_storage_connections_per_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = AsyncMock()
+    storage.max_connections = 4
+    fs = WorkspaceFS(
+        storage,
+        server_transfer_max_concurrency_per_user=2,
+        server_transfer_queue_timeout_seconds=0.2,
+    )
+    opened = 0
+    two_open = asyncio.Event()
+    release = asyncio.Event()
+
+    class Source:
+        size = 0
+        etag = "source-v1"
+
+        async def read(self) -> bytes:
+            await release.wait()
+            return b""
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        object_name = "temporary"
+
+        async def write(self, _chunk: bytes) -> None:
+            pass
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            pass
+
+    async def open_stream(_target: WorkspaceTarget, _path: str) -> Source:
+        nonlocal opened
+        opened += 1
+        if opened == 2:
+            two_open.set()
+        return Source()
+
+    monkeypatch.setattr(fs, "open_stream", open_stream)
+    monkeypatch.setattr(
+        fs,
+        "begin_transfer_upload",
+        AsyncMock(return_value=(Sink(), "temporary")),
+    )
+    monkeypatch.setattr(fs, "commit_uploaded_object", AsyncMock())
+    target = WorkspaceTarget.personal(uuid4())
+    tasks = [
+        asyncio.create_task(
+            fs.transfer_server_to_server(
+                target,
+                f"source-{index}",
+                target,
+                f"destination-{index}",
+                user_id=uuid4(),
+                quota_bytes=100,
+                mode="copy",
+            )
+        )
+        for index in range(3)
+    ]
+
+    await two_open.wait()
+    await asyncio.sleep(0)
+    assert opened == 2
+    release.set()
+    await asyncio.gather(*tasks)
+    assert opened == 3
+
+
+async def test_uploaded_object_publish_propagates_cancellation_after_true_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = AsyncMock()
+    storage.max_connections = 4
+    published = asyncio.Event()
+    release_publish = asyncio.Event()
+    metadata = ObjectMetadata("destination", 1, "destination-etag")
+
+    async def metadata_pages(*_args: object, **_kwargs: object):
+        yield ()
+
+    async def promote(*_args: object, **_kwargs: object) -> ObjectMetadata:
+        published.set()
+        await release_publish.wait()
+        return metadata
+
+    storage.promote_if_absent.side_effect = promote
+    monkeypatch.setattr("openctopus_server.workspace.fs._metadata_pages", metadata_pages)
+    fs = WorkspaceFS(storage)
+    target = WorkspaceTarget.personal(uuid4())
+    task = asyncio.create_task(
+        fs.commit_uploaded_object(
+            target,
+            "destination",
+            "temporary",
+            size=1,
+            quota_bytes=100,
+        )
+    )
+    await published.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    storage.promote_if_absent.assert_awaited_once()
+
+
+async def test_uploaded_object_cleanup_does_not_hold_committed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = AsyncMock()
+    storage.max_connections = 4
+    storage.promote_if_absent.return_value = ObjectMetadata(
+        "destination",
+        1,
+        "destination-etag",
+    )
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def metadata_pages(*_args: object, **_kwargs: object):
+        yield ()
+
+    async def delete(_object_name: str) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    storage.delete.side_effect = delete
+    monkeypatch.setattr("openctopus_server.workspace.fs._metadata_pages", metadata_pages)
+    fs = WorkspaceFS(storage)
+
+    result = await asyncio.wait_for(
+        fs.commit_uploaded_object(
+            WorkspaceTarget.personal(uuid4()),
+            "destination",
+            "temporary",
+            size=1,
+            quota_bytes=100,
+        ),
+        timeout=0.1,
+    )
+
+    assert result.etag == "destination-etag"
+    await cleanup_started.wait()
+    release_cleanup.set()
 
 
 async def test_list_dir_returns_public_metadata_without_reading_file_contents() -> None:

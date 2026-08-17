@@ -312,5 +312,6 @@ def test_py4_registry_includes_message_and_ten_workspace_tools(pg_engine) -> Non
     assert [schema["name"] for schema in registry.get_tool_schemas()] == [
         "web_fetch",
         "message",
+        "file_transfer",
         *EXPECTED_TOOL_NAMES,
     ]

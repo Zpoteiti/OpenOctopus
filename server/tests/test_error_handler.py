@@ -69,6 +69,7 @@ def test_error_status_map_covers_workspace_codes():
         ErrorCode.WORKSPACE_STORAGE_ERROR: 503,
         ErrorCode.WORKSPACE_TRANSFER_BUSY: 429,
         ErrorCode.WORKSPACE_TRANSFER_TIMEOUT: 408,
+        ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED: 502,
     }
 
     assert {code: ERROR_STATUS[code] for code in expected} == expected

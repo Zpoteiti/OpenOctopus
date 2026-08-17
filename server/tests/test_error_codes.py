@@ -5,6 +5,7 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import (
     AuthError,
     ChatError,
+    DeviceError,
     McpError,
     NetworkError,
     OpenOctopusError,
@@ -22,6 +23,7 @@ def test_error_codes_match_snapshot():
 
 
 def test_all_exception_classes_exist():
+    assert issubclass(DeviceError, OpenOctopusError)
     assert issubclass(WorkspaceError, OpenOctopusError)
     assert issubclass(ToolError, OpenOctopusError)
     assert issubclass(NetworkError, OpenOctopusError)

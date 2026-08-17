@@ -284,9 +284,8 @@ Specific behavior remains as documented in `TOOLS.md`:
 
 - `read_file` line-paginates text with a 128,000-character cap, stream-scans large
   text, recognizes images, and materializes supported PDF/Office documents only
-  within the 8 MiB bound. Its unchanged-read cache is a bounded process LRU keyed by
-  session, virtual path, ETag, offset, limit, and PDF `pages`; `force=true` bypasses
-  it.
+  within the 8 MiB bound. Every invocation returns the requested content; there is
+  no unchanged-read cache or `force` argument.
 - `write_file` is an intentional unconditional replacement.
 - `edit_file` and `apply_patch` transform the latest locked content and surface
   ambiguous/no-match conflicts.

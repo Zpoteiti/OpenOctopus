@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import openctopus_server.chat.runner as chat_runner
 from openctopus_server.admission import KeyedAdmission
 from openctopus_server.chat.runner import ChatRuntime
-from openctopus_server.db.models import Session, SystemConfig, TurnRun, User
+from openctopus_server.db.models import Device, Session, SystemConfig, TurnRun, User
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.anthropic import (
@@ -490,9 +490,10 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
 
         assert response.status_code == 200
         assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
-            "web_fetch",
-            "message",
-            "read_file",
+                "web_fetch",
+                "message",
+                "file_transfer",
+                "read_file",
             "write_file",
             "edit_file",
             "apply_patch",
@@ -509,6 +510,56 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
         assert "Wrote notes/a.txt (5 bytes)." in str(provider_result["content"])
         assert workspace.read_paths == ["SOUL.md", "MEMORY.md"] * 2
         assert workspace.list_calls == 1
+    finally:
+        await runtime.close()
+
+
+async def test_provider_schema_includes_only_the_session_owners_paired_devices(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        owner = await db.scalar(select(User).where(User.email == "user@test.com"))
+        assert owner is not None
+        other = User(email="other@test.com", password_hash="hash", name="Other")
+        db.add(other)
+        await db.flush()
+        db.add_all(
+            [
+                Device(
+                    user_id=owner.id,
+                    name="owner-laptop",
+                    token_hash=b"o" * 32,
+                    token_hint="owner-token",
+                ),
+                Device(
+                    user_id=other.id,
+                    name="other-laptop",
+                    token_hash=b"x" * 32,
+                    token_hint="other-token",
+                ),
+            ]
+        )
+        await db.commit()
+
+    provider = _ScriptedProvider([_ProviderStep(content=[{"type": "text", "text": "done"}])])
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ScriptedTool([]),)),
+    )
+    test_app.state.chat_runtime = runtime
+    try:
+        response = await _post(user_client, uuid4(), "show my tools")
+
+        assert response.status_code == 200
+        schema = provider.calls[0]["tools"][0]
+        assert schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
+            "server",
+            "owner-laptop",
+        ]
     finally:
         await runtime.close()
 

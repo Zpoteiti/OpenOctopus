@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from openctopus_server.api.router import router as api_router
 from openctopus_server.chat.runner import ChatRuntime, get_context_admission
@@ -12,6 +13,9 @@ from openctopus_server.chat.token_estimator import initialize_token_estimator
 from openctopus_server.config import get_settings
 from openctopus_server.db.base import Base
 from openctopus_server.db.engine import get_engine
+from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.protocol import MAX_TEXT_FRAME_BYTES
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.http import register_error_handler
 from openctopus_server.services.turn_runs import abandon_running_turns
 from openctopus_server.services.workspace_deletions import (
@@ -26,9 +30,41 @@ from openctopus_server.tools.registry import (
 )
 from openctopus_server.workspace.fs import _workspace_fs_for_storage
 from openctopus_server.workspace.service import WorkspaceService
-from openctopus_server.workspace.storage import get_object_storage
+from openctopus_server.workspace.storage import ObjectStorage, get_object_storage
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 60.0
+DEVICE_WS_MAX_SIZE = MAX_TEXT_FRAME_BYTES
+DEVICE_WS_MAX_QUEUE = 1
+DEVICE_WS_PER_MESSAGE_DEFLATE = False
+DEVICE_WS_PROTOCOL_PING_INTERVAL = None
+
+
+async def _close_lifespan_resources(
+    *,
+    runtime: ChatRuntime | None,
+    device_registry: DeviceRegistry | None,
+    deletion_worker: WorkspaceDeletionWorker | None,
+    object_storage: ObjectStorage | None,
+    engine: AsyncEngine | None,
+) -> None:
+    try:
+        if runtime is not None:
+            await runtime.close()
+    finally:
+        try:
+            if device_registry is not None:
+                await device_registry.close()
+        finally:
+            try:
+                if deletion_worker is not None:
+                    await deletion_worker.close()
+            finally:
+                try:
+                    if object_storage is not None:
+                        await object_storage.close()
+                finally:
+                    if engine is not None:
+                        await engine.dispose()
 
 
 @asynccontextmanager
@@ -55,6 +91,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as exc:
         print(f"Database bootstrap failed: {exc}", file=sys.stderr)
+        await _close_lifespan_resources(
+            runtime=None,
+            device_registry=None,
+            deletion_worker=None,
+            object_storage=None,
+            engine=engine,
+        )
         sys.exit(1)
 
     object_storage = None
@@ -62,6 +105,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         object_storage = get_object_storage()
         await asyncio.wait_for(
             object_storage.probe_startup(),
+            timeout=STARTUP_PROBE_TIMEOUT_SECONDS,
+        )
+        await asyncio.wait_for(
+            object_storage.recover_transfer_uploads(),
             timeout=STARTUP_PROBE_TIMEOUT_SECONDS,
         )
     except Exception as exc:
@@ -89,61 +136,60 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
         sys.exit(1)
 
-    deletion_worker = WorkspaceDeletionWorker(
-        engine,
-        workspace_fs,
-        purge_storage=WorkspacePurgeStorageConfig.from_settings(settings),
-        purge_timeout_seconds=settings.workspace_deletion_purge_timeout_seconds,
-        shutdown_grace_seconds=settings.workspace_deletion_shutdown_grace_seconds,
-    )
-    deletion_worker.start()
-
+    deletion_worker: WorkspaceDeletionWorker | None = None
     runtime = getattr(app.state, "chat_runtime", None)
-    if runtime is None:
-        workspace_service = WorkspaceService(workspace_fs)
-        runtime = ChatRuntime(
-            engine,
-            workspace_service=workspace_service,
-            tool_registry=build_py4_registry(
-                engine,
-                workspace_service,
-                web_admission=get_web_fetch_admission(),
-                content_converter=content_converter,
-            ),
-            context_admission=get_context_admission(),
-        )
-        app.state.chat_runtime = runtime
+    device_registry = getattr(runtime, "device_registry", None)
     try:
+        deletion_worker = WorkspaceDeletionWorker(
+            engine,
+            workspace_fs,
+            purge_storage=WorkspacePurgeStorageConfig.from_settings(settings),
+            purge_timeout_seconds=settings.workspace_deletion_purge_timeout_seconds,
+            shutdown_grace_seconds=settings.workspace_deletion_shutdown_grace_seconds,
+        )
+        deletion_worker.start()
+
+        if runtime is None:
+            workspace_service = WorkspaceService(workspace_fs)
+            device_registry = get_device_registry()
+            runtime = ChatRuntime(
+                engine,
+                workspace_service=workspace_service,
+                tool_registry=build_py4_registry(
+                    engine,
+                    workspace_service,
+                    web_admission=get_web_fetch_admission(),
+                    content_converter=content_converter,
+                    device_registry=device_registry,
+                ),
+                context_admission=get_context_admission(),
+                device_registry=device_registry,
+            )
+            app.state.chat_runtime = runtime
         await abandon_running_turns(
             engine,
             runner_instance_id=runtime.runner_instance_id,
         )
     except BaseException:
-        try:
-            await runtime.close()
-        finally:
-            try:
-                await deletion_worker.close()
-            finally:
-                try:
-                    await object_storage.close()
-                finally:
-                    await engine.dispose()
+        await _close_lifespan_resources(
+            runtime=runtime,
+            device_registry=device_registry,
+            deletion_worker=deletion_worker,
+            object_storage=object_storage,
+            engine=engine,
+        )
         raise
 
     try:
         yield
     finally:
-        try:
-            await runtime.close()
-        finally:
-            try:
-                await deletion_worker.close()
-            finally:
-                try:
-                    await object_storage.close()
-                finally:
-                    await engine.dispose()
+        await _close_lifespan_resources(
+            runtime=runtime,
+            device_registry=device_registry,
+            deletion_worker=deletion_worker,
+            object_storage=object_storage,
+            engine=engine,
+        )
 
 
 def create_app() -> FastAPI:
@@ -160,4 +206,12 @@ if __name__ == "__main__":
     import uvicorn
 
     settings = get_settings()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        ws_max_size=DEVICE_WS_MAX_SIZE,
+        ws_max_queue=DEVICE_WS_MAX_QUEUE,
+        ws_per_message_deflate=DEVICE_WS_PER_MESSAGE_DEFLATE,
+        ws_ping_interval=DEVICE_WS_PROTOCOL_PING_INTERVAL,
+    )

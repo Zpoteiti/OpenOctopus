@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -31,8 +32,23 @@ class WorkspaceFileDeliveryRef:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceFileDeliveryRef:
+    path: str
+    device_id: UUID
+    openoctopus_device: str
+    filename: str
+    mime: str
+    size: int | None = None
+    type: Literal["device_file"] = "device_file"
+    online_only: Literal[True] = True
+
+
+type DeliveryRef = WorkspaceFileDeliveryRef | DeviceFileDeliveryRef
+
+
+@dataclass(frozen=True, slots=True)
 class MessageDeliveryEffect:
-    delivery_refs: tuple[WorkspaceFileDeliveryRef, ...]
+    delivery_refs: tuple[DeliveryRef, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +64,7 @@ class ToolContext:
     user_id: UUID
     session_id: UUID
     openoctopus_device: str | None = None
+    device_targets: Mapping[str, UUID] | None = None
 
 
 class Tool(ABC):

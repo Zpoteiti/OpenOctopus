@@ -1,12 +1,15 @@
+import asyncio
 import hmac
 from uuid import UUID
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.auth.password import hash_password
 from openctopus_server.config import get_settings
-from openctopus_server.db.models import User, Workspace, WorkspaceMember
+from openctopus_server.db.models import Device, User, Workspace, WorkspaceMember
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import AuthError
 from openctopus_server.services.workspace_deletions import (
@@ -91,6 +94,7 @@ async def delete_user(
     user: User,
     *,
     workspace_fs: WorkspaceLifecycle,
+    device_registry: DeviceRegistry,
 ) -> None:
     if user.is_admin:
         await db.execute(
@@ -102,6 +106,17 @@ async def delete_user(
     if locked_user is None:
         return
     user = locked_user
+
+    device_ids = tuple(
+        (
+            await db.scalars(
+                select(Device.id)
+                .where(Device.user_id == user.id)
+                .order_by(Device.id)
+                .with_for_update()
+            )
+        ).all()
+    )
 
     workspace_ids = list(
         (
@@ -147,12 +162,21 @@ async def delete_user(
             await workspace_fs.reactivate_workspace(target)
         await db.rollback()
         raise
-    try:
-        await db.commit()
-    except BaseException:
-        await db.rollback()
-        await reactivate_if_deletion_rolled_back(db, retired_targets, workspace_fs)
-        raise
+
+    async def commit_release_and_invalidate_devices() -> None:
+        try:
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            await reactivate_if_deletion_rolled_back(db, retired_targets, workspace_fs)
+            raise
+        try:
+            await db.close()
+        finally:
+            await device_registry.remove_devices(device_ids)
+
+    invalidation = asyncio.create_task(commit_release_and_invalidate_devices())
+    await await_future_cancellation_safe(invalidation)
     await try_finalize_workspace_deletions(db, retired_targets, workspace_fs)
 
 

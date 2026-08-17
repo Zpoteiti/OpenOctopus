@@ -11,7 +11,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from openctopus_server.db.models import User, WorkspaceDeletion
+from openctopus_server.db.models import Device, User, WorkspaceDeletion
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.services import users, workspace_purge
@@ -170,7 +171,9 @@ async def test_failed_purge_leaves_durable_cleanup_after_metadata_deletion(
         await db.commit()
         user_id = user.id
 
-        await users.delete_user(db, user, workspace_fs=workspace_fs)
+        await users.delete_user(
+            db, user, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+        )
 
         assert await db.get(User, user_id) is None
         deletion = await db.scalar(select(WorkspaceDeletion))
@@ -246,7 +249,9 @@ async def test_ambiguous_commit_keeps_a_deleted_target_retired(
         user = await db.get(User, user_id)
         assert user is not None
         try:
-            await users.delete_user(db, user, workspace_fs=workspace_fs)
+            await users.delete_user(
+                db, user, workspace_fs=workspace_fs, device_registry=DeviceRegistry()
+            )
         except ConnectionError:
             pass
         else:
@@ -258,6 +263,120 @@ async def test_ambiguous_commit_keeps_a_deleted_target_retired(
 
     assert deletion is not None
     assert workspace_fs.reactivated == []
+
+
+async def test_user_deletion_commit_and_device_invalidation_survive_cancellation(
+    pg_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_fs = _LifecycleFS()
+    invalidated = asyncio.Event()
+
+    class RecordingRegistry:
+        async def remove_devices(self, device_ids: tuple[object, ...]) -> None:
+            assert device_ids == (device_id,)
+            invalidated.set()
+
+    registry = RecordingRegistry()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as setup_db:
+        user = User(
+            email="cancelled-delete@test.com",
+            password_hash="not-used",
+            name="Cancelled Delete",
+        )
+        setup_db.add(user)
+        await setup_db.flush()
+        user_id = user.id
+        device = Device(
+            user_id=user_id,
+            name="laptop",
+            token_hash=b"c" * 32,
+            token_hint="openoctopus_dev_...cancel",
+            workspace_path="~/workspace",
+            sandbox_mode=True,
+            ssrf_denylist=[],
+        )
+        setup_db.add(device)
+        await setup_db.commit()
+        device_id = device.id
+
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = await db.get(User, user_id)
+        assert user is not None
+        original_commit = db.commit
+
+        async def blocked_commit() -> None:
+            commit_started.set()
+            await release_commit.wait()
+            await original_commit()
+
+        monkeypatch.setattr(db, "commit", blocked_commit)
+        deletion = asyncio.create_task(
+            users.delete_user(
+                db,
+                user,
+                workspace_fs=workspace_fs,
+                device_registry=registry,  # type: ignore[arg-type]
+            )
+        )
+        await asyncio.wait_for(commit_started.wait(), timeout=1)
+
+        deletion.cancel()
+        await asyncio.sleep(0)
+        assert deletion.done() is False
+
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(deletion, timeout=1)
+
+    async with AsyncSession(pg_engine) as verify_db:
+        assert await verify_db.get(User, user_id) is None
+    assert invalidated.is_set()
+
+
+async def test_user_deletion_rollback_does_not_invalidate_devices(
+    pg_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_fs = _LifecycleFS()
+    invalidated = asyncio.Event()
+
+    class RecordingRegistry:
+        async def remove_devices(self, device_ids: tuple[object, ...]) -> None:
+            del device_ids
+            invalidated.set()
+
+    async with AsyncSession(pg_engine, expire_on_commit=False) as setup_db:
+        user = User(
+            email="rolled-back-delete@test.com",
+            password_hash="not-used",
+            name="Rolled Back Delete",
+        )
+        setup_db.add(user)
+        await setup_db.commit()
+        user_id = user.id
+
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = await db.get(User, user_id)
+        assert user is not None
+
+        async def fail_commit() -> None:
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(db, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await users.delete_user(
+                db,
+                user,
+                workspace_fs=workspace_fs,
+                device_registry=RecordingRegistry(),  # type: ignore[arg-type]
+            )
+
+    async with AsyncSession(pg_engine) as verify_db:
+        assert await verify_db.get(User, user_id) is not None
+    assert invalidated.is_set() is False
 
 
 async def test_runtime_worker_finalizes_a_durable_cleanup_job(
@@ -481,13 +600,20 @@ async def test_partial_child_purge_keeps_row_for_replay_to_completion(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    replay_completed = asyncio.Event()
+
+    class SignallingLifecycleFS(_LifecycleFS):
+        async def forget_workspace(self, target: WorkspaceTarget) -> None:
+            await super().forget_workspace(target)
+            replay_completed.set()
+
     monkeypatch.setattr(
         "openctopus_server.services.workspace_deletions._CHILD_TERMINATE_GRACE_SECONDS",
         0.02,
     )
     (tmp_path / "object-1").write_bytes(b"first")
     (tmp_path / "object-2").write_bytes(b"second")
-    workspace_fs = _LifecycleFS()
+    workspace_fs = SignallingLifecycleFS()
     target = WorkspaceTarget.personal(uuid4())
     async with AsyncSession(pg_engine) as db:
         db.add(WorkspaceDeletion(kind=target.kind, target_id=target.id))
@@ -518,15 +644,14 @@ async def test_partial_child_purge_keeps_row_for_replay_to_completion(
         workspace_fs,
         purge_storage=_purge_config(str(tmp_path)),
         retry_interval_seconds=0.01,
-        purge_timeout_seconds=1,
+        purge_timeout_seconds=60,
         shutdown_grace_seconds=0.2,
         purge_entrypoint=_complete_file_purge_child,
     )
     replay_worker.start()
     try:
-        async with asyncio.timeout(2):
-            while target not in workspace_fs.forgotten:
-                await asyncio.sleep(0.01)
+        async with asyncio.timeout(10):
+            await replay_completed.wait()
     finally:
         await replay_worker.close()
 

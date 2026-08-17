@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -11,7 +13,9 @@ from uuid import UUID
 
 from fastapi import Depends
 
+from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.config import get_settings
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.locks import KeyedLockManager
@@ -21,6 +25,7 @@ from openctopus_server.workspace.storage import (
     ObjectMetadata,
     ObjectStorage,
     ObjectStream,
+    ObjectUpload,
     StoredObject,
     get_object_storage,
 )
@@ -35,6 +40,10 @@ class FileMetadata:
     size: int
     etag: str
     created: bool = False
+
+
+class UploadCommittedAfterCancellation(asyncio.CancelledError):
+    """The destination was published before caller cancellation took effect."""
 
 
 @dataclass(frozen=True)
@@ -83,11 +92,26 @@ class WorkspaceFS:
         materialization_concurrency: int = 4,
         heavy_operation_concurrency: int = 4,
         file_operation_concurrency: int = 4,
+        server_transfer_max_concurrency_per_user: int = 2,
+        server_transfer_queue_timeout_seconds: float = 5.0,
     ) -> None:
         self._storage = storage
         self._materializations = asyncio.Semaphore(materialization_concurrency)
         self._heavy_operations = asyncio.Semaphore(heavy_operation_concurrency)
         self._file_operations = asyncio.Semaphore(file_operation_concurrency)
+        connection_limit = getattr(storage, "max_connections", None)
+        if not isinstance(connection_limit, int) or connection_limit < 2:
+            connection_limit = 8
+        server_transfer_capacity = max(1, connection_limit // 2)
+        self._server_transfers = KeyedAdmission(
+            global_limit=server_transfer_capacity,
+            per_key_limit=min(
+                server_transfer_max_concurrency_per_user,
+                server_transfer_capacity,
+            ),
+            timeout_seconds=server_transfer_queue_timeout_seconds,
+        )
+        self._transfer_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._mutation_locks = KeyedLockManager()
         self._retired_targets: set[WorkspaceTarget] = set()
 
@@ -188,7 +212,181 @@ class WorkspaceFS:
         relative_path: str,
     ) -> ObjectStream:
         self._ensure_active(target)
+        await self._ensure_regular_file(target, relative_path)
         return await self._storage.open_stream(_object_key(target, relative_path))
+
+    async def begin_transfer_upload(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        size: int,
+        quota_bytes: int,
+    ) -> tuple[ObjectUpload, str]:
+        """Reserve a bounded temporary object for a no-overwrite transfer."""
+        if size < 0:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Transfer size must not be negative",
+            )
+        self._ensure_active(target)
+        await self._ensure_destination_absent(target, relative_path)
+        await self._ensure_transfer_quota(target, size=size, quota_bytes=quota_bytes)
+        temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
+        return self._storage.begin_upload(temporary_object, length=size), temporary_object
+
+    async def transfer_server_to_server(
+        self,
+        source_target: WorkspaceTarget,
+        source_path: str,
+        destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
+        user_id: UUID,
+        quota_bytes: int,
+        mode: str,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        try:
+            async with self._server_transfers.slot(user_id):
+                return await self._transfer_server_to_server(
+                    source_target,
+                    source_path,
+                    destination_target,
+                    destination_path,
+                    quota_bytes=quota_bytes,
+                    mode=mode,
+                )
+        except AdmissionTimeoutError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_BUSY,
+                "Workspace transfer capacity is busy; retry later",
+            ) from exc
+
+    async def _transfer_server_to_server(
+        self,
+        source_target: WorkspaceTarget,
+        source_path: str,
+        destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
+        quota_bytes: int,
+        mode: str,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        """Stream one server workspace object through a temporary RustFS object."""
+        if mode not in {"copy", "move"}:
+            raise WorkspaceError(ErrorCode.WORKSPACE_INVALID_REQUEST, "Transfer mode is invalid")
+        source = await self.open_stream(source_target, source_path)
+        try:
+            sink, temporary_object = await self.begin_transfer_upload(
+                destination_target,
+                destination_path,
+                size=source.size,
+                quota_bytes=quota_bytes,
+            )
+        except BaseException:
+            await source.aclose()
+            raise
+        digest = hashlib.sha256()
+        transferred = 0
+        try:
+            while chunk := await source.read():
+                digest.update(chunk)
+                transferred += len(chunk)
+                await sink.write(chunk)
+            await sink.finish()
+            try:
+                await self.commit_uploaded_object(
+                    destination_target,
+                    destination_path,
+                    temporary_object,
+                    size=transferred,
+                    quota_bytes=quota_bytes,
+                )
+            except UploadCommittedAfterCancellation:
+                # Publication is the irreversible success point. Continue to
+                # report its true result and, for a move, conditionally remove
+                # the source instead of entering the pre-commit abort path.
+                pass
+        except BaseException:
+            await sink.abort()
+            raise
+        finally:
+            await source.aclose()
+
+        warnings: list[str] = []
+        if mode == "move":
+            try:
+                await self.delete_file(source_target, source_path, if_match=source.etag)
+            except Exception:
+                warnings.append("source_delete_failed")
+        return transferred, digest.hexdigest(), tuple(warnings)
+
+    async def _ensure_regular_file(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+    ) -> FileMetadata:
+        object_name = _object_key(target, relative_path)
+        try:
+            metadata = await self._storage.stat(object_name)
+        except WorkspaceError as exc:
+            if exc.code is not ErrorCode.WORKSPACE_NOT_FOUND:
+                raise
+            if (await self._storage.list_page(f"{object_name}/", limit=1)).items:
+                raise WorkspaceError(
+                    ErrorCode.TOOL_IS_DIRECTORY,
+                    "Workspace path is a directory",
+                ) from exc
+            raise
+        return FileMetadata(size=metadata.size, etag=metadata.etag)
+
+    async def _ensure_destination_absent(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+    ) -> None:
+        object_name = _object_key(target, relative_path)
+        try:
+            await self._storage.stat(object_name)
+        except WorkspaceError as exc:
+            if exc.code is not ErrorCode.WORKSPACE_NOT_FOUND:
+                raise
+        else:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace file already exists",
+            )
+        if (await self._storage.list_page(f"{object_name}/", limit=1)).items:
+            raise WorkspaceError(
+                ErrorCode.TOOL_IS_DIRECTORY,
+                "Workspace path is a directory",
+            )
+
+    async def _ensure_transfer_quota(
+        self,
+        target: WorkspaceTarget,
+        *,
+        size: int,
+        quota_bytes: int,
+    ) -> None:
+        usage = 0
+        async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
+            usage += sum(item.size for item in objects)
+        if usage > quota_bytes:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_SOFT_LOCKED,
+                "Workspace is over quota; delete files before writing",
+            )
+        if size * 5 > quota_bytes * 4:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                "Workspace operation exceeds the single-operation size limit",
+            )
+        if usage + size > quota_bytes:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+                "Workspace quota would be exceeded",
+            )
 
     @asynccontextmanager
     async def collect_upload(
@@ -410,6 +608,82 @@ class WorkspaceFS:
             if_match=if_match,
             if_none_match=if_none_match,
         )
+
+    async def commit_uploaded_object(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        temporary_object: str,
+        *,
+        size: int,
+        quota_bytes: int,
+    ) -> FileMetadata:
+        """Atomically publish a completed RustFS upload under a mutation lock."""
+        if size < 0:
+            raise ValueError("uploaded object size must be non-negative")
+        object_name = _object_key(target, relative_path)
+        async with self._mutation_locks.hold(target):
+            self._ensure_active(target)
+            usage = 0
+            existing = None
+            parent_names = set(_parent_object_names(_workspace_prefix(target), object_name))
+            parent_is_file = False
+            target_is_directory = False
+            folder_prefix = f"{object_name}/"
+            async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
+                for item in objects:
+                    usage += item.size
+                    if item.object_name == object_name:
+                        existing = item
+                    elif item.object_name in parent_names:
+                        parent_is_file = True
+                    elif item.object_name.startswith(folder_prefix):
+                        target_is_directory = True
+            if parent_is_file:
+                raise WorkspaceError(
+                    ErrorCode.TOOL_NOT_A_DIRECTORY,
+                    "A workspace path parent is a file",
+                )
+            if target_is_directory:
+                raise WorkspaceError(
+                    ErrorCode.TOOL_IS_DIRECTORY,
+                    "Workspace path is a directory",
+                )
+            if existing is not None:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_FILE_CHANGED,
+                    "Workspace file already exists",
+                )
+            if usage > quota_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_SOFT_LOCKED,
+                    "Workspace is over quota; delete files before writing",
+                )
+            if size * 5 > quota_bytes * 4:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                    "Workspace operation exceeds the single-operation size limit",
+                )
+            if usage + size > quota_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+                    "Workspace quota would be exceeded",
+                )
+            publish = asyncio.create_task(
+                self._storage.promote_if_absent(
+                    temporary_object,
+                    object_name,
+                    size=size,
+                )
+            )
+            uploaded, cancelled = await _await_irreversible_result(publish)
+            cleanup = asyncio.create_task(self._delete_transfer_temporary(temporary_object))
+            self._transfer_cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._transfer_cleanup_tasks.discard)
+            metadata = FileMetadata(size=size, etag=uploaded.etag, created=True)
+            if cancelled:
+                raise UploadCommittedAfterCancellation
+            return metadata
 
     async def _write(
         self,
@@ -857,10 +1131,35 @@ class WorkspaceFS:
                 "Workspace was not found",
             )
 
+    async def _delete_transfer_temporary(self, object_name: str) -> None:
+        try:
+            await self._storage.delete(object_name)
+        except Exception:
+            # Startup recovery removes leftovers. The published destination is
+            # already verified and must remain successful after cleanup errors.
+            pass
+
 
 async def _run_transform(transform: Callable[[bytes], bytes], current: bytes) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
     return await await_future_cancellation_safe(worker)
+
+
+async def _await_irreversible_result[T](future: asyncio.Future[T]) -> tuple[T, bool]:
+    """Resolve a started publish and report cancellation after a successful result."""
+
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+        return result, cancelled
 
 
 async def _run_optional_transform(
@@ -971,7 +1270,16 @@ def _too_large_to_edit() -> WorkspaceError:
 
 @lru_cache
 def _workspace_fs_for_storage(storage: ObjectStorage) -> WorkspaceFS:
-    return WorkspaceFS(storage)
+    settings = get_settings()
+    return WorkspaceFS(
+        storage,
+        server_transfer_max_concurrency_per_user=(
+            settings.rest_transfer_max_concurrency_per_user
+        ),
+        server_transfer_queue_timeout_seconds=(
+            settings.rest_transfer_queue_timeout_seconds
+        ),
+    )
 
 
 def get_workspace_fs(

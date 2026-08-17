@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openctopus_server.auth.dependencies import get_current_user
 from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
+from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.dto.user import UserResponse
 from openctopus_server.services import users
 from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
@@ -41,6 +43,12 @@ async def delete_me(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
+    device_registry: DeviceRegistry = Depends(get_device_registry),
 ) -> Response:
-    await users.delete_user(db, user, workspace_fs=workspace_fs)
+    await users.delete_user(
+        db,
+        user,
+        workspace_fs=workspace_fs,
+        device_registry=device_registry,
+    )
     return Response(status_code=204)

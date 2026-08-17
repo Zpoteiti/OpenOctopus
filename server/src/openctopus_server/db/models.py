@@ -8,7 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
     Index,
-    Integer,
+    LargeBinary,
     Text,
     UniqueConstraint,
 )
@@ -189,37 +189,25 @@ class TurnRun(Base):
 class Device(Base):
     __tablename__ = "devices"
 
-    token: Mapped[str] = mapped_column(Text, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    workspace_path: Mapped[str] = mapped_column(Text, nullable=False)
-    sandbox_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
-    shell_timeout_max: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("600")
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False, unique=True)
+    token_hint: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_path: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'~/openoctopus/workspace'")
     )
+    sandbox_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
     ssrf_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
         server_default=text(
-            '\'["127.0.0.0/8","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10"]\'::jsonb'
+            '\'["0.0.0.0/8","127.0.0.0/8","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10","ff00::/8"]\'::jsonb'
         ),
-    )
-    env_allowlist: Mapped[list[Any]] = mapped_column(
-        JSONB,
-        nullable=False,
-        server_default=text('\'["PATH","HOME","LANG","TERM"]\'::jsonb'),
-    )
-    command_denylist: Mapped[list[Any]] = mapped_column(
-        JSONB,
-        nullable=False,
-        server_default=text(
-            '\'["shutdown","reboot","halt","poweroff","mkfs","dd","mount","umount","systemctl","service"]\'::jsonb'
-        ),
-    )
-    mcp_servers: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -227,10 +215,15 @@ class Device(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "name"),
-        CheckConstraint("shell_timeout_max >= 0", name="check_shell_timeout_max_non_negative"),
         CheckConstraint(
-            "name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server'",
+            "char_length(name) <= 64 "
+            "AND name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' "
+            "AND name <> 'server'",
             name="check_device_name",
+        ),
+        CheckConstraint(
+            "octet_length(token_hash) = 32",
+            name="check_device_token_hash_length",
         ),
     )
 

@@ -7,6 +7,9 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
 
 ERROR_STATUS: dict[ErrorCode, int] = {
+    ErrorCode.DEVICE_NOT_FOUND: 404,
+    ErrorCode.DEVICE_INVALID_REQUEST: 400,
+    ErrorCode.DEVICE_NAME_TAKEN: 409,
     ErrorCode.WORKSPACE_NOT_FOUND: 404,
     ErrorCode.WORKSPACE_PERMISSION_DENIED: 403,
     ErrorCode.WORKSPACE_BLOCKED_PATH: 400,
@@ -22,8 +25,12 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_STORAGE_ERROR: 503,
     ErrorCode.WORKSPACE_TRANSFER_BUSY: 429,
     ErrorCode.WORKSPACE_TRANSFER_TIMEOUT: 408,
+    ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED: 502,
     ErrorCode.WORKSPACE_INVALID_REQUEST: 400,
     ErrorCode.WORKSPACE_REF_CONFLICT: 409,
+    ErrorCode.TOOL_DEVICE_UNREACHABLE: 409,
+    ErrorCode.TOOL_DEVICE_BUSY: 429,
+    ErrorCode.TOOL_PATH_OUTSIDE_WORKSPACE: 403,
     ErrorCode.TOOL_NO_MATCH: 409,
     ErrorCode.TOOL_AMBIGUOUS_EDIT: 409,
     ErrorCode.TOOL_IS_DIRECTORY: 409,
@@ -70,6 +77,14 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    if request.url.path.startswith("/api/devices"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": ErrorCode.DEVICE_INVALID_REQUEST.value,
+                "message": "Device request is invalid",
+            },
+        )
     if request.url.path.startswith("/api/workspace"):
         return JSONResponse(
             status_code=400,

@@ -11,6 +11,8 @@ from openctopus_server.auth.dependencies import require_admin
 from openctopus_server.db.advisory import lock_personal_quota_read
 from openctopus_server.db.models import SystemConfig, User
 from openctopus_server.db.session import get_db
+from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.dto.user import AdminUserResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import AuthError
@@ -79,9 +81,15 @@ async def delete_user(
     user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
+    device_registry: DeviceRegistry = Depends(get_device_registry),
 ) -> Response:
     target = await users.get_user_by_id(db, user_id)
     if target is None:
         raise AuthError(ErrorCode.USER_NOT_FOUND, "User not found")
-    await users.delete_user(db, target, workspace_fs=workspace_fs)
+    await users.delete_user(
+        db,
+        target,
+        workspace_fs=workspace_fs,
+        device_registry=device_registry,
+    )
     return Response(status_code=204)

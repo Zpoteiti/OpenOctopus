@@ -6,6 +6,8 @@ from typing import Annotated
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from openctopus_server.devices.protocol import MAX_TOOL_CALL_RESERVATION_BYTES
+
 _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
@@ -64,6 +66,22 @@ class Settings(BaseSettings):
     chat_context_max_concurrency_per_user: Annotated[int, Field(ge=1, le=255)]
     chat_context_queue_timeout_seconds: Annotated[float, Field(ge=0.1, le=300)]
 
+    # Device pending-call admission — all required
+    device_pending_calls_max: Annotated[int, Field(ge=64, le=65536)]
+    device_pending_calls_max_per_user: Annotated[int, Field(ge=1, le=1024)]
+    device_pending_bytes_max: Annotated[
+        int, Field(gt=MAX_TOOL_CALL_RESERVATION_BYTES, le=1024 * 1024 * 1024)
+    ]
+    device_pending_bytes_max_per_user: Annotated[
+        int, Field(ge=MAX_TOOL_CALL_RESERVATION_BYTES, le=256 * 1024 * 1024)
+    ]
+
+    # Device transfer admission — all required
+    device_transfer_max_concurrency: Annotated[int, Field(ge=2, le=256)]
+    device_transfer_max_concurrency_per_user: Annotated[int, Field(ge=1, le=32)]
+    device_transfer_queue_timeout_seconds: Annotated[float, Field(ge=0.1, le=60)]
+    device_transfer_idle_timeout_seconds: Annotated[float, Field(ge=1, le=600)]
+
     # Runtime workspace deletion — all required
     workspace_deletion_purge_timeout_seconds: Annotated[float, Field(ge=1, le=3600)]
     workspace_deletion_shutdown_grace_seconds: Annotated[float, Field(ge=0.1, le=60)]
@@ -86,6 +104,12 @@ class Settings(BaseSettings):
             raise ValueError("per-user web concurrency must be below the global limit")
         if self.chat_context_max_concurrency_per_user >= self.chat_context_max_concurrency:
             raise ValueError("per-user context concurrency must be below the global limit")
+        if self.device_pending_calls_max_per_user >= self.device_pending_calls_max:
+            raise ValueError("per-user device pending calls must be below the global limit")
+        if self.device_pending_bytes_max_per_user >= self.device_pending_bytes_max:
+            raise ValueError("per-user device pending bytes must be below the global limit")
+        if self.device_transfer_max_concurrency_per_user >= self.device_transfer_max_concurrency:
+            raise ValueError("per-user device transfer concurrency must be below the global limit")
         return self
 
     @model_validator(mode="after")
