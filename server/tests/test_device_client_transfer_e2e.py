@@ -414,11 +414,15 @@ async def test_real_file_transfer_and_device_workspace_relay(
             )
             assert route_before_disconnect is not None
             success_ack_blocked = asyncio.Event()
+            success_ack_cancelled = asyncio.Event()
+            success_ack_delivered = asyncio.Event()
+            release_success_ack = asyncio.Event()
             raw_http_closed = asyncio.Event()
-            ack_held_through_disconnect = asyncio.Event()
-            late_timeout_acknowledged = asyncio.Event()
+            committed_abort_entered = asyncio.Event()
+            success_ack_results: list[bool] = []
             block_next_success_ack = True
             original_send_text = registry.send_text
+            original_abort = registry.transfers._abort
 
             async def hold_success_ack(
                 handle: Any,
@@ -436,22 +440,41 @@ async def test_real_file_transfer_and_device_workspace_relay(
                 ):
                     block_next_success_ack = False
                     success_ack_blocked.set()
-                    await raw_http_closed.wait()
-                    ack_held_through_disconnect.set()
-                    await asyncio.Event().wait()
+                    try:
+                        await release_success_ack.wait()
+                    except asyncio.CancelledError:
+                        success_ack_cancelled.set()
+                        raise
                 result = bool(await original_send_text(handle, payload, **kwargs))
-                if (
-                    is_transfer_end
-                    and frame.get("ack") is True
-                    and frame.get("ok") is False
-                    and frame.get("code") == "workspace_transfer_timeout"
-                ):
-                    late_timeout_acknowledged.set()
+                if is_transfer_end and frame.get("ack") is True and frame.get("ok") is True:
+                    success_ack_results.append(result)
+                    success_ack_delivered.set()
                 return result
 
-            with monkeypatch.context() as race_patch:
+            async def observe_committed_abort(
+                slot: Any,
+                code: str,
+                *,
+                send_frame: bool,
+                error: BaseException | None = None,
+            ) -> None:
+                if code == "cancelled" and slot.committed_result is not None:
+                    assert raw_http_closed.is_set()
+                    committed_abort_entered.set()
+                await original_abort(
+                    slot,
+                    code,
+                    send_frame=send_frame,
+                    error=error,
+                )
+
+            with (
+                monkeypatch.context() as race_patch,
+                contextlib.ExitStack() as race_cleanup,
+            ):
+                race_cleanup.callback(release_success_ack.set)
                 race_patch.setattr(registry, "send_text", hold_success_ack)
-                race_patch.setattr(registry.transfers, "_idle_timeout_seconds", 0.2)
+                race_patch.setattr(registry.transfers, "_abort", observe_committed_abort)
 
                 host, port_text = server_url.removeprefix("http://").rsplit(":", 1)
                 reader, writer = await asyncio.open_connection(host, int(port_text))
@@ -486,22 +509,26 @@ async def test_real_file_transfer_and_device_workspace_relay(
                         reader.readexactly(content_length),
                         timeout=5,
                     ) == replacement_bytes
+                    await asyncio.wait_for(success_ack_blocked.wait(), timeout=5)
                 finally:
                     writer.close()
                     await writer.wait_closed()
                     raw_http_closed.set()
 
-                await asyncio.wait_for(success_ack_blocked.wait(), timeout=1)
-                await asyncio.wait_for(ack_held_through_disconnect.wait(), timeout=1)
-                await asyncio.wait_for(late_timeout_acknowledged.wait(), timeout=40)
+                await asyncio.wait_for(committed_abort_entered.wait(), timeout=5)
+                await asyncio.sleep(0)
+                assert success_ack_cancelled.is_set() is False
+                release_success_ack.set()
+                await asyncio.wait_for(success_ack_delivered.wait(), timeout=5)
+                assert success_ack_results == [True]
                 assert process.returncode is None
-                route_after_timeout = await registry.get_route_snapshot(
+                route_after_disconnect = await registry.get_route_snapshot(
                     device_id,
                     user_id=user_id,
                     expected_device_name=device_name,
                 )
-                assert route_after_timeout is not None
-                assert route_after_timeout.handle == route_before_disconnect.handle
+                assert route_after_disconnect is not None
+                assert route_after_disconnect.handle == route_before_disconnect.handle
 
             follow_up = await http_client.get(
                 "/api/workspace/files/browser.bin",
