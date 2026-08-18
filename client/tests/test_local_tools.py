@@ -352,11 +352,13 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
         tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         open_threads: list[int] = []
+        original_open = dispatcher_module._open_transfer_source
 
-        def tracked_open(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
+        def tracked_open(
+            path: Path, delete_access: bool = False
+        ) -> tuple[int, tuple[int, int, int, int, int]]:
             open_threads.append(threading.get_ident())
-            descriptor = os.open(path, os.O_RDONLY)
-            return descriptor, dispatcher_module._transfer_identity(os.fstat(descriptor))
+            return original_open(path, delete_access)
 
         monkeypatch.setattr(dispatcher_module, "_open_transfer_source", tracked_open)
         result = await tools.execute(
@@ -462,6 +464,8 @@ def test_regular_file_opens_request_nonblocking_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flags_seen: list[int] = []
+    nonblocking = int(getattr(os, "O_NONBLOCK", 0)) or 0x4000
+    monkeypatch.setattr(os, "O_NONBLOCK", nonblocking, raising=False)
 
     def reject_open(path: Path, flags: int, *args: object) -> int:
         del path, args
@@ -472,13 +476,15 @@ def test_regular_file_opens_request_nonblocking_mode(
     with pytest.raises(ToolFailure):
         dispatcher_module._read_regular_fd(tmp_path / "pipe", 100)
 
-    assert flags_seen[0] & int(getattr(os, "O_NONBLOCK", 0))
+    assert flags_seen[0] & nonblocking
 
 
 def test_transfer_source_open_requests_nonblocking_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flags_seen: list[int] = []
+    nonblocking = int(getattr(os, "O_NONBLOCK", 0)) or 0x4000
+    monkeypatch.setattr(os, "O_NONBLOCK", nonblocking, raising=False)
     source = tmp_path / "source.txt"
     source.write_text("payload", encoding="utf-8")
 
@@ -491,7 +497,7 @@ def test_transfer_source_open_requests_nonblocking_mode(
     with pytest.raises(ToolFailure):
         dispatcher_module._open_transfer_source(source)
 
-    assert flags_seen[0] & int(getattr(os, "O_NONBLOCK", 0))
+    assert flags_seen[0] & nonblocking
 
 
 def test_web_fetch_enforces_client_denylist_before_connecting(tmp_path: Path) -> None:
