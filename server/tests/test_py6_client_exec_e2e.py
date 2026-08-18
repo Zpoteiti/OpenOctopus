@@ -11,7 +11,12 @@ import contextlib
 import json
 import os
 import re
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from shutil import which
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -51,6 +56,126 @@ pytestmark = pytest.mark.skipif(
 )
 
 _SESSION_ID = re.compile(r"^session_id=([0-9a-f-]{36})$", re.MULTILINE)
+_WINDOWS_SHELLS = ("pwsh", "powershell", "powershell_x86", "cmd")
+
+
+@dataclass(frozen=True)
+class _PlatformCommands:
+    shell: str | None
+    agent: str
+    pipe: str
+    background: str
+    tty: str
+    tty_input: str
+
+
+def _resolve_windows_shell(name: str) -> str | None:
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    known_paths = {
+        "powershell": Path(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        "powershell_x86": Path(
+            root,
+            "SysWOW64",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        ),
+        "cmd": Path(root, "System32", "cmd.exe"),
+    }
+    known = known_paths.get(name)
+    if known is not None and known.is_file():
+        return str(known)
+    return which(name, path=os.environ.get("PATH"))
+
+
+def _select_windows_shell(resolver: Callable[[str], str | None]) -> str:
+    for name in _WINDOWS_SHELLS:
+        if resolver(name) is not None:
+            return name
+    raise AssertionError("Windows E2E requires pwsh, Windows PowerShell, or cmd")
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _windows_python_command(*, shell: str, executable: str, code: str) -> str:
+    if shell in {"pwsh", "powershell", "powershell_x86"}:
+        return f"& {_powershell_quote(executable)} -u -c {_powershell_quote(code)}"
+    if shell == "cmd":
+        return subprocess.list2cmdline([executable, "-u", "-c", code])
+    raise AssertionError(f"unsupported Windows E2E shell: {shell}")
+
+
+def _platform_commands(
+    *,
+    platform_name: str | None = None,
+    python_executable: str | None = None,
+    shell_resolver: Callable[[str], str | None] | None = None,
+) -> _PlatformCommands:
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name != "nt":
+        return _PlatformCommands(
+            shell=None,
+            agent=(
+                "printf 'py6-agent-sentinel\\n' > agent-sentinel.txt; "
+                "printf 'py6-agent-output\\n'"
+            ),
+            pipe="printf 'pipe-e2e\\n'",
+            background="printf 'before-reconnect\\n'; sleep 30",
+            tty=(
+                "printf 'READY> '; read -r value; "
+                "printf 'tty-echo:%s\\n' \"$value\""
+            ),
+            tty_input="hello-e2e\n",
+        )
+
+    resolver = _resolve_windows_shell if shell_resolver is None else shell_resolver
+    shell = _select_windows_shell(resolver)
+    executable = sys.executable if python_executable is None else python_executable
+    agent_code = (
+        "from pathlib import Path; import sys; "
+        "Path('agent-sentinel.txt').write_bytes(b'py6-agent-sentinel\\n'); "
+        "sys.stdout.buffer.write(b'py6-agent-output\\n'); sys.stdout.buffer.flush()"
+    )
+    pipe_code = (
+        "import sys; sys.stdout.buffer.write(b'pipe-e2e\\n'); "
+        "sys.stdout.buffer.flush()"
+    )
+    background_code = (
+        "import sys, time; sys.stdout.buffer.write(b'before-reconnect\\n'); "
+        "sys.stdout.buffer.flush(); time.sleep(30)"
+    )
+    tty_code = (
+        "import sys; print('READY> ', end='', flush=True); "
+        "value = sys.stdin.readline().rstrip('\\r\\n'); "
+        "print('tty-echo:' + value, flush=True)"
+    )
+    def build(code: str) -> str:
+        return _windows_python_command(
+            shell=shell,
+            executable=executable,
+            code=code,
+        )
+    return _PlatformCommands(
+        shell=shell,
+        agent=build(agent_code),
+        pipe=build(pipe_code),
+        background=build(background_code),
+        tty=build(tty_code),
+        tty_input="hello-e2e\r\n",
+    )
+
+
+def _exec_args(
+    commands: _PlatformCommands,
+    command: str,
+    **options: object,
+) -> dict[str, object]:
+    args: dict[str, object] = {"command": command, **options}
+    if commands.shell is not None:
+        args["shell"] = commands.shell
+    return args
 
 
 def _content(result: ToolResultFrame) -> str:
@@ -144,6 +269,8 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
     get_engine.cache_clear()
     get_device_registry.cache_clear()
     registry = get_device_registry()
+    commands = _platform_commands()
+    device_name = "py6-client-e2e"
     provider = _ScriptedProvider(
         [
             _ProviderStep(
@@ -152,14 +279,12 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                         "type": "tool_use",
                         "id": "agent-exec-1",
                         "name": "exec",
-                        "input": {
-                            "command": (
-                                "printf 'py6-agent-sentinel\\n' > agent-sentinel.txt; "
-                                "printf 'py6-agent-output\\n'"
-                            ),
-                            "yield_time_ms": 3000,
-                            "openoctopus_device": "py6-linux",
-                        },
+                        "input": _exec_args(
+                            commands,
+                            commands.agent,
+                            yield_time_ms=3000,
+                            openoctopus_device=device_name,
+                        ),
                     }
                 ]
             ),
@@ -185,7 +310,6 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
 
     workspace = tmp_path / "trusted-workspace"
     workspace.mkdir()
-    device_name = "py6-linux"
     try:
         async with httpx.AsyncClient(
             base_url=server_url,
@@ -225,7 +349,17 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                     "sandbox_mode": False,
                     "ssrf_denylist": [],
                     "shell_timeout_max": 120,
-                    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"],
+                    "env_allowlist": [
+                        "PATH",
+                        "HOME",
+                        "LANG",
+                        "TERM",
+                        *(
+                            ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"]
+                            if os.name == "nt"
+                            else []
+                        ),
+                    ],
                 },
             )
             assert create_response.status_code == 201, create_response.text
@@ -260,11 +394,12 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                 device_name=device_name,
                 chat_id=owner_chat,
                 name="exec",
-                args={
-                    "command": "printf 'pipe-e2e\\n'",
-                    "timeout": 10,
-                    "yield_time_ms": 3000,
-                },
+                args=_exec_args(
+                    commands,
+                    commands.pipe,
+                    timeout=10,
+                    yield_time_ms=3000,
+                ),
             )
             assert pipe.is_error is False, _content(pipe)
             assert "status=exited" in _content(pipe)
@@ -277,16 +412,35 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                 device_name=device_name,
                 chat_id=owner_chat,
                 name="exec",
-                args={
-                    "command": "printf 'before-reconnect\\n'; sleep 30",
-                    "timeout": 60,
-                    "yield_time_ms": 100,
-                },
+                args=_exec_args(
+                    commands,
+                    commands.background,
+                    timeout=60,
+                    yield_time_ms=100,
+                ),
             )
             assert background.is_error is False, _content(background)
             assert "status=running" in _content(background)
-            assert "stdout=before-reconnect\n" in _content(background)
             background_id = _session_id(background)
+            background_content = _content(background)
+            if commands.shell is not None and "stdout=before-reconnect\n" not in background_content:
+                background_ready = await _dispatch(
+                    registry,
+                    device_id=device_id,
+                    user_id=user_id,
+                    device_name=device_name,
+                    chat_id=owner_chat,
+                    name="write_stdin",
+                    args={
+                        "session_id": str(background_id),
+                        "wait_for": "before-reconnect",
+                        "wait_timeout_ms": 5_000,
+                    },
+                )
+                assert background_ready.is_error is False, _content(background_ready)
+                assert "status=running" in _content(background_ready)
+                background_content += _content(background_ready)
+            assert "stdout=before-reconnect\n" in background_content
 
             foreign = await _dispatch(
                 registry,
@@ -347,14 +501,13 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                 device_name=device_name,
                 chat_id=owner_chat,
                 name="exec",
-                args={
-                    "command": (
-                        "printf 'READY> '; read -r value; printf 'tty-echo:%s\\n' \"$value\""
-                    ),
-                    "timeout": 10,
-                    "tty": True,
-                    "yield_time_ms": 100,
-                },
+                args=_exec_args(
+                    commands,
+                    commands.tty,
+                    timeout=10,
+                    tty=True,
+                    yield_time_ms=100,
+                ),
                 timeout=15,
             )
             assert tty.is_error is False, _content(tty)
@@ -371,7 +524,7 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                 name="write_stdin",
                 args={
                     "session_id": str(tty_id),
-                    "chars": "hello-e2e\n",
+                    "chars": commands.tty_input,
                     "wait_for": "tty-echo:hello-e2e",
                     "wait_timeout_ms": 5000,
                 },
@@ -424,6 +577,9 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
             assert agent_dispatch["name"] == "exec"
             tool_result_payload = json.dumps(provider.calls[1]["messages"][-1], sort_keys=True)
             assert str(agent_chat) not in tool_result_payload
+            assert client_process is not None
+            await _stop_client(client_process, expected_returncode=0, secret=token)
+            client_process = None
     finally:
         if client_process is not None and client_process.returncode is None:
             with contextlib.suppress(Exception):
