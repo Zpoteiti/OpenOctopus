@@ -284,3 +284,37 @@ def test_conpty_line_repl_round_trips_unicode_input() -> None:
             await _close_conpty(handle)
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_conpty_nested_python_command_reaps_host_after_child_exit() -> None:
+    async def run() -> None:
+        shell = discover_shells().default
+        code = (
+            "import sys; "
+            "print('READY> ', end='', flush=True); "
+            "value=sys.stdin.readline().rstrip('\\r\\n'); "
+            "print('tty-echo:' + value, flush=True)"
+        )
+        command = _shell_command(shell, (sys.executable, "-u", "-c", code))
+        handle = await process_module._spawn_conpty(
+            build_argv(shell, command, login=False, tty=True),
+            cwd=Path.cwd(),
+            env=_child_environment(),
+        )
+        try:
+            await _read_until(handle, "READY> ")
+            await asyncio.wait_for(handle.write(b"hello-e2e\r\n"), timeout=5)
+            await _read_until(handle, "tty-echo:hello-e2e")
+            result = await asyncio.wait_for(handle.wait(), timeout=3)
+            await asyncio.to_thread(handle._reader.join, 2)
+            await asyncio.to_thread(handle._exit_watcher.join, 2)
+
+            assert result.returncode == 0
+            assert handle.process.isalive() is False
+            assert handle._reader.is_alive() is False
+            assert handle._exit_watcher.is_alive() is False
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_conpty(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))

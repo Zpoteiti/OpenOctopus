@@ -1125,7 +1125,13 @@ class ConPtyProcessHandle:
         self._reader = threading.Thread(
             target=self._read_loop, name="openoctopus-conpty", daemon=True
         )
+        self._exit_watcher = threading.Thread(
+            target=self._watch_exit,
+            name="openoctopus-conpty-exit",
+            daemon=True,
+        )
         self._reader.start()
+        self._exit_watcher.start()
 
     @property
     def terminal_control_truncated(self) -> bool:
@@ -1160,6 +1166,16 @@ class ConPtyProcessHandle:
             self._force_close_sync()
             self._loop.call_soon_threadsafe(self._fail, exc)
 
+    def _watch_exit(self) -> None:
+        try:
+            self.process.wait()
+            if self._stop.is_set():
+                return
+            self.process.pty.cancel_io()
+        except Exception as exc:
+            self._force_close_sync()
+            self._loop.call_soon_threadsafe(self._fail, exc)
+
     def _write_sync(self, value: str) -> None:
         if not value:
             return
@@ -1184,6 +1200,7 @@ class ConPtyProcessHandle:
         if self._finished:
             return
         self._finished = True
+        self._stop.set()
         tail = self._normalizer.flush()
         if tail:
             self._output_buffer.put_if_fits(tail.encode("utf-8"))
