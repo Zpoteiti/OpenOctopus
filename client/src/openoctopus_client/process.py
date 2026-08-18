@@ -558,8 +558,7 @@ async def _terminate_windows(
     process: asyncio.subprocess.Process, job: _JobHandle | None = None
 ) -> bool:
     if job is not None and job.terminate():
-        job.close()
-        return True
+        return job.close()
     taskkill = os.path.join(
         os.environ.get("SystemRoot", r"C:\\Windows"), "System32", "taskkill.exe"
     )

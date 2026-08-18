@@ -563,6 +563,23 @@ def test_windows_tree_termination_falls_back_to_taskkill(
     )
 
 
+def test_windows_job_close_failure_is_cleanup_failure() -> None:
+    class FakeProcess:
+        pid = 42
+
+    class CloseFailingJob:
+        def terminate(self) -> bool:
+            return True
+
+        def close(self) -> bool:
+            return False
+
+    assert (
+        asyncio.run(_terminate_windows(FakeProcess(), CloseFailingJob()))  # type: ignore[arg-type]
+        is False
+    )
+
+
 def test_conpty_dsr_write_failure_is_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeJob:
         terminated = False
