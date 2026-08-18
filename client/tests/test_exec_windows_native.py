@@ -439,3 +439,98 @@ def test_pipe_concurrent_drain_unicode_cwd_stdin_non_tty_and_nonzero(tmp_path: P
             await _close_pipe(handle)
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_pipe_ctrl_break_reaches_new_process_group_handler() -> None:
+    async def run() -> None:
+        script = "\n".join(
+            (
+                "import os, signal, time",
+                "def handled(signum, frame):",
+                "    del signum, frame",
+                "    os.write(1, b'BREAK_HANDLED\\n')",
+                "    os._exit(0)",
+                "signal.signal(signal.SIGBREAK, handled)",
+                "os.write(1, b'BREAK_READY\\n')",
+                "while True:",
+                "    time.sleep(0.05)",
+            )
+        )
+        handle = await spawn_pipe(
+            (sys.executable, "-u", "-c", script),
+            cwd=None,
+            env=_child_environment(),
+        )
+        root = psutil.Process(handle.pid)
+        try:
+            await _read_until_bytes(handle.stdout, b"BREAK_READY", timeout=5)
+            assert await asyncio.wait_for(handle.interrupt(), timeout=5) is True
+            output, error, result = await asyncio.wait_for(
+                asyncio.gather(handle.stdout.read(), handle.stderr.read(), handle.wait()),
+                timeout=8,
+            )
+            assert b"BREAK_HANDLED" in output, {
+                "returncode": result.returncode,
+                "stdout_bytes": len(output),
+                "stderr_bytes": len(error),
+            }
+            assert result.returncode == 0
+            assert handle.cleanup_incomplete is False
+            await _wait_processes_gone((root,))
+        finally:
+            await _close_pipe(handle)
+            await _force_stop_processes((root,))
+
+    asyncio.run(asyncio.wait_for(run(), timeout=20))
+
+
+def test_pipe_ctrl_break_delivery_failure_is_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def run() -> None:
+        script_path = tmp_path / "ctrl_break_wait.py"
+        script_path.write_text(
+            "import sys, time\n"
+            "print('BREAK_READY', flush=True)\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        shell = discover_shells().default
+        manager = ExecSessionManager()
+        request = _exec_request(
+            tmp_path,
+            _shell_command(shell, (sys.executable, "-u", str(script_path))),
+        )
+        try:
+            started = await asyncio.wait_for(manager.start(UUID(int=1), request), timeout=10)
+            session_id = _session_id(started)
+            ready = await asyncio.wait_for(
+                manager.write(
+                    UUID(int=1),
+                    ExecWrite(session_id, None, False, None, "BREAK_READY", 5_000, 20_000),
+                ),
+                timeout=8,
+            )
+            assert "BREAK_READY" in cast(str, ready.content)
+            session = manager._sessions[session_id]  # noqa: SLF001 - native backend contract
+            handle = cast(PipeProcessHandle, session.handle)
+
+            def fail_delivery(sig: int) -> None:
+                del sig
+                raise OSError("injected CTRL_BREAK delivery failure")
+
+            monkeypatch.setattr(handle.process, "send_signal", fail_delivery)
+            failed = await asyncio.wait_for(
+                manager.write(
+                    UUID(int=1),
+                    ExecWrite(session_id, "\x03", False, None, None, None, 20_000),
+                ),
+                timeout=8,
+            )
+            assert failed.code == "tool_exec_interrupt_failed"
+            assert "Unable to deliver interrupt" in cast(str, failed.content)
+            assert handle.process.returncode is None
+        finally:
+            assert await asyncio.wait_for(manager.shutdown(), timeout=12) is True
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
