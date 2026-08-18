@@ -1472,7 +1472,9 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
                 del code, reason
 
         monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
-        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
+        # On Windows, allow the thread-pool worker to start before exercising
+        # the timeout path; the events below prove the residual thread exists.
+        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
         runtime = ClientRuntime(
             load_config(_environment()),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
@@ -1824,7 +1826,9 @@ def test_tool_worker_waits_for_timed_out_thread_before_dequeuing_next_call(
                 sent.set()
 
         monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
-        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
+        # On Windows, allow the thread-pool worker to start before exercising
+        # the timeout path; the events below prove the residual thread exists.
+        monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
         dispatcher = dispatcher_module.ClientToolDispatcher(
             tmp_path, sandbox_mode=True, ssrf_denylist=[]
         )
