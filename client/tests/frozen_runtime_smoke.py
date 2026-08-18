@@ -15,10 +15,27 @@ from typing import Any
 
 COMMAND_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.02
+_WINPTY_NATIVE_FILES = frozenset(
+    {
+        "conpty.dll",
+        "openconsole.exe",
+        "winpty.dll",
+        "winpty-agent.exe",
+    }
+)
 
 
 class SmokeError(RuntimeError):
     pass
+
+
+def _assert_winpty_native_bundle(binary: Path) -> None:
+    names = {path.name.casefold() for path in binary.parent.rglob("*") if path.is_file()}
+    missing = sorted(_WINPTY_NATIVE_FILES - names)
+    if not any(name.startswith("_winpty.") and name.endswith(".pyd") for name in names):
+        missing.append("_winpty.*.pyd")
+    if missing:
+        raise SmokeError("frozen bundle is missing pywinpty native files: " + ", ".join(missing))
 
 
 @dataclass(frozen=True)
@@ -193,6 +210,8 @@ def main() -> int:
         fixture = corpus / "sample.html"
         if not fixture.is_file():
             raise SmokeError(f"document corpus is missing {fixture.name}")
+        if os.name == "nt":
+            _assert_winpty_native_bundle(binary)
         psutil = _psutil()
 
         version = _run(binary, "version", psutil=psutil)
