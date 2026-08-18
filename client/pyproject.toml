@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller==6.21.0"]
-dev = ["mypy>=1.13", "psutil>=6", "pytest>=8.0", "ruff>=0.8", "types-regex"]
+dev = ["mypy>=1.13", "psutil>=6", "pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "types-regex"]
 
 [project.scripts]
 openoctopus-client = "openoctopus_client.cli:main"

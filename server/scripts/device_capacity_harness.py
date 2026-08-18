@@ -33,6 +33,7 @@ from openctopus_server.devices.protocol import (
 from openctopus_server.devices.registry import (
     ConnectionHandle,
     DeviceBusyError,
+    DeviceOutcomeUnknownError,
     DeviceRegistry,
     DeviceUnavailableError,
 )
@@ -462,6 +463,7 @@ class _SourceHarness:
         device_index: int,
         session_id: UUID,
         record_latency: bool,
+        on_issued: Callable[[], None] | None = None,
     ) -> _DispatchOutcome:
         identity = self.identities[device_index]
         started = time.perf_counter()
@@ -477,6 +479,7 @@ class _SourceHarness:
                 max_result_bytes=1024,
                 timeout_seconds=max(self.config.liveness_timeout_seconds * 4, 1.0),
                 expected_device_name=identity.device_name,
+                on_issued=on_issued,
             )
         except Exception as exc:
             self.error_counts[type(exc).__name__] += 1
@@ -648,21 +651,43 @@ class _SourceHarness:
         return await asyncio.gather(*tasks)
 
     async def disconnect_pending_probe(self) -> bool:
+        issued = asyncio.Event()
         pending_task = asyncio.create_task(
             self._dispatch(
                 index=-300,
                 device_index=0,
                 session_id=uuid5(_HARNESS_NAMESPACE, "disconnect-pending"),
                 record_latency=False,
+                on_issued=issued.set,
             )
         )
-        await self._wait_for_pending(self.user_ids[0], 1)
-        unregistered = await self.registry.unregister(self.handles[0])
-        outcome = await pending_task
-        return unregistered and isinstance(outcome.error, DeviceUnavailableError)
+        issued_waiter = asyncio.create_task(issued.wait())
+        tasks = (issued_waiter, pending_task)
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=max(self.config.liveness_timeout_seconds * 4, 1.0),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if pending_task in done:
+                await pending_task
+                return False
+            if issued_waiter not in done:
+                return False
+            unregistered = await self.registry.unregister(self.handles[0])
+            outcome = await pending_task
+            return unregistered and isinstance(outcome.error, DeviceOutcomeUnknownError)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self) -> None:
         await self.registry.close()
+        await asyncio.gather(
+            *(transport.close(1001, "harness_shutdown") for transport in self.transports),
+        )
         for task in self.heartbeat_tasks:
             if not task.done():
                 task.cancel()
@@ -731,7 +756,7 @@ async def run_harness(config: HarnessConfig = HarnessConfig()) -> dict[str, obje
         rss_growth = max(0, after_cleanup.rss_bytes - dispatch_baseline_sample.rss_bytes)
     rss_plateau = rss_growth is None or rss_growth <= max(4 * 1024 * 1024, (peak_rss or 0) // 10)
     baseline_tasks = baseline_sample.task_count
-    task_baseline_ok = after_cleanup.task_count <= baseline_tasks + 1
+    task_baseline_ok = after_cleanup.task_count <= baseline_tasks
     required_users = 100 if harness.config.connections >= 500 else 1
     checks = {
         "authenticated_connections": harness.authenticated_connections
