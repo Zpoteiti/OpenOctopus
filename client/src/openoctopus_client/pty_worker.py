@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import errno
-import fcntl
 import json
 import os
 import select
@@ -13,9 +12,23 @@ import signal
 import socket
 import struct
 import sys
-import termios
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import Any, cast
+
+# Keep the write helper importable on Windows without presenting this POSIX
+# worker as a runnable backend there.
+if sys.platform == "win32":
+    _fcntl = cast(Any, None)
+    _termios = cast(Any, None)
+    _posix_os = cast(Any, os)
+    _posix_signal = cast(Any, signal)
+else:
+    import fcntl as _fcntl
+    import termios as _termios
+
+    _posix_os = os
+    _posix_signal = signal
 
 ROWS = 24
 COLS = 80
@@ -70,15 +83,15 @@ def _send_ack(
 
 
 def _set_cooked(fd: int) -> None:
-    attrs = termios.tcgetattr(fd)
-    attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG
-    attrs[6][termios.VINTR] = 3
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    attrs = _termios.tcgetattr(fd)
+    attrs[3] |= _termios.ICANON | _termios.ECHO | _termios.ISIG
+    attrs[6][_termios.VINTR] = 3
+    _termios.tcsetattr(fd, _termios.TCSANOW, attrs)
 
 
 def _set_window_size(fd: int) -> None:
     size = struct.pack("HHHH", ROWS, COLS, 0, 0)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+    _fcntl.ioctl(fd, _termios.TIOCSWINSZ, size)
 
 
 def _default_wait_writable(fd: int) -> None:
@@ -112,7 +125,7 @@ def _write_all(
 
 def _group_exists(pid: int) -> bool:
     try:
-        os.killpg(pid, 0)
+        _posix_os.killpg(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -124,7 +137,7 @@ def _cleanup_group(pid: int) -> bool:
     if not _group_exists(pid):
         return True
     try:
-        os.killpg(pid, signal.SIGTERM)
+        _posix_os.killpg(pid, _posix_signal.SIGTERM)
     except ProcessLookupError:
         return True
     deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
@@ -132,7 +145,7 @@ def _cleanup_group(pid: int) -> bool:
         time.sleep(0.05)
     if _group_exists(pid):
         try:
-            os.killpg(pid, signal.SIGKILL)
+            _posix_os.killpg(pid, _posix_signal.SIGKILL)
         except ProcessLookupError:
             return True
         time.sleep(0.01)
@@ -161,14 +174,16 @@ def _validate_spawn(
 
 def _fork_child(argv: Sequence[str], cwd: str | None, environment: Mapping[str, str]) -> None:
     if cwd is not None:
-        os.chdir(cwd)
+        _posix_os.chdir(cwd)
     _set_window_size(0)
     _set_cooked(0)
-    os.execvpe(argv[0], list(argv), dict(environment))
+    _posix_os.execvpe(argv[0], list(argv), dict(environment))
     raise AssertionError("execvpe returned")
 
 
 def run(control_fd: int, events_fd: int) -> int:
+    if os.name == "nt":
+        return 2
     control = socket.socket(fileno=control_fd)
     events = socket.socket(fileno=events_fd)
     first = next(_recv_lines(control), None)
@@ -178,11 +193,11 @@ def run(control_fd: int, events_fd: int) -> int:
     if spawn is None:
         return 2
     request_id, argv, cwd, environment = spawn
-    pid, master = os.forkpty()
+    pid, master = _posix_os.forkpty()
     if pid == 0:
         _fork_child(argv, cwd, environment)
     _set_window_size(master)
-    os.set_blocking(master, False)
+    _posix_os.set_blocking(master, False)
     control.setblocking(False)
     selector = selectors.DefaultSelector()
     selector.register(master, selectors.EVENT_READ, "master")
@@ -195,14 +210,14 @@ def run(control_fd: int, events_fd: int) -> int:
     master_open = True
     while True:
         try:
-            child_pid, status = os.waitpid(pid, os.WNOHANG)
+            child_pid, status = _posix_os.waitpid(pid, _posix_os.WNOHANG)
             if child_pid == pid:
-                exit_code = os.waitstatus_to_exitcode(status)
+                exit_code = _posix_os.waitstatus_to_exitcode(status)
         except ChildProcessError:
             pass
         if terminate_deadline is not None and time.monotonic() >= terminate_deadline:
             try:
-                os.killpg(pid, signal.SIGKILL)
+                _posix_os.killpg(pid, _posix_signal.SIGKILL)
             except ProcessLookupError:
                 pass
             terminate_deadline = None
@@ -211,7 +226,7 @@ def run(control_fd: int, events_fd: int) -> int:
             if master_open:
                 try:
                     while True:
-                        output = os.read(master, 65536)
+                        output = _posix_os.read(master, 65536)
                         if not output:
                             break
                         events.sendall(_frame(b"O", output))
@@ -223,7 +238,7 @@ def run(control_fd: int, events_fd: int) -> int:
         for key, _ in selector.select(0.1):
             if key.data == "master":
                 try:
-                    output = os.read(master, 65536)
+                    output = _posix_os.read(master, 65536)
                 except OSError as exc:
                     if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK, errno.EIO}:
                         raise
@@ -242,7 +257,7 @@ def run(control_fd: int, events_fd: int) -> int:
             if not data:
                 if terminate_deadline is None:
                     try:
-                        os.killpg(pid, signal.SIGTERM)
+                        _posix_os.killpg(pid, _posix_signal.SIGTERM)
                     except ProcessLookupError:
                         pass
                     terminate_deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
@@ -264,9 +279,9 @@ def run(control_fd: int, events_fd: int) -> int:
                         payload = base64.b64decode(str(request.get("data", "")), validate=True)
                         _write_all(master, payload)
                     elif kind == "interrupt":
-                        os.killpg(pid, signal.SIGINT)
+                        _posix_os.killpg(pid, _posix_signal.SIGINT)
                     elif kind == "terminate":
-                        os.killpg(pid, signal.SIGTERM)
+                        _posix_os.killpg(pid, _posix_signal.SIGTERM)
                         terminate_deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
                     else:
                         raise ValueError("unknown PTY control request")

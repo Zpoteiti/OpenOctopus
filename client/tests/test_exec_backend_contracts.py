@@ -19,6 +19,7 @@ from typing import Any, cast
 import pytest
 
 import openoctopus_client.process as process_module
+import openoctopus_client.pty_worker as pty_worker_module
 from openoctopus_client.process import (
     InvalidProcessArgumentsError,
     ProcessBackendError,
@@ -195,6 +196,19 @@ def test_write_all_retries_partial_writes_and_eagain() -> None:
 
     assert calls == [b"abcde", b"abcde", b"cde"]
     assert waits == [9]
+
+
+def test_posix_pty_worker_refuses_windows_before_opening_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_opened(*args: object, **kwargs: object) -> socket.socket:
+        del args, kwargs
+        raise AssertionError("Windows must not open POSIX PTY worker channels")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(socket, "socket", fail_if_opened)
+
+    assert pty_worker_module.run(10, 11) == 2
 
 
 def test_login_unsupported_has_stable_error_code() -> None:
