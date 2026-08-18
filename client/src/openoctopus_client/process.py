@@ -433,15 +433,19 @@ async def spawn_pipe(
 ) -> PipeProcessHandle:
     process = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
         env=dict(env),
         **_new_session_kwargs(),
     )
-    if process.stdout is None or process.stderr is None:
+    if process.stdin is None or process.stdout is None or process.stderr is None:
         raise ProcessBackendError("pipe streams were not created")
+    # Windows' NUL character device reports isatty() as true.  Closing the
+    # parent side of a real anonymous pipe gives the child immediate EOF while
+    # preserving the non-TTY pipe contract.
+    process.stdin.close()
     return PipeProcessHandle(process)
 
 

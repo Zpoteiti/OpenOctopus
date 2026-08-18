@@ -374,3 +374,68 @@ def test_real_session_final_report_drains_short_lived_nested_shell(tmp_path: Pat
             assert await asyncio.wait_for(manager.shutdown(), timeout=12) is True
 
     asyncio.run(asyncio.wait_for(run(), timeout=25))
+
+
+def test_pipe_concurrent_drain_unicode_cwd_stdin_non_tty_and_nonzero(tmp_path: Path) -> None:
+    async def run() -> None:
+        working_dir = tmp_path / "native 空格 目录"
+        working_dir.mkdir()
+        unicode_payload = "中文🙂".encode()
+        script = "\n".join(
+            (
+                "import json, os, sys",
+                "stdin_closed = sys.stdin.buffer.read(1) == b''",
+                "metadata = {'cwd': os.getcwd(), 'stdin_closed': stdin_closed, "
+                "'stdin_tty': sys.stdin.isatty(), 'stdout_tty': sys.stdout.isatty()}",
+                "sys.stdout.buffer.write(b'PIPE_READY\\n')",
+                "sys.stdout.buffer.flush()",
+                "sys.stdout.buffer.write(b'O' * 400000)",
+                "sys.stdout.buffer.write(b'\\nUNICODE:' + "
+                f"bytes.fromhex('{unicode_payload.hex()}') + b'\\n')",
+                "sys.stdout.buffer.write(b'META:' + json.dumps(metadata).encode('utf-8') + b'\\n')",
+                "sys.stdout.buffer.flush()",
+                "sys.stderr.buffer.write(b'E' * 400000 + b'\\nSTDERR_DRAIN_DONE\\n')",
+                "sys.stderr.buffer.flush()",
+                "raise SystemExit(23)",
+            )
+        )
+        handle = await spawn_pipe(
+            (sys.executable, "-u", "-c", script),
+            cwd=working_dir,
+            env=_child_environment(),
+        )
+        ready = asyncio.Event()
+        stdout_task = asyncio.create_task(_drain_stream(handle.stdout, b"PIPE_READY", ready))
+        stderr_task = asyncio.create_task(
+            _drain_stream(handle.stderr, b"STDERR_DRAIN_DONE", asyncio.Event())
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            result = await asyncio.wait_for(handle.wait(), timeout=15)
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task), timeout=5
+            )
+            metadata_match = re.search(rb"META:(\{[^\r\n]+\})", stdout)
+            assert metadata_match is not None
+            metadata = json.loads(metadata_match.group(1))
+
+            assert result.returncode == 23
+            assert b"UNICODE:" + unicode_payload in stdout
+            assert b"STDERR_DRAIN_DONE" in stderr
+            assert len(stdout) > 400_000
+            assert len(stderr) > 400_000
+            assert metadata == {
+                "cwd": str(working_dir),
+                "stdin_closed": True,
+                "stdin_tty": False,
+                "stdout_tty": False,
+            }
+            assert handle.cleanup_incomplete is False
+        finally:
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await _close_pipe(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
