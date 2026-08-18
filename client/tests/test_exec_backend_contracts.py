@@ -631,6 +631,7 @@ def test_terminate_posix_cleans_group_even_after_leader_exit(
         os,
         "killpg",
         lambda pid, sig: sent.append(sig),
+        raising=False,
     )
 
     async def no_sleep(delay: float) -> None:
@@ -661,7 +662,7 @@ def _assert_process_stopped(pid: int) -> None:
     while _pid_is_running(pid) and time.monotonic() < deadline:
         time.sleep(0.02)
     if _pid_is_running(pid):
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, cast(int, getattr(signal, "SIGKILL")))
         pytest.fail("same-group descendant survived natural leader exit")
 
 

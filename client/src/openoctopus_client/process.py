@@ -497,7 +497,7 @@ class PipeProcessHandle:
             if os.name == "nt":
                 self.process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT))
             else:
-                os.killpg(self.pid, signal.SIGINT)
+                _send_process_group_signal(self.pid, signal.SIGINT)
             return True
         except (OSError, ValueError):
             return False
@@ -518,9 +518,14 @@ class PipeProcessHandle:
         return await self.wait()
 
 
+def _send_process_group_signal(pid: int, sig: int) -> None:
+    killpg = cast(Callable[[int, int], None], getattr(os, "killpg"))
+    killpg(pid, sig)
+
+
 def _process_group_exists(pid: int) -> bool:
     try:
-        os.killpg(pid, 0)
+        _send_process_group_signal(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -533,7 +538,7 @@ async def _terminate_posix(process: asyncio.subprocess.Process, pid: int) -> boo
     if not _process_group_exists(pid):
         return True
     try:
-        os.killpg(pid, signal.SIGTERM)
+        _send_process_group_signal(pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
     deadline = asyncio.get_running_loop().time() + 2
@@ -541,7 +546,8 @@ async def _terminate_posix(process: asyncio.subprocess.Process, pid: int) -> boo
         await asyncio.sleep(0.05)
     if _process_group_exists(pid):
         try:
-            os.killpg(pid, signal.SIGKILL)
+            sigkill = cast(int, getattr(signal, "SIGKILL"))
+            _send_process_group_signal(pid, sigkill)
         except ProcessLookupError:
             return True
         await asyncio.sleep(0)
