@@ -524,6 +524,7 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
                 if manager.active_count == 0:
                     break
                 await asyncio.sleep(0.001)
+            await writer.drain()
             frames = [json.loads(item) for item in socket.sent if isinstance(item, str)]
             created_ack = next(
                 frame
@@ -554,6 +555,7 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
                 if manager.active_count == 0:
                     break
                 await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -588,7 +590,11 @@ def test_workspace_upload_if_match_mismatch_does_not_write(tmp_path: Path) -> No
                     if_match="stale",
                 )
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -938,7 +944,11 @@ def test_receive_rejects_existing_destination_and_unknown_binary_slot(tmp_path: 
                     if_none_match=True,
                 )
             )
-            await asyncio.sleep(0.01)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             frame = next(json.loads(item) for item in socket.sent if isinstance(item, str))
             assert frame["type"] == "transfer_end"
             assert frame["ack"] is False
@@ -968,7 +978,11 @@ def test_file_transfer_never_overwrites_existing_destination(tmp_path: Path) -> 
                     total_bytes=3,
                 )
             )
-            await asyncio.sleep(0.01)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -1061,7 +1075,12 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
             await manager.handle_control(
                 TransferRequest(id=SLOT, purpose="http_relay", src_path="source.bin")
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.slot_state(SLOT) is TransferState.BEGUN:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.slot_state(SLOT) is TransferState.BEGUN
+            await writer.drain()
             assert not any(isinstance(item, bytes) for item in socket.sent)
             begin = next(
                 json.loads(item)
@@ -1081,11 +1100,15 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
             binary = [item for item in socket.sent if isinstance(item, bytes)]
             assert binary
             assert all(len(item) <= 16 + 64 * 1024 for item in binary)
-            end = next(
+            ends = [
                 json.loads(item)
                 for item in socket.sent
                 if isinstance(item, str) and json.loads(item)["type"] == "transfer_end"
-            )
+            ]
+            assert ends and ends[-1].get("ok") is True, [
+                item.get("code") for item in ends
+            ]
+            end = ends[-1]
             await manager.handle_control(
                 TransferEnd(
                     id=SLOT,
@@ -1095,7 +1118,10 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
                     sha256=end["sha256"],
                 )
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
             assert manager.active_count == 0
         finally:
             await _stop(manager, writer, writer_task)
@@ -1363,7 +1389,12 @@ def test_empty_chunks_do_not_extend_receiver_idle_deadline(tmp_path: Path) -> No
                     break
                 await manager.handle_binary(encode_binary_chunk(SLOT, b""))
                 await asyncio.sleep(0.015)
-            await asyncio.sleep(0.03)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.active_count == 0
+            await writer.drain()
             assert not (tmp_path / "empty.txt").exists()
             ends = [
                 json.loads(item)
@@ -1395,7 +1426,12 @@ def test_receiver_end_wakes_empty_stream_and_commits_zero_byte_file(tmp_path: Pa
             await manager.handle_control(
                 TransferEnd(id=SLOT, ack=False, ok=True, bytes_sent=0, sha256=digest)
             )
-            await asyncio.sleep(0.03)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.active_count == 0
+            await writer.drain()
             assert (tmp_path / "empty.txt").read_bytes() == b""
             assert any(
                 isinstance(item, str)

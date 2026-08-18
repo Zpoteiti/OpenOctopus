@@ -1066,7 +1066,15 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
                     ):
                         await asyncio.sleep(0)
                 if frame is None:
-                    await asyncio.sleep(0.05)
+                    async def wait_for_terminal_transfer() -> None:
+                        while not any(
+                            isinstance(sent, str)
+                            and json.loads(sent)["type"] == "transfer_end"
+                            for sent in self.sent
+                        ):
+                            await asyncio.sleep(0)
+
+                    await asyncio.wait_for(wait_for_terminal_transfer(), timeout=5)
                 return frame
 
             async def close(self, code: int, reason: str) -> None:
@@ -1081,7 +1089,9 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
         return socket.sent, disposition
 
     sent, disposition = asyncio.run(exercise())
-    assert (tmp_path / "result.txt").read_bytes() == b"abc"
+    result_path = tmp_path / "result.txt"
+    assert result_path.is_file(), sent
+    assert result_path.read_bytes() == b"abc"
     assert any(
         isinstance(frame, str) and json.loads(frame)["type"] == "transfer_ready" for frame in sent
     )
