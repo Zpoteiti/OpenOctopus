@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import ctypes
 import importlib
 import json
@@ -533,6 +534,102 @@ def _process_group_exists(pid: int) -> bool:
     return True
 
 
+def _windows_process_snapshot() -> dict[int, int] | None:
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    first = kernel32.Process32FirstW
+    first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    first.restype = wintypes.BOOL
+    next_entry = kernel32.Process32NextW
+    next_entry.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    next_entry.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or int(snapshot) == ctypes.c_void_p(-1).value:
+        return None
+    processes: dict[int, int] = {}
+    complete = True
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ctypes.set_last_error(0)
+        available = bool(first(snapshot, ctypes.byref(entry)))
+        if not available and ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+            complete = False
+        while available:
+            processes[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ctypes.set_last_error(0)
+            available = bool(next_entry(snapshot, ctypes.byref(entry)))
+        if ctypes.get_last_error() not in {0, 18}:
+            complete = False
+    finally:
+        if not close_handle(snapshot):
+            complete = False
+    return processes if complete else None
+
+
+def _windows_process_tree(pid: int) -> set[int] | None:
+    snapshot = _windows_process_snapshot()
+    if snapshot is None:
+        return None
+    tree = {pid}
+    while True:
+        children = {
+            child_pid
+            for child_pid, parent_pid in snapshot.items()
+            if parent_pid in tree and child_pid not in tree
+        }
+        if not children:
+            return tree
+        tree.update(children)
+
+
+async def _wait_windows_processes_gone(pids: set[int]) -> bool:
+    tracked = set(pids)
+    deadline = asyncio.get_running_loop().time() + 2
+    while True:
+        snapshot = _windows_process_snapshot()
+        if snapshot is None:
+            return False
+        while True:
+            children = {
+                child_pid
+                for child_pid, parent_pid in snapshot.items()
+                if parent_pid in tracked and child_pid not in tracked
+            }
+            if not children:
+                break
+            tracked.update(children)
+        if not tracked.intersection(snapshot):
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+
+
 async def _terminate_posix(process: asyncio.subprocess.Process, pid: int) -> bool:
     del process
     if not _process_group_exists(pid):
@@ -559,18 +656,43 @@ async def _terminate_windows(
 ) -> bool:
     if job is not None and job.terminate():
         return job.close()
+    tree = _windows_process_tree(process.pid)
     taskkill = os.path.join(
         os.environ.get("SystemRoot", r"C:\\Windows"), "System32", "taskkill.exe"
     )
+    killer: asyncio.subprocess.Process | None = None
+    taskkill_complete = False
     try:
         killer = await asyncio.create_subprocess_exec(
-            taskkill, "/PID", str(process.pid), "/T", "/F"
+            taskkill,
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        return await asyncio.wait_for(killer.wait(), 2) == 0
+        taskkill_complete = await asyncio.wait_for(killer.wait(), 2) == 0
     except (OSError, TimeoutError):
-        if process.returncode is None:
-            process.kill()
-        return False
+        if killer is not None and getattr(killer, "returncode", None) is None:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                killer.kill()
+            with contextlib.suppress(OSError, TimeoutError):
+                await asyncio.wait_for(killer.wait(), 1)
+    tree_gone = bool(
+        taskkill_complete
+        and tree is not None
+        and await _wait_windows_processes_gone(tree)
+    )
+    job_closed = job is None or job.close()
+    complete = taskkill_complete and tree_gone and job_closed
+    if not complete and getattr(process, "returncode", None) is None:
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            with contextlib.suppress(OSError, ProcessLookupError):
+                kill()
+    return complete
 
 
 class _NullReader:

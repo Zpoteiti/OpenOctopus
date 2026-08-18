@@ -522,7 +522,8 @@ def test_windows_tree_termination_falls_back_to_taskkill(
             return False
 
         def close(self) -> bool:
-            raise AssertionError("failed jobs must use taskkill fallback")
+            calls.append(("job_close",))
+            return True
 
     class FakeKiller:
         async def wait(self) -> int:
@@ -536,31 +537,79 @@ def test_windows_tree_termination_falls_back_to_taskkill(
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
 
+    def process_tree(pid: int) -> set[int]:
+        calls.append(("tree", pid))
+        return {pid, 84}
+
+    async def wait_tree(pids: set[int]) -> bool:
+        calls.append(("verify", *sorted(pids)))
+        return True
+
+    monkeypatch.setattr(process_module, "_windows_process_tree", process_tree, raising=False)
+    monkeypatch.setattr(
+        process_module, "_wait_windows_processes_gone", wait_tree, raising=False
+    )
+
     actual_job = FailingJob() if job else None
     assert asyncio.run(_terminate_windows(FakeProcess(), actual_job)) is True  # type: ignore[arg-type]
+    taskkill = str(Path(r"C:\Windows") / "System32" / "taskkill.exe")
     assert (
         calls
         == [
             ("job",),
+            ("tree", 42),
             (
-                r"C:\Windows/System32/taskkill.exe",
+                taskkill,
                 "/PID",
                 "42",
                 "/T",
                 "/F",
             ),
+            ("verify", 42, 84),
+            ("job_close",),
         ]
         if job
         else [
+            ("tree", 42),
             (
-                r"C:\Windows/System32/taskkill.exe",
+                taskkill,
                 "/PID",
                 "42",
                 "/T",
                 "/F",
-            )
+            ),
+            ("verify", 42, 84),
         ]
     )
+
+
+def test_taskkill_success_without_tree_proof_is_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 42
+
+    class FakeKiller:
+        async def wait(self) -> int:
+            return 0
+
+    async def create_process(*args: object, **kwargs: object) -> FakeKiller:
+        del args, kwargs
+        return FakeKiller()
+
+    async def not_gone(pids: set[int]) -> bool:
+        assert pids == {42, 84}
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        process_module, "_windows_process_tree", lambda _pid: {42, 84}, raising=False
+    )
+    monkeypatch.setattr(
+        process_module, "_wait_windows_processes_gone", not_gone, raising=False
+    )
+
+    assert asyncio.run(_terminate_windows(FakeProcess())) is False  # type: ignore[arg-type]
 
 
 def test_windows_job_close_failure_is_cleanup_failure() -> None:

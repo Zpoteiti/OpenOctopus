@@ -534,3 +534,83 @@ def test_pipe_ctrl_break_delivery_failure_is_stable(
             assert await asyncio.wait_for(manager.shutdown(), timeout=12) is True
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_windows_job_terminate_closes_handle_and_removes_descendant(tmp_path: Path) -> None:
+    async def run() -> None:
+        script = tmp_path / "job_tree.py"
+        release = tmp_path / "release-job"
+        _write_tree_script(script, release)
+        handle = await spawn_pipe(
+            (sys.executable, "-u", str(script)),
+            cwd=tmp_path,
+            env=_child_environment(),
+        )
+        processes = await _tree_processes(handle)
+        job = cast(Any, handle._job)  # noqa: SLF001 - native Job handle contract
+        try:
+            assert job is not None
+            result = await asyncio.wait_for(handle.terminate(), timeout=10)
+            await _wait_processes_gone(processes)
+            assert result.returncode is not None
+            assert job._handle == 0  # noqa: SLF001 - native Job handle-close contract
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_pipe(handle)
+            await _force_stop_processes(processes)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=25))
+
+
+def test_windows_job_close_after_natural_root_exit_removes_descendant(tmp_path: Path) -> None:
+    async def run() -> None:
+        script = tmp_path / "natural_tree.py"
+        release = tmp_path / "release-natural"
+        _write_tree_script(script, release)
+        handle = await spawn_pipe(
+            (sys.executable, "-u", str(script)),
+            cwd=tmp_path,
+            env=_child_environment(),
+        )
+        processes = await _tree_processes(handle)
+        job = cast(Any, handle._job)  # noqa: SLF001 - native Job handle contract
+        try:
+            assert job is not None
+            release.write_bytes(b"ready")
+            result = await asyncio.wait_for(handle.wait(), timeout=10)
+            await _wait_processes_gone(processes)
+            assert result.returncode == 0
+            assert job._handle == 0  # noqa: SLF001 - native Job handle-close contract
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_pipe(handle)
+            await _force_stop_processes(processes)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=25))
+
+
+def test_taskkill_fallback_proves_real_process_tree_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def run() -> None:
+        script = tmp_path / "taskkill_tree.py"
+        release = tmp_path / "release-taskkill"
+        _write_tree_script(script, release)
+        monkeypatch.setattr(process_module, "_create_windows_job", lambda _pid: None)
+        handle = await spawn_pipe(
+            (sys.executable, "-u", str(script)),
+            cwd=tmp_path,
+            env=_child_environment(),
+        )
+        processes = await _tree_processes(handle)
+        try:
+            assert handle._job is None  # noqa: SLF001 - injected fallback contract
+            result = await asyncio.wait_for(handle.terminate(), timeout=12)
+            await _wait_processes_gone(processes)
+            assert result.returncode is not None
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_pipe(handle)
+            await _force_stop_processes(processes)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
