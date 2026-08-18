@@ -471,7 +471,7 @@ def test_conpty_receives_argv_dimensions_and_eof_is_normal(
         "echo hello world",
     ]
     assert captured["dimensions"] == (24, 80)
-    assert captured["backend"] == 0
+    assert captured["backend"] == "0"
 
 
 def test_conpty_marks_cleanup_incomplete_when_job_close_fails(

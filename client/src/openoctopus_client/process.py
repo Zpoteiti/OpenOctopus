@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ctypes
+import importlib
 import json
 import os
 import signal
@@ -104,10 +105,12 @@ def validate_pty_backend() -> None:
 
     try:
         if os.name == "nt":
-            from winpty import Backend, PtyProcess  # type: ignore[import-not-found]
+            winpty = importlib.import_module("winpty")
+            backend_type = getattr(winpty, "Backend")
+            pty_process_type = getattr(winpty, "PtyProcess")
 
-            if not callable(getattr(PtyProcess, "spawn", None)) or not isinstance(
-                getattr(Backend, "ConPTY", None),
+            if not callable(getattr(pty_process_type, "spawn", None)) or not isinstance(
+                getattr(backend_type, "ConPTY", None),
                 int,
             ):
                 raise ImportError
@@ -1276,18 +1279,23 @@ async def _spawn_conpty(
     argv: Sequence[str], *, cwd: Path | None, env: Mapping[str, str]
 ) -> ConPtyProcessHandle:
     try:
-        from winpty import Backend, PtyProcess
+        winpty = importlib.import_module("winpty")
+        backend_type = getattr(winpty, "Backend")
+        pty_process_type = getattr(winpty, "PtyProcess")
     except ImportError as exc:
         raise PtyUnavailableError("pywinpty/ConPTY is not installed") from exc
     if not argv:
         raise InvalidProcessArgumentsError("argv is empty")
     spawn_call = partial(
-        PtyProcess.spawn,
+        pty_process_type.spawn,
         list(argv),
         cwd=str(cwd) if cwd is not None else None,
         env=dict(env),
         dimensions=(24, 80),
-        backend=Backend.ConPTY,
+        # ``Backend.ConPTY`` is integer zero.  pywinpty 3.0.5 treats a numeric
+        # zero as absent and consults PYWINPTY_BACKEND, while the equivalent
+        # truthy string is parsed back to the required explicit backend.
+        backend=str(backend_type.ConPTY),
     )
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openoctopus-conpty-spawn")
     try:
