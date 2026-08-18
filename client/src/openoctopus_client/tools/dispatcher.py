@@ -410,7 +410,11 @@ class ClientToolDispatcher:
                 "workspace_invalid_request", "Transfer source and destination must differ"
             )
         async with self._locks.hold(str(source), str(destination)):
-            source_fd, initial = await self._run_blocking(_open_transfer_source, source)
+            source_fd, initial = await self._run_blocking(
+                _open_transfer_source,
+                source,
+                action.mode == "move",
+            )
             try:
                 await self._run_blocking(_check_transfer_destination, destination)
                 await self._run_blocking(self._paths.prepare_parent, destination)
@@ -1506,7 +1510,9 @@ async def _run_irreversible_mutation[T](
             continue
 
 
-def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
+def _open_transfer_source(
+    path: Path, delete_access: bool = False
+) -> tuple[int, tuple[int, int, int, int, int]]:
     try:
         initial = os.lstat(path)
     except FileNotFoundError as exc:
@@ -1525,7 +1531,13 @@ def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, int, in
     )
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags)
+        descriptor = (
+            # Hold an identity-stable handle that shares DELETE while writers
+            # are still allowed.  Acquire DELETE access only at commit time.
+            _open_windows_transfer_source(path, delete_access=False)
+            if os.name == "nt" and delete_access
+            else os.open(path, flags)
+        )
         opened = os.fstat(descriptor)
     except FileNotFoundError as exc:
         if descriptor is not None:
@@ -1548,6 +1560,52 @@ def _open_transfer_source(path: Path) -> tuple[int, tuple[int, int, int, int, in
             os.close(descriptor)
         raise ToolFailure("workspace_file_changed", "Source changed during transfer")
     return descriptor, identity
+
+
+def _open_windows_transfer_source(path: Path, *, delete_access: bool) -> int:
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    desired_access = 0x80000000  # GENERIC_READ
+    if delete_access:
+        desired_access |= 0x00010000  # DELETE
+    handle = create_file(
+        str(path),
+        desired_access,
+        0x00000001 | 0x00000002 | 0x00000004,  # FILE_SHARE_READ | WRITE | DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if not handle or handle == invalid_handle:
+        error = getattr(ctypes, "get_last_error")()
+        if error in {2, 3}:
+            raise ToolFailure("workspace_not_found", "Source file was not found")
+        raise ToolFailure("workspace_permission_denied", "Source file is unavailable")
+    try:
+        open_osfhandle = cast(
+            Callable[[int, int], int], getattr(msvcrt, "open_osfhandle")
+        )
+        return int(
+            open_osfhandle(int(handle), os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+        )
+    except (OSError, OverflowError):
+        kernel32.CloseHandle(handle)
+        raise
 
 
 def _create_transfer_temp(parent: Path, name: str) -> tuple[int, Path]:
@@ -1690,7 +1748,16 @@ def _rename_transfer_no_replace(
         if result != 0:
             _raise_exclusive_move_error(ctypes.get_errno())
     elif os.name == "nt":
-        _rename_windows_handle_no_replace(source_fd, destination)
+        rename_fd = _open_windows_transfer_source(source, delete_access=True)
+        try:
+            opened_identity = _transfer_identity(os.fstat(rename_fd))
+            source_identity = _transfer_identity(os.fstat(source_fd))
+            if opened_identity[:2] != source_identity[:2]:
+                raise ToolFailure("workspace_file_changed", "Source changed during transfer")
+            _rename_windows_handle_no_replace(rename_fd, destination)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(rename_fd)
     else:
         raise ToolFailure(
             "workspace_storage_unavailable",
@@ -1741,7 +1808,9 @@ def _rename_windows_handle_no_replace(source_fd: int, destination: Path) -> None
 
     encoded = str(destination).encode("utf-16-le")
     file_name_offset = FileRenameInfo.file_name.offset
-    buffer = ctypes.create_string_buffer(file_name_offset + len(encoded))
+    buffer = ctypes.create_string_buffer(
+        file_name_offset + len(encoded) + ctypes.sizeof(wintypes.WCHAR)
+    )
     info = ctypes.cast(buffer, ctypes.POINTER(FileRenameInfo)).contents
     info.flags = 0
     info.root_directory = None
@@ -1756,7 +1825,8 @@ def _rename_windows_handle_no_replace(source_fd: int, destination: Path) -> None
         wintypes.DWORD,
     ]
     set_file_information.restype = wintypes.BOOL
-    handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_fd))  # type: ignore[attr-defined]
+    get_osfhandle = cast(Callable[[int], int], getattr(msvcrt, "get_osfhandle"))
+    handle = wintypes.HANDLE(get_osfhandle(source_fd))
     if not set_file_information(handle, 22, buffer, len(buffer)):
         error = getattr(ctypes, "get_last_error")()
         if error in {80, 183}:
@@ -1811,12 +1881,15 @@ def _source_unchanged(
 
 
 def _transfer_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    # On Windows, path-based stat reports creation time for st_ctime while
+    # descriptor stat may report last-write time for the same file.
+    change_time = 0 if os.name == "nt" else getattr(info, "st_ctime_ns", 0)
     return (
         info.st_dev,
         info.st_ino,
         info.st_size,
         info.st_mtime_ns,
-        getattr(info, "st_ctime_ns", 0),
+        change_time,
     )
 
 
