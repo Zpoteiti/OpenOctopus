@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +21,8 @@ from openoctopus_client.tools.common import ToolOutput
 
 CHAT_ID = UUID("0190d5a7-0000-7000-8000-000000000003")
 OTHER_CHAT_ID = UUID("0190d5a7-0000-7000-8000-000000000005")
+TEST_SHELL = "cmd" if os.name == "nt" else "sh"
+TEST_COMMAND = "echo test"
 
 
 class _Reader:
@@ -183,16 +186,16 @@ def _request(*, tty: bool = False, timeout: int = 60, yield_ms: int = 1) -> Exec
         sandbox_mode=False,
         shell_timeout_max=600,
         env_allowlist=("PATH",),
-        available_shells=("sh",),
-        default_shell="sh",
+        available_shells=(TEST_SHELL,),
+        default_shell=TEST_SHELL,
         epoch=1,
     )
     return ExecStart(
         policy=policy,
-        command="cat",
+        command=TEST_COMMAND,
         working_dir=None,
         timeout_seconds=timeout,
-        shell="sh",
+        shell=TEST_SHELL,
         login=False,
         tty=tty,
         yield_time_ms=yield_ms,
@@ -575,8 +578,8 @@ def test_policy_transition_blocks_new_start_until_old_sessions_are_terminated() 
             sandbox_mode=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
-            available_shells=("sh",),
-            default_shell="sh",
+            available_shells=(TEST_SHELL,),
+            default_shell=TEST_SHELL,
             epoch=2,
         )
         transition = asyncio.create_task(manager.apply_policy(new_policy))
@@ -585,10 +588,10 @@ def test_policy_transition_blocks_new_start_until_old_sessions_are_terminated() 
             CHAT_ID,
             _request().__class__(
                 policy=new_policy,
-                command="cat",
+                command=TEST_COMMAND,
                 working_dir=None,
                 timeout_seconds=60,
-                shell="sh",
+                shell=TEST_SHELL,
                 login=False,
                 tty=False,
                 yield_time_ms=1,
@@ -623,16 +626,16 @@ def test_policy_transition_stays_fenced_until_old_session_cleanup_converges() ->
             sandbox_mode=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
-            available_shells=("sh",),
-            default_shell="sh",
+            available_shells=(TEST_SHELL,),
+            default_shell=TEST_SHELL,
             epoch=2,
         )
         new_request = ExecStart(
             policy=new_policy,
-            command="cat",
+            command=TEST_COMMAND,
             working_dir=None,
             timeout_seconds=60,
-            shell="sh",
+            shell=TEST_SHELL,
             login=False,
             tty=False,
             yield_time_ms=1,
@@ -665,8 +668,8 @@ def test_policy_transition_waits_for_an_inflight_spawn_to_be_reaped() -> None:
             sandbox_mode=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
-            available_shells=("sh",),
-            default_shell="sh",
+            available_shells=(TEST_SHELL,),
+            default_shell=TEST_SHELL,
             epoch=2,
         )
 
@@ -714,8 +717,8 @@ def test_policy_transition_fences_an_old_start_before_process_spawn(
             sandbox_mode=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
-            available_shells=("sh",),
-            default_shell="sh",
+            available_shells=(TEST_SHELL,),
+            default_shell=TEST_SHELL,
             epoch=2,
         )
 
@@ -740,17 +743,17 @@ def test_policy_transition_fences_an_old_start_before_process_spawn(
     asyncio.run(run())
 
 
-def test_report_uses_resolved_cwd_and_aggregate_output_limit() -> None:
+def test_report_uses_resolved_cwd_and_aggregate_output_limit(tmp_path: Path) -> None:
     async def run() -> None:
         launcher = _Launcher()
         manager = ExecSessionManager(launcher)
         request = _request()
         request = ExecStart(
             policy=request.policy,
-            command="cat",
-            working_dir="/tmp",
+            command=TEST_COMMAND,
+            working_dir=str(tmp_path),
             timeout_seconds=60,
-            shell="sh",
+            shell=TEST_SHELL,
             login=False,
             tty=False,
             yield_time_ms=1,
@@ -768,7 +771,7 @@ def test_report_uses_resolved_cwd_and_aggregate_output_limit() -> None:
         content = cast(str, result.content)
         stdout = content.split("stdout=", 1)[1].split("\nstderr=", 1)[0]
         stderr = content.split("stderr=", 1)[1].split("\noutput=", 1)[0]
-        assert "cwd=/tmp" in content
+        assert f"cwd={tmp_path}" in content
         assert len(stdout) + len(stderr) <= 10
         await manager.shutdown()
 

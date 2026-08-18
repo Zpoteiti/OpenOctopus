@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+import openoctopus_client.process as process_module
 from openoctopus_client.process import (
     ShellUnavailableError,
     build_argv,
@@ -44,15 +45,22 @@ def test_child_environment_is_allowlisted_and_removes_client_secrets() -> None:
         ("sh", False, ["sh", "-c", "echo ok"]),
     ],
 )
-def test_posix_shell_argv(shell: str, login: bool, expected: list[str]) -> None:
-    if shell == "zsh" and not os.path.exists("/bin/zsh"):
-        pytest.skip("zsh is not installed on this test host")
+def test_posix_shell_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    shell: str,
+    login: bool,
+    expected: list[str],
+) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(process_module, "_resolve_executable", lambda name: f"/bin/{name}")
     actual = build_argv(shell, "echo ok", login=login, tty=False)
     assert actual[1:] == expected[1:]
     assert actual[0].endswith(expected[0])
 
 
-def test_login_is_rejected_for_sh() -> None:
+def test_login_is_rejected_for_sh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(process_module, "_resolve_executable", lambda name: f"/bin/{name}")
     with pytest.raises(ShellUnavailableError, match="login"):
         build_argv("sh", "echo ok", login=True, tty=False)
 

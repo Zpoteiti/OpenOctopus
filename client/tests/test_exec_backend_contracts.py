@@ -212,8 +212,9 @@ def test_posix_pty_worker_refuses_windows_before_opening_channels(
 
 
 def test_login_unsupported_has_stable_error_code() -> None:
+    shell = "cmd" if os.name == "nt" else "sh"
     with pytest.raises(ShellLoginUnsupportedError) as raised:
-        build_argv("sh", "echo ok", login=True, tty=False)
+        build_argv(shell, "echo ok", login=True, tty=False)
 
     assert raised.value.code == "tool_shell_login_unsupported"
 
