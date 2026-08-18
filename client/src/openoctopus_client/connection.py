@@ -341,6 +341,19 @@ class ClientRuntime:
         attempt = 0
         loop = asyncio.get_running_loop()
         installed_signals: list[signal.Signals] = []
+        windows_break_signal = getattr(signal, "SIGBREAK", None)
+        previous_windows_break_handler: Any = None
+        windows_break_installed = False
+        if os.name == "nt" and windows_break_signal is not None:
+            try:
+                previous_windows_break_handler = signal.getsignal(windows_break_signal)
+                signal.signal(
+                    windows_break_signal,
+                    lambda _signum, _frame: self.request_shutdown(),
+                )
+                windows_break_installed = True
+            except (OSError, ValueError):
+                pass
         for signum in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(signum, self.request_shutdown)
@@ -410,6 +423,10 @@ class ClientRuntime:
             for signum in installed_signals:
                 with contextlib.suppress(NotImplementedError, OSError):
                     loop.remove_signal_handler(signum)
+            if windows_break_installed:
+                assert windows_break_signal is not None
+                with contextlib.suppress(OSError, ValueError):
+                    signal.signal(windows_break_signal, previous_windows_break_handler)
 
     async def _run_connection_attempt(self) -> CloseDisposition:
         async with connect(
