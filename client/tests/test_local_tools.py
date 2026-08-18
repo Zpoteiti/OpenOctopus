@@ -5,6 +5,7 @@ import builtins
 import errno
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -19,6 +20,26 @@ from openoctopus_client.tools.common import ToolFailure, ToolOutput
 
 def _run(dispatcher: ClientToolDispatcher, name: str, **args: Any) -> ToolOutput:
     return asyncio.run(dispatcher.execute(name, args))
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
 
 
 def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> None:
@@ -70,7 +91,7 @@ def test_paths_reject_escape_and_symlink_traversal(tmp_path: Path) -> None:
     workspace.mkdir()
     outside.mkdir()
     (outside / "secret.txt").write_text("secret")
-    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    _make_directory_link(workspace / "link", outside)
     tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
 
     escaped = _run(tools, "read_file", path="../outside/secret.txt")
@@ -83,7 +104,7 @@ def test_workspace_root_and_nul_text_are_rejected(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     link = tmp_path / "workspace-link"
-    link.symlink_to(workspace, target_is_directory=True)
+    _make_directory_link(link, workspace)
     with pytest.raises(ToolFailure, match="symbolic link"):
         ClientToolDispatcher(link, sandbox_mode=True, ssrf_denylist=[])
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -67,6 +68,26 @@ async def _wait_receiver_ready(manager: TransferManager, slot_id: UUID = SLOT) -
             return
         await asyncio.sleep(0.001)
     raise AssertionError(f"receiver slot {slot_id} did not become ready")
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
 
 
 def test_binary_header_is_exactly_bounded_and_uuidv7_checked() -> None:
@@ -578,11 +599,33 @@ def test_workspace_upload_if_match_mismatch_does_not_write(tmp_path: Path) -> No
     assert frames[-1]["code"] == "workspace_file_changed"
 
 
-def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path) -> None:
+def test_workspace_upload_rechecks_symlinked_parent_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     parent = tmp_path / "nested"
     outside = tmp_path / "outside"
     parent.mkdir()
     outside.mkdir()
+    commit_check_started = threading.Event()
+    release_commit_check = threading.Event()
+    check_calls = 0
+    original_check = transfer_module._destination_parent_unchanged
+
+    def gated_parent_check(
+        paths: WorkspacePaths, path: str, destination: Path
+    ) -> bool:
+        nonlocal check_calls
+        check_calls += 1
+        if check_calls == 2:
+            commit_check_started.set()
+            assert release_commit_check.wait(timeout=5)
+        return original_check(paths, path, destination)
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_destination_parent_unchanged",
+        gated_parent_check,
+    )
 
     async def exercise() -> list[dict[str, object]]:
         manager, writer, socket, writer_task = await _manager(tmp_path)
@@ -598,16 +641,6 @@ def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path
             )
             await _wait_receiver_ready(manager)
             await manager.handle_binary(encode_binary_chunk(SLOT, b"abc"))
-            for _ in range(100):
-                if manager.slot_state(SLOT) is TransferState.STREAMING:
-                    break
-                await asyncio.sleep(0.001)
-            moved = tmp_path / "moved"
-            parent.rename(moved)
-            try:
-                parent.symlink_to(outside, target_is_directory=True)
-            except OSError:
-                pytest.skip("symbolic links are unavailable on this platform")
             await manager.handle_control(
                 TransferEnd(
                     id=SLOT,
@@ -617,9 +650,19 @@ def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path
                     sha256=hashlib.sha256(b"abc").hexdigest(),
                 )
             )
-            await asyncio.sleep(0.03)
+            assert await asyncio.to_thread(commit_check_started.wait, 5)
+            moved = tmp_path / "moved"
+            parent.rename(moved)
+            _make_directory_link(parent, outside)
+            release_commit_check.set()
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
+            release_commit_check.set()
             await _stop(manager, writer, writer_task)
 
     frames = asyncio.run(exercise())
