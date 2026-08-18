@@ -215,7 +215,10 @@ def main() -> int:
         psutil = _psutil()
 
         version = _run(binary, "version", psutil=psutil)
-        if version.completed.returncode != 0 or version.completed.stdout != "0.0.1\n":
+        if (
+            version.completed.returncode != 0
+            or version.completed.stdout not in {"0.0.1\n", "0.0.1\r\n"}
+        ):
             raise SmokeError(
                 f"version failed: stdout={version.completed.stdout!r}; "
                 f"stderr={version.completed.stderr!r}"
