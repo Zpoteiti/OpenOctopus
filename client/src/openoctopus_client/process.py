@@ -464,13 +464,24 @@ class PipeProcessHandle:
         raise ProcessBackendError("pipe stdin is closed")
 
     async def wait(self) -> ProcessExit:
-        code = await self.process.wait()
         if os.name == "nt":
+            # Proactor process.wait() is not resolved until inherited stdout
+            # and stderr handles reach EOF.  A surviving descendant can hold
+            # those handles forever, so observe the root exit first and close
+            # its kill-on-close Job before awaiting transport convergence.
+            while self.process.returncode is None:
+                await asyncio.sleep(0.01)
+            code = self.process.returncode
             if self._job is None:
                 self.cleanup_incomplete = self._job_assignment_failed
             elif not self._job.close():
                 self.cleanup_incomplete = True
+            try:
+                await asyncio.wait_for(self.process.wait(), 2)
+            except TimeoutError:
+                self.cleanup_incomplete = True
         else:
+            code = await self.process.wait()
             complete = await _terminate_posix(self.process, self.pid)
             self.cleanup_incomplete = self.cleanup_incomplete or not complete
         return ProcessExit(code, -code if code < 0 else None)

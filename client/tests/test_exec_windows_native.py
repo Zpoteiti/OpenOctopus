@@ -318,3 +318,59 @@ def test_conpty_nested_python_command_reaps_host_after_child_exit() -> None:
             await _close_conpty(handle)
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_pipe_default_shell_executes_command() -> None:
+    async def run() -> None:
+        shell = discover_shells().default
+        marker = b"NATIVE_DEFAULT_SHELL_OK"
+        command = (
+            "Write-Output 'NATIVE_DEFAULT_SHELL_OK'"
+            if shell in {"pwsh", "powershell", "powershell_x86"}
+            else "echo NATIVE_DEFAULT_SHELL_OK"
+        )
+        handle = await spawn_pipe(
+            build_argv(shell, command, login=False, tty=False),
+            cwd=None,
+            env=_child_environment(),
+        )
+        try:
+            stdout, stderr, result = await asyncio.wait_for(
+                asyncio.gather(handle.stdout.read(), handle.stderr.read(), handle.wait()),
+                timeout=15,
+            )
+            assert marker in stdout
+            assert stderr == b""
+            assert result.returncode == 0
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_pipe(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=20))
+
+
+def test_real_session_final_report_drains_short_lived_nested_shell(tmp_path: Path) -> None:
+    async def run() -> None:
+        shell = discover_shells().default
+        marker = "NESTED_PIPE_FINAL_OUTPUT"
+        code = (
+            "import sys; "
+            f"sys.stdout.buffer.write(b'{marker}\\n'); "
+            "sys.stdout.buffer.flush()"
+        )
+        request = _exec_request(
+            tmp_path,
+            _shell_command(shell, (sys.executable, "-u", "-c", code)),
+            yield_ms=3_000,
+        )
+        manager = ExecSessionManager()
+        try:
+            result = await asyncio.wait_for(manager.start(UUID(int=9), request), timeout=10)
+            content = cast(str, result.content)
+            assert "status=exited" in content
+            assert f"stdout={marker}\n" in content, repr(content)
+            assert "cleanup_incomplete=false" in content
+        finally:
+            assert await asyncio.wait_for(manager.shutdown(), timeout=12) is True
+
+    asyncio.run(asyncio.wait_for(run(), timeout=25))
