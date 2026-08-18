@@ -992,6 +992,22 @@ def test_receive_rechecks_destination_before_exposing_completed_file(
     assert frames[-1]["ack"] is True
 
 
+def test_source_unchanged_accepts_path_ctime_skew_with_stable_open_handle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    descriptor = os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    initial = (1, 2, 7, 4, 5)
+    identities = iter((initial, (1, 2, 7, 4, 6)))
+    monkeypatch.setattr(transfer_module, "_identity", lambda _info: next(identities))
+
+    try:
+        assert transfer_module._source_unchanged(source, descriptor, initial)
+    finally:
+        os.close(descriptor)
+
+
 def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"x" * (64 * 1024 + 7))

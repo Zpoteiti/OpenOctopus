@@ -700,7 +700,7 @@ class TransferManager:
             await asyncio.wait_for(
                 self._run_filesystem(os.fsync, file_handle.fileno()), self._idle_timeout
             )
-            slot.temporary_identity = _identity(
+            open_identity = _identity(
                 await self._run_filesystem(os.fstat, file_handle.fileno())
             )
             # Close before the rename so Windows does not reject replacing an
@@ -708,6 +708,11 @@ class TransferManager:
             # if closing itself fails.
             await self._run_filesystem(file_handle.close)
             file_handle = None
+            slot.temporary_identity = await self._run_filesystem(
+                _identity_after_close,
+                slot.temporary,
+                open_identity,
+            )
             declared_end = slot.remote_end
             if declared_end is None:
                 raise TransferOperationError(
@@ -1230,6 +1235,23 @@ def _temporary_unchanged(
     return stat.S_ISREG(info.st_mode) and _identity(info) == expected
 
 
+def _identity_after_close(
+    path: Path, open_identity: tuple[int, int, int, int, int]
+) -> tuple[int, int, int, int, int]:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise TransferOperationError(
+            "workspace_file_changed", "Temporary destination changed during transfer"
+        ) from exc
+    closed_identity = _identity(info)
+    if not stat.S_ISREG(info.st_mode) or closed_identity[:3] != open_identity[:3]:
+        raise TransferOperationError(
+            "workspace_file_changed", "Temporary destination changed during transfer"
+        )
+    return closed_identity
+
+
 def _commit_no_replace(
     temporary: Path,
     destination: Path,
@@ -1363,10 +1385,13 @@ def _stat_fingerprint(path: Path) -> str | None:
 
 def _source_unchanged(path: Path, fd: int, initial: tuple[int, int, int, int, int]) -> bool:
     try:
-        return (
-            _identity(os.fstat(fd)) == initial
-            and _identity(os.stat(path, follow_symlinks=False)) == initial
-        )
+        handle_identity = _identity(os.fstat(fd))
+        path_identity = _identity(os.stat(path, follow_symlinks=False))
+        # Windows can expose a slightly different creation-time value through
+        # an open descriptor and a path stat.  The descriptor still proves the
+        # opened file's full identity, while the path check proves it was not
+        # replaced; do not reject that representation-only ctime skew.
+        return handle_identity == initial and path_identity[:4] == initial[:4]
     except OSError:
         return False
 
