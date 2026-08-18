@@ -5,7 +5,9 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 from openoctopus_client import __version__
 from openoctopus_client.config import ConfigurationError, load_config
@@ -23,7 +25,15 @@ from openoctopus_client.process import (
 )
 
 
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            cast(Callable[..., Any], reconfigure)(encoding="utf-8", errors="strict")
+
+
 def main() -> int:
+    _configure_utf8_stdio()
     parser = argparse.ArgumentParser(prog="openoctopus-client")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("version")
