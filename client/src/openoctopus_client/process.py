@@ -1161,13 +1161,16 @@ class ConPtyProcessHandle:
             self._loop.call_soon_threadsafe(self._fail, exc)
 
     def _write_sync(self, value: str) -> None:
-        remaining = value
+        if not value:
+            return
         with self._io_lock:
-            while remaining:
-                written = self.process.write(remaining)
-                if not isinstance(written, int) or written <= 0:
-                    raise OSError("ConPTY input write made no progress")
-                remaining = remaining[min(written, len(remaining)) :]
+            # pywinpty 3.0.5 submits ConPTY input with overlapped writes.  Its
+            # count can describe an earlier completed write, so zero is valid
+            # even after the complete current string was accepted.  Retrying a
+            # suffix from that count can duplicate multibyte input.
+            written = self.process.write(value)
+            if not isinstance(written, int) or written < 0:
+                raise OSError("ConPTY input write returned an invalid result")
 
     def _force_close_sync(self) -> None:
         self._stop.set()

@@ -253,3 +253,34 @@ def test_conpty_backend_ignores_parent_winpty_override(
             await _close_conpty(handle)
 
     asyncio.run(asyncio.wait_for(run(), timeout=20))
+
+
+def test_conpty_line_repl_round_trips_unicode_input() -> None:
+    async def run() -> None:
+        handle = await process_module._spawn_conpty(
+            (sys.executable, "-u", "-i"),
+            cwd=Path.cwd(),
+            env=_child_environment(),
+        )
+        try:
+            await _read_until(handle, ">>> ")
+            await asyncio.wait_for(
+                handle.write(
+                    b"print('native-'+'line:'+chr(0x4e2d)+chr(0x6587)+chr(0x1f642)+':'"
+                    b"+str(__import__('sys').stdin.isatty())"
+                    b"+':'+str(__import__('sys').stdout.isatty()))\r\n"
+                ),
+                timeout=5,
+            )
+            await _read_until(handle, "native-line:中文🙂:True:True")
+            await asyncio.wait_for(handle.write(b"exit()\r\n"), timeout=5)
+            result = await asyncio.wait_for(handle.wait(), timeout=10)
+            await asyncio.to_thread(handle._reader.join, 2)
+
+            assert result.returncode == 0
+            assert handle._reader.is_alive() is False
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_conpty(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
