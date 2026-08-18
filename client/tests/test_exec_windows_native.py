@@ -614,3 +614,84 @@ def test_taskkill_fallback_proves_real_process_tree_gone(
             await _force_stop_processes(processes)
 
     asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+def test_real_session_hard_timeout_drains_without_poll_and_final_poll_consumes(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        script = tmp_path / "hard_timeout_tree.py"
+        script.write_text(
+            "import os, subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(f'TREE_READY:{os.getpid()}:{child.pid}', flush=True)\n"
+            "payload = b'x' * 65536\n"
+            "while True:\n"
+            "    os.write(1, payload)\n",
+            encoding="utf-8",
+        )
+        shell = discover_shells().default
+        manager = ExecSessionManager()
+        processes: tuple[psutil.Process, ...] = ()
+        try:
+            started = await asyncio.wait_for(
+                manager.start(
+                    UUID(int=2),
+                    _exec_request(
+                        tmp_path,
+                        _shell_command(shell, (sys.executable, "-u", str(script))),
+                        timeout=1,
+                        yield_ms=0,
+                    ),
+                ),
+                timeout=10,
+            )
+            session_id = _session_id(started)
+            ready = await asyncio.wait_for(
+                manager.write(
+                    UUID(int=2),
+                    ExecWrite(
+                        session_id,
+                        None,
+                        False,
+                        None,
+                        "TREE_READY:",
+                        5_000,
+                        20_000,
+                    ),
+                ),
+                timeout=8,
+            )
+            marker = re.search(r"TREE_READY:(\d+):(\d+)", cast(str, ready.content))
+            assert marker is not None
+            session = manager._sessions[session_id]  # noqa: SLF001 - native lifecycle contract
+            assert session.handle is not None and session.terminal is not None
+            processes = (
+                psutil.Process(session.handle.pid),
+                psutil.Process(int(marker.group(1))),
+                psutil.Process(int(marker.group(2))),
+            )
+
+            # Do not poll while output exceeds both the OS pipe and retained
+            # session buffer.  The internal drain and hard deadline must still run.
+            await asyncio.wait_for(asyncio.shield(session.terminal), timeout=8)
+            final = await asyncio.wait_for(
+                manager.write(
+                    UUID(int=2),
+                    ExecWrite(session_id, None, False, 0, None, None, 20_000),
+                ),
+                timeout=5,
+            )
+            final_content = cast(str, final.content)
+            dropped = re.search(r"stdout_total_dropped_chars=(\d+)", final_content)
+            assert final.code == "tool_exec_timeout"
+            assert "cleanup_incomplete=false" in final_content
+            assert dropped is not None and int(dropped.group(1)) > 0
+            listed = await manager.list_sessions(UUID(int=2))
+            assert str(session_id) not in cast(str, listed.content)
+            await _wait_processes_gone(processes)
+        finally:
+            assert await asyncio.wait_for(manager.shutdown(), timeout=12) is True
+            await _force_stop_processes(processes)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=35))

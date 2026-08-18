@@ -339,7 +339,15 @@ class ExecSessionManager:
                 asyncio.shield(session.terminal), timeout=max(0, request.yield_time_ms) / 1000
             )
         except TimeoutError:
-            return self._report(session, consume=True)
+            if session.state != "terminating":
+                return self._report(session, consume=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(session.terminal),
+                    timeout=self.TERMINATE_TIMEOUT_SECONDS + self.REAP_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                return self._report(session, consume=True)
         return await self._final_report(
             session,
             remove=session.state in {"exited", "terminated"} and not session.cleanup_incomplete,
@@ -712,7 +720,9 @@ class ExecSessionManager:
         if not defer_fence:
             session.state = "terminating"
         session.reason = reason
-        session.cleanup_incomplete = False
+        # Cleanup remains unproven while terminate/reap is in flight.  A
+        # concurrent yield must never report a terminating session as clean.
+        session.cleanup_incomplete = True
         cancelled = False
         if session.spawn_done is not None and not session.spawn_done.done():
             while True:
@@ -733,11 +743,12 @@ class ExecSessionManager:
             )
             cancelled = cancelled or reap_cancelled
             session.exit = reaped_exit or terminated_exit
-            converged = terminated_ok and reaped_ok
-            session.cleanup_incomplete = session.cleanup_incomplete or bool(
-                getattr(session.handle, "cleanup_incomplete", False)
+            converged = (
+                terminated_ok
+                and reaped_ok
+                and not bool(getattr(session.handle, "cleanup_incomplete", False))
             )
-            converged = converged and not session.cleanup_incomplete
+        session.cleanup_incomplete = not converged
         if converged:
             session.state = "terminated"
             session.reason = reason
