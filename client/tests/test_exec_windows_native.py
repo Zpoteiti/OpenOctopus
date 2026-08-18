@@ -695,3 +695,98 @@ def test_real_session_hard_timeout_drains_without_poll_and_final_poll_consumes(
             await _force_stop_processes(processes)
 
     asyncio.run(asyncio.wait_for(run(), timeout=35))
+
+
+def test_conpty_etx_write_is_bounded_and_session_can_still_exit() -> None:
+    async def run() -> None:
+        handle = await process_module._spawn_conpty(
+            (sys.executable, "-u", "-i"),
+            cwd=Path.cwd(),
+            env=_child_environment(),
+        )
+        try:
+            await _read_until(handle, ">>> ")
+            assert await asyncio.wait_for(handle.interrupt(), timeout=5) is True
+            try:
+                await _read_until(handle, ">>> ", timeout=3)
+            except (TimeoutError, AssertionError):
+                result = await asyncio.wait_for(handle.terminate(), timeout=8)
+            else:
+                await asyncio.wait_for(handle.write(b"exit()\r\n"), timeout=5)
+                result = await asyncio.wait_for(handle.wait(), timeout=10)
+            await asyncio.to_thread(handle._reader.join, 2)
+            assert result.returncode is not None
+            assert handle._reader.is_alive() is False
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_conpty(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+
+@pytest.mark.parametrize("backend", ["pipe", "conpty"])
+def test_real_child_environment_strips_client_secrets_from_each_backend(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def run() -> None:
+        secret_name = "OPENOCTOPUS_DEVICE_TOKEN"
+        mixed_name = "OpenOctopus_MiXeD_Secret"
+        secret_value = "native-secret-sentinel-device"
+        mixed_value = "native-secret-sentinel-mixed"
+        monkeypatch.setenv(secret_name, secret_value)
+        monkeypatch.setenv(mixed_name, mixed_value)
+        environment = _child_environment(secret_name, mixed_name)
+        script = "\n".join(
+            (
+                "import json, os",
+                "names = tuple(os.environ)",
+                "print(json.dumps({",
+                "    'secret_present': any(name.casefold().startswith('openoctopus_') "
+                "for name in names),",
+                "    'path_present': bool(os.environ.get('PATH')),",
+                "    'system_root_present': bool(os.environ.get('SystemRoot')),",
+                "}, sort_keys=True), flush=True)",
+            )
+        )
+        combined = b""
+        if backend == "pipe":
+            handle = await spawn_pipe(
+                (sys.executable, "-u", "-c", script),
+                cwd=None,
+                env=environment,
+            )
+            try:
+                stdout, stderr, result = await asyncio.wait_for(
+                    asyncio.gather(handle.stdout.read(), handle.stderr.read(), handle.wait()),
+                    timeout=15,
+                )
+                combined = stdout + stderr
+                assert result.returncode == 0
+                assert handle.cleanup_incomplete is False
+            finally:
+                await _close_pipe(handle)
+        else:
+            conpty = await process_module._spawn_conpty(
+                (sys.executable, "-u", "-c", script),
+                cwd=None,
+                env=environment,
+            )
+            try:
+                combined = await asyncio.wait_for(_read_all(conpty.output), timeout=15)
+                result = await asyncio.wait_for(conpty.wait(), timeout=5)
+                assert result.returncode == 0
+                assert conpty.cleanup_incomplete is False
+            finally:
+                await _close_conpty(conpty)
+
+        assert secret_value.encode() not in combined
+        assert mixed_value.encode() not in combined
+        payload_match = re.search(rb"\{[^\r\n]+\}", combined)
+        assert payload_match is not None
+        assert json.loads(payload_match.group()) == {
+            "path_present": True,
+            "secret_present": False,
+            "system_root_present": True,
+        }
+
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
