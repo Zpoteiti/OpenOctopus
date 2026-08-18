@@ -24,9 +24,10 @@ class WorkspacePaths:
         return self._root
 
     def resolve(self, value: str, *, directory: bool | None = None) -> Path:
-        if not value or "\x00" in value or ntpath.splitdrive(value)[0]:
-            raise ToolFailure("tool_path_outside_workspace", "Path is invalid")
         supplied = Path(value)
+        drive = ntpath.splitdrive(value)[0]
+        if not value or "\x00" in value or (drive and not supplied.is_absolute()):
+            raise ToolFailure("tool_path_outside_workspace", "Path is invalid")
         candidate = supplied if supplied.is_absolute() else self._root / supplied
         self._check_existing_components(candidate)
         resolved_parent, tail = self._closest_existing_parent(candidate)
