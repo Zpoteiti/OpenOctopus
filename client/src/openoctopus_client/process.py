@@ -640,6 +640,8 @@ async def _terminate_posix(process: asyncio.subprocess.Process, pid: int) -> boo
         _send_process_group_signal(pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
+    except PermissionError:
+        pass
     deadline = asyncio.get_running_loop().time() + 2
     while _process_group_exists(pid) and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.05)
@@ -649,6 +651,8 @@ async def _terminate_posix(process: asyncio.subprocess.Process, pid: int) -> boo
             _send_process_group_signal(pid, sigkill)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return False
         await asyncio.sleep(0)
     return not _process_group_exists(pid)
 

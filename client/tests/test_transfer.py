@@ -70,6 +70,12 @@ async def _wait_receiver_ready(manager: TransferManager, slot_id: UUID = SLOT) -
     raise AssertionError(f"receiver slot {slot_id} did not become ready")
 
 
+async def _wait_slot_closed(manager: TransferManager, slot_id: UUID) -> None:
+    async with asyncio.timeout(5):
+        while manager.slot_state(slot_id) is not None:
+            await asyncio.sleep(0.001)
+
+
 def _make_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -520,10 +526,7 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
             await manager.handle_control(
                 TransferEnd(id=SLOT, ack=False, ok=True, bytes_sent=3, sha256=digest_one)
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT)
             await writer.drain()
             frames = [json.loads(item) for item in socket.sent if isinstance(item, str)]
             created_ack = next(
@@ -551,10 +554,7 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
             await manager.handle_control(
                 TransferEnd(id=SLOT_2, ack=False, ok=True, bytes_sent=3, sha256=digest_two)
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT_2)
             await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:

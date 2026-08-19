@@ -140,6 +140,8 @@ def _cleanup_group(pid: int) -> bool:
         _posix_os.killpg(pid, _posix_signal.SIGTERM)
     except ProcessLookupError:
         return True
+    except PermissionError:
+        pass
     deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
     while _group_exists(pid) and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -148,6 +150,8 @@ def _cleanup_group(pid: int) -> bool:
             _posix_os.killpg(pid, _posix_signal.SIGKILL)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return False
         time.sleep(0.01)
     return not _group_exists(pid)
 

@@ -40,6 +40,11 @@ from openoctopus_client.pty_worker import _write_all
 from openoctopus_client.terminal import TerminalNormalizer
 
 
+def _deny_group_signal(pid: int, sig: int) -> None:
+    del pid, sig
+    raise PermissionError
+
+
 def test_queue_reader_returns_one_available_chunk_without_waiting_for_more() -> None:
     async def run() -> bytes:
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -196,6 +201,39 @@ def test_write_all_retries_partial_writes_and_eagain() -> None:
 
     assert calls == [b"abcde", b"abcde", b"cde"]
     assert waits == [9]
+
+
+def test_pty_group_cleanup_waits_for_a_permission_denied_zombie_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existence = [True, False, False]
+
+    monkeypatch.setattr(
+        pty_worker_module,
+        "_group_exists",
+        lambda pid: existence.pop(0) if existence else False,
+    )
+    monkeypatch.setattr(
+        pty_worker_module._posix_os,
+        "killpg",
+        _deny_group_signal,
+    )
+
+    assert pty_worker_module._cleanup_group(123) is True
+
+
+def test_pty_group_cleanup_reports_a_persistent_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pty_worker_module, "_group_exists", lambda pid: True)
+    monkeypatch.setattr(pty_worker_module, "TERMINATE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        pty_worker_module._posix_os,
+        "killpg",
+        _deny_group_signal,
+    )
+
+    assert pty_worker_module._cleanup_group(123) is False
 
 
 def test_posix_pty_worker_refuses_windows_before_opening_channels(
@@ -826,6 +864,57 @@ def test_terminate_posix_cleans_group_even_after_leader_exit(
 
     assert complete is True
     assert sent == [signal.SIGTERM]
+
+
+def test_terminate_posix_waits_for_a_permission_denied_zombie_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existence = [True, False, False]
+
+    class ExitedProcess:
+        returncode = 0
+
+    monkeypatch.setattr(
+        process_module,
+        "_process_group_exists",
+        lambda pid: existence.pop(0) if existence else False,
+    )
+    monkeypatch.setattr(
+        process_module,
+        "_send_process_group_signal",
+        _deny_group_signal,
+    )
+
+    complete = asyncio.run(process_module._terminate_posix(ExitedProcess(), 123))  # type: ignore[arg-type]
+
+    assert complete is True
+
+
+def test_terminate_posix_reports_a_persistent_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        returncode = 0
+
+    class ExpiredLoop:
+        def __init__(self) -> None:
+            self._times = iter((0.0, 3.0))
+
+        def time(self) -> float:
+            return next(self._times)
+
+    async def run() -> bool:
+        expired_loop = ExpiredLoop()
+        monkeypatch.setattr(process_module, "_process_group_exists", lambda pid: True)
+        monkeypatch.setattr(
+            process_module,
+            "_send_process_group_signal",
+            _deny_group_signal,
+        )
+        monkeypatch.setattr(asyncio, "get_running_loop", lambda: expired_loop)
+        return await process_module._terminate_posix(ExitedProcess(), 123)  # type: ignore[arg-type]
+
+    assert asyncio.run(run()) is False
 
 
 def _pid_is_running(pid: int) -> bool:
