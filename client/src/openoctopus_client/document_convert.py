@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import traceback
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
@@ -241,6 +242,8 @@ def conversion_worker_main() -> int:
         payload = {"code": exc.code, "message": exc.message, "ok": False}
         return_code = 1
     except Exception:
+        if os.environ.get("OPENOCTOPUS_CONVERSION_DEBUG") == "1":
+            traceback.print_exc(file=sys.stderr)
         payload = {
             "code": "tool_content_conversion_failed",
             "message": "Document conversion failed",
