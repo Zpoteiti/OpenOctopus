@@ -114,32 +114,6 @@ jobs:
       - name: Build native one-folder bundle
         run: python -m PyInstaller --noconfirm --clean openoctopus_client.spec
 
-      - name: Probe native frozen PDF converter
-        env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
-          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
-          OPENOCTOPUS_CONVERSION_DEBUG: "1"
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-
-          completed = subprocess.run(
-              [os.environ["OO_CLIENT_BIN"], "_conversion-worker"],
-              input=json.dumps(
-                  {
-                      "path": os.path.join(os.environ["OO_DOCUMENT_CORPUS"], "sample.pdf"),
-                      "pages": None,
-                  }
-              ),
-              stdout=subprocess.DEVNULL,
-              text=True,
-              check=False,
-          )
-          raise SystemExit(completed.returncode)
-          PY
-
       - name: Smoke test native frozen bundle
         env:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client

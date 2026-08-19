@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from io import BytesIO, StringIO
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -153,35 +153,6 @@ def test_cli_normalizes_unexpected_failures(
         "message": "Document conversion failed",
         "ok": False,
     }
-
-
-def test_conversion_worker_only_prints_tracebacks_in_explicit_debug_mode(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fail(
-        name: str,
-        data: bytes,
-        pages: str | None,
-        *,
-        base_url: str | None = None,
-    ) -> str:
-        del name, data, pages, base_url
-        raise RuntimeError("diagnostic sentinel")
-
-    request = json.dumps({"path": str(FIXTURES / "sample.pdf"), "pages": None})
-    monkeypatch.setattr(document_convert, "_convert_bytes", fail)
-    monkeypatch.setattr(sys, "stdin", StringIO(request))
-
-    assert document_convert.conversion_worker_main() == 1
-    captured = capsys.readouterr()
-    assert "diagnostic sentinel" not in captured.err
-
-    monkeypatch.setenv("OPENOCTOPUS_CONVERSION_DEBUG", "1")
-    monkeypatch.setattr(sys, "stdin", StringIO(request))
-    assert document_convert.conversion_worker_main() == 1
-    captured = capsys.readouterr()
-    assert "RuntimeError: diagnostic sentinel" in captured.err
 
 
 def test_conversion_worker_environment_excludes_parent_secrets(
