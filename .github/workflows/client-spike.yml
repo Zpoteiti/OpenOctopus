@@ -73,6 +73,71 @@ jobs:
             client/metrics
           if-no-files-found: warn
 
+  macos-native:
+    name: macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    defaults:
+      run:
+        working-directory: client
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: client/pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev,build]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Type check
+        run: python -m mypy --strict src tests
+
+      - name: Test
+        run: python -m pytest -v
+
+      - name: Build native one-folder bundle
+        run: python -m PyInstaller --noconfirm --clean openoctopus_client.spec
+
+      - name: Smoke test native frozen bundle
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          mkdir -p metrics
+          python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
+
+      - name: Smoke test native frozen runtime
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
+
+      - name: Upload native bundle and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: py6-client-macos-${{ matrix.arch }}
+          path: |
+            client/dist/openoctopus-client
+            client/metrics
+          if-no-files-found: warn
+
   frozen-device-e2e:
     name: linux-x64-device-e2e
     needs: frozen-smoke
