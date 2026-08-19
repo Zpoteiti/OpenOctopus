@@ -493,7 +493,8 @@ def test_receive_file_commits_only_after_digest_and_cleans_temp(tmp_path: Path) 
                     sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 )
             )
-            await asyncio.sleep(0.05)
+            await _wait_slot_closed(manager, SLOT)
+            await writer.drain()
             assert (tmp_path / "nested/result.txt").read_bytes() == b"abc"
             assert not list((tmp_path / "nested").glob(".*.tmp"))
             frames = [json.loads(item) for item in socket.sent if isinstance(item, str)]

@@ -339,15 +339,16 @@ class ExecSessionManager:
                 asyncio.shield(session.terminal), timeout=max(0, request.yield_time_ms) / 1000
             )
         except TimeoutError:
-            if session.state != "terminating":
+            if session.state == "running":
                 return self._report(session, consume=True)
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(session.terminal),
-                    timeout=self.TERMINATE_TIMEOUT_SECONDS + self.REAP_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                return self._report(session, consume=True)
+            if session.state == "terminating":
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(session.terminal),
+                        timeout=self.TERMINATE_TIMEOUT_SECONDS + self.REAP_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    return self._report(session, consume=True)
         return await self._final_report(
             session,
             remove=session.state in {"exited", "terminated"} and not session.cleanup_incomplete,
