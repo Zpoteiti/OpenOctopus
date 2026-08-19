@@ -372,10 +372,16 @@ def test_permanent_replacement_arms_watchdog_for_stuck_exec_cleanup(
 
     async def exercise() -> list[int]:
         forced: list[int] = []
+        forced_event = threading.Event()
+
+        def hard_exit(code: int) -> None:
+            forced.append(code)
+            forced_event.set()
+
         runtime = ClientRuntime(
             load_config(_environment()),
             exec_session_manager=cast(Any, StuckExecManager()),
-            hard_exit=forced.append,
+            hard_exit=hard_exit,
         )
 
         async def fail() -> CloseDisposition:
@@ -383,7 +389,7 @@ def test_permanent_replacement_arms_watchdog_for_stuck_exec_cleanup(
 
         monkeypatch.setattr(runtime, "_run_connection_attempt", fail)
         assert await runtime.run() == 1
-        await asyncio.sleep(0.1)
+        assert await asyncio.to_thread(forced_event.wait, 1)
         runtime._cancel_shutdown_watchdog()
         return forced
 
