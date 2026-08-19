@@ -52,6 +52,8 @@ def test_cli_ctrl_break_gracefully_shuts_down() -> None:
         environment["no_proxy"] = "127.0.0.1,localhost"
         environment["OPENOCTOPUS_SERVER_URL"] = f"http://127.0.0.1:{port}"
         environment["OPENOCTOPUS_DEVICE_TOKEN"] = "openoctopus_dev_native_shutdown"
+        creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+        ctrl_break = int(getattr(signal, "CTRL_BREAK_EVENT"))
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -61,11 +63,11 @@ def test_cli_ctrl_break_gracefully_shuts_down() -> None:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=creationflags,
         )
         try:
             await asyncio.wait_for(connected.wait(), timeout=10)
-            process.send_signal(signal.CTRL_BREAK_EVENT)
+            process.send_signal(ctrl_break)
             await asyncio.wait_for(process.communicate(), timeout=8)
             assert process.returncode == 0
             await asyncio.wait_for(disconnected.wait(), timeout=3)

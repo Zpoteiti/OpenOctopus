@@ -1049,6 +1049,98 @@ def test_receive_rechecks_destination_before_exposing_completed_file(
     assert frames[-1]["ack"] is True
 
 
+def test_receive_rejects_same_size_temp_change_after_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "result.txt"
+    original_identity_after_close = transfer_module._identity_after_close
+
+    def change_before_identity_check(
+        path: Path,
+        open_identity: tuple[int, int, int, int, int],
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> tuple[int, int, int, int, int]:
+        path.write_bytes(b"xyz")
+        info = path.stat()
+        os.utime(
+            path,
+            ns=(info.st_atime_ns, open_identity[3] + 1_000_000_000),
+        )
+        return original_identity_after_close(
+            path,
+            open_identity,
+            expected_bytes,
+            expected_sha256,
+        )
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_identity_after_close",
+        change_before_identity_check,
+    )
+
+    async def exercise() -> list[dict[str, object]]:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.txt",
+                    dst_path="result.txt",
+                    total_bytes=3,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"abc"))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=3,
+                    sha256=hashlib.sha256(b"abc").hexdigest(),
+                )
+            )
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
+            return [json.loads(item) for item in socket.sent if isinstance(item, str)]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    frames = asyncio.run(exercise())
+    assert target.exists() is False
+    assert frames[-1]["code"] == "workspace_file_changed"
+
+
+def test_closed_temp_recheck_accepts_timestamp_skew_when_payload_matches(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / "temporary.bin"
+    payload = b"abc"
+    temporary.write_bytes(payload)
+    open_identity = transfer_module._identity(temporary.stat())
+    info = temporary.stat()
+    os.utime(
+        temporary,
+        ns=(info.st_atime_ns, open_identity[3] + 1_000_000_000),
+    )
+
+    closed_identity = transfer_module._identity_after_close(
+        temporary,
+        open_identity,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert closed_identity == transfer_module._identity(temporary.stat())
+
+
 def test_source_unchanged_accepts_path_ctime_skew_with_stable_open_handle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

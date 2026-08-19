@@ -286,6 +286,34 @@ def test_conpty_line_repl_round_trips_unicode_input() -> None:
     asyncio.run(asyncio.wait_for(run(), timeout=30))
 
 
+def test_conpty_terminate_unblocks_reader_and_exit_watcher() -> None:
+    async def run() -> None:
+        handle = await process_module._spawn_conpty(
+            (
+                sys.executable,
+                "-u",
+                "-c",
+                "import time; print('READY', flush=True); time.sleep(120)",
+            ),
+            cwd=Path.cwd(),
+            env=_child_environment(),
+        )
+        try:
+            await _read_until(handle, "READY")
+            result = await asyncio.wait_for(handle.terminate(), timeout=8)
+            await asyncio.to_thread(handle._reader.join, 2)
+            await asyncio.to_thread(handle._exit_watcher.join, 2)
+
+            assert result.returncode is not None
+            assert handle._reader.is_alive() is False
+            assert handle._exit_watcher.is_alive() is False
+            assert handle.cleanup_incomplete is False
+        finally:
+            await _close_conpty(handle)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=20))
+
+
 def test_conpty_nested_python_command_reaps_host_after_child_exit() -> None:
     async def run() -> None:
         shell = discover_shells().default

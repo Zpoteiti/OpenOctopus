@@ -474,6 +474,44 @@ def test_conpty_receives_argv_dimensions_and_eof_is_normal(
     assert captured["backend"] == "0"
 
 
+@pytest.mark.parametrize("missing", ["Backend", "PtyProcess"])
+def test_windows_pty_preflight_normalizes_incomplete_winpty_module(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    fake_winpty = types.ModuleType("winpty")
+    if missing != "Backend":
+        fake_winpty.Backend = types.SimpleNamespace(ConPTY=0)  # type: ignore[attr-defined]
+    if missing != "PtyProcess":
+        fake_winpty.PtyProcess = types.SimpleNamespace(spawn=lambda: None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "winpty", fake_winpty)
+    monkeypatch.setattr(os, "name", "nt")
+
+    with pytest.raises(process_module.PtyUnavailableError):
+        process_module.validate_pty_backend()
+
+
+@pytest.mark.parametrize("missing", ["Backend", "PtyProcess"])
+def test_conpty_spawn_normalizes_incomplete_winpty_module(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    fake_winpty = types.ModuleType("winpty")
+    if missing != "Backend":
+        fake_winpty.Backend = types.SimpleNamespace(ConPTY=0)  # type: ignore[attr-defined]
+    if missing != "PtyProcess":
+        fake_winpty.PtyProcess = types.SimpleNamespace(spawn=lambda: None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "winpty", fake_winpty)
+
+    async def run() -> None:
+        with pytest.raises(process_module.PtyUnavailableError):
+            await process_module._spawn_conpty(
+                ["cmd.exe", "/c", "echo ok"],
+                cwd=None,
+                env={},
+            )
+
+    asyncio.run(run())
+
+
 def test_conpty_marks_cleanup_incomplete_when_job_close_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -505,6 +543,85 @@ def test_conpty_marks_cleanup_incomplete_when_job_close_fails(
         return handle.cleanup_incomplete
 
     assert asyncio.run(run()) is True
+
+
+def test_conpty_exit_watcher_cancels_reader_after_stop_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeJob:
+        def terminate(self) -> bool:
+            return True
+
+        def close(self) -> bool:
+            return True
+
+    class FakePty:
+        def __init__(self, process: FakeProcess) -> None:
+            self._process = process
+
+        def cancel_io(self) -> None:
+            self._process.cancel_called.set()
+            self._process.release_reader.set()
+
+    class FakeProcess:
+        pid = 42
+        exitstatus = 0
+
+        def __init__(self) -> None:
+            self.reader_started = threading.Event()
+            self.release_reader = threading.Event()
+            self.wait_started = threading.Event()
+            self.release_wait = threading.Event()
+            self.cancel_called = threading.Event()
+            self.pty = FakePty(self)
+
+        def read(self) -> str:
+            self.reader_started.set()
+            if not self.release_reader.wait(2):
+                raise RuntimeError("reader was not released")
+            raise EOFError
+
+        def wait(self) -> int:
+            self.wait_started.set()
+            if not self.release_wait.wait(2):
+                raise RuntimeError("waiter was not released")
+            return 0
+
+        def write(self, value: str) -> int:
+            return len(value)
+
+        def close(self, force: bool = False) -> None:
+            del force
+            self.release_reader.set()
+
+    monkeypatch.setattr(process_module, "_create_windows_job", lambda pid: FakeJob())
+
+    async def run() -> None:
+        process = FakeProcess()
+        handle = process_module.ConPtyProcessHandle(process)
+        try:
+            assert await asyncio.to_thread(process.reader_started.wait, 1)
+            assert await asyncio.to_thread(process.wait_started.wait, 1)
+
+            # Explicit termination sets stop before the child exit is observed.
+            handle._stop.set()  # noqa: SLF001 - ConPTY watcher contract
+            process.release_wait.set()
+
+            result = await asyncio.wait_for(handle.wait(), 0.5)
+            await asyncio.to_thread(handle._reader.join, 0.5)
+            await asyncio.to_thread(handle._exit_watcher.join, 0.5)
+            assert result.returncode == 0
+            assert process.cancel_called.is_set()
+            assert handle._reader.is_alive() is False
+            assert handle._exit_watcher.is_alive() is False
+            assert handle.cleanup_incomplete is False
+        finally:
+            process.release_wait.set()
+            process.release_reader.set()
+            await asyncio.to_thread(handle._reader.join, 1)
+            await asyncio.to_thread(handle._exit_watcher.join, 1)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("job", [None, "failing"])

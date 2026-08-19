@@ -708,10 +708,13 @@ class TransferManager:
             # if closing itself fails.
             await self._run_filesystem(file_handle.close)
             file_handle = None
+            digest = slot.received_digest.hexdigest()
             slot.temporary_identity = await self._run_filesystem(
                 _identity_after_close,
                 slot.temporary,
                 open_identity,
+                slot.received_bytes,
+                digest,
             )
             declared_end = slot.remote_end
             if declared_end is None:
@@ -723,7 +726,6 @@ class TransferManager:
                     declared_end.code or "workspace_transfer_integrity_failed",
                     "Sender aborted the transfer",
                 )
-            digest = slot.received_digest.hexdigest()
             expected_bytes = slot.begin.total_bytes if slot.begin is not None else None
             if (
                 (expected_bytes is not None and slot.received_bytes != expected_bytes)
@@ -1236,20 +1238,73 @@ def _temporary_unchanged(
 
 
 def _identity_after_close(
-    path: Path, open_identity: tuple[int, int, int, int, int]
+    path: Path,
+    open_identity: tuple[int, int, int, int, int],
+    expected_bytes: int,
+    expected_sha256: str,
 ) -> tuple[int, int, int, int, int]:
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_BINARY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_NONBLOCK", 0))
+    )
+    fd: int | None = None
     try:
-        info = os.lstat(path)
+        path_before_info = os.lstat(path)
+        path_before = _identity(path_before_info)
+        if (
+            not stat.S_ISREG(path_before_info.st_mode)
+            or path_before[:3] != open_identity[:3]
+        ):
+            raise TransferOperationError(
+                "workspace_file_changed", "Temporary destination changed during transfer"
+            )
+
+        fd = os.open(path, flags)
+        handle_before_info = os.fstat(fd)
+        handle_before = _identity(handle_before_info)
+        if (
+            not stat.S_ISREG(handle_before_info.st_mode)
+            or handle_before[:4] != path_before[:4]
+        ):
+            raise TransferOperationError(
+                "workspace_file_changed", "Temporary destination changed during transfer"
+            )
+
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while chunk := os.read(fd, TRANSFER_CHUNK_BYTES):
+            digest.update(chunk)
+            bytes_read += len(chunk)
+
+        handle_after_info = os.fstat(fd)
+        path_after_info = os.lstat(path)
+        handle_after = _identity(handle_after_info)
+        path_after = _identity(path_after_info)
+        if (
+            not stat.S_ISREG(handle_after_info.st_mode)
+            or not stat.S_ISREG(path_after_info.st_mode)
+            or handle_after != handle_before
+            or path_after != path_before
+            or path_after[:4] != handle_after[:4]
+            or bytes_read != expected_bytes
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise TransferOperationError(
+                "workspace_file_changed", "Temporary destination changed during transfer"
+            )
+        return path_after
+    except TransferOperationError:
+        raise
     except OSError as exc:
         raise TransferOperationError(
             "workspace_file_changed", "Temporary destination changed during transfer"
         ) from exc
-    closed_identity = _identity(info)
-    if not stat.S_ISREG(info.st_mode) or closed_identity[:3] != open_identity[:3]:
-        raise TransferOperationError(
-            "workspace_file_changed", "Temporary destination changed during transfer"
-        )
-    return closed_identity
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _commit_no_replace(

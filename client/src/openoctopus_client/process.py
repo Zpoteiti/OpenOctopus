@@ -127,7 +127,7 @@ def validate_pty_backend() -> None:
 
             if not callable(getattr(os, "forkpty", None)) or not callable(pty_worker.run):
                 raise ImportError
-    except (ImportError, OSError) as exc:
+    except (AttributeError, ImportError, OSError) as exc:
         raise PtyUnavailableError("PTY backend is unavailable") from exc
 
 
@@ -566,6 +566,8 @@ def _windows_process_snapshot() -> dict[int, int] | None:
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
+    set_last_error = cast(Callable[[int], None], getattr(ctypes, "set_last_error"))
+    get_last_error = cast(Callable[[], int], getattr(ctypes, "get_last_error"))
 
     snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
     if not snapshot or int(snapshot) == ctypes.c_void_p(-1).value:
@@ -575,15 +577,15 @@ def _windows_process_snapshot() -> dict[int, int] | None:
     try:
         entry = ProcessEntry32W()
         entry.dwSize = ctypes.sizeof(entry)
-        ctypes.set_last_error(0)
+        set_last_error(0)
         available = bool(first(snapshot, ctypes.byref(entry)))
-        if not available and ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+        if not available and get_last_error() != 18:  # ERROR_NO_MORE_FILES
             complete = False
         while available:
             processes[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
-            ctypes.set_last_error(0)
+            set_last_error(0)
             available = bool(next_entry(snapshot, ctypes.byref(entry)))
-        if ctypes.get_last_error() not in {0, 18}:
+        if get_last_error() not in {0, 18}:
             complete = False
     finally:
         if not close_handle(snapshot):
@@ -1311,9 +1313,8 @@ class ConPtyProcessHandle:
     def _watch_exit(self) -> None:
         try:
             self.process.wait()
-            if self._stop.is_set():
-                return
-            self.process.pty.cancel_io()
+            if self._reader.is_alive():
+                self.process.pty.cancel_io()
         except Exception as exc:
             self._force_close_sync()
             self._loop.call_soon_threadsafe(self._fail, exc)
@@ -1444,7 +1445,7 @@ async def _spawn_conpty(
         winpty = importlib.import_module("winpty")
         backend_type = getattr(winpty, "Backend")
         pty_process_type = getattr(winpty, "PtyProcess")
-    except ImportError as exc:
+    except (AttributeError, ImportError) as exc:
         raise PtyUnavailableError("pywinpty/ConPTY is not installed") from exc
     if not argv:
         raise InvalidProcessArgumentsError("argv is empty")
