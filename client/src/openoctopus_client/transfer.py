@@ -6,7 +6,6 @@ import hashlib
 import os
 import secrets
 import stat
-import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -39,8 +38,6 @@ TRANSFER_IDLE_TIMEOUT_SECONDS = 30.0
 TOMBSTONE_TTL_SECONDS = 60.0
 TOMBSTONE_MAX_ENTRIES = 4096
 _TO_THREAD_CANCEL_GRACE_SECONDS = 0.1
-_TEMPORARY_UNLINK_ATTEMPTS = 10
-_TEMPORARY_UNLINK_RETRY_SECONDS = 0.05
 
 
 class TransferState(StrEnum):
@@ -1018,7 +1015,8 @@ class TransferManager:
 
     async def _cleanup_slot(self, slot: _Slot) -> None:
         if slot.temporary is not None:
-            await self._run_filesystem(_unlink_temporary, slot.temporary)
+            with contextlib.suppress(OSError):
+                await self._run_filesystem(slot.temporary.unlink)
             slot.temporary = None
         if slot.lock_stack is not None:
             await slot.lock_stack.aclose()
@@ -1151,24 +1149,8 @@ def _destination_parent_unchanged(
 
 
 def _discard_destination_reservation(reservation: _DestinationReservation) -> None:
-    _unlink_temporary(reservation.temporary)
-
-
-def _unlink_temporary(path: Path) -> None:
-    """Remove a temporary entry, tolerating only transient Windows sharing errors."""
-
-    for attempt in range(_TEMPORARY_UNLINK_ATTEMPTS):
-        try:
-            os.unlink(path)
-            return
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            if getattr(exc, "winerror", None) not in {32, 33}:
-                return
-            if attempt + 1 == _TEMPORARY_UNLINK_ATTEMPTS:
-                return
-            time.sleep(_TEMPORARY_UNLINK_RETRY_SECONDS)
+    with contextlib.suppress(OSError):
+        reservation.temporary.unlink()
 
 
 def _close_open_source_result(

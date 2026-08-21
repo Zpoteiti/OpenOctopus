@@ -689,34 +689,28 @@ def test_workspace_upload_rejects_temp_symlink_swap(
         pytest.skip("symbolic links are unavailable on this platform")
     probe.unlink()
 
-    original_open_temp = transfer_module._open_temp
-    original_unlink = os.unlink
-    cleanup_attempts = 0
-    temporary_path: Path | None = None
+    original_identity_after_close = transfer_module._identity_after_close
 
-    def flaky_unlink(path: os.PathLike[str] | str, *, dir_fd: int | None = None) -> None:
-        nonlocal cleanup_attempts
-        if temporary_path is not None and os.fspath(path) == os.fspath(temporary_path):
-            cleanup_attempts += 1
-            if cleanup_attempts == 1:
-                error = OSError("temporary path is in use")
-                setattr(error, "winerror", 32)
-                raise error
-        if dir_fd is None:
-            original_unlink(path)
-        else:
-            original_unlink(path, dir_fd=dir_fd)
-
-    def swap_temp(path: Path) -> tuple[object, tuple[int, int, int, int, int]]:
-        nonlocal temporary_path
-        handle, identity = original_open_temp(path)
+    def swap_temp_after_close(
+        path: Path,
+        open_identity: tuple[int, int, int, int, int],
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> tuple[int, int, int, int, int]:
         path.unlink()
         path.symlink_to(outside)
-        temporary_path = path
-        monkeypatch.setattr(os, "unlink", flaky_unlink)
-        return handle, identity
+        return original_identity_after_close(
+            path,
+            open_identity,
+            expected_bytes,
+            expected_sha256,
+        )
 
-    monkeypatch.setattr(transfer_module, "_open_temp", swap_temp)
+    monkeypatch.setattr(
+        transfer_module,
+        "_identity_after_close",
+        swap_temp_after_close,
+    )
 
     async def exercise() -> list[dict[str, object]]:
         manager, writer, socket, writer_task = await _manager(tmp_path)
@@ -750,7 +744,6 @@ def test_workspace_upload_rejects_temp_symlink_swap(
     assert outside.read_text() == "keep"
     assert not (tmp_path / "result.txt").exists()
     assert not list(tmp_path.glob(".*.tmp"))
-    assert cleanup_attempts >= 2
     assert frames[-1]["code"] == "workspace_file_changed"
 
 
