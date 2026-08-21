@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    types: [labeled]
+    types: [labeled, synchronize, reopened]
 
 concurrency:
   group: device-capacity-500-${{ github.ref }}
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   capacity-500:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'capacity-500'
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'capacity-500')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -29,16 +29,16 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U openoctopus -d openoctopus"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload capacity evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: device-capacity-500-${{ github.run_id }}
           path: server/device-capacity-500.json
