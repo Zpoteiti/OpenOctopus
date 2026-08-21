@@ -1174,6 +1174,46 @@ async def test_uploaded_object_publish_propagates_cancellation_after_true_result
     storage.promote_if_absent.assert_awaited_once()
 
 
+async def test_uploaded_object_marks_issued_only_at_irreversible_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = AsyncMock()
+    storage.max_connections = 4
+    preflight_started = asyncio.Event()
+    release_preflight = asyncio.Event()
+    issued: list[None] = []
+
+    async def metadata_pages(*_args: object, **_kwargs: object):
+        preflight_started.set()
+        await release_preflight.wait()
+        yield ()
+
+    async def promote(*_args: object, **_kwargs: object) -> ObjectMetadata:
+        assert issued == [None]
+        return ObjectMetadata("destination", 1, "destination-etag")
+
+    storage.promote_if_absent.side_effect = promote
+    monkeypatch.setattr("openctopus_server.workspace.fs._metadata_pages", metadata_pages)
+    fs = WorkspaceFS(storage)
+    task = asyncio.create_task(
+        fs.commit_uploaded_object(
+            WorkspaceTarget.personal(uuid4()),
+            "destination",
+            "temporary",
+            size=1,
+            quota_bytes=100,
+            on_issued=lambda: issued.append(None),
+        )
+    )
+
+    await preflight_started.wait()
+    assert issued == []
+    release_preflight.set()
+    await task
+
+    assert issued == [None]
+
+
 async def test_uploaded_object_cleanup_does_not_hold_committed_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

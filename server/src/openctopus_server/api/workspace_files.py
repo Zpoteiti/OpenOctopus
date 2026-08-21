@@ -32,11 +32,12 @@ from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
     DeviceBusyError,
+    DeviceOutcomeUnknownError,
     DeviceRegistry,
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferError
+from openctopus_server.devices.transfer import TransferDisconnectedError, TransferError
 from openctopus_server.devices.workspace import (
     DeviceDirectoryPageResult,
     DeviceFileMutationResult,
@@ -305,9 +306,8 @@ async def _download_device(
     )
     lease = await _acquire_transfer(admission, user.id, "download", settings)
     try:
-        metadata_future: asyncio.Future[_RelayMetadata] = (
-            asyncio.get_running_loop().create_future()
-        )
+        metadata_future: asyncio.Future[_RelayMetadata] = asyncio.get_running_loop().create_future()
+
         async def make_sink(begin: TransferBeginFrame) -> _RelaySink:
             if (
                 begin.purpose != "http_relay"
@@ -572,7 +572,9 @@ async def edit_file(
             registry=registry,
         )
         assert isinstance(result, DeviceFileMutationResult)
-        return _mutation_response(response, path=path, metadata=result, replacements=result.replacements)
+        return _mutation_response(
+            response, path=path, metadata=result, replacements=result.replacements
+        )
     metadata, replacements = await service.edit_text(
         db,
         user_id=user.id,
@@ -1022,10 +1024,15 @@ async def _close_request_source(source: _RequestBodySource) -> None:
 def _raise_device_transfer(exc: BaseException, settings: Settings) -> NoReturn:
     if isinstance(exc, WorkspaceError):
         raise exc
-    raw_code: object = getattr(exc, "code", None)
-    code = raw_code.value if isinstance(raw_code, ErrorCode) else raw_code
+    if isinstance(exc, (DeviceOutcomeUnknownError, TransferDisconnectedError)):
+        code: object = ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value
+    else:
+        raw_code = getattr(exc, "code", None)
+        code = raw_code.value if isinstance(raw_code, ErrorCode) else raw_code
     if not isinstance(code, str):
-        if isinstance(exc, (DeviceUnavailableError, ConnectionError)):
+        if isinstance(exc, DeviceOutcomeUnknownError):
+            code = ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value
+        elif isinstance(exc, (DeviceUnavailableError, ConnectionError)):
             code = ErrorCode.TOOL_DEVICE_UNREACHABLE.value
         elif isinstance(exc, DeviceBusyError):
             code = ErrorCode.TOOL_DEVICE_BUSY.value
@@ -1035,6 +1042,11 @@ def _raise_device_transfer(exc: BaseException, settings: Settings) -> NoReturn:
             code = ErrorCode.WORKSPACE_STORAGE_ERROR.value
     if code in {"workspace_transfer_busy", ErrorCode.TOOL_DEVICE_BUSY.value}:
         raise _device_busy(settings) from exc
+    if code == ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value:
+        raise WorkspaceError(
+            ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+            "Device transfer outcome is unknown; do not retry automatically",
+        ) from exc
     if code in {"peer_disconnected", ErrorCode.TOOL_DEVICE_UNREACHABLE.value}:
         raise WorkspaceError(
             ErrorCode.TOOL_DEVICE_UNREACHABLE,

@@ -5,7 +5,9 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 from openoctopus_client import __version__
 from openoctopus_client.config import ConfigurationError, load_config
@@ -15,9 +17,23 @@ from openoctopus_client.document_convert import (
     conversion_worker_main,
     convert_path,
 )
+from openoctopus_client.process import (
+    ProcessBackendError,
+    PtyUnavailableError,
+    frozen_backend_smoke,
+    validate_pty_backend,
+)
+
+
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            cast(Callable[..., Any], reconfigure)(encoding="utf-8", errors="strict")
 
 
 def main() -> int:
+    _configure_utf8_stdio()
     parser = argparse.ArgumentParser(prog="openoctopus-client")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("version")
@@ -26,18 +42,32 @@ def main() -> int:
     spike.add_argument("path", type=Path)
     spike.add_argument("--pages")
     commands.add_parser("_conversion-worker", help=argparse.SUPPRESS)
+    commands.add_parser("_exec-backend-smoke", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if arguments.command == "version":
         print(__version__)
         return 0
     if arguments.command == "_conversion-worker":
         return conversion_worker_main()
+    if arguments.command == "_exec-backend-smoke":
+        try:
+            payload = asyncio.run(frozen_backend_smoke())
+        except ProcessBackendError:
+            print(json.dumps({"code": "tool_exec_failed", "ok": False}, sort_keys=True))
+            return 1
+        print(json.dumps(payload, sort_keys=True))
+        return 0
     if arguments.command in {None, "run"}:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
         try:
             config = load_config()
         except ConfigurationError as exc:
             print(f"configuration error: {exc}", file=sys.stderr)
+            return 78
+        try:
+            validate_pty_backend()
+        except PtyUnavailableError:
+            print("backend error: PTY backend is unavailable", file=sys.stderr)
             return 78
         try:
             return asyncio.run(ClientRuntime(config).run())

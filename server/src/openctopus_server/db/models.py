@@ -209,6 +209,16 @@ class Device(Base):
             '\'["0.0.0.0/8","127.0.0.0/8","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10","ff00::/8"]\'::jsonb'
         ),
     )
+    shell_timeout_max: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("600")
+    )
+    env_allowlist: Mapped[list[Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            "'[\"PATH\",\"HOME\",\"LANG\",\"TERM\",\"SystemRoot\",\"ComSpec\",\"PATHEXT\",\"TEMP\",\"TMP\",\"USERPROFILE\"]'::jsonb"
+        ),
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -224,6 +234,10 @@ class Device(Base):
         CheckConstraint(
             "octet_length(token_hash) = 32",
             name="check_device_token_hash_length",
+        ),
+        CheckConstraint(
+            "shell_timeout_max >= 0 AND shell_timeout_max <= 86400",
+            name="check_device_shell_timeout_max",
         ),
     )
 

@@ -50,7 +50,7 @@ HELLO_TIMEOUT_SECONDS = 10.0
 PING_INTERVAL_SECONDS = 30.0
 LIVENESS_TIMEOUT_SECONDS = 70.0
 
-_VERSION_REASON = '{"code":"version_unsupported","protocol_version":"1"}'
+_VERSION_REASON = '{"code":"version_unsupported","protocol_version":"2"}'
 
 
 class _WebSocketLike(Protocol):
@@ -398,6 +398,8 @@ async def serve_device_socket(
                 transport=transport,
                 expected_revocation_epoch=registration_epoch,
                 ready=False,
+                operating_system=hello.os,
+                shells=hello.shells,
             )
             if handle is None:
                 await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
@@ -409,6 +411,8 @@ async def serve_device_socket(
                     workspace_path=device.workspace_path,
                     sandbox_mode=device.sandbox_mode,
                     ssrf_denylist=device.ssrf_denylist,
+                    shell_timeout_max=device.shell_timeout_max,
+                    env_allowlist=device.env_allowlist,
                 ),
             )
             if not await registry.activate(handle, ack.model_dump_json()):

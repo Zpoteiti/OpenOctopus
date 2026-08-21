@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -35,6 +36,26 @@ def _run(dispatcher: ClientToolDispatcher, **args: object) -> ToolOutput:
 def _json(output: ToolOutput) -> dict[str, Any]:
     assert isinstance(output.content, str)
     return cast(dict[str, Any], json.loads(output.content))
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
 
 
 def test_workspace_rest_returns_machine_results_and_etag_guard(tmp_path: Path) -> None:
@@ -282,15 +303,17 @@ def test_workspace_rest_local_transfer_rejects_same_path_links_and_special_files
         )
         assert special.code == "workspace_blocked_path"
 
-    if hasattr(os, "symlink"):
-        os.symlink(tmp_path / "source.txt", tmp_path / "link.txt")
-        linked = _run(
-            dispatcher,
-            operation="transfer_local",
-            path="link.txt",
-            dst_path="link-copy.txt",
-        )
-        assert linked.code == "workspace_symlink_escape"
+    link_target = tmp_path / "link-target"
+    link_target.mkdir()
+    (link_target / "source.txt").write_text("payload", encoding="utf-8")
+    _make_directory_link(tmp_path / "link", link_target)
+    linked = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="link/source.txt",
+        dst_path="link-copy.txt",
+    )
+    assert linked.code == "workspace_symlink_escape"
 
 
 def test_workspace_rest_local_transfer_detects_external_source_change(
@@ -378,7 +401,53 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
     assert _json(result)["sha256"] == hashlib.sha256(b"after").hexdigest()
 
 
-def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
+def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    before = b"before"
+    after = b"after!"
+    source.write_bytes(before)
+    source_fd = os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    monkeypatch.setattr(os, "name", "nt")
+    initial_info = os.fstat(source_fd)
+    initial = dispatcher_module._transfer_identity(initial_info)
+
+    def change_then_rename(
+        source_path: Path, destination_path: Path, descriptor: int
+    ) -> None:
+        del descriptor
+        source_path.write_bytes(after)
+        os.utime(
+            source_path,
+            ns=(initial_info.st_atime_ns, initial_info.st_mtime_ns),
+        )
+        os.rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_rename_transfer_no_replace",
+        change_then_rename,
+    )
+    try:
+        bytes_transferred, digest = dispatcher_module._rename_verify_and_hash_fd(
+            source,
+            destination,
+            source_fd,
+            initial,
+            len(before),
+            hashlib.sha256(before).hexdigest(),
+        )
+    finally:
+        os.close(source_fd)
+
+    assert destination.read_bytes() == after
+    assert bytes_transferred == len(after)
+    assert digest == hashlib.sha256(after).hexdigest()
+
+
+def test_workspace_rest_local_move_returns_result_after_cancel_follows_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.bin"
@@ -405,7 +474,6 @@ def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
 
     monkeypatch.setattr(dispatcher_module, "_rename_transfer_no_replace", rename_then_signal)
     monkeypatch.setattr(os, "read", slow_read)
-    monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.01)
 
     async def exercise() -> ToolOutput:
         task = asyncio.create_task(
@@ -420,7 +488,7 @@ def test_workspace_rest_local_move_does_not_report_timeout_after_rename(
             )
         )
         assert await asyncio.to_thread(rename_completed.wait, 1)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
         assert task.done() is False
         task.cancel()
         await asyncio.sleep(0)

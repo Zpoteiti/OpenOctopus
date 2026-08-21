@@ -12,6 +12,7 @@ from openctopus_server.db.models import Device, User
 from openctopus_server.devices.protocol import MAX_TEXT_FRAME_BYTES, ToolResultFrame
 from openctopus_server.devices.registry import (
     DeviceBusyError,
+    DeviceOutcomeUnknownError,
     DeviceRegistry,
     DeviceUnavailableError,
 )
@@ -228,6 +229,11 @@ async def dispatch_workspace_action(
             "Workspace device is busy; retry later",
             headers={"Retry-After": "1"},
         ) from exc
+    except DeviceOutcomeUnknownError as exc:
+        raise WorkspaceError(
+            ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+            "Workspace device call outcome is unknown",
+        ) from exc
     except (DeviceUnavailableError, TimeoutError) as exc:
         raise WorkspaceError(
             ErrorCode.TOOL_DEVICE_UNREACHABLE,
@@ -275,6 +281,11 @@ def _raise_client_error(code: str | None) -> None:
             error_code,
             "Workspace device is busy; retry later",
             headers={"Retry-After": "1"},
+        )
+    if error_code is ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN:
+        raise WorkspaceError(
+            error_code,
+            "Workspace device call outcome is unknown",
         )
     # Client-side tool errors use the same stable codes as WorkspaceService.
     if error_code in {

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -14,6 +14,7 @@ type RawToolResultContent = str | list[ToolResultContentBlock]
 
 class ToolRoutingMode(StrEnum):
     ROUTING_ONLY = "routing_only"
+    CLIENT_ONLY = "client_only"
     INTRINSIC_DEVICE = "intrinsic_device"
     PURE_SERVER = "pure_server"
 
@@ -65,10 +66,12 @@ class ToolContext:
     session_id: UUID
     openoctopus_device: str | None = None
     device_targets: Mapping[str, UUID] | None = None
+    on_issued: Callable[[], None] | None = None
 
 
 class Tool(ABC):
     routing_mode = ToolRoutingMode.ROUTING_ONLY
+    manages_issue_boundary = False
 
     @abstractmethod
     def name(self) -> str:

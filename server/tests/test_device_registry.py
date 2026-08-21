@@ -9,6 +9,7 @@ import pytest
 
 from openctopus_server.devices.protocol import (
     DeviceConfigFrame,
+    ShellMetadata,
     ToolResultFrame,
     TransferBeginFrame,
     TransferEndFrame,
@@ -17,10 +18,12 @@ from openctopus_server.devices.protocol import (
 from openctopus_server.devices.registry import (
     ConnectionHandle,
     DeviceBusyError,
+    DeviceOutcomeUnknownError,
     DeviceProtocolError,
     DeviceRegistry,
     DeviceUnavailableError,
 )
+from openctopus_server.devices.transfer import TransferUnavailableError
 
 
 @dataclass
@@ -169,7 +172,7 @@ async def test_result_must_fit_the_credit_reserved_by_its_tool_call() -> None:
 
     assert pending.done() is False
     assert await registry.unregister(handle) is True
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending
 
 
@@ -204,7 +207,7 @@ async def test_replacement_fails_old_pending_and_stale_unregister_is_harmless() 
         transport=new_transport,
     )
 
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending
     assert old_transport.closes == [(4000, "connection_replaced")]
     assert new_handle.generation > old_handle.generation
@@ -308,6 +311,45 @@ async def test_unready_registration_is_not_online_or_routable_until_activation()
     assert await registry.is_online(device_id, user_id=user_id) is True
 
 
+async def test_live_hello_metadata_follows_the_current_connection_generation() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    old_shells = ShellMetadata(default="bash", available=["bash", "sh"])
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+        operating_system="linux",
+        shells=old_shells,
+    )
+
+    metadata = await registry.get_live_metadata(device_id, user_id=user_id)
+    assert metadata is not None
+    assert metadata.os == "linux"
+    assert metadata.default_shell == "bash"
+    assert metadata.available_shells == ("bash", "sh")
+
+    new_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+        operating_system="darwin",
+        shells=ShellMetadata(default="zsh", available=["zsh", "bash", "sh"]),
+    )
+    assert new_handle.generation > old_handle.generation
+    metadata = await registry.get_live_metadata(device_id, user_id=user_id)
+    assert metadata is not None
+    assert metadata.os == "darwin"
+    assert metadata.default_shell == "zsh"
+    assert metadata.available_shells == ("zsh", "bash", "sh")
+
+    assert await registry.unregister(new_handle) is True
+    assert await registry.get_live_metadata(device_id, user_id=user_id) is None
+
+
 async def test_replacement_waits_for_an_admitted_tool_call_send_boundary() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
@@ -344,7 +386,7 @@ async def test_replacement_waits_for_an_admitted_tool_call_send_boundary() -> No
 
     old_transport.release_send.set()
     await replacement
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending
 
 
@@ -354,13 +396,16 @@ async def test_revocation_epoch_rejects_a_stale_handshake_after_token_rotation()
     epoch = await registry.registration_epoch(device_id)
 
     assert await registry.revoke(device_id) is False
-    assert await registry.register(
-        device_id=device_id,
-        user_id=uuid4(),
-        device_name="laptop",
-        transport=FakeTransport(),
-        expected_revocation_epoch=epoch,
-    ) is None
+    assert (
+        await registry.register(
+            device_id=device_id,
+            user_id=uuid4(),
+            device_name="laptop",
+            transport=FakeTransport(),
+            expected_revocation_epoch=epoch,
+        )
+        is None
+    )
 
 
 async def test_config_push_updates_the_current_connection_name() -> None:
@@ -375,16 +420,19 @@ async def test_config_push_updates_the_current_connection_name() -> None:
         transport=transport,
     )
 
-    assert await registry.push_config(
-        device_id=device_id,
-        user_id=user_id,
-        device_name="new-name",
-        config=DeviceConfigFrame(
-            workspace_path="~/workspace",
-            sandbox_mode=True,
-            ssrf_denylist=[],
-        ),
-    ) is True
+    assert (
+        await registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="new-name",
+            config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            ),
+        )
+        is True
+    )
     payload = json.loads(transport.sent_text[-1])
     assert payload["type"] == "config_update"
     assert payload["device_name"] == "new-name"
@@ -440,9 +488,7 @@ async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
             max_result_bytes=1024,
             timeout_seconds=1,
         )
-    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
-        "config_update"
-    ]
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == ["config_update"]
 
 
 async def test_config_push_send_failure_marks_the_device_offline() -> None:
@@ -456,16 +502,19 @@ async def test_config_push_send_failure_marks_the_device_offline() -> None:
         transport=FailingTransport(),
     )
 
-    assert await registry.push_config(
-        device_id=device_id,
-        user_id=user_id,
-        device_name="laptop",
-        config=DeviceConfigFrame(
-            workspace_path="~/workspace",
-            sandbox_mode=True,
-            ssrf_denylist=[],
-        ),
-    ) is False
+    assert (
+        await registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                sandbox_mode=True,
+                ssrf_denylist=[],
+            ),
+        )
+        is False
+    )
     assert await registry.is_online(device_id, user_id=user_id) is False
 
 
@@ -902,7 +951,7 @@ async def test_terminal_past_registry_check_cannot_commit_after_replacement(
     assert sink.finished is False
 
 
-async def test_config_epoch_change_aborts_active_route_before_finish() -> None:
+async def test_config_push_preserves_active_transfer_and_rejects_stale_new_route() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
     user_id = uuid4()
@@ -960,9 +1009,98 @@ async def test_config_epoch_change_aborts_active_route_before_finish() -> None:
         ),
     )
 
-    with pytest.raises(Exception):
-        await transfer
-    assert sink.finished is False
+    await registry.handle_transfer_frame(
+        handle,
+        TransferEndFrame(
+            id=slot_id,
+            ack=False,
+            ok=True,
+            bytes_sent=0,
+            sha256=hashlib.sha256(b"").hexdigest(),
+        ),
+    )
+    result = await transfer
+    assert result.bytes_transferred == 0
+    assert sink.finished is True
+
+    with pytest.raises(TransferUnavailableError):
+        await registry.transfers.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path="stale-source.txt",
+            dst_path="stale-destination.txt",
+            sink_factory=lambda _frame: _sink(RecordingSink()),
+        )
+    current_route = await registry.get_route_snapshot(
+        device_id,
+        user_id=user_id,
+        expected_device_name="laptop",
+    )
+    assert current_route is not None
+    assert current_route.config_epoch == route.config_epoch + 1
+
+
+async def test_config_push_fences_an_unissued_transfer_preflight() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    assert handle is not None
+    route = await registry.get_route_snapshot(
+        device_id,
+        user_id=user_id,
+        expected_device_name="laptop",
+    )
+    assert route is not None
+    source_factory_started = asyncio.Event()
+
+    class WaitingSource:
+        size = 0
+        etag: str | None = None
+
+        async def read(self) -> bytes:
+            return b""
+
+        async def aclose(self) -> None:
+            return None
+
+    async def source_factory() -> WaitingSource:
+        source_factory_started.set()
+        await asyncio.Event().wait()
+        return WaitingSource()
+
+    transfer = asyncio.create_task(
+        registry.transfers.start_server_to_client(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path="source.txt",
+            dst_path="destination.txt",
+            source_factory=source_factory,
+            total_bytes=0,
+        )
+    )
+    await source_factory_started.wait()
+
+    assert await registry.push_config(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        config=DeviceConfigFrame(
+            workspace_path="~/different-workspace",
+            sandbox_mode=True,
+            ssrf_denylist=[],
+        ),
+    )
+    with pytest.raises(TransferUnavailableError):
+        await asyncio.wait_for(transfer, timeout=0.2)
 
 
 async def test_stale_generation_binary_frame_cannot_write_during_replacement(
@@ -1127,7 +1265,7 @@ async def test_close_does_not_wait_for_inbound_transfer_backpressure(
     assert await inbound is False
 
 
-async def test_disconnect_and_timeout_remove_pending_calls() -> None:
+async def test_disconnect_and_timeout_keep_issued_calls_until_late_result() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
     user_id = uuid4()
@@ -1150,16 +1288,17 @@ async def test_disconnect_and_timeout_remove_pending_calls() -> None:
     )
     payload = await _wait_for_sent(transport)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await timed_out
-    assert registry.pending_count == 0
+    assert registry.pending_count == 1
     late = ToolResultFrame(
         id=UUID(str(payload["id"])),
         content="late",
         is_error=False,
     )
     assert await registry.resolve_tool_result(handle, late) is True
-    assert await registry.resolve_tool_result(handle, late) is True
+    assert await registry.resolve_tool_result(handle, late) is False
+    assert registry.pending_count == 0
     assert (
         await registry.resolve_tool_result(
             handle,
@@ -1181,7 +1320,7 @@ async def test_disconnect_and_timeout_remove_pending_calls() -> None:
     )
     await _wait_for_sent(transport)
     assert await registry.unregister(handle) is True
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending
     assert registry.pending_count == 0
 
@@ -1320,11 +1459,11 @@ async def test_pending_byte_admission_is_per_user_and_releases_after_disconnect(
     await _wait_for_sent(second_transport)
 
     assert await registry.unregister(first_handle) is True
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await first
 
     await registry.unregister(second_handle)
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await second
     assert registry.pending_count == 0
 
@@ -1358,12 +1497,15 @@ async def test_close_prevents_registration_after_shutdown() -> None:
     registry = DeviceRegistry()
     await registry.close()
 
-    assert await registry.register(
-        device_id=uuid4(),
-        user_id=uuid4(),
-        device_name="laptop",
-        transport=FakeTransport(),
-    ) is None
+    assert (
+        await registry.register(
+            device_id=uuid4(),
+            user_id=uuid4(),
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+        is None
+    )
 
 
 async def test_close_serializes_with_registration_already_waiting() -> None:

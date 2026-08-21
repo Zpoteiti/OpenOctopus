@@ -1,0 +1,953 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from pydantic import ValidationError
+
+from openctopus_server.devices.protocol import (
+    DeviceCapabilities,
+    DeviceConfigFrame,
+    HelloFrame,
+    ShellMetadata,
+    ToolCallFrame,
+    ToolResultFrame,
+    new_uuid7,
+)
+from openctopus_server.devices.registry import (
+    DeviceBusyError,
+    DeviceOutcomeUnknownError,
+    DeviceRegistry,
+    DeviceUnavailableError,
+)
+from openctopus_server.devices.transfer import TransferDisconnectedError
+from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import DeviceError, WorkspaceError
+from openctopus_server.errors.http import ERROR_STATUS
+from openctopus_server.services import devices
+from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
+from openctopus_server.tools.file_transfer import FileTransferTool
+from openctopus_server.tools.registry import (
+    _EXEC_SCHEMA,
+    _LIST_EXEC_SESSIONS_SCHEMA,
+    _WRITE_STDIN_SCHEMA,
+    ToolRegistry,
+    _ClientOnlyTool,
+    _device_result_credit,
+)
+
+
+@dataclass
+class _Transport:
+    sent: list[str] = field(default_factory=list)
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.sent.append(payload)
+        self.event.set()
+
+    async def send_binary(self, payload: bytes) -> None:
+        del payload
+
+    async def close(self, code: int, reason: str) -> None:
+        del code, reason
+
+
+@dataclass
+class _BlockingTransport(_Transport):
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+    fail: bool = False
+
+    async def send_text(self, payload: str) -> None:
+        self.started.set()
+        await self.release.wait()
+        if self.fail:
+            raise OSError("socket lost")
+        await super().send_text(payload)
+
+
+@dataclass
+class _DeviceDispatcher:
+    content: str = "ok"
+    code: str | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def dispatch_tool(self, **kwargs: object) -> ToolResultFrame:
+        self.calls.append(kwargs)
+        return ToolResultFrame(
+            id=new_uuid7(),
+            content=self.content,
+            is_error=self.code is not None,
+            code=self.code,
+        )
+
+
+class _FileTool(Tool):
+    def name(self) -> str:
+        return "read_file"
+
+    def schema(self) -> dict[str, Any]:
+        return {
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        return ToolResult(content="server")
+
+
+def test_v2_hello_requires_shell_inventory() -> None:
+    hello = HelloFrame(
+        id=new_uuid7(),
+        version="2",
+        client_version="0.0.1",
+        os="linux",
+        caps=DeviceCapabilities(),
+        shells=ShellMetadata(default="bash", available=["bash", "sh"]),
+    )
+
+    assert hello.shells.default == "bash"
+    with pytest.raises(ValidationError):
+        ShellMetadata(default="zsh", available=["bash"])
+
+    with pytest.raises(ValidationError):
+        DeviceCapabilities(exec=False)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        DeviceCapabilities(mcp=False)  # type: ignore[call-arg]
+
+
+def test_env_allowlist_rejects_reserved_prefix_case_insensitively() -> None:
+    for name in ("OPENOCTOPUS_TOKEN", "openoctopus_token", "OpenOctopus_Token"):
+        with pytest.raises(ValidationError):
+            DeviceConfigFrame(
+                workspace_path="~/workspace",
+                sandbox_mode=False,
+                ssrf_denylist=[],
+                env_allowlist=[name],
+            )
+        with pytest.raises(DeviceError):
+            devices._validate_env_allowlist([name])
+
+
+def test_exec_tool_call_requires_chat_ownership_but_shared_call_does_not() -> None:
+    chat_id = uuid4()  # Session rows use PostgreSQL gen_random_uuid (UUIDv4).
+    call = ToolCallFrame(
+        id=new_uuid7(),
+        name="exec",
+        args={"command": "pwd"},
+        max_result_bytes=1000,
+        chat_session_id=chat_id,
+    )
+    assert call.chat_session_id == chat_id
+
+    with pytest.raises(ValidationError):
+        ToolCallFrame(id=new_uuid7(), name="exec", args={}, max_result_bytes=1000)
+
+    shared = ToolCallFrame(id=new_uuid7(), name="read_file", args={}, max_result_bytes=1000)
+    assert shared.chat_session_id is None
+
+
+async def test_dispatch_includes_hidden_chat_session_id_and_late_result_is_consumed() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    chat_id = uuid4()
+    transport = _Transport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    call = asyncio.create_task(
+        registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="exec",
+            args={"command": "echo ok"},
+            max_result_bytes=1000,
+            timeout_seconds=0.01,
+            chat_session_id=chat_id,
+        )
+    )
+    await transport.event.wait()
+    payload = json.loads(transport.sent[-1])
+    assert payload["chat_session_id"] == str(chat_id)
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await call
+    late = ToolResultFrame(id=UUID(payload["id"]), content="ok", is_error=False)
+    assert await registry.resolve_tool_result(handle, late) is True
+    assert await registry.resolve_tool_result(handle, late) is False
+    assert await registry.unregister(handle) is True
+
+
+async def test_late_result_holds_bounded_pending_credit_until_consumed() -> None:
+    registry = DeviceRegistry(pending_calls_max=1, pending_calls_max_per_user=1)
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = _Transport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    first = asyncio.create_task(
+        registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "a.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=0.01,
+        )
+    )
+    await transport.event.wait()
+    payload = json.loads(transport.sent[-1])
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await first
+    assert registry.pending_count == 1
+
+    with pytest.raises(DeviceBusyError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "b.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=0.01,
+        )
+
+    late = ToolResultFrame(id=UUID(payload["id"]), content="ok", is_error=False)
+    assert await registry.resolve_tool_result(handle, late) is True
+    assert registry.pending_count == 0
+
+
+async def test_disconnect_after_tool_frame_send_is_outcome_unknown() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = _Transport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    call = asyncio.create_task(
+        registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "a.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=10,
+        )
+    )
+    await transport.event.wait()
+    assert await registry.unregister(handle) is True
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await call
+
+
+async def test_issued_notification_skips_preflight_and_precedes_transport_await() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    issued: list[str] = []
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "a.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=1,
+            on_issued=lambda: issued.append("preflight"),
+        )
+    assert issued == []
+
+    transport = _BlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    call = asyncio.create_task(
+        registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "a.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=1,
+            on_issued=lambda: issued.append("sent"),
+        )
+    )
+    await transport.started.wait()
+    assert issued == ["sent"]
+    assert transport.sent == []
+    transport.release.set()
+    await transport.event.wait()
+    payload = json.loads(transport.sent[-1])
+    await registry.resolve_tool_result(
+        handle,
+        ToolResultFrame(id=UUID(payload["id"]), content="ok", is_error=False),
+    )
+    await call
+
+
+async def test_issued_notification_precedes_a_transport_failure() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = _BlockingTransport(fail=True)
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    issued: list[bool] = []
+    call = asyncio.create_task(
+        registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="read_file",
+            args={"path": "a.txt"},
+            max_result_bytes=1000,
+            timeout_seconds=1,
+            on_issued=lambda: issued.append(True),
+        )
+    )
+    await transport.started.wait()
+    assert issued == [True]
+    transport.release.set()
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await call
+
+
+async def test_config_fence_between_send_admission_and_issue_prevents_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = _Transport()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    issued: list[bool] = []
+    original_mark = registry._mark_call_issued
+
+    async def fence_then_mark(*args: object, **kwargs: object) -> bool:
+        assert await registry.begin_config_update(device_id=device_id, user_id=user_id)
+        return await original_mark(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "_mark_call_issued", fence_then_mark)
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="exec",
+            args={"command": "pwd"},
+            max_result_bytes=1000,
+            timeout_seconds=1,
+            expected_device_name="laptop",
+            chat_session_id=uuid4(),
+            on_issued=lambda: issued.append(True),
+        )
+
+    assert issued == []
+    assert transport.sent == []
+
+
+async def test_ambiguous_policy_commit_retires_the_fenced_connection() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=_Transport(),
+    )
+    assert handle is not None
+    assert await registry.begin_config_update(device_id=device_id, user_id=user_id)
+
+    await registry.retire_config_update(device_id=device_id, user_id=user_id)
+
+    assert await registry.is_online(device_id, user_id=user_id) is False
+    assert await registry.unregister(handle) is False
+
+
+def test_client_only_exec_schemas_have_only_trusted_device_targets() -> None:
+    registry = ToolRegistry((_ClientOnlyTool("exec", _EXEC_SCHEMA),))
+    assert registry.get_tool_schemas() == []
+    schema = registry.get_tool_schemas(
+        device_names=("sandbox", "trusted"),
+        trusted_device_names=("trusted",),
+    )[0]
+    assert schema["input_schema"]["properties"]["openoctopus_device"]["enum"] == ["trusted"]
+    assert "server" not in schema["input_schema"]["properties"]["openoctopus_device"]["enum"]
+
+
+def test_write_stdin_schema_explains_pipe_and_tty_control_semantics() -> None:
+    description = _WRITE_STDIN_SCHEMA["description"]
+    assert "pipe" in description
+    assert "OS interrupt" in description
+    assert "不会写入 ETX" in description
+    assert "tty" in description
+    assert "terminate=true" in description
+
+
+async def test_client_only_dispatch_rechecks_trust_without_blocking_sandbox_file_tools() -> None:
+    user_id = uuid4()
+    sandbox_id = uuid4()
+    trusted_id = uuid4()
+
+    async def resolve(_user_id: UUID, name: str) -> UUID | None:
+        return {"sandbox": sandbox_id, "trusted": trusted_id}.get(name)
+
+    async def resolve_trusted(_user_id: UUID, name: str) -> UUID | None:
+        return trusted_id if name == "trusted" else None
+
+    dispatcher = _DeviceDispatcher()
+    registry = ToolRegistry(
+        (
+            _FileTool(),
+            _ClientOnlyTool("exec", _EXEC_SCHEMA),
+            _ClientOnlyTool("write_stdin", _WRITE_STDIN_SCHEMA),
+        ),
+        device_resolver=resolve,
+        trusted_device_resolver=resolve_trusted,
+    )
+    ctx = ToolContext(user_id=user_id, session_id=uuid4())
+
+    rejected = await registry.execute(
+        name="exec",
+        args={"command": "pwd", DEVICE_FIELD_NAME: "sandbox"},
+        ctx=ctx,
+        device_targets={"sandbox": sandbox_id, "trusted": trusted_id},
+        device_registry=dispatcher,
+    )
+    accepted = await registry.execute(
+        name="exec",
+        args={"command": "pwd", DEVICE_FIELD_NAME: "trusted"},
+        ctx=ctx,
+        device_targets={"sandbox": sandbox_id, "trusted": trusted_id},
+        device_registry=dispatcher,
+    )
+    sandbox_file = await registry.execute(
+        name="read_file",
+        args={"path": "a.txt", DEVICE_FIELD_NAME: "sandbox"},
+        ctx=ctx,
+        device_targets={"sandbox": sandbox_id, "trusted": trusted_id},
+        device_registry=dispatcher,
+    )
+
+    assert rejected.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert accepted.is_error is False
+    assert sandbox_file.is_error is False
+    assert len(dispatcher.calls) == 2
+
+
+async def test_client_only_args_credit_deadline_and_result_limit_are_server_enforced() -> None:
+    device_id = uuid4()
+    user_id = uuid4()
+
+    async def resolve(_user_id: UUID, _name: str) -> UUID | None:
+        return device_id
+
+    dispatcher = _DeviceDispatcher(content="x" * 20_000)
+    registry = ToolRegistry(
+        (
+            _ClientOnlyTool("exec", _EXEC_SCHEMA),
+            _ClientOnlyTool("write_stdin", _WRITE_STDIN_SCHEMA),
+            _ClientOnlyTool("list_exec_sessions", _LIST_EXEC_SESSIONS_SCHEMA),
+        ),
+        device_resolver=resolve,
+        trusted_device_resolver=resolve,
+    )
+    ctx = ToolContext(user_id=user_id, session_id=uuid4())
+
+    invalid = await registry.execute(
+        name="exec",
+        args={"cmd": "pwd", DEVICE_FIELD_NAME: "laptop"},
+        ctx=ctx,
+        device_targets={"laptop": device_id},
+        device_registry=dispatcher,
+    )
+    result = await registry.execute(
+        name="exec",
+        args={
+            "command": "pwd",
+            "yield_time_ms": 1234,
+            "max_output_chars": 50_000,
+            DEVICE_FIELD_NAME: "laptop",
+        },
+        ctx=ctx,
+        device_targets={"laptop": device_id},
+        device_registry=dispatcher,
+    )
+
+    assert invalid.code is ErrorCode.TOOL_INVALID_ARGS
+    assert len(dispatcher.calls) == 1
+    assert dispatcher.calls[0]["max_result_bytes"] == _device_result_credit("exec", 50_000)
+    assert dispatcher.calls[0]["timeout_seconds"] == pytest.approx(6.234)
+    assert result.content[1]["text"] == "x" * 20_000
+
+
+def test_exec_result_credit_covers_maximum_unicode_cwd_metadata() -> None:
+    content = "\n".join(
+        (
+            f"session_id={new_uuid7()}",
+            "status=running",
+            "tty=false",
+            "shell=bash",
+            "login=false",
+            "exit_code=null",
+            "signal=null",
+            "reason=running",
+            "elapsed_ms=1",
+            "cwd=/" + "界" * 8192,
+            "stdout=" + "x" * 1000,
+            "stderr=",
+            "output=",
+        )
+    )
+    encoded = ToolResultFrame(
+        id=new_uuid7(),
+        content=content,
+        is_error=False,
+    ).model_dump_json()
+
+    assert len(encoded.encode("utf-8")) <= _device_result_credit("exec", 1000)
+
+
+async def test_exec_normalization_preserves_bounded_output_report_metadata() -> None:
+    device_id = uuid4()
+
+    async def resolve(_user_id: UUID, _name: str) -> UUID | None:
+        return device_id
+
+    report = "\n".join(
+        (
+            f"session_id={new_uuid7()}",
+            "status=running",
+            "cwd=/" + "界" * 8192,
+            "stdout=" + "x" * 1000,
+            "stderr=",
+            "output=",
+            "response_truncated_chars=0",
+            "cleanup_incomplete=false",
+        )
+    )
+    dispatcher = _DeviceDispatcher(content=report)
+    registry = ToolRegistry(
+        (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
+        trusted_device_resolver=resolve,
+    )
+
+    result = await registry.execute(
+        name="exec",
+        args={
+            "command": "pwd",
+            "max_output_chars": 1000,
+            "yield_time_ms": 0,
+            DEVICE_FIELD_NAME: "laptop",
+        },
+        ctx=ToolContext(user_id=uuid4(), session_id=uuid4()),
+        device_targets={"laptop": device_id},
+        device_registry=dispatcher,
+    )
+
+    assert result.is_error is False
+    assert result.content[1]["text"] == report
+    assert result.content[1]["text"].endswith("cleanup_incomplete=false")
+
+
+async def test_device_specific_timeout_cap_is_left_to_the_current_client_config() -> None:
+    device_id = uuid4()
+
+    async def resolve(_user_id: UUID, _name: str) -> UUID | None:
+        return device_id
+
+    dispatcher = _DeviceDispatcher()
+    registry = ToolRegistry(
+        (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
+        device_resolver=resolve,
+        trusted_device_resolver=resolve,
+    )
+    result = await registry.execute(
+        name="exec",
+        args={
+            "command": "sleep 1",
+            "timeout": 86_400,
+            "yield_time_ms": 0,
+            DEVICE_FIELD_NAME: "laptop",
+        },
+        ctx=ToolContext(user_id=uuid4(), session_id=uuid4()),
+        device_targets={"laptop": device_id},
+        device_registry=dispatcher,
+    )
+
+    assert result.is_error is False
+    assert dispatcher.calls[0]["args"] == {
+        "command": "sleep 1",
+        "timeout": 86_400,
+        "yield_time_ms": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "deadline"),
+    [
+        ("exec", {"command": "pwd"}, 35.0),
+        ("write_stdin", {"session_id": "0198e2c8-592a-7000-8000-000000000001"}, 6.0),
+        (
+            "write_stdin",
+            {
+                "session_id": "0198e2c8-592a-7000-8000-000000000001",
+                "wait_for": "ready",
+                "wait_timeout_ms": 2500,
+            },
+            7.5,
+        ),
+        ("list_exec_sessions", {}, 10.0),
+    ],
+)
+async def test_client_only_transport_deadlines_follow_report_window(
+    name: str,
+    args: dict[str, object],
+    deadline: float,
+) -> None:
+    device_id = uuid4()
+
+    async def resolve(_user_id: UUID, _name: str) -> UUID | None:
+        return device_id
+
+    dispatcher = _DeviceDispatcher()
+    schemas = {
+        "exec": _EXEC_SCHEMA,
+        "write_stdin": _WRITE_STDIN_SCHEMA,
+        "list_exec_sessions": _LIST_EXEC_SESSIONS_SCHEMA,
+    }
+    registry = ToolRegistry(
+        (_ClientOnlyTool(name, schemas[name]),),
+        device_resolver=resolve,
+        trusted_device_resolver=resolve,
+    )
+    await registry.execute(
+        name=name,
+        args={**args, DEVICE_FIELD_NAME: "laptop"},
+        ctx=ToolContext(user_id=uuid4(), session_id=uuid4()),
+        device_targets={"laptop": device_id},
+        device_registry=dispatcher,
+    )
+    assert dispatcher.calls[0]["timeout_seconds"] == pytest.approx(deadline)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "tool_exec_timeout",
+        "tool_exec_failed",
+        "tool_exec_session_not_found",
+        "tool_exec_stdin_closed",
+        "tool_exec_interrupt_failed",
+        "tool_shell_unavailable",
+        "tool_pty_unavailable",
+        "tool_shell_login_unsupported",
+        "tool_client_shutting_down",
+    ],
+)
+async def test_client_exec_stable_errors_are_preserved(code: str) -> None:
+    device_id = uuid4()
+
+    async def resolve(_user_id: UUID, _name: str) -> UUID | None:
+        return device_id
+
+    registry = ToolRegistry(
+        (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
+        device_resolver=resolve,
+        trusted_device_resolver=resolve,
+    )
+    result = await registry.execute(
+        name="exec",
+        args={"command": "pwd", DEVICE_FIELD_NAME: "laptop"},
+        ctx=ToolContext(user_id=uuid4(), session_id=uuid4()),
+        device_targets={"laptop": device_id},
+        device_registry=_DeviceDispatcher(code=code),
+    )
+    assert result.code is ErrorCode(code)
+
+
+async def test_transfer_disconnect_is_outcome_unknown_at_agent_and_rest_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = FileTransferTool(None, None, None)
+
+    async def disconnected(*_args: object, **_kwargs: object) -> Any:
+        raise TransferDisconnectedError("lost after issue")
+
+    monkeypatch.setattr(tool, "transfer", disconnected)
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "server",
+            "src_path": "source.txt",
+            "openoctopus_dst_device": "laptop",
+            "dst_path": "dest.txt",
+            "mode": "copy",
+        },
+        ToolContext(user_id=uuid4(), session_id=uuid4()),
+    )
+    assert result.code is ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN
+
+    from openctopus_server.api.workspace_files import _raise_device_transfer
+
+    with pytest.raises(WorkspaceError) as raised:
+        _raise_device_transfer(
+            TransferDisconnectedError("lost after issue"),
+            SimpleNamespace(rest_transfer_queue_timeout_seconds=1),  # type: ignore[arg-type]
+        )
+    assert raised.value.code is ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN
+    assert ERROR_STATUS[raised.value.code] == 409
+
+
+async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import patch_device
+    from openctopus_server.dto.device import DevicePatchRequest
+    from openctopus_server.services.devices import DeviceSnapshot
+
+    device_id = uuid4()
+    user_id = uuid4()
+    committed = asyncio.Event()
+    release = asyncio.Event()
+    snapshot = DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/workspace",
+        sandbox_mode=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+
+    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
+        return device_id
+
+    async def patch(*_args: object, **_kwargs: object) -> DeviceSnapshot:
+        committed.set()
+        await release.wait()
+        return snapshot
+
+    monkeypatch.setattr(devices, "owned_id", owned_id)
+    monkeypatch.setattr(devices, "patch", patch)
+
+    class _DB:
+        async def close(self) -> None:
+            return None
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.aborted = 0
+            self.pushed = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def abort_config_update(self, **_kwargs: object) -> None:
+            self.aborted += 1
+
+        async def push_config(self, **_kwargs: object) -> bool:
+            self.pushed += 1
+            return True
+
+        async def is_online(self, *_args: object, **_kwargs: object) -> bool:
+            return True
+
+    registry = _Registry()
+    request = asyncio.create_task(
+        patch_device(
+            "laptop",
+            DevicePatchRequest(sandbox_mode=False),
+            user=SimpleNamespace(id=user_id),  # type: ignore[arg-type]
+            db=_DB(),  # type: ignore[arg-type]
+            registry=registry,  # type: ignore[arg-type]
+        )
+    )
+    await committed.wait()
+    request.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert registry.aborted == 0
+    assert registry.pushed == 1
+
+
+async def test_patch_db_close_failure_still_activates_committed_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _patch_and_activate
+    from openctopus_server.dto.device import DevicePatchRequest
+    from openctopus_server.services.devices import DeviceSnapshot
+
+    device_id = uuid4()
+    user_id = uuid4()
+    snapshot = DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/new-workspace",
+        sandbox_mode=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+
+    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
+        return device_id
+
+    async def patch(*_args: object, **_kwargs: object) -> DeviceSnapshot:
+        return snapshot
+
+    monkeypatch.setattr(devices, "owned_id", owned_id)
+    monkeypatch.setattr(devices, "patch", patch)
+
+    class _DB:
+        async def close(self) -> None:
+            raise RuntimeError("close failed after commit")
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.aborted = 0
+            self.pushed: list[DeviceConfigFrame] = []
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def abort_config_update(self, **_kwargs: object) -> None:
+            self.aborted += 1
+
+        async def push_config(self, **kwargs: object) -> bool:
+            config = kwargs["config"]
+            assert isinstance(config, DeviceConfigFrame)
+            self.pushed.append(config)
+            return True
+
+    registry = _Registry()
+    with pytest.raises(RuntimeError, match="close failed after commit"):
+        await _patch_and_activate(
+            _DB(),  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(workspace_path="~/new-workspace"),
+        )
+
+    assert registry.aborted == 0
+    assert [config.workspace_path for config in registry.pushed] == ["~/new-workspace"]
+
+
+async def test_patch_ambiguous_commit_retires_the_fenced_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _patch_and_activate
+    from openctopus_server.dto.device import DevicePatchRequest
+
+    device_id = uuid4()
+    user_id = uuid4()
+    row = SimpleNamespace(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/old-workspace",
+        sandbox_mode=False,
+        ssrf_denylist=[],
+        shell_timeout_max=600,
+        env_allowlist=[],
+        created_at=datetime.now(UTC),
+    )
+    durable_workspace = "~/old-workspace"
+    db_closed = False
+
+    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
+        return device_id
+
+    async def owned_for_update(*_args: object, **_kwargs: object) -> object:
+        return row
+
+    monkeypatch.setattr(devices, "owned_id", owned_id)
+    monkeypatch.setattr(devices, "_owned_for_update", owned_for_update)
+
+    class _DB:
+        async def commit(self) -> None:
+            nonlocal durable_workspace
+            durable_workspace = row.workspace_path
+            raise OSError("commit acknowledgement lost")
+
+        async def rollback(self) -> None:
+            raise AssertionError("an ambiguous commit must not be treated as rolled back")
+
+        async def close(self) -> None:
+            nonlocal db_closed
+            db_closed = True
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.aborted = 0
+            self.retired = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def abort_config_update(self, **_kwargs: object) -> None:
+            self.aborted += 1
+
+        async def retire_config_update(self, **_kwargs: object) -> None:
+            assert db_closed
+            self.retired += 1
+
+    registry = _Registry()
+    with pytest.raises(OSError, match="commit acknowledgement lost"):
+        await _patch_and_activate(
+            _DB(),  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(workspace_path="~/new-workspace"),
+        )
+
+    assert durable_workspace == "~/new-workspace"
+    assert registry.aborted == 0
+    assert registry.retired == 1
+
+
+def test_outcome_unknown_is_stable_tool_error() -> None:
+    # The mapping is exercised through the public result code contract.
+    assert ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value == "tool_execution_outcome_unknown"
+    assert ToolContext(user_id=uuid4(), session_id=uuid4()).session_id is not None

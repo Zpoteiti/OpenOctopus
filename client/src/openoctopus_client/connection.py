@@ -21,7 +21,10 @@ from websockets.asyncio.client import connect
 
 from openoctopus_client import __version__
 from openoctopus_client.config import ClientConfiguration
+from openoctopus_client.exec_sessions import ExecPolicy, ExecSessionManager
+from openoctopus_client.process import ShellInventory, discover_shells
 from openoctopus_client.protocol import (
+    EXEC_TOOL_NAMES,
     ConfigUpdate,
     DeviceConfig,
     ErrorFrame,
@@ -30,6 +33,7 @@ from openoctopus_client.protocol import (
     Ping,
     Pong,
     ProtocolError,
+    ShellMetadata,
     ToolCall,
     ToolResult,
     TransferBegin,
@@ -41,6 +45,7 @@ from openoctopus_client.protocol import (
     encode_frame,
 )
 from openoctopus_client.tools import ClientToolDispatcher, ToolOutput
+from openoctopus_client.tools.exec import ExecManager, ExecToolDispatcher
 from openoctopus_client.tools.locks import PathLocks
 from openoctopus_client.transfer import (
     MAX_ACTIVE_TRANSFER_SLOTS,
@@ -54,8 +59,9 @@ _TOOL_QUEUE_MAX = 64
 _TOOL_QUEUE_BYTES_MAX = 32 * 1024 * 1024
 _CONFIG_UPDATE_BACKLOG_MAX = 16
 _SHUTDOWN_GRACE_SECONDS = 2.0
+_SHUTDOWN_WATCHDOG_SECONDS = 15.0
 _HELLO_ACK_TIMEOUT_SECONDS = 10.0
-_RETRYABLE_CLOSE_CODES = frozenset({1000, 1001, 1006, 1013, 4000, 4408})
+_RETRYABLE_CLOSE_CODES = frozenset({1000, 1001, 1006, 1013, 4408})
 
 
 class ClosableWebSocket(TextWebSocket, Protocol):
@@ -64,8 +70,48 @@ class ClosableWebSocket(TextWebSocket, Protocol):
     async def close(self, code: int, reason: str) -> None: ...
 
 
-class ToolDispatcher(Protocol):
+class LocalToolDispatcher(Protocol):
     async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput: ...
+
+
+class ToolDispatcher(Protocol):
+    async def execute_call(self, call: ToolCall) -> ToolOutput: ...
+
+
+class _RuntimeExecManager(ExecManager, Protocol):
+    async def apply_policy(self, policy: ExecPolicy) -> None: ...
+
+    async def shutdown(self) -> bool: ...
+
+
+_QueuedToolDispatcher = ToolDispatcher | LocalToolDispatcher
+
+
+class _DeviceToolDispatcher:
+    """Combine existing local tools with the policy-bound exec tools."""
+
+    def __init__(
+        self,
+        local: LocalToolDispatcher,
+        exec_tools: ExecToolDispatcher,
+    ) -> None:
+        self._local = local
+        self._exec_tools = exec_tools
+
+    async def execute_call(self, call: ToolCall) -> ToolOutput:
+        if call.name in EXEC_TOOL_NAMES:
+            return await self._exec_tools.execute(
+                call.name,
+                call.args,
+                chat_session_id=call.chat_session_id,
+            )
+        return await self._local.execute(call.name, call.args)
+
+    def has_pending_blocking(self) -> bool:
+        return _dispatcher_has_pending_blocking(self._local)
+
+    async def wait_for_pending_blocking(self) -> None:
+        await _wait_for_dispatcher_blocking(self._local)
 
 
 class _RetryableConfigError(RuntimeError):
@@ -79,10 +125,10 @@ class _ConfigBoundDispatcher:
         self._prepared = prepared
         self._resolved: ToolDispatcher | None = None
 
-    async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput:
+    async def execute_call(self, call: ToolCall) -> ToolOutput:
         dispatcher = (await asyncio.shield(self._prepared)).dispatcher
         self._resolved = dispatcher
-        return await dispatcher.execute(name, args)
+        return await dispatcher.execute_call(call)
 
     def has_pending_blocking(self) -> bool:
         return self._resolved is not None and _dispatcher_has_pending_blocking(self._resolved)
@@ -101,9 +147,17 @@ class _PreparedConfig:
 
 
 @dataclass(frozen=True)
+class _PreparedConfigCandidate:
+    workspace: Path
+    dispatcher: LocalToolDispatcher
+    config: DeviceConfig
+    device_name: str
+
+
+@dataclass(frozen=True)
 class _QueuedToolCall:
     call: ToolCall
-    dispatcher: ToolDispatcher
+    dispatcher: _QueuedToolDispatcher
     retained_bytes: int
 
 
@@ -113,17 +167,22 @@ class _ToolWorker:
         self._writer = writer
         self._queue: asyncio.Queue[_QueuedToolCall] = asyncio.Queue(maxsize=_TOOL_QUEUE_MAX)
         self._retained_bytes = 0
+        self._active = False
         self._failed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._dispatchers: list[ToolDispatcher] = []
+        self._dispatchers: list[_QueuedToolDispatcher] = []
         self._task = asyncio.create_task(self._run())
 
     @property
     def failed(self) -> asyncio.Future[None]:
         return self._failed
 
-    def enqueue(self, call: ToolCall, dispatcher: ToolDispatcher) -> bool:
+    def enqueue(self, call: ToolCall, dispatcher: _QueuedToolDispatcher) -> bool:
         retained_bytes = len(call.model_dump_json().encode("utf-8")) + call.max_result_bytes
-        if self._queue.full() or self._retained_bytes + retained_bytes > _TOOL_QUEUE_BYTES_MAX:
+        if (
+            (call.name in EXEC_TOOL_NAMES and (self._active or not self._queue.empty()))
+            or self._queue.full()
+            or (self._retained_bytes + retained_bytes > _TOOL_QUEUE_BYTES_MAX)
+        ):
             return False
         if not any(item is dispatcher for item in self._dispatchers):
             self._dispatchers.append(dispatcher)
@@ -187,11 +246,13 @@ class _ToolWorker:
         try:
             while True:
                 request = await self._queue.get()
+                self._active = True
                 try:
                     result = await self._runtime._run_tool(request.call, request.dispatcher)
                     self._writer.enqueue_normal(encode_frame(result))
                     await _wait_for_dispatcher_blocking(request.dispatcher)
                 finally:
+                    self._active = False
                     self._retained_bytes -= request.retained_bytes
                     self._queue.task_done()
         except asyncio.CancelledError:
@@ -206,6 +267,7 @@ class ReconnectDisposition(Enum):
     RETRY = "retry"
     PERMANENT_AUTH = "permanent_auth"
     PERMANENT_CONFIG = "permanent_config"
+    PERMANENT_REPLACED = "permanent_replaced"
 
 
 class CloseDisposition(Enum):
@@ -220,13 +282,23 @@ class ClientRuntime:
         *,
         hello_factory: Callable[[], Hello] | None = None,
         random_value: Callable[[], float] = random.random,
-        tool_dispatcher_factory: Callable[[Path, bool, list[str]], ToolDispatcher] | None = None,
+        tool_dispatcher_factory: Callable[[Path, bool, list[str]], LocalToolDispatcher]
+        | None = None,
+        shell_inventory: ShellInventory | None = None,
+        exec_session_manager: _RuntimeExecManager | None = None,
         hard_exit: Callable[[int], object] = os._exit,
     ) -> None:
         self._config = config
         self._hello_factory = hello_factory or self._new_hello
         self._random_value = random_value
         self._path_locks = PathLocks()
+        self._shell_inventory = shell_inventory or discover_shells()
+        self._exec_sessions: _RuntimeExecManager = exec_session_manager or ExecSessionManager()
+        self._exec_policy_lock = asyncio.Lock()
+        self._exec_policy_key: tuple[object, ...] | None = None
+        self._exec_policy: ExecPolicy | None = None
+        self._exec_policy_epoch = 0
+        self._exec_shutdown = False
         self._tool_dispatcher_factory = tool_dispatcher_factory or self._default_dispatcher
         self._stopping = asyncio.Event()
         self._active_config: DeviceConfig | None = None
@@ -242,10 +314,13 @@ class ClientRuntime:
 
     def request_shutdown(self) -> None:
         self._stopping.set()
+        self._arm_shutdown_watchdog()
+
+    def _arm_shutdown_watchdog(self) -> None:
         with self._shutdown_watchdog_lock:
             if self._shutdown_watchdog is not None:
                 return
-            watchdog = threading.Timer(_SHUTDOWN_GRACE_SECONDS, self._force_exit)
+            watchdog = threading.Timer(_SHUTDOWN_WATCHDOG_SECONDS, self._force_exit)
             watchdog.daemon = True
             self._shutdown_watchdog = watchdog
             watchdog.start()
@@ -266,6 +341,19 @@ class ClientRuntime:
         attempt = 0
         loop = asyncio.get_running_loop()
         installed_signals: list[signal.Signals] = []
+        windows_break_signal = getattr(signal, "SIGBREAK", None)
+        previous_windows_break_handler: Any = None
+        windows_break_installed = False
+        if os.name == "nt" and windows_break_signal is not None:
+            try:
+                previous_windows_break_handler = signal.getsignal(windows_break_signal)
+                signal.signal(
+                    windows_break_signal,
+                    lambda _signum, _frame: self.request_shutdown(),
+                )
+                windows_break_installed = True
+            except (OSError, ValueError):
+                pass
         for signum in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(signum, self.request_shutdown)
@@ -301,6 +389,9 @@ class ClientRuntime:
                     if disposition_from_error == ReconnectDisposition.PERMANENT_AUTH:
                         LOGGER.error("Device authentication was rejected")
                         return 1
+                    if disposition_from_error == ReconnectDisposition.PERMANENT_REPLACED:
+                        LOGGER.error("This client was replaced by a newer device connection")
+                        return 1
                     if disposition_from_error == ReconnectDisposition.PERMANENT_CONFIG:
                         detail = _sanitized_close_detail(exc)
                         suffix = f": {detail}" if detail else ""
@@ -326,11 +417,16 @@ class ClientRuntime:
                     pass
             return 0
         finally:
+            await self._shutdown_exec_sessions()
             if not self._shutdown_cleanup_incomplete:
                 self._cancel_shutdown_watchdog()
             for signum in installed_signals:
                 with contextlib.suppress(NotImplementedError, OSError):
                     loop.remove_signal_handler(signum)
+            if windows_break_installed:
+                assert windows_break_signal is not None
+                with contextlib.suppress(OSError, ValueError):
+                    signal.signal(windows_break_signal, previous_windows_break_handler)
 
     async def _run_connection_attempt(self) -> CloseDisposition:
         async with connect(
@@ -436,9 +532,7 @@ class ClientRuntime:
                         pass
                     transfer_failure_task.result()
                 completed_updates = [task for task in config_update_tasks if task in done]
-                completed_transfers = [
-                    task for task in config_bound_transfer_tasks if task in done
-                ]
+                completed_transfers = [task for task in config_bound_transfer_tasks if task in done]
                 if completed_updates or completed_transfers:
                     for update_task in completed_updates:
                         update_task.result()
@@ -497,15 +591,16 @@ class ClientRuntime:
                             frame.device_name,
                             frame.config,
                             generation=config_generation,
-                            previous=config_update_tasks[-1]
-                            if config_update_tasks
-                            else None,
+                            previous=config_update_tasks[-1] if config_update_tasks else None,
                             transfer_manager=transfer_manager,
                         )
                     )
                 elif isinstance(frame, ToolCall):
                     if self._tools is None:
                         raise ProtocolError("Tool call arrived before device configuration")
+                    if config_update_tasks and frame.name in EXEC_TOOL_NAMES:
+                        writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
+                        continue
                     dispatcher: ToolDispatcher = self._tools
                     if config_update_tasks:
                         dispatcher = _ConfigBoundDispatcher(config_update_tasks[-1])
@@ -515,10 +610,7 @@ class ClientRuntime:
                     # Server errors are already correlated and safe to ignore here;
                     # untrusted details never become client logs.
                     continue
-                elif (
-                    isinstance(frame, (TransferRequest, TransferBegin))
-                    and config_update_tasks
-                ):
+                elif isinstance(frame, (TransferRequest, TransferBegin)) and config_update_tasks:
                     if transfer_manager is None:
                         raise ProtocolError("Transfer arrived before device configuration")
                     if len(config_bound_transfer_tasks) >= MAX_ACTIVE_TRANSFER_SLOTS:
@@ -561,6 +653,12 @@ class ClientRuntime:
                 except (WriterOverflowError, TimeoutError):
                     pass
                 await websocket.close(1002, "protocol_error")
+                if not acknowledged:
+                    # A peer that cannot complete the strict v2 handshake will
+                    # not become compatible by reconnecting with the same
+                    # binary/configuration.  Let run() classify this as a
+                    # permanent protocol error (exit 78).
+                    raise
                 return CloseDisposition.RETRY
             shutdown_requested = True
             return CloseDisposition.SHUTDOWN
@@ -633,7 +731,7 @@ class ClientRuntime:
 
     def _default_dispatcher(
         self, workspace: Path, sandbox_mode: bool, denylist: list[str]
-    ) -> ToolDispatcher:
+    ) -> LocalToolDispatcher:
         return ClientToolDispatcher(
             workspace,
             sandbox_mode=sandbox_mode,
@@ -652,6 +750,10 @@ class ClientRuntime:
         return Hello.new(
             client_version=__version__,
             operating_system=cast(Literal["linux", "darwin", "windows"], operating_system),
+            shells=ShellMetadata(
+                default=self._shell_inventory.default,
+                available=list(self._shell_inventory.available),
+            ),
         )
 
     async def _install_config(
@@ -672,7 +774,7 @@ class ClientRuntime:
         )
         self._track_config_task(task)
         try:
-            prepared = await asyncio.shield(task)
+            candidate = await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -681,6 +783,10 @@ class ClientRuntime:
             ) from None
         if expected_generation is not None and expected_generation != self._config_generation:
             raise asyncio.CancelledError
+        prepared = await self._bind_exec_policy(
+            candidate,
+            expected_generation=expected_generation,
+        )
         return self._activate_prepared_config(prepared).dispatcher
 
     def _schedule_config_update(
@@ -705,7 +811,7 @@ class ClientRuntime:
             )
             self._track_config_task(prepare_task)
             try:
-                prepared = await asyncio.shield(prepare_task)
+                candidate = await asyncio.shield(prepare_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -714,6 +820,10 @@ class ClientRuntime:
                 ) from None
             if generation != self._config_generation:
                 raise asyncio.CancelledError
+            prepared = await self._bind_exec_policy(
+                candidate,
+                expected_generation=generation,
+            )
             self._activate_prepared_config(prepared)
             if transfer_manager is not None:
                 transfer_manager.update_config(_transfer_snapshot(prepared))
@@ -750,6 +860,85 @@ class ClientRuntime:
         self._tools = prepared.dispatcher
         return prepared
 
+    async def _bind_exec_policy(
+        self,
+        candidate: _PreparedConfigCandidate,
+        *,
+        expected_generation: int | None,
+    ) -> _PreparedConfig:
+        key = (
+            candidate.workspace,
+            candidate.config.sandbox_mode,
+            candidate.config.shell_timeout_max,
+            tuple(candidate.config.env_allowlist),
+            self._shell_inventory.available,
+            self._shell_inventory.default,
+        )
+        async with self._exec_policy_lock:
+            if expected_generation is not None and expected_generation != self._config_generation:
+                raise asyncio.CancelledError
+            if key != self._exec_policy_key:
+                self._exec_policy_epoch += 1
+                policy = ExecPolicy(
+                    workspace=candidate.workspace,
+                    sandbox_mode=candidate.config.sandbox_mode,
+                    shell_timeout_max=candidate.config.shell_timeout_max,
+                    env_allowlist=tuple(candidate.config.env_allowlist),
+                    available_shells=self._shell_inventory.available,
+                    default_shell=self._shell_inventory.default,
+                    epoch=self._exec_policy_epoch,
+                )
+                apply_task = asyncio.create_task(self._exec_sessions.apply_policy(policy))
+                cancelled = False
+                try:
+                    while True:
+                        try:
+                            await asyncio.shield(apply_task)
+                            break
+                        except asyncio.CancelledError:
+                            cancelled = True
+                            if apply_task.done():
+                                apply_task.result()
+                except RuntimeError:
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    raise _RetryableConfigError(
+                        "Exec policy cleanup could not be completed"
+                    ) from None
+                self._exec_policy_key = key
+                self._exec_policy = policy
+                if cancelled:
+                    raise asyncio.CancelledError
+            else:
+                assert self._exec_policy is not None
+                policy = self._exec_policy
+        return _PreparedConfig(
+            workspace=candidate.workspace,
+            dispatcher=_DeviceToolDispatcher(
+                candidate.dispatcher,
+                ExecToolDispatcher(self._exec_sessions, policy),
+            ),
+            config=candidate.config,
+            device_name=candidate.device_name,
+        )
+
+    async def _shutdown_exec_sessions(self) -> None:
+        if self._exec_shutdown:
+            return
+        self._exec_shutdown = True
+        self._arm_shutdown_watchdog()
+        task = asyncio.create_task(self._exec_sessions.shutdown())
+        try:
+            complete = await asyncio.wait_for(asyncio.shield(task), _SHUTDOWN_WATCHDOG_SECONDS)
+            if not complete:
+                self._shutdown_cleanup_incomplete = True
+        except TimeoutError:
+            self._shutdown_cleanup_incomplete = True
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+        except Exception:
+            self._shutdown_cleanup_incomplete = True
+
     def _track_config_task(self, task: asyncio.Task[Any]) -> None:
         self._config_tasks.add(task)
         task.add_done_callback(self._config_task_done)
@@ -771,12 +960,19 @@ class ClientRuntime:
         return not remaining
 
     async def _run_tool(
-        self, call: ToolCall, dispatcher: ToolDispatcher | None = None
+        self, call: ToolCall, dispatcher: _QueuedToolDispatcher | None = None
     ) -> ToolResult:
         active_dispatcher = dispatcher or self._tools
         if active_dispatcher is None:
             raise ProtocolError("Tool call arrived before device configuration")
-        output = await active_dispatcher.execute(call.name, call.args)
+        execute_call = getattr(active_dispatcher, "execute_call", None)
+        if callable(execute_call):
+            output = await execute_call(call)
+        else:
+            execute = getattr(active_dispatcher, "execute", None)
+            if not callable(execute):
+                raise ProtocolError("Tool dispatcher is unavailable")
+            output = await execute(call.name, call.args)
         return self._result_with_credit(call, output)
 
     @staticmethod
@@ -836,17 +1032,17 @@ def _prepare_workspace(value: str) -> Path:
 
 
 def _prepare_config_candidate(
-    factory: Callable[[Path, bool, list[str]], ToolDispatcher],
+    factory: Callable[[Path, bool, list[str]], LocalToolDispatcher],
     device_name: str,
     config: DeviceConfig,
-) -> _PreparedConfig:
+) -> _PreparedConfigCandidate:
     workspace = _prepare_workspace(config.workspace_path)
     dispatcher = factory(
         workspace,
         config.sandbox_mode,
         config.ssrf_denylist,
     )
-    return _PreparedConfig(
+    return _PreparedConfigCandidate(
         workspace=workspace,
         dispatcher=dispatcher,
         config=config,
@@ -873,12 +1069,12 @@ async def _wait_for_transfer_failure(failure: asyncio.Future[None]) -> str | byt
     raise AssertionError("Transfer manager finished without a failure")
 
 
-def _dispatcher_has_pending_blocking(dispatcher: ToolDispatcher) -> bool:
+def _dispatcher_has_pending_blocking(dispatcher: object) -> bool:
     checker = getattr(dispatcher, "has_pending_blocking", None)
     return bool(checker()) if callable(checker) else False
 
 
-async def _wait_for_dispatcher_blocking(dispatcher: ToolDispatcher) -> None:
+async def _wait_for_dispatcher_blocking(dispatcher: object) -> None:
     waiter = getattr(dispatcher, "wait_for_pending_blocking", None)
     if callable(waiter):
         await waiter()
@@ -932,6 +1128,8 @@ def reconnect_disposition(
     if close_code is not None:
         if close_code == 4401:
             return ReconnectDisposition.PERMANENT_AUTH
+        if close_code == 4000:
+            return ReconnectDisposition.PERMANENT_REPLACED
         if close_code == 4409 or close_code not in _RETRYABLE_CLOSE_CODES:
             return ReconnectDisposition.PERMANENT_CONFIG
         return ReconnectDisposition.RETRY

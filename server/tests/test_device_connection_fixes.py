@@ -15,9 +15,9 @@ from openctopus_server.devices.protocol import (
     new_uuid7,
 )
 from openctopus_server.devices.registry import (
+    DeviceOutcomeUnknownError,
     DeviceProtocolError,
     DeviceRegistry,
-    DeviceUnavailableError,
 )
 
 
@@ -66,7 +66,7 @@ async def test_heartbeat_send_failure_unregisters_generation_and_fails_pending()
     await _heartbeat_for_test(registry, handle, transport)
 
     assert await registry.is_online(device_id, user_id=user_id) is False
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending
 
 
@@ -177,7 +177,9 @@ async def test_writer_prioritizes_critical_control_over_queued_bulk() -> None:
         for idx in range(4)
     ]
     critical = asyncio.create_task(
-        transport.send_text(json.dumps({"type": "error", "id": str(new_uuid7()), "code": "x", "message": "x"}))
+        transport.send_text(
+            json.dumps({"type": "error", "id": str(new_uuid7()), "code": "x", "message": "x"})
+        )
     )
 
     websocket.release_binary.set()

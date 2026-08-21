@@ -19,6 +19,8 @@ SsrfDenyEntry = Annotated[
     AfterValidator(_reject_nul),
 ]
 SsrfDenylist = Annotated[list[SsrfDenyEntry], Field(max_length=256)]
+EnvName = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[^=\x00-\x1f]+")]
+EnvAllowlist = Annotated[list[EnvName], Field(max_length=64)]
 
 
 class DeviceCreateRequest(BaseModel):
@@ -28,6 +30,8 @@ class DeviceCreateRequest(BaseModel):
     workspace_path: WorkspacePath = "~/openoctopus/workspace"
     sandbox_mode: bool = True
     ssrf_denylist: SsrfDenylist | None = None
+    shell_timeout_max: int = Field(default=600, ge=0, le=86400)
+    env_allowlist: EnvAllowlist | None = None
 
 
 class DevicePatchRequest(BaseModel):
@@ -37,6 +41,8 @@ class DevicePatchRequest(BaseModel):
     workspace_path: WorkspacePath | None = None
     sandbox_mode: bool | None = None
     ssrf_denylist: SsrfDenylist | None = None
+    shell_timeout_max: int | None = Field(default=None, ge=0, le=86400)
+    env_allowlist: EnvAllowlist | None = None
 
 
 class DeviceResponse(BaseModel):
@@ -48,6 +54,8 @@ class DeviceResponse(BaseModel):
     workspace_path: str
     sandbox_mode: bool
     ssrf_denylist: list[str]
+    shell_timeout_max: int
+    env_allowlist: list[str]
     online: bool
     created_at: datetime
 

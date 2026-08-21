@@ -2,11 +2,11 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131). When the implementation drifts from this doc, fix one or the other.
 
-**Py5 milestone:** the active client surface is the eleven shared tools plus
-server-orchestrated single-regular-file `file_transfer`. `exec`,
-`write_stdin`, `list_exec_sessions`, MCP-wrapped tools, recursive folder
-transfer, and client-to-client transfer remain deferred and are not advertised
-by the Py5 client.
+**Py6 milestone:** the active client surface is the eleven shared tools plus
+server-orchestrated single-regular-file `file_transfer` and the three trusted
+client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). MCP,
+recursive folder transfer, and client-to-client transfer remain later
+milestones and are not part of the Py6 contract.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -15,7 +15,7 @@ This is a *design* document. Use it during implementation as the source of truth
 ## Conventions
 
 - **Source schemas are nanobot-shape.** Two patterns for how device-awareness shows up in source:
-  - **Routing-only device** — for active shared tools (`read_file`, `write_file`, etc.), the source schema has **no device field at all**. `ToolRegistry.get_tool_schemas(device_names=...)` injects an `openoctopus_device` property (ADR-071) with an enum populated from the server and paired devices, and appends `openoctopus_device` to `required`. Deferred client/MCP tools are not part of the Py5 registry.
+  - **Routing-only device** — for active shared tools (`read_file`, `write_file`, etc.), the source schema has **no device field at all**. `ToolRegistry.get_tool_schemas(device_names=...)` injects an `openoctopus_device` property (ADR-071) with an enum populated from the server and paired devices, and appends `openoctopus_device` to `required`. Client-only exec tools use the same injection but are restricted to trusted paired devices; MCP remains later.
   - **Intrinsic device** — for tools that natively operate across devices (`file_transfer`, `message`), the device field IS part of the source schema. `file_transfer` uses `openoctopus_src_device` + `openoctopus_dst_device`; `message` uses `openoctopus_device`. Each source stub has `enum: ["server"]`. At merge time, each such enum is **extended** with paired device names.
 - **Reserved `openoctopus_` prefix.** The routing field name MUST use the `openoctopus_` prefix and MUST NOT be just `device` / `src_device` / `dst_device`. Why: the merger would otherwise clobber an MCP tool's native `device` arg (e.g., a tool selecting a GPU). The reserved prefix makes collision impossible.
 - **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
@@ -24,7 +24,7 @@ This is a *design* document. Use it during implementation as the source of truth
   - **Inject:** add a brand-new `openoctopus_device` property (string, `enum` of install sites, marker `x-openoctopus-device: true`) and append `openoctopus_device` to `required`. Applies to routing-only tools.
   - **Extend:** for every property carrying `x-openoctopus-device: true`, replace its enum with the extended list of install sites. Applies to intrinsic-device tools.
   - Nothing else mutates. All other property names, types, descriptions, non-device enums, and the rest of `required` are strictly pass-through. See pseudocode in the Cross-cutting concerns section below.
-- **Package locations for active Py5 tools:**
+- **Package locations for active Py6 tools:**
   - **Tool source schemas and server implementations** → `openctopus_server/tools/`
     (`workspace_files.py` contains the eleven shared file-tool schemas and
     wrappers; `web_fetch.py`, `message.py`, and `file_transfer.py` contain the
@@ -33,8 +33,9 @@ This is a *design* document. Use it during implementation as the source of truth
     `openoctopus_client/tools/dispatcher.py`. The client Workspace REST action
     and DTO models are in `openoctopus_client/tools/workspace_rest.py`; the
     transfer protocol implementation is in `openoctopus_client/transfer.py`.
-  - Deferred `exec`, session, and MCP locations are future placeholders only;
-    no corresponding Py5 modules or schemas exist.
+  - `exec`, `write_stdin`, and `list_exec_sessions` are implemented by the
+    client runtime; the server owns their canonical source schemas and routes
+    them as `CLIENT_ONLY` calls.
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
@@ -47,7 +48,7 @@ This is a *design* document. Use it during implementation as the source of truth
   a server-generated `[untrusted tool result]: ...` warning text block; raw
   string output becomes the following text block, and raw safe block arrays are
   appended after the warning. Image bytes are not modified. Deferred tools have
-  no Py5 result frame. The wrap is the signal; no system-prompt rule.
+  no separate client result frame. The wrap is the signal; no system-prompt rule.
 
 ---
 
@@ -67,16 +68,16 @@ This is a *design* document. Use it during implementation as the source of truth
 | `notebook_edit` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Edit Jupyter notebook cells |
 | `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — server has hardcoded private-IP block, clients enforce per-device denylist policy (ADR-052) |
 | `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
-| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between server and a paired device (Py5) |
-| `cron` | future placeholder | — | — | Not registered in the Py5 tool registry |
-| `exec` | client-only (deferred) | openoctopus_client | openoctopus_client | Execute a shell command on a device (Py6) |
-| `write_stdin` | client-only (deferred) | openoctopus_client | openoctopus_client | Manage a background exec session (Py6) |
-| `list_exec_sessions` | client-only (deferred) | openoctopus_client | openoctopus_client | List background exec sessions (Py6) |
+| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between server and a paired device |
+| `cron` | future placeholder | — | — | Not registered in the Py6 tool registry |
+| `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
+| `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
+| `list_exec_sessions` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | List sessions owned by the current chat |
 | `mcp_<server>_<tool>`, `mcp_<server>_resource_<name>`, `mcp_<server>_prompt_<name>` | dynamic (deferred) | MCP (Python `mcp` SDK) | wherever the MCP is installed | Wrapped MCP capabilities (Py7/Py8) |
 
-The active Py5 registry contains thirteen first-class tools: eleven shared
-tools, `message`, and `file_transfer`. `cron`, `exec`, background-session tools,
-and MCP-wrapped tools are future placeholders and are not advertised by Py5.
+The active Py6 registry contains sixteen first-class tools: eleven shared
+tools, `message`, `file_transfer`, and the three client-only exec tools. `cron`
+and MCP-wrapped tools remain outside the active client shell contract.
 
 Schemas below are the **source** schemas (what gets written in code). The agent sees these plus the merger's additions per ADR-071 (`openoctopus_device` property on routing-only tools, enum extension on intrinsic-device tools).
 
@@ -172,7 +173,7 @@ returned as Anthropic `image` blocks.
   encryption, path traversal, excessive members, declared size, and compression
   ratio before MarkItDown imports or converts them.
 - **Deferred conversion features:** no VLM, OCR, audio/video, Azure, YouTube,
-  archive recursion, or remote-document fetch is enabled in Py5.
+  archive recursion, or remote-document fetch is enabled in Py6.
 - **Images** (detected by mime/magic bytes): returned as `text + image` content blocks, not plain text. The image block shape is Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
 - **Detection fallback:** if image magic-byte detection is inconclusive, try the normal text path. If the file is not readable text and not a supported document type, return an error instead of embedding arbitrary binary bytes into text.
 - Repeated reads always return the requested content. `read_file` has no hidden
@@ -699,7 +700,7 @@ or explain the failure.
 
 **Purpose:** Edit a Jupyter notebook (`.ipynb`) cell — replace source, insert a new cell after an index, or delete an existing cell.
 
-**REST availability:** Agent tool only. Py5 intentionally defines no dedicated
+**REST availability:** Agent tool only. Py6 intentionally defines no dedicated
 REST equivalent; frontend callers can still download or replace the raw
 `.ipynb` file through the normal Workspace Files API.
 
@@ -783,7 +784,7 @@ REST equivalent; frontend callers can still download or replace the raw
   - Loopback (127.0.0.0/8, ::1)
   - IPv6 ULA `fc00::/7` and link-local `fe80::/10`
 - **Client site:** if `sandbox_mode=true`, rejects targets matching `device.ssrf_denylist` (CIDR, host, or `host:port`). The default sandbox-device denylist contains private/reserved ranges and common metadata-service addresses. Users remove entries from the denylist to allow known internal services. If `sandbox_mode=false`, private/internal access is allowed by default; trusted devices created without an explicit list store `[]`, while any explicit deny entries the user keeps still reject matching targets.
-- **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command can still make its own network calls subject only to command-denylist/env policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
+- **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command retains the host user's network access; the environment allowlist is not an egress policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
 - Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity
   encoding, rejects compressed responses, and raw-streams at most 5 MB before
   extraction. The server site has separate per-user/global admission for the
@@ -815,24 +816,24 @@ REST equivalent; frontend callers can still download or replace the raw
 
 ## Server-orchestrated tools
 
-`message` executes on the server. `file_transfer` is also
-server-orchestrated, but its client legs execute on the paired device. Their
-schemas and routing live in `openctopus_server/tools/`; Py5 does not advertise
-client-only shell or MCP tools.
+`message` executes on the server. `file_transfer` is also server-orchestrated,
+but its client legs execute on the paired device. Their schemas and routing
+live in `openctopus_server/tools/`; Py6 additionally advertises the three
+fixed client-only shell tools, but no MCP tools.
 
 ### `message`
 
 **Lives in:** `openctopus_server/tools/message.py`
 
-**Availability:** Registered for the current web session in Py5. The current
+**Availability:** Registered for the current web session in Py6. The current
 provider-visible schema exposes `content`, optional `media`, and the intrinsic
 `openoctopus_device` field. `content` must contain non-whitespace text and is
-capped at 16,000 characters; `media` accepts at most ten unique paths. Py5
+capped at 16,000 characters; `media` accepts at most ten unique paths. Py6
 records media references without opening device files at send time; unknown
 MIME types use `application/octet-stream`.
 
 **Purpose:** Deliver text and optional workspace-file references to the current
-web session. Py5 does not expose channel, chat, or button arguments.
+web session. Py6 does not expose channel, chat, or button arguments.
 
 **Source schema:**
 ```json
@@ -888,7 +889,7 @@ web session. Py5 does not expose channel, chat, or button arguments.
 - The provider-visible transcript remains the assistant message containing the
   `message` tool use plus its matching persisted `tool_result`, which records
   delivery success/failure. The agent supplies workspace paths, never
-  `delivery_refs`. For current-web delivery, the Py5 helper generates refs,
+  `delivery_refs`. For current-web delivery, the Py6 helper generates refs,
   links them to the matching `tool_use_id`, and appends them to the existing
   assistant row containing that tool use. Server-workspace refs also retain the
   immutable workspace ID and workspace-relative path so a future frontend can
@@ -908,7 +909,7 @@ web session. Py5 does not expose channel, chat, or button arguments.
 
 **Lives in:** `openctopus_server/tools/file_transfer.py`
 
-**Purpose:** Copy or move one regular file. Py5 supports `server -> server`,
+**Purpose:** Copy or move one regular file. Py6 supports `server -> server`,
 `server -> client`, `client -> server`, and a coordinated local copy/move when
 both endpoints name the same paired device. Different client-to-client
 endpoints are rejected; recursive folder transfer is not supported.
@@ -969,12 +970,12 @@ remain visible and return `tool_device_unreachable` at dispatch.
 **Mechanism:**
 - Source schema in `openctopus_server` — the server merge step injects `openoctopus_src_device` and `openoctopus_dst_device`, then extends both enums with paired device names.
 - `server -> server` reads, writes, and conditionally deletes through `WorkspaceService`, rejecting an existing destination before the copy.
-- Py5 `server -> client` and `client -> server` first resolve the named user device and require it to be connected. For client sources the server sends `transfer_request`; the byte sender then sends `transfer_begin`, waits for the receiver's `transfer_ready`, streams bounded binary chunks, and finishes with `transfer_end(ack=false)`. The receiver returns the final `transfer_end(ack=true)` acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with SHA-256 verification and bounded queues, without a durable local file cache.
+- Py6 `server -> client` and `client -> server` first resolve the named user device and require it to be connected. For client sources the server sends `transfer_request`; the byte sender then sends `transfer_begin`, waits for the receiver's `transfer_ready`, streams bounded binary chunks, and finishes with `transfer_end(ack=false)`. The receiver returns the final `transfer_end(ack=true)` acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with SHA-256 verification and bounded queues, without a durable local file cache.
 - When both device fields name the same paired client, the server dispatches
   the private `transfer_local` action; the client copies or moves one regular
   file under its path policy without a WebSocket transfer slot.
 - Different client-to-client endpoints are rejected with `tool_invalid_args`;
-  Py5 has no client-to-client bridge.
+  Py6 has no client-to-client bridge.
 - **Reject** if `dst_path` already exists (no implicit overwrite, no overwrite flag), `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
 
 **Timeout:** Server-to-server path is normal workspace I/O. Device transfer stall detection belongs to the transfer-slot implementation.
@@ -987,12 +988,12 @@ stream failures.
 
 ---
 
-### `cron` (future placeholder; not a Py5 contract)
+### `cron` (future placeholder; not a Py6 contract)
 
 This section is historical only; no `cron` module or registry entry exists in
-Py5.
+Py6.
 
-**Implementation:** none in Py5; the future module location is intentionally TBD.
+**Implementation:** none in Py6; the future module location is intentionally TBD.
 
 **Purpose:** Schedule reminders and recurring tasks. A single tool with an `action` enum — add, list, or remove jobs. Each firing injects a synthesized user message into a dedicated cron session per ADR-053.
 
@@ -1060,65 +1061,37 @@ Py5.
 
 ---
 
-## Client-only tools (deferred from Py5)
+## Client-only tools (Py6)
 
-Py5 does not advertise or execute any client-only shell tool. The following
-names are milestone placeholders only, not active schemas or configuration:
-the server must not send these calls to a Py5 client, and Py5 device rows do
-not contain shell, environment, command-policy, or MCP fields.
+The three tools below are fixed `CLIENT_ONLY` schemas. Their source schemas do
+not contain `openoctopus_device`; the server injects that required routing
+field and lists only paired devices with `sandbox_mode=false`. `server` is
+never an exec target. Offline trusted devices remain in the enum and return
+`tool_device_unreachable` at dispatch. Server-side REST has no exec equivalent.
 
-### `exec` (deferred to Py6)
+### `exec`
 
-**Implementation:** none in Py5; the future module location is intentionally TBD.
+Runs one command as an independent shell process. `tty=false` (the default)
+uses closed-stdin pipes; `tty=true` uses POSIX PTY or Windows ConPTY. PTY is
+line-oriented only: no screen canvas, resize, screenshot, full TUI, or secret
+input. A PowerShell/REPL session is started by the command itself (for example
+`command: "pwsh"`); an empty command that means “open a shell” is invalid.
 
-**Purpose:** Execute a shell command on the device. The agent's escape hatch for everything not covered by file ops (git, build commands, system queries, network from inside a private network, etc.). Renamed from `shell` for nanobot alignment.
-
-**Source schema (nanobot-aligned with OpenOctopus timeout-cap extension):**
 ```json
 {
   "name": "exec",
-  "description": "Execute a shell command and return its output. Prefer read_file/write_file/edit_file over cat/echo/sed, and find_files/grep over shell find/grep. Use -y or --yes flags to avoid interactive prompts. For long-running commands, pass yield_time_ms; if the command keeps running, exec returns a session_id that can be polled or written to with write_stdin. Output is truncated at 10 000 chars; timeout defaults to 60s.",
+  "description": "Execute a command on a trusted device. Pipe is the default; use tty=true for a REPL, TTY detection, SSH shell, or line-oriented prompt. Set an explicit large timeout for long interaction; yield_time_ms never extends the hard timeout.",
   "input_schema": {
     "type": "object",
     "properties": {
-      "command": { "type": "string", "description": "The shell command to execute" },
-      "cmd": { "type": "string", "description": "Compatibility alias for command" },
-      "working_dir": { "type": "string", "description": "Optional working directory for the command" },
-      "workdir": { "type": "string", "description": "Compatibility alias for working_dir" },
-      "timeout": {
-        "type": "integer",
-        "description": "Future Py6 process hard timeout field; not accepted by Py5.",
-        "minimum": 0
-      },
-      "shell": {
-        "type": "string",
-        "description": "Optional shell binary to launch. On Unix, supports sh, bash, or zsh.",
-        "nullable": true
-      },
-      "login": {
-        "type": "boolean",
-        "description": "Whether to run bash/zsh with login shell semantics (default true).",
-        "default": true,
-        "nullable": true
-      },
-      "yield_time_ms": {
-        "type": "integer",
-        "description": "Optional milliseconds to wait before returning output. When set, a still-running command returns a session_id that can be polled or written to with write_stdin.",
-        "minimum": 0,
-        "maximum": 30000
-      },
-      "max_output_chars": {
-        "type": "integer",
-        "description": "Maximum output characters to return when yield_time_ms is used (default 10000, max 50000).",
-        "minimum": 1000,
-        "maximum": 50000
-      },
-      "max_output_tokens": {
-        "type": "integer",
-        "description": "Compatibility alias for max_output_chars. OpenOctopus uses a character budget.",
-        "minimum": 1000,
-        "maximum": 50000
-      }
+      "command": {"type": "string", "minLength": 1, "maxLength": 24000},
+      "working_dir": {"type": "string", "minLength": 1, "maxLength": 4096},
+      "timeout": {"type": "integer", "minimum": 0, "maximum": 86400},
+      "shell": {"type": "string", "enum": ["bash", "sh", "zsh", "pwsh", "powershell", "powershell_x86", "cmd"]},
+      "login": {"type": "boolean", "default": false},
+      "tty": {"type": "boolean", "default": false},
+      "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+      "max_output_chars": {"type": "integer", "minimum": 1000, "maximum": 50000, "default": 10000}
     },
     "required": ["command"],
     "additionalProperties": false
@@ -1126,80 +1099,37 @@ not contain shell, environment, command-policy, or MCP fields.
 }
 ```
 
-**Py5 status:** no `exec` schema is merged, no `tool_call` is sent for this
-name, and no client subprocess/session policy exists. The fields and behavior
-above are retained only as a non-normative Py6 placeholder; do not add any of
-them to the Py5 device row or handshake.
+`cmd`, `workdir`, `max_output_tokens`, `interactive`, `mode`, and arbitrary
+shell executable paths are not accepted. `working_dir` defaults to the device
+workspace; trusted devices may use an existing OS-accessible absolute path.
+`timeout` is a hard process lifetime, default `min(60, shell_timeout_max)`,
+and `yield_time_ms` is only the initial report window. `timeout=0` is allowed
+only when the device cap is zero and a bounded yield is supplied. A normal
+`git commit` must use `-m` or `-F`; editor TUI is outside the contract.
 
-**Timeout/result/errors:** not applicable in Py5.
-**Result cap:** one-shot output defaults to 10,000 characters; session polling defaults to 10,000 and can request up to 50,000 characters.
-**Future error names:** `tool_exec_timeout`, `tool_command_denied`,
-`tool_env_not_allowed`, `tool_cwd_outside_workspace` (not emitted by Py5).
-**Related ADRs:** 039 (client-only schema), 050 (per-device config), 051 (device-only permissions), 073 (device policy gates), 095 (result wrap).
+### `write_stdin`
 
-### `write_stdin` (deferred to Py6)
+Operates a session owned by the current chat. Omitted/empty `chars` polls.
+Pipe stdin is closed from spawn: the sole non-empty value `"\u0003"` requests
+an OS interrupt and does not write ETX; any other non-empty value returns
+`tool_exec_stdin_closed`. PTY sends chars to the terminal; `\u0003` is only a
+best-effort Ctrl-C. `terminate=true` is the cross-platform forced termination
+operation and cannot be combined with chars or `wait_for`.
 
-**Implementation:** none in Py5; the future module location is intentionally TBD.
-
-**Purpose:** Interact with a running exec session created by `exec` with
-`yield_time_ms`. This mirrors nanobot's companion tool: poll recent output,
-send stdin, close stdin, wait for expected output, or terminate the process.
-
-**Source schema (matches nanobot):**
 ```json
 {
   "name": "write_stdin",
-  "description": "Interact with a running exec session created by exec with yield_time_ms. Use chars='' to poll output, chars to send stdin, close_stdin=true to send EOF, or terminate=true to stop the process.",
+  "description": "Poll or operate a current-chat exec session. Pipe chars=\\u0003 is an OS interrupt control operation; tty writes chars to the terminal. Use terminate=true when the process must end.",
   "input_schema": {
     "type": "object",
     "properties": {
-      "session_id": {
-        "type": "string",
-        "description": "Session id returned by exec"
-      },
-      "chars": {
-        "type": "string",
-        "description": "Text to write to stdin. Pass empty string to only poll recent output."
-      },
-      "close_stdin": {
-        "type": "boolean",
-        "description": "Close stdin after writing chars. Useful for commands waiting for EOF.",
-        "default": false
-      },
-      "terminate": {
-        "type": "boolean",
-        "description": "Terminate the running exec session.",
-        "default": false
-      },
-      "yield_time_ms": {
-        "type": "integer",
-        "description": "Milliseconds to wait before returning recent output. Default 1000, maximum 30000.",
-        "minimum": 0,
-        "maximum": 30000
-      },
-      "wait_for": {
-        "type": "string",
-        "description": "Optional text to wait for in output before returning. Useful for dev servers, test watchers, and prompts.",
-        "nullable": true
-      },
-      "wait_timeout_ms": {
-        "type": "integer",
-        "description": "Maximum milliseconds to wait for wait_for text. Default 10000, maximum 120000.",
-        "minimum": 0,
-        "maximum": 120000
-      },
-      "max_output_chars": {
-        "type": "integer",
-        "description": "Maximum output characters to return from this poll. Default 10000, maximum 50000.",
-        "minimum": 1000,
-        "maximum": 50000
-      },
-      "max_output_tokens": {
-        "type": "integer",
-        "description": "Compatibility alias for max_output_chars. OpenOctopus uses a character budget.",
-        "minimum": 1000,
-        "maximum": 50000
-      }
+      "session_id": {"type": "string", "format": "uuid"},
+      "chars": {"type": "string", "maxLength": 65536, "description": "At most 65,536 Unicode characters and 65,536 UTF-8 bytes."},
+      "terminate": {"type": "boolean", "default": false},
+      "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+      "wait_for": {"type": "string", "minLength": 1, "maxLength": 4096},
+      "wait_timeout_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+      "max_output_chars": {"type": "integer", "minimum": 1000, "maximum": 50000, "default": 10000}
     },
     "required": ["session_id"],
     "additionalProperties": false
@@ -1207,47 +1137,48 @@ send stdin, close stdin, wait for expected output, or terminate the process.
 }
 ```
 
-**Merge-time injection:** same as `exec`; `openoctopus_device` is injected and
-lists paired client devices only. Paired-but-offline targets return
-`tool_device_unreachable`.
+`wait_for` searches already unread output first, then waits for new output:
+pipe searches stdout and stderr independently; PTY searches the normalized
+merged stream. `wait_timeout_ms` without `wait_for` is invalid. Poll consumes
+unread output at most once; a terminal record is removed after final poll or
+idle cleanup. A session is owned by a chat UUID, not by the provider.
 
-**Result:** text status from the exec-session manager, normalized per ADR-095.
-If the session exits, it is removed after the final poll. Missing or
-cross-session-inaccessible session ids return a tool error.
+### `list_exec_sessions`
 
-### `list_exec_sessions` (deferred to Py6)
+Lists up to eight sessions owned by the current chat on the selected device.
+Each item includes `session_id`, status, tty, shell, login, cwd, elapsed/idle
+time, remaining hard-timeout, and a 200-character command preview. Listing
+does not refresh idle time and never reveals another chat's sessions.
 
-**Implementation:** none in Py5; the future module location is intentionally TBD.
-
-**Purpose:** List active long-running exec sessions on the selected device so
-the agent can recover a `session_id` after context shifts before polling,
-writing stdin, or terminating with `write_stdin`.
-
-**Source schema (matches nanobot):**
 ```json
 {
   "name": "list_exec_sessions",
-  "description": "List active long-running exec sessions, including session_id, cwd, elapsed time, idle time, remaining timeout, and command preview.",
-  "input_schema": {
-    "type": "object",
-    "properties": {},
-    "additionalProperties": false
-  }
+  "description": "List current-chat exec sessions on a trusted device.",
+  "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
 }
 ```
 
-**Merge-time injection:** same as `exec`; `openoctopus_device` is injected and
-lists paired client devices only. Paired-but-offline targets return
-`tool_device_unreachable`.
+All three schemas use the same result contract: pipe reports separate
+stdout/stderr and PTY reports one normalized output stream; each stream is a
+50,000-character head+tail ring, with reports capped at 10,000 by default and
+50,000 maximum. Sessions survive ordinary WS reconnect and server restart but
+not token rotation, device deletion, replacement, normal client shutdown, or
+policy change. Client restart/crash/power loss has no recovery guarantee.
+There is no `command_denylist`; `sandbox_mode=false` is a trusted-device gate,
+not an OS sandbox. Stable errors include `tool_invalid_args`,
+`tool_device_busy`, `tool_exec_timeout`, `tool_exec_session_not_found`,
+`tool_exec_stdin_closed`, `tool_exec_interrupt_failed`,
+`tool_pty_unavailable`, `tool_shell_unavailable`, and
+`tool_execution_outcome_unknown`.
 
 ---
 
-## MCP tools, resources, prompts (deferred to Py7/Py8; not a Py5 contract)
+## MCP tools, resources, prompts (deferred to Py7/Py8; not a Py6 contract)
 
-Py5 has no MCP dependency, handshake frame, persisted MCP configuration, or
-MCP tool registry. The remainder of this section is historical milestone
-planning only. It must not be used to construct Py5 schemas, REST requests,
-device config, or client subprocesses.
+Py6 has no MCP dependency, handshake frame, persisted MCP configuration, or
+MCP tool registry. The remainder of this section is later-milestone planning
+only. It must not be used to construct Py6 schemas, REST requests, device
+config, or client subprocesses.
 
 MCP servers advertise three capability surfaces — **tools**, **resources**, **prompts**. OpenOctopus wraps all three uniformly into the per-user tool registry (ADR-047), so the agent sees one flat list of callable entries. Naming by surface (ADR-048):
 
@@ -1261,7 +1192,7 @@ The typed infixes (`_resource_` / `_prompt_`) make cross-surface name collisions
 
 Py8 supports two MCP tenancy scopes (ADR-114):
 - **Admin shared-service MCPs** live in `system_config.server_mcp`, are configured only by admins, use shared credentials, and appear as install site `openoctopus_device="server"`. They are intended for stateless or low-state shared services such as search and internal KB lookup. OpenOctopus runs one shared runtime/client per configured MCP server with a bounded per-MCP FIFO queue. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract.
-- Future device MCPs are outside the Py5 device row and handshake; their
+- Future device MCPs are outside the Py6 device row and handshake; their
   storage and runtime contract is intentionally unspecified here.
 
 User-scoped server MCP and session-scoped MCP are out of scope for Py8. Personal OAuth, browser/IDE state, and resource-heavy MCPs should be installed on a user device.
@@ -1270,7 +1201,7 @@ User-scoped server MCP and session-scoped MCP are out of scope for Py8. Personal
 
 - **Source schema:** the MCP-provided `input_schema` is taken **as-is** — wrap is purely a name rewrite.
 - **Merge-time injection:** at session tool-schema-build time, `openoctopus_device` is added as a brand-new top-level property (with `x-openoctopus-device: true`), enum listing every install site of this MCP, appended to `required` (same mechanism as the routing-only-device pattern for shared tools, ADR-071). The reserved `openoctopus_` prefix ensures no collision with any MCP tool's native args — even if an MCP advertises a field named `device`, the merger's injected field never overwrites it.
-- **Implementation:** none in Py5; future MCP wrapper and install locations are intentionally TBD.
+- **Implementation:** none in Py6; future MCP wrapper and install locations are intentionally TBD.
 
 **Worked example.** A tool `web_search` from MCP server `minimax` whose source schema is:
 

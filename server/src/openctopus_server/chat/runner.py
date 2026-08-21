@@ -51,6 +51,7 @@ from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services.messages import (
     cancel_tool_batch,
     capture_pending_for_turn,
+    discard_cancel_waiter,
     finish_final_turn,
     finish_tool_batch_and_continue,
     is_cancel_requested,
@@ -58,6 +59,7 @@ from openctopus_server.services.messages import (
     persist_human_marker,
     persist_tool_result,
     promote_pending_for_turn,
+    register_cancel_waiter,
     reserve_pending_turn,
 )
 from openctopus_server.tools.base import (
@@ -439,42 +441,90 @@ class ChatRuntime:
                 await self._cancel_turn(
                     state,
                     turn,
-                    [str(block["id"]) for block in tool_uses],
+                    outcome_unknown_tool_ids=[],
+                    cancelled_tool_ids=[str(block["id"]) for block in tool_uses],
                 )
                 return
 
             last_result_id: UUID | None = None
             for index, tool_use in enumerate(tool_uses):
-                if await self._cancel_requested(turn.session_id):
-                    await self._cancel_turn(
-                        state,
-                        turn,
-                        [str(block["id"]) for block in tool_uses[index:]],
-                    )
-                    return
-
                 tool_id = str(tool_use["id"])
                 tool_name = str(tool_use["name"])
                 tool_input = tool_use.get("input")
                 if not isinstance(tool_input, dict):
                     tool_input = {}
-                await self._publish_tool_progress(
-                    state,
-                    turn,
-                    kind="tool_started",
-                    tool_call_id=tool_id,
-                    tool_name=tool_name,
-                )
-                tool_result = await self.tool_registry.execute(
-                    name=tool_name,
-                    args=tool_input,
-                    ctx=ToolContext(
-                        user_id=completed.user_id,
-                        session_id=turn.session_id,
-                    ),
-                    device_targets=completed.device_targets,
-                    device_registry=self.device_registry,
-                )
+                cancel_waiter = register_cancel_waiter(turn.session_id)
+                try:
+                    if await self._cancel_requested(turn.session_id) or cancel_waiter.done():
+                        await self._cancel_turn(
+                            state,
+                            turn,
+                            outcome_unknown_tool_ids=[],
+                            cancelled_tool_ids=[str(block["id"]) for block in tool_uses[index:]],
+                        )
+                        return
+
+                    await self._publish_tool_progress(
+                        state,
+                        turn,
+                        kind="tool_started",
+                        tool_call_id=tool_id,
+                        tool_name=tool_name,
+                    )
+                    if cancel_waiter.done():
+                        await self._cancel_turn(
+                            state,
+                            turn,
+                            outcome_unknown_tool_ids=[],
+                            cancelled_tool_ids=[str(block["id"]) for block in tool_uses[index:]],
+                        )
+                        return
+
+                    issued = asyncio.Event()
+                    tool_task = asyncio.create_task(
+                        self.tool_registry.execute(
+                            name=tool_name,
+                            args=tool_input,
+                            ctx=ToolContext(
+                                user_id=completed.user_id,
+                                session_id=turn.session_id,
+                            ),
+                            device_targets=completed.device_targets,
+                            device_registry=self.device_registry,
+                            on_issued=issued.set,
+                        )
+                    )
+                    try:
+                        await asyncio.wait(
+                            (tool_task, cancel_waiter),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        tool_task.cancel()
+                        await asyncio.gather(tool_task, return_exceptions=True)
+                        raise
+                    if cancel_waiter.done():
+                        tool_task.cancel()
+                        await asyncio.gather(tool_task, return_exceptions=True)
+                        tool_completed = not tool_task.cancelled() and tool_task.exception() is None
+                        if not tool_completed:
+                            was_issued = issued.is_set()
+                            outcome_unknown_tool_ids = [tool_id] if was_issued else []
+                            cancelled_tool_ids = [
+                                str(block["id"]) for block in tool_uses[index + 1 :]
+                            ]
+                            if not was_issued:
+                                cancelled_tool_ids.insert(0, tool_id)
+                            await self._cancel_turn(
+                                state,
+                                turn,
+                                outcome_unknown_tool_ids=outcome_unknown_tool_ids,
+                                cancelled_tool_ids=cancelled_tool_ids,
+                            )
+                            return
+                    tool_result = tool_task.result()
+                finally:
+                    discard_cancel_waiter(turn.session_id, cancel_waiter)
                 result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tool_id,
@@ -503,9 +553,7 @@ class ChatRuntime:
                             rendered_ref["size"] = ref.size
                         if isinstance(ref, WorkspaceFileDeliveryRef):
                             rendered_ref["workspace_id"] = str(ref.workspace_id)
-                            rendered_ref["workspace_relative_path"] = (
-                                ref.workspace_relative_path
-                            )
+                            rendered_ref["workspace_relative_path"] = ref.workspace_relative_path
                         else:
                             rendered_ref["device_id"] = str(ref.device_id)
                         delivery_refs.append(rendered_ref)
@@ -543,7 +591,8 @@ class ChatRuntime:
                     await self._cancel_turn(
                         state,
                         turn,
-                        [str(block["id"]) for block in tool_uses[index + 1 :]],
+                        outcome_unknown_tool_ids=[],
+                        cancelled_tool_ids=[str(block["id"]) for block in tool_uses[index + 1 :]],
                     )
                     return
 
@@ -619,7 +668,12 @@ class ChatRuntime:
                     await self._publish_turn_started(state, turn)
                     started = True
                     if await self._cancel_requested(turn.session_id):
-                        await self._cancel_turn(state, turn, [])
+                        await self._cancel_turn(
+                            state,
+                            turn,
+                            outcome_unknown_tool_ids=[],
+                            cancelled_tool_ids=[],
+                        )
                         return None
 
                     provider = await self._provider_for(prepared.config)
@@ -752,6 +806,7 @@ class ChatRuntime:
                 add_compaction_continuation=not pending_rows,
                 workspace_service=self.workspace_service,
                 skills_cache=self.skills_cache,
+                device_registry=self.device_registry,
             )
             prospective_messages.extend(
                 {
@@ -766,21 +821,25 @@ class ChatRuntime:
                 add_compaction_continuation=False,
             )
             user_id = session.user_id
-            device_targets: dict[str, UUID] = {
-                name: device_id
-                for name, device_id in (
+            device_rows = list(
+                (
                     await db.execute(
-                        select(Device.name, Device.id)
+                        select(Device.name, Device.id, Device.sandbox_mode)
                         .where(Device.user_id == user_id)
                         .order_by(Device.created_at, Device.id)
                     )
                 )
                 .tuples()
                 .all()
-            }
+            )
+            device_targets = {name: device_id for name, device_id, _ in device_rows}
+            trusted_device_names = [
+                name for name, _, sandbox_mode in device_rows if not sandbox_mode
+            ]
 
         registry_schemas = self.tool_registry.get_tool_schemas(
-            device_names=device_targets.keys()
+            device_names=device_targets.keys(),
+            trusted_device_names=trusted_device_names,
         )
 
         should_compact = False
@@ -853,6 +912,7 @@ class ChatRuntime:
                     config=config,
                     workspace_service=self.workspace_service,
                     skills_cache=self.skills_cache,
+                    device_registry=self.device_registry,
                 )
             await self._estimate_tokens(
                 system=system,
@@ -1072,13 +1132,16 @@ class ChatRuntime:
         self,
         state: _SessionState,
         turn: TurnStart,
-        remaining_tool_ids: list[str],
+        *,
+        outcome_unknown_tool_ids: list[str],
+        cancelled_tool_ids: list[str],
     ) -> None:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             result_rows, marker = await cancel_tool_batch(
                 db,
                 turn=turn,
-                remaining_tool_ids=remaining_tool_ids,
+                outcome_unknown_tool_ids=outcome_unknown_tool_ids,
+                cancelled_tool_ids=cancelled_tool_ids,
             )
         for row in result_rows:
             await self._publish_message(state, turn, row)

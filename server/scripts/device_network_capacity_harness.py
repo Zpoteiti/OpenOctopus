@@ -47,11 +47,13 @@ from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import Device, User
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.protocol import (
+    PROTOCOL_VERSION,
     DeviceCapabilities,
     HelloAckFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
+    ShellMetadata,
     ToolCallFrame,
     ToolResultFrame,
     TransferBeginFrame,
@@ -184,10 +186,21 @@ class _SourcePeer:
         self.transfer_bytes_received = 0
         self.send_lock = asyncio.Lock()
 
+    @staticmethod
+    def _hello_frame() -> HelloFrame:
+        return HelloFrame(
+            id=new_uuid7(),
+            version=PROTOCOL_VERSION,
+            client_version="capacity-source-peer",
+            os="linux",
+            caps=DeviceCapabilities(),
+            shells=ShellMetadata(default="sh", available=["sh"]),
+        )
+
     async def connect(self, base_url: str, timeout: float) -> None:
         url = base_url.replace("http://", "ws://", 1) + "/ws/device"
         self.websocket = await connect(url, additional_headers={"Authorization": f"Bearer {self.identity.token}"}, compression=None, max_size=_MAX_TEXT_FRAME_BYTES, open_timeout=timeout, close_timeout=timeout, ping_interval=None, proxy=None)
-        hello = HelloFrame(id=new_uuid7(), version="1", client_version="capacity-source-peer", os="linux", caps=DeviceCapabilities())
+        hello = self._hello_frame()
         await self.websocket.send(hello.model_dump_json())
         raw = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
         if not isinstance(raw, str):

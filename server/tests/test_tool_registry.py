@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
@@ -38,7 +39,12 @@ class _FakeDeviceRegistry:
         max_result_bytes: int,
         timeout_seconds: float,
         expected_device_name: str | None = None,
+        chat_session_id: UUID | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> ToolResultFrame:
+        del chat_session_id
+        if on_issued is not None:
+            on_issued()
         self.calls.append(
             {
                 "device_id": device_id,
@@ -270,7 +276,7 @@ async def test_registry_dispatches_non_server_routing_to_captured_owned_device()
             "user_id": user_id,
             "name": "echo",
             "args": {"value": "hello"},
-            "max_result_bytes": 100_096,
+            "max_result_bytes": 161_536,
             "timeout_seconds": 60.0,
             "expected_device_name": "laptop",
         }
@@ -313,7 +319,7 @@ async def test_registry_rechecks_live_device_identity_before_ws_io() -> None:
 
 
 def test_device_result_credit_covers_json_escaping_and_image_blocks() -> None:
-    assert _device_result_credit("echo", 16_000) == 100_096
+    assert _device_result_credit("echo", 16_000) == 161_536
     assert _device_result_credit("read_file", 128_000) == MAX_TEXT_FRAME_BYTES
 
 

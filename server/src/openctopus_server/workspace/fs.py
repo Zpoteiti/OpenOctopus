@@ -245,6 +245,7 @@ class WorkspaceFS:
         user_id: UUID,
         quota_bytes: int,
         mode: str,
+        on_issued: Callable[[], None] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         try:
             async with self._server_transfers.slot(user_id):
@@ -255,6 +256,7 @@ class WorkspaceFS:
                     destination_path,
                     quota_bytes=quota_bytes,
                     mode=mode,
+                    on_issued=on_issued,
                 )
         except AdmissionTimeoutError as exc:
             raise WorkspaceError(
@@ -271,6 +273,7 @@ class WorkspaceFS:
         *,
         quota_bytes: int,
         mode: str,
+        on_issued: Callable[[], None] | None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Stream one server workspace object through a temporary RustFS object."""
         if mode not in {"copy", "move"}:
@@ -301,6 +304,7 @@ class WorkspaceFS:
                     temporary_object,
                     size=transferred,
                     quota_bytes=quota_bytes,
+                    on_issued=on_issued,
                 )
             except UploadCommittedAfterCancellation:
                 # Publication is the irreversible success point. Continue to
@@ -617,6 +621,7 @@ class WorkspaceFS:
         *,
         size: int,
         quota_bytes: int,
+        on_issued: Callable[[], None] | None = None,
     ) -> FileMetadata:
         """Atomically publish a completed RustFS upload under a mutation lock."""
         if size < 0:
@@ -669,6 +674,8 @@ class WorkspaceFS:
                     ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
                     "Workspace quota would be exceeded",
                 )
+            if on_issued is not None:
+                on_issued()
             publish = asyncio.create_task(
                 self._storage.promote_if_absent(
                     temporary_object,

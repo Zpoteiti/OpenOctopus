@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import openctopus_server.chat.prompt as prompt_module
 from openctopus_server.chat.prompt import _load_skills, _parse_skill_header, build_system_prompt
-from openctopus_server.db.models import Session, User, Workspace, WorkspaceMember
+from openctopus_server.db.models import Device, Session, User, Workspace, WorkspaceMember
+from openctopus_server.devices.protocol import ShellMetadata
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import DirectoryEntry, DirectoryPage
@@ -77,6 +79,17 @@ class _PromptWorkspace:
         )
 
 
+class _PromptTransport:
+    async def send_text(self, payload: str) -> None:
+        del payload
+
+    async def send_binary(self, payload: bytes) -> None:
+        del payload
+
+    async def close(self, code: int, reason: str) -> None:
+        del code, reason
+
+
 async def test_prompt_loads_workspace_identity_memory_skills_and_shared_refs(pg_engine) -> None:
     user = User(
         id=uuid4(),
@@ -142,6 +155,173 @@ async def test_prompt_loads_workspace_identity_memory_skills_and_shared_refs(pg_
     cached_skills = skills_cache.get(user.id)
     assert cached_skills is not None
     assert next(skill for skill in cached_skills if skill.name == "research").body == ""
+
+
+async def test_prompt_describes_exec_only_for_trusted_devices(pg_engine) -> None:
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4()}@test.com",
+        password_hash="hash",
+        name="Alice",
+        is_admin=False,
+    )
+    session = Session(
+        id=uuid4(),
+        user_id=user.id,
+        session_key=f"web:{uuid4()}",
+        channel="web",
+        chat_id="chat-exec",
+        title="New chat",
+    )
+    sandbox_device = Device(
+        user_id=user.id,
+        name="sandbox-laptop",
+        token_hash=b"s" * 32,
+        token_hint="sandbox-token",
+        workspace_path="/sandbox/workspace",
+        sandbox_mode=True,
+        shell_timeout_max=600,
+    )
+    trusted_device = Device(
+        user_id=user.id,
+        name="trusted-laptop",
+        token_hash=b"t" * 32,
+        token_hint="trusted-token",
+        workspace_path="/trusted/workspace",
+        sandbox_mode=False,
+        shell_timeout_max=900,
+    )
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(user)
+        await db.flush()
+        db.add_all([session, sandbox_device, trusted_device])
+        await db.commit()
+
+        prompt = await build_system_prompt(db, session=session, user=user)
+
+    assert "server — OpenOctopus server tool target; exec: unavailable" in prompt
+    assert (
+        "sandbox-laptop — workspace_root: /sandbox/workspace; sandbox_mode: true; exec: unavailable"
+    ) in prompt
+    sandbox_line = next(
+        line for line in prompt.splitlines() if line.startswith("- sandbox-laptop ")
+    )
+    assert "exec: available" not in sandbox_line
+    assert "shell_timeout_max" not in sandbox_line
+    assert (
+        "trusted-laptop — workspace_root: /trusted/workspace; sandbox_mode: false; "
+        "exec: available; shell_timeout_max: 900 seconds"
+    ) in prompt
+    assert (
+        "Exec on trusted devices defaults to pipes; use tty=true for line-oriented "
+        "interaction. It runs with host OS privileges and is not an OS sandbox."
+    ) in prompt
+    assert "Prefer file tools for ordinary file reads and writes." in prompt
+    assert (
+        "For long-running commands, yield and then use list_exec_sessions or write_stdin "
+        "to poll."
+    ) in prompt
+    assert (
+        "After tool_execution_outcome_unknown, inspect the session or external state and "
+        "do not replay the command."
+    ) in prompt
+    assert (
+        "Never request or enter passwords, 2FA codes, or passphrases; ask the user to take over."
+    ) in prompt
+    assert "env_allowlist" not in prompt
+    assert str(trusted_device.id) not in prompt
+
+
+async def test_prompt_describes_only_live_trusted_device_shell_metadata(pg_engine) -> None:
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4()}@test.com",
+        password_hash="hash",
+        name="Alice",
+        is_admin=False,
+    )
+    session = Session(
+        id=uuid4(),
+        user_id=user.id,
+        session_key=f"web:{uuid4()}",
+        channel="web",
+        chat_id="chat-live-shells",
+        title="New chat",
+    )
+    trusted_device = Device(
+        user_id=user.id,
+        name="trusted-laptop",
+        token_hash=b"t" * 32,
+        token_hint="trusted-token",
+        workspace_path="/trusted/workspace",
+        sandbox_mode=False,
+        shell_timeout_max=900,
+    )
+    registry = DeviceRegistry()
+    old_handle = None
+    new_handle = None
+    try:
+        async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+            db.add(user)
+            await db.flush()
+            db.add_all([session, trusted_device])
+            await db.commit()
+
+            old_handle = await registry.register(
+                device_id=trusted_device.id,
+                user_id=user.id,
+                device_name=trusted_device.name,
+                transport=_PromptTransport(),
+                operating_system="linux",
+                shells=ShellMetadata(default="bash", available=["bash", "sh"]),
+            )
+            prompt = await build_system_prompt(
+                db,
+                session=session,
+                user=user,
+                device_registry=registry,
+            )
+
+        assert (
+            "trusted-laptop — workspace_root: /trusted/workspace; sandbox_mode: false; "
+            "exec: available; shell_timeout_max: 900 seconds; os: linux; "
+            "default_shell: bash; available_shells: bash, sh"
+        ) in prompt
+        assert str(trusted_device.id) not in prompt
+        assert "trusted-token" not in prompt
+
+        new_handle = await registry.register(
+            device_id=trusted_device.id,
+            user_id=user.id,
+            device_name=trusted_device.name,
+            transport=_PromptTransport(),
+            operating_system="darwin",
+            shells=ShellMetadata(default="zsh", available=["zsh", "bash", "sh"]),
+        )
+        prompt = await build_system_prompt(
+            db,
+            session=session,
+            user=user,
+            device_registry=registry,
+        )
+        assert "; os: darwin; default_shell: zsh; available_shells: zsh, bash, sh" in prompt
+        assert "; os: linux; default_shell: bash; available_shells: bash, sh" not in prompt
+
+        assert new_handle is not None
+        assert await registry.unregister(new_handle) is True
+        prompt = await build_system_prompt(
+            db,
+            session=session,
+            user=user,
+            device_registry=registry,
+        )
+        assert "default_shell:" not in prompt
+    finally:
+        if new_handle is not None:
+            await registry.unregister(new_handle)
+        elif old_handle is not None:
+            await registry.unregister(old_handle)
+        await registry.close()
 
 
 async def test_prompt_caps_optional_files_with_a_read_file_marker(pg_engine) -> None:

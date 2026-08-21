@@ -3,7 +3,7 @@ import json
 from collections import deque
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -12,12 +12,14 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 import openctopus_server.chat.runner as chat_runner
 from openctopus_server.admission import KeyedAdmission
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Device, Session, SystemConfig, TurnRun, User
+from openctopus_server.devices.protocol import ToolResultFrame
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.anthropic import (
@@ -29,7 +31,8 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
-from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.services import messages as message_service
+from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import ToolRegistry, build_py3_registry, build_py4_registry
 from openctopus_server.tools.result import UNTRUSTED_TOOL_RESULT_WARNING
@@ -147,6 +150,53 @@ class _ScriptedTool(Tool):
             return step.result
         finally:
             self.active -= 1
+
+
+class _ReadFileTool(_ScriptedTool):
+    def name(self) -> str:
+        return "read_file"
+
+
+class _ExecTool(_ScriptedTool):
+    routing_mode = ToolRoutingMode.CLIENT_ONLY
+
+    def name(self) -> str:
+        return "exec"
+
+
+class _SelfCancellingTool(_ScriptedTool):
+    def __init__(self, engine: AsyncEngine) -> None:
+        super().__init__([])
+        self.engine = engine
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        self.calls.append(str(args["value"]))
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            session = await db.get(Session, ctx.session_id)
+            assert session is not None and session.user_id == ctx.user_id
+            session.cancel_requested = True
+            await db.commit()
+        asyncio.get_running_loop().call_soon(
+            message_service._notify_cancel_waiters,
+            ctx.session_id,
+        )
+        return ToolResult(content="known result")
+
+
+@dataclass(slots=True)
+class _DeviceTransport:
+    sent: list[str] = field(default_factory=list)
+    sent_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.sent.append(payload)
+        self.sent_event.set()
+
+    async def send_binary(self, payload: bytes) -> None:
+        del payload
+
+    async def close(self, code: int, reason: str) -> None:
+        del code, reason
 
 
 class _CountingPromptWorkspace:
@@ -490,10 +540,10 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
 
         assert response.status_code == 200
         assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
-                "web_fetch",
-                "message",
-                "file_transfer",
-                "read_file",
+            "web_fetch",
+            "message",
+            "file_transfer",
+            "read_file",
             "write_file",
             "edit_file",
             "apply_patch",
@@ -559,6 +609,61 @@ async def test_provider_schema_includes_only_the_session_owners_paired_devices(
         assert schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
             "server",
             "owner-laptop",
+        ]
+    finally:
+        await runtime.close()
+
+
+async def test_sandbox_device_keeps_file_tools_but_not_exec(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        owner = await db.scalar(select(User).where(User.email == "user@test.com"))
+        assert owner is not None
+        db.add_all(
+            [
+                Device(
+                    user_id=owner.id,
+                    name="sandbox-laptop",
+                    token_hash=b"s" * 32,
+                    token_hint="sandbox-token",
+                    sandbox_mode=True,
+                ),
+                Device(
+                    user_id=owner.id,
+                    name="trusted-laptop",
+                    token_hash=b"t" * 32,
+                    token_hint="trusted-token",
+                    sandbox_mode=False,
+                ),
+            ]
+        )
+        await db.commit()
+
+    provider = _ScriptedProvider([_ProviderStep(content=[{"type": "text", "text": "done"}])])
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ReadFileTool([]), _ExecTool([]))),
+    )
+    test_app.state.chat_runtime = runtime
+    try:
+        response = await _post(user_client, uuid4(), "show my tools")
+
+        assert response.status_code == 200
+        schemas = {schema["name"]: schema for schema in provider.calls[0]["tools"]}
+        assert set(
+            schemas["read_file"]["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"]
+        ) == {
+            "server",
+            "sandbox-laptop",
+            "trusted-laptop",
+        }
+        assert schemas["exec"]["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
+            "trusted-laptop"
         ]
     finally:
         await runtime.close()
@@ -1432,7 +1537,9 @@ async def test_unexpected_tool_exception_repairs_ambiguous_dispatch_and_drains_p
         "human",
         "assistant",
     ]
-    assert history["messages"][2]["content"][0]["code"] == "server_restart"
+    assert history["messages"][2]["content"][0]["code"] == (
+        ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value
+    )
     assert history["status"] == "idle"
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         runs = list(
@@ -1522,6 +1629,75 @@ async def test_cancel_idle_is_noop(user_client, pg_engine):
         session = await db.get(Session, session_id)
     assert session is not None
     assert session.cancel_requested is False
+
+
+async def test_cancel_commit_notification_survives_caller_cancellation(
+    user_client,
+    pg_engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del user_client
+    session_id = uuid4()
+    now = datetime.now(UTC)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as setup_db:
+        user = (
+            await setup_db.execute(select(User).where(User.email == "user@test.com"))
+        ).scalar_one()
+        setup_db.add(
+            Session(
+                id=session_id,
+                user_id=user.id,
+                session_key=f"web:{session_id}",
+                channel="web",
+                chat_id=str(session_id),
+                title="New chat",
+                created_at=now,
+            )
+        )
+        setup_db.add(
+            TurnRun(
+                id=uuid4(),
+                session_id=session_id,
+                runner_instance_id=uuid4(),
+                status="running",
+                started_at=now,
+            )
+        )
+        await setup_db.commit()
+        user_id = user.id
+
+    commit_completed = asyncio.Event()
+    release_commit_return = asyncio.Event()
+    waiter = message_service.register_cancel_waiter(session_id)
+    try:
+        async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+            original_commit = db.commit
+
+            async def commit_then_pause() -> None:
+                await original_commit()
+                commit_completed.set()
+                await release_commit_return.wait()
+
+            monkeypatch.setattr(db, "commit", commit_then_pause)
+            cancel_task = asyncio.create_task(
+                message_service.request_cancel(
+                    db,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            )
+            await asyncio.wait_for(commit_completed.wait(), timeout=1)
+            cancel_task.cancel()
+            release_commit_return.set()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task
+
+        assert waiter.done()
+        async with AsyncSession(pg_engine, expire_on_commit=False) as verify_db:
+            session = await verify_db.get(Session, session_id)
+        assert session is not None and session.cancel_requested is True
+    finally:
+        message_service.discard_cancel_waiter(session_id, waiter)
 
 
 async def test_cancel_during_final_no_tools_normal_completion_wins(
@@ -1627,7 +1803,7 @@ async def test_cancel_before_tool_dispatch_synthesizes_all_results(
     assert history["messages"][-1]["content"] == [{"type": "text", "text": "[User pressed stop]"}]
 
 
-async def test_cancel_during_first_tool_preserves_it_and_skips_remaining(
+async def test_cancel_during_first_tool_stops_wait_and_marks_outcome_unknown(
     user_client,
     pg_engine,
     install_runtime,
@@ -1662,31 +1838,224 @@ async def test_cancel_during_first_tool_preserves_it_and_skips_remaining(
     await asyncio.wait_for(first_started.wait(), timeout=2)
     cancel = await user_client.post(f"/api/sessions/{session_id}/cancel")
     assert cancel.json() == {"cancel_requested": True}
-    release_first.set()
     response = await asyncio.wait_for(post_task, timeout=2)
 
     assert tool.calls == ["one"]
+    assert tool.active == 0
     assert len(provider.calls) == 1
     progress = [event for event in _events(response) if event["type"] == "tool_progress"]
     assert [(event["kind"], event["tool_call_id"]) for event in progress] == [
         ("tool_started", "tool-1"),
-        ("tool_finished", "tool-1"),
     ]
+    history = await _history(user_client, session_id)
+    assert [message["message_kind"] for message in history["messages"]] == [
+        "human",
+        "assistant",
+        "synthetic_tool_result",
+        "synthetic_tool_result",
+        "synthetic_tool_result",
+        "human",
+    ]
+    synthetic = history["messages"][2:5]
+    assert [message["content"][0]["tool_use_id"] for message in synthetic] == [
+        "tool-1",
+        "tool-2",
+        "tool-3",
+    ]
+    assert [message["content"][0]["code"] for message in synthetic] == [
+        ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value,
+        ErrorCode.USER_CANCELLED.value,
+        ErrorCode.USER_CANCELLED.value,
+    ]
+    release_first.set()
+
+
+async def test_known_tool_result_wins_same_tick_cancel(
+    user_client,
+    pg_engine,
+    install_runtime,
+):
+    await _configure_provider(pg_engine)
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[
+                    _tool_use("tool-1", "one"),
+                    _tool_use("tool-2", "two"),
+                ]
+            )
+        ]
+    )
+    tool = _SelfCancellingTool(pg_engine)
+    install_runtime(provider, tool)
+    session_id = uuid4()
+
+    await asyncio.wait_for(_post(user_client, session_id, "start"), timeout=2)
+
+    assert tool.calls == ["one"]
     history = await _history(user_client, session_id)
     assert [message["message_kind"] for message in history["messages"]] == [
         "human",
         "assistant",
         "tool_result",
         "synthetic_tool_result",
-        "synthetic_tool_result",
         "human",
     ]
     assert history["messages"][2]["content"][0]["tool_use_id"] == "tool-1"
-    assert [message["content"][0]["tool_use_id"] for message in history["messages"][3:5]] == [
-        "tool-2",
-        "tool-3",
-    ]
-    assert history["messages"][2]["content"][0]["content"] == [
-        {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-        {"type": "text", "text": "result-one"},
-    ]
+    assert history["messages"][3]["content"][0]["tool_use_id"] == "tool-2"
+    assert history["messages"][3]["content"][0]["code"] == ErrorCode.USER_CANCELLED.value
+
+
+async def test_cancel_during_device_preflight_marks_current_and_remaining_cancelled(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        owner = await db.scalar(select(User).where(User.email == "user@test.com"))
+        assert owner is not None
+        device = Device(
+            user_id=owner.id,
+            name="trusted-laptop",
+            token_hash=b"p" * 32,
+            token_hint="preflight-token",
+            sandbox_mode=False,
+        )
+        db.add(device)
+        await db.commit()
+        device_id = device.id
+
+    preflight_started = asyncio.Event()
+
+    async def block_preflight(user_id: UUID, name: str) -> UUID | None:
+        del user_id
+        assert name == "trusted-laptop"
+        preflight_started.set()
+        await asyncio.Event().wait()
+        return device_id
+
+    def exec_use(tool_id: str, command: str) -> dict[str, Any]:
+        return {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": "exec",
+            "input": {
+                "command": command,
+                DEVICE_FIELD_NAME: "trusted-laptop",
+            },
+        }
+
+    provider = _ScriptedProvider(
+        [_ProviderStep(content=[exec_use("exec-1", "echo one"), exec_use("exec-2", "echo two")])]
+    )
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry(
+            (_ExecTool([]),),
+            trusted_device_resolver=block_preflight,
+        ),
+    )
+    test_app.state.chat_runtime = runtime
+    session_id = uuid4()
+    try:
+        post_task = asyncio.create_task(_post(user_client, session_id, "start"))
+        await asyncio.wait_for(preflight_started.wait(), timeout=2)
+
+        cancel = await user_client.post(f"/api/sessions/{session_id}/cancel")
+        assert cancel.json() == {"cancel_requested": True}
+        response = await asyncio.wait_for(post_task, timeout=2)
+
+        assert [
+            event["status"] for event in _events(response) if event["type"] == "turn_finished"
+        ] == ["cancelled"]
+        history = await _history(user_client, session_id)
+        synthetic = history["messages"][2:4]
+        assert [message["content"][0]["tool_use_id"] for message in synthetic] == [
+            "exec-1",
+            "exec-2",
+        ]
+        assert all(
+            message["content"][0]["code"] == ErrorCode.USER_CANCELLED.value for message in synthetic
+        )
+    finally:
+        await runtime.close()
+
+
+async def test_cancel_after_device_issue_consumes_late_result_without_overwrite(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        owner = await db.scalar(select(User).where(User.email == "user@test.com"))
+        assert owner is not None
+        device = Device(
+            user_id=owner.id,
+            name="trusted-laptop",
+            token_hash=b"i" * 32,
+            token_hint="issued-token",
+            sandbox_mode=False,
+        )
+        db.add(device)
+        await db.commit()
+        device_id = device.id
+
+    transport = _DeviceTransport()
+    device_registry = DeviceRegistry()
+    handle = await device_registry.register(
+        device_id=device_id,
+        user_id=owner.id,
+        device_name="trusted-laptop",
+        transport=transport,
+    )
+    provider = _ScriptedProvider(
+        [
+            _ProviderStep(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "exec-1",
+                        "name": "exec",
+                        "input": {
+                            "command": "sleep 10",
+                            DEVICE_FIELD_NAME: "trusted-laptop",
+                        },
+                    }
+                ]
+            )
+        ]
+    )
+    runtime = ChatRuntime(
+        pg_engine,
+        provider_factory=lambda config: provider,
+        tool_registry=ToolRegistry((_ExecTool([]),)),
+        device_registry=device_registry,
+    )
+    test_app.state.chat_runtime = runtime
+    session_id = uuid4()
+    try:
+        post_task = asyncio.create_task(_post(user_client, session_id, "start"))
+        await asyncio.wait_for(transport.sent_event.wait(), timeout=2)
+        payload = json.loads(transport.sent[-1])
+
+        cancel = await user_client.post(f"/api/sessions/{session_id}/cancel")
+        assert cancel.json() == {"cancel_requested": True}
+        await asyncio.wait_for(post_task, timeout=2)
+        assert len(transport.sent) == 1
+
+        before = await _history(user_client, session_id)
+        synthetic = before["messages"][2]
+        assert synthetic["content"][0]["code"] == (ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value)
+        late = ToolResultFrame(
+            id=UUID(payload["id"]),
+            content="late success",
+            is_error=False,
+        )
+        assert await device_registry.resolve_tool_result(handle, late) is True
+        assert await _history(user_client, session_id) == before
+    finally:
+        await runtime.close()
+        await device_registry.unregister(handle)

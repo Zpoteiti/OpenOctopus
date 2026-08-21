@@ -375,13 +375,13 @@ async def test_restart_repair_preserves_real_results_and_inserts_only_missing_on
                 {
                     "type": "text",
                     "text": (
-                        "[server restart: tool was not executed because the OpenOctopus "
-                        "server restarted before completing this tool batch]"
+                        "[server restart: tool execution outcome is unknown because the "
+                        "OpenOctopus server restarted before recording its result]"
                     ),
                 }
             ],
             "is_error": True,
-            "code": "server_restart",
+            "code": "tool_execution_outcome_unknown",
         }
     ]
 

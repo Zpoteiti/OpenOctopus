@@ -5,6 +5,7 @@ import builtins
 import errno
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -19,6 +20,26 @@ from openoctopus_client.tools.common import ToolFailure, ToolOutput
 
 def _run(dispatcher: ClientToolDispatcher, name: str, **args: Any) -> ToolOutput:
     return asyncio.run(dispatcher.execute(name, args))
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
 
 
 def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> None:
@@ -70,7 +91,7 @@ def test_paths_reject_escape_and_symlink_traversal(tmp_path: Path) -> None:
     workspace.mkdir()
     outside.mkdir()
     (outside / "secret.txt").write_text("secret")
-    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    _make_directory_link(workspace / "link", outside)
     tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
 
     escaped = _run(tools, "read_file", path="../outside/secret.txt")
@@ -83,7 +104,7 @@ def test_workspace_root_and_nul_text_are_rejected(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     link = tmp_path / "workspace-link"
-    link.symlink_to(workspace, target_is_directory=True)
+    _make_directory_link(link, workspace)
     with pytest.raises(ToolFailure, match="symbolic link"):
         ClientToolDispatcher(link, sandbox_mode=True, ssrf_denylist=[])
 
@@ -331,11 +352,13 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
         tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         open_threads: list[int] = []
+        original_open = dispatcher_module._open_transfer_source
 
-        def tracked_open(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
+        def tracked_open(
+            path: Path, delete_access: bool = False
+        ) -> tuple[int, tuple[int, int, int, int, int]]:
             open_threads.append(threading.get_ident())
-            descriptor = os.open(path, os.O_RDONLY)
-            return descriptor, dispatcher_module._transfer_identity(os.fstat(descriptor))
+            return original_open(path, delete_access)
 
         monkeypatch.setattr(dispatcher_module, "_open_transfer_source", tracked_open)
         result = await tools.execute(
@@ -441,6 +464,8 @@ def test_regular_file_opens_request_nonblocking_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flags_seen: list[int] = []
+    nonblocking = int(getattr(os, "O_NONBLOCK", 0)) or 0x4000
+    monkeypatch.setattr(os, "O_NONBLOCK", nonblocking, raising=False)
 
     def reject_open(path: Path, flags: int, *args: object) -> int:
         del path, args
@@ -451,13 +476,15 @@ def test_regular_file_opens_request_nonblocking_mode(
     with pytest.raises(ToolFailure):
         dispatcher_module._read_regular_fd(tmp_path / "pipe", 100)
 
-    assert flags_seen[0] & int(getattr(os, "O_NONBLOCK", 0))
+    assert flags_seen[0] & nonblocking
 
 
 def test_transfer_source_open_requests_nonblocking_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flags_seen: list[int] = []
+    nonblocking = int(getattr(os, "O_NONBLOCK", 0)) or 0x4000
+    monkeypatch.setattr(os, "O_NONBLOCK", nonblocking, raising=False)
     source = tmp_path / "source.txt"
     source.write_text("payload", encoding="utf-8")
 
@@ -470,7 +497,7 @@ def test_transfer_source_open_requests_nonblocking_mode(
     with pytest.raises(ToolFailure):
         dispatcher_module._open_transfer_source(source)
 
-    assert flags_seen[0] & int(getattr(os, "O_NONBLOCK", 0))
+    assert flags_seen[0] & nonblocking
 
 
 def test_web_fetch_enforces_client_denylist_before_connecting(tmp_path: Path) -> None:

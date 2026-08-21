@@ -864,6 +864,7 @@ class WorkspaceService:
         src_path: str,
         dst_path: str,
         mode: str,
+        on_issued: Callable[[], None] | None = None,
     ) -> WorkspaceTransferResult:
         source = await self.authorize_transfer_source(db, user_id=user_id, path=src_path)
         destination = await self.authorize_transfer_destination(
@@ -885,6 +886,7 @@ class WorkspaceService:
                 user_id=user_id,
                 quota_bytes=destination.quota_bytes,
                 mode=mode,
+                on_issued=on_issued,
             )
             return WorkspaceTransferResult(transferred, digest, warnings)
         finally:

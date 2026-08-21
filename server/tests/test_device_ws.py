@@ -15,15 +15,17 @@ from openctopus_server.devices.protocol import (
     DeviceCapabilities,
     DeviceConfigFrame,
     HelloFrame,
+    ShellMetadata,
     new_uuid7,
 )
 from openctopus_server.devices.registry import (
     ConnectionHandle,
+    DeviceOutcomeUnknownError,
     DeviceRegistry,
     DeviceTransport,
     DeviceUnavailableError,
 )
-from openctopus_server.services.devices import DeviceSnapshot
+from openctopus_server.services.devices import DEFAULT_ENV_ALLOWLIST, DeviceSnapshot
 
 
 @dataclass
@@ -76,15 +78,16 @@ def _snapshot() -> DeviceSnapshot:
     )
 
 
-def _hello(*, version: str = "1") -> str:
+def _hello(*, version: str = "2") -> str:
     return json.dumps(
         {
             **HelloFrame(
                 id=new_uuid7(),
-                version="1",
+                version="2",
                 client_version="0.1.0",
                 os="linux",
                 caps=DeviceCapabilities(),
+                shells=ShellMetadata(default="bash", available=["bash", "sh"]),
             ).model_dump(mode="json"),
             "version": version,
         }
@@ -132,6 +135,8 @@ async def test_handshake_rechecks_token_registers_and_acks_only_active_config(
                 "workspace_path": "~/workspace",
                 "sandbox_mode": True,
                 "ssrf_denylist": ["127.0.0.0/8"],
+                "shell_timeout_max": 600,
+                "env_allowlist": list(DEFAULT_ENV_ALLOWLIST),
             },
         }
     ]
@@ -161,6 +166,7 @@ async def test_handshake_generation_is_not_routable_before_hello_ack_is_written(
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
 
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
+    assert await registry.get_live_metadata(snapshot.id, user_id=snapshot.user_id) is None
     with pytest.raises(DeviceUnavailableError):
         await registry.dispatch_tool(
             device_id=snapshot.id,
@@ -177,6 +183,11 @@ async def test_handshake_generation_is_not_routable_before_hello_ack_is_written(
             break
         await asyncio.sleep(0)
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is True
+    metadata = await registry.get_live_metadata(snapshot.id, user_id=snapshot.user_id)
+    assert metadata is not None
+    assert metadata.os == "linux"
+    assert metadata.default_shell == "bash"
+    assert metadata.available_shells == ("bash", "sh")
     disconnect.set()
     await asyncio.wait_for(serving, timeout=1)
 
@@ -199,6 +210,8 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
             transport: DeviceTransport,
             expected_revocation_epoch: int | None = None,
             ready: bool = True,
+            operating_system: str | None = None,
+            shells: ShellMetadata | None = None,
         ) -> ConnectionHandle | None:
             self.register_started.set()
             await self.release_register.wait()
@@ -209,6 +222,8 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
                 transport=transport,
                 expected_revocation_epoch=expected_revocation_epoch,
                 ready=ready,
+                operating_system=operating_system,
+                shells=shells,
             )
 
     snapshot = replace(_snapshot(), sandbox_mode=False)
@@ -286,13 +301,13 @@ async def test_revoked_token_between_hello_and_registration_is_rejected(
 async def test_version_mismatch_closes_with_4409(monkeypatch: Any) -> None:
     websocket = _FakeWebSocket(
         headers={"authorization": "Bearer token"},
-        incoming=[{"type": "websocket.receive", "text": _hello(version="2")}],
+        incoming=[{"type": "websocket.receive", "text": _hello(version="1")}],
     )
     monkeypatch.setattr(device_ws, "_find_device_by_token", AsyncMock(return_value=_snapshot()))
 
     await device_ws.serve_device_socket(websocket, DeviceRegistry(), object())  # type: ignore[arg-type]
 
-    assert websocket.closes == [(4409, '{"code":"version_unsupported","protocol_version":"1"}')]
+    assert websocket.closes == [(4409, '{"code":"version_unsupported","protocol_version":"2"}')]
 
 
 async def test_unknown_frame_gets_protocol_error(monkeypatch: Any) -> None:
@@ -376,5 +391,5 @@ async def test_heartbeat_sends_ping_and_closes_after_liveness_timeout() -> None:
     assert any(json.loads(payload)["type"] == "ping" for payload in websocket.sent)
     assert websocket.closes == [(4408, "")]
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DeviceOutcomeUnknownError):
         await pending

@@ -8,6 +8,8 @@ connection evidence run.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -16,7 +18,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from device_capacity_harness import HarnessConfig, run_harness  # noqa: E402
+from device_capacity_harness import (  # noqa: E402
+    HarnessConfig,
+    _SourceHarness,
+    run_harness,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OO_RUN_CAPACITY_HARNESS") != "1",
@@ -41,7 +47,7 @@ async def test_source_capacity_harness_smoke() -> None:
         )
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is True, json.dumps(result, indent=2, sort_keys=True)
     assert result["network_exercised"] is False
     assert result["transfers_exercised"] is False
     assert result["authenticated_connections"] == 8
@@ -71,3 +77,63 @@ async def test_source_capacity_harness_smoke() -> None:
         "queue_high_water_is_bounded": True,
         "rss_plateau": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_disconnect_probe_returns_when_dispatch_finishes_before_issue() -> None:
+    baseline_tasks = set(asyncio.all_tasks())
+    harness = _SourceHarness(
+        HarnessConfig(
+            connections=2,
+            users=2,
+            sessions=1,
+            queue_capacity=2,
+            pending_calls_per_user=2,
+            ping_interval_seconds=0.01,
+            liveness_timeout_seconds=0.05,
+        )
+    )
+    await harness.connect_all()
+    try:
+        assert await harness.registry.unregister(harness.handles[0]) is True
+        assert await asyncio.wait_for(harness.disconnect_pending_probe(), timeout=0.2) is False
+    finally:
+        await harness.close()
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() <= baseline_tasks
+
+
+@pytest.mark.asyncio
+async def test_disconnect_probe_timeout_cancels_unissued_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_tasks = set(asyncio.all_tasks())
+    harness = _SourceHarness(
+        HarnessConfig(
+            connections=2,
+            users=2,
+            sessions=1,
+            queue_capacity=2,
+            pending_calls_per_user=2,
+            ping_interval_seconds=0.01,
+            liveness_timeout_seconds=0.02,
+        )
+    )
+    stalled_tasks: list[asyncio.Task[None]] = []
+
+    async def stalled_dispatch(**_: object) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        stalled_tasks.append(task)
+        await asyncio.Future()
+
+    monkeypatch.setattr(harness, "_dispatch", stalled_dispatch)
+    try:
+        assert await asyncio.wait_for(harness.disconnect_pending_probe(), timeout=1.5) is False
+    finally:
+        for task in stalled_tasks:
+            task.cancel()
+        await asyncio.gather(*stalled_tasks, return_exceptions=True)
+        await harness.close()
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() <= baseline_tasks

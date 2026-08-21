@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -67,6 +68,32 @@ async def _wait_receiver_ready(manager: TransferManager, slot_id: UUID = SLOT) -
             return
         await asyncio.sleep(0.001)
     raise AssertionError(f"receiver slot {slot_id} did not become ready")
+
+
+async def _wait_slot_closed(manager: TransferManager, slot_id: UUID) -> None:
+    async with asyncio.timeout(5):
+        while manager.slot_state(slot_id) is not None:
+            await asyncio.sleep(0.001)
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
 
 
 def test_binary_header_is_exactly_bounded_and_uuidv7_checked() -> None:
@@ -466,7 +493,8 @@ def test_receive_file_commits_only_after_digest_and_cleans_temp(tmp_path: Path) 
                     sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 )
             )
-            await asyncio.sleep(0.05)
+            await _wait_slot_closed(manager, SLOT)
+            await writer.drain()
             assert (tmp_path / "nested/result.txt").read_bytes() == b"abc"
             assert not list((tmp_path / "nested").glob(".*.tmp"))
             frames = [json.loads(item) for item in socket.sent if isinstance(item, str)]
@@ -499,10 +527,8 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
             await manager.handle_control(
                 TransferEnd(id=SLOT, ack=False, ok=True, bytes_sent=3, sha256=digest_one)
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT)
+            await writer.drain()
             frames = [json.loads(item) for item in socket.sent if isinstance(item, str)]
             created_ack = next(
                 frame
@@ -529,10 +555,8 @@ def test_workspace_upload_create_and_conditional_overwrite_return_metadata(
             await manager.handle_control(
                 TransferEnd(id=SLOT_2, ack=False, ok=True, bytes_sent=3, sha256=digest_two)
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT_2)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -567,7 +591,11 @@ def test_workspace_upload_if_match_mismatch_does_not_write(tmp_path: Path) -> No
                     if_match="stale",
                 )
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -578,11 +606,33 @@ def test_workspace_upload_if_match_mismatch_does_not_write(tmp_path: Path) -> No
     assert frames[-1]["code"] == "workspace_file_changed"
 
 
-def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path) -> None:
+def test_workspace_upload_rechecks_symlinked_parent_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     parent = tmp_path / "nested"
     outside = tmp_path / "outside"
     parent.mkdir()
     outside.mkdir()
+    commit_check_started = threading.Event()
+    release_commit_check = threading.Event()
+    check_calls = 0
+    original_check = transfer_module._destination_parent_unchanged
+
+    def gated_parent_check(
+        paths: WorkspacePaths, path: str, destination: Path
+    ) -> bool:
+        nonlocal check_calls
+        check_calls += 1
+        if check_calls == 2:
+            commit_check_started.set()
+            assert release_commit_check.wait(timeout=5)
+        return original_check(paths, path, destination)
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_destination_parent_unchanged",
+        gated_parent_check,
+    )
 
     async def exercise() -> list[dict[str, object]]:
         manager, writer, socket, writer_task = await _manager(tmp_path)
@@ -598,16 +648,6 @@ def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path
             )
             await _wait_receiver_ready(manager)
             await manager.handle_binary(encode_binary_chunk(SLOT, b"abc"))
-            for _ in range(100):
-                if manager.slot_state(SLOT) is TransferState.STREAMING:
-                    break
-                await asyncio.sleep(0.001)
-            moved = tmp_path / "moved"
-            parent.rename(moved)
-            try:
-                parent.symlink_to(outside, target_is_directory=True)
-            except OSError:
-                pytest.skip("symbolic links are unavailable on this platform")
             await manager.handle_control(
                 TransferEnd(
                     id=SLOT,
@@ -617,9 +657,19 @@ def test_workspace_upload_rechecks_symlinked_parent_before_commit(tmp_path: Path
                     sha256=hashlib.sha256(b"abc").hexdigest(),
                 )
             )
-            await asyncio.sleep(0.03)
+            assert await asyncio.to_thread(commit_check_started.wait, 5)
+            moved = tmp_path / "moved"
+            parent.rename(moved)
+            _make_directory_link(parent, outside)
+            release_commit_check.set()
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
+            release_commit_check.set()
             await _stop(manager, writer, writer_task)
 
     frames = asyncio.run(exercise())
@@ -895,7 +945,11 @@ def test_receive_rejects_existing_destination_and_unknown_binary_slot(tmp_path: 
                     if_none_match=True,
                 )
             )
-            await asyncio.sleep(0.01)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             frame = next(json.loads(item) for item in socket.sent if isinstance(item, str))
             assert frame["type"] == "transfer_end"
             assert frame["ack"] is False
@@ -925,7 +979,11 @@ def test_file_transfer_never_overwrites_existing_destination(tmp_path: Path) -> 
                     total_bytes=3,
                 )
             )
-            await asyncio.sleep(0.01)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -992,6 +1050,114 @@ def test_receive_rechecks_destination_before_exposing_completed_file(
     assert frames[-1]["ack"] is True
 
 
+def test_receive_rejects_same_size_temp_change_after_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "result.txt"
+    original_identity_after_close = transfer_module._identity_after_close
+
+    def change_before_identity_check(
+        path: Path,
+        open_identity: tuple[int, int, int, int, int],
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> tuple[int, int, int, int, int]:
+        path.write_bytes(b"xyz")
+        info = path.stat()
+        os.utime(
+            path,
+            ns=(info.st_atime_ns, open_identity[3] + 1_000_000_000),
+        )
+        return original_identity_after_close(
+            path,
+            open_identity,
+            expected_bytes,
+            expected_sha256,
+        )
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_identity_after_close",
+        change_before_identity_check,
+    )
+
+    async def exercise() -> list[dict[str, object]]:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.txt",
+                    dst_path="result.txt",
+                    total_bytes=3,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"abc"))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=3,
+                    sha256=hashlib.sha256(b"abc").hexdigest(),
+                )
+            )
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
+            return [json.loads(item) for item in socket.sent if isinstance(item, str)]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    frames = asyncio.run(exercise())
+    assert target.exists() is False
+    assert frames[-1]["code"] == "workspace_file_changed"
+
+
+def test_closed_temp_recheck_accepts_timestamp_skew_when_payload_matches(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / "temporary.bin"
+    payload = b"abc"
+    temporary.write_bytes(payload)
+    open_identity = transfer_module._identity(temporary.stat())
+    info = temporary.stat()
+    os.utime(
+        temporary,
+        ns=(info.st_atime_ns, open_identity[3] + 1_000_000_000),
+    )
+
+    closed_identity = transfer_module._identity_after_close(
+        temporary,
+        open_identity,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert closed_identity == transfer_module._identity(temporary.stat())
+
+
+def test_source_unchanged_accepts_path_ctime_skew_with_stable_open_handle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    descriptor = os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    initial = (1, 2, 7, 4, 5)
+    identities = iter((initial, (1, 2, 7, 4, 6)))
+    monkeypatch.setattr(transfer_module, "_identity", lambda _info: next(identities))
+
+    try:
+        assert transfer_module._source_unchanged(source, descriptor, initial)
+    finally:
+        os.close(descriptor)
+
+
 def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"x" * (64 * 1024 + 7))
@@ -1002,7 +1168,12 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
             await manager.handle_control(
                 TransferRequest(id=SLOT, purpose="http_relay", src_path="source.bin")
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.slot_state(SLOT) is TransferState.BEGUN:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.slot_state(SLOT) is TransferState.BEGUN
+            await writer.drain()
             assert not any(isinstance(item, bytes) for item in socket.sent)
             begin = next(
                 json.loads(item)
@@ -1022,11 +1193,15 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
             binary = [item for item in socket.sent if isinstance(item, bytes)]
             assert binary
             assert all(len(item) <= 16 + 64 * 1024 for item in binary)
-            end = next(
+            ends = [
                 json.loads(item)
                 for item in socket.sent
                 if isinstance(item, str) and json.loads(item)["type"] == "transfer_end"
-            )
+            ]
+            assert ends and ends[-1].get("ok") is True, [
+                item.get("code") for item in ends
+            ]
+            end = ends[-1]
             await manager.handle_control(
                 TransferEnd(
                     id=SLOT,
@@ -1036,7 +1211,10 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
                     sha256=end["sha256"],
                 )
             )
-            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
             assert manager.active_count == 0
         finally:
             await _stop(manager, writer, writer_task)
@@ -1304,7 +1482,12 @@ def test_empty_chunks_do_not_extend_receiver_idle_deadline(tmp_path: Path) -> No
                     break
                 await manager.handle_binary(encode_binary_chunk(SLOT, b""))
                 await asyncio.sleep(0.015)
-            await asyncio.sleep(0.03)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.active_count == 0
+            await writer.drain()
             assert not (tmp_path / "empty.txt").exists()
             ends = [
                 json.loads(item)
@@ -1336,7 +1519,12 @@ def test_receiver_end_wakes_empty_stream_and_commits_zero_byte_file(tmp_path: Pa
             await manager.handle_control(
                 TransferEnd(id=SLOT, ack=False, ok=True, bytes_sent=0, sha256=digest)
             )
-            await asyncio.sleep(0.03)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            assert manager.active_count == 0
+            await writer.drain()
             assert (tmp_path / "empty.txt").read_bytes() == b""
             assert any(
                 isinstance(item, str)

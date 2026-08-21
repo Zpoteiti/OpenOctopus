@@ -216,7 +216,11 @@ def main() -> int:
         version_durations: list[float] = []
         for _ in range(VERSION_RUNS):
             result, elapsed, _ = _run(binary, "version", psutil=psutil)
-            if result.returncode != 0 or result.stdout != "0.0.1\n" or result.stderr:
+            if (
+                result.returncode != 0
+                or result.stdout not in {"0.0.1\n", "0.0.1\r\n"}
+                or result.stderr
+            ):
                 raise SmokeError(
                     f"version failed: stdout={result.stdout!r}; stderr={result.stderr!r}"
                 )

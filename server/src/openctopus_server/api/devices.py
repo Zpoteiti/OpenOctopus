@@ -51,6 +51,8 @@ async def create_device(
         workspace_path=body.workspace_path,
         sandbox_mode=body.sandbox_mode,
         ssrf_denylist=body.ssrf_denylist,
+        shell_timeout_max=body.shell_timeout_max,
+        env_allowlist=body.env_allowlist,
     )
     return DeviceTokenResponse(token=token, device=await _response(snapshot, registry))
 
@@ -65,20 +67,78 @@ async def patch_device(
 ) -> DeviceResponse:
     patch = body or DevicePatchRequest()
     async with _config_update_guard(registry, user.id, name):
+        transition = asyncio.create_task(
+            _patch_and_activate(
+                db,
+                registry,
+                user_id=user.id,
+                name=name,
+                patch=patch,
+            )
+        )
+        snapshot = await await_future_cancellation_safe(transition)
+    return await _response(snapshot, registry)
+
+
+async def _patch_and_activate(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    user_id: UUID,
+    name: str,
+    patch: DevicePatchRequest,
+) -> devices.DeviceSnapshot:
+    policy_fields = {
+        "workspace_path",
+        "sandbox_mode",
+        "shell_timeout_max",
+        "env_allowlist",
+    }
+    fenced_device_id: UUID | None = None
+    fence_installed = False
+    if patch.model_fields_set & policy_fields:
+        fenced_device_id = await devices.owned_id(db, user_id=user_id, name=name)
+        if fenced_device_id is not None:
+            fence_installed = await registry.begin_config_update(
+                device_id=fenced_device_id,
+                user_id=user_id,
+            )
+    try:
         snapshot = await devices.patch(
             db,
-            user_id=user.id,
+            user_id=user_id,
             name=name,
             fields=set(patch.model_fields_set),
             new_name=patch.name,
             workspace_path=patch.workspace_path,
             sandbox_mode=patch.sandbox_mode,
             ssrf_denylist=patch.ssrf_denylist,
+            shell_timeout_max=patch.shell_timeout_max,
+            env_allowlist=patch.env_allowlist,
         )
-        if patch.model_fields_set:
-            # The commit above ended the DB transaction.  Close the session
-            # before any potentially slow device transport await.
+    except devices.DevicePatchCommitOutcomeUnknownError as exc:
+        try:
             await db.close()
+        finally:
+            await registry.retire_config_update(
+                device_id=exc.device_id,
+                user_id=user_id,
+            )
+        raise exc.cause
+    except BaseException:
+        if fence_installed and fenced_device_id is not None:
+            await registry.abort_config_update(
+                device_id=fenced_device_id,
+                user_id=user_id,
+            )
+        raise
+    if patch.model_fields_set:
+        # The commit above ended the DB transaction. Close the session before
+        # any potentially slow device transport await. The committed policy
+        # fence must still be activated if session cleanup fails.
+        try:
+            await db.close()
+        finally:
             await registry.push_config(
                 device_id=snapshot.id,
                 user_id=snapshot.user_id,
@@ -87,9 +147,11 @@ async def patch_device(
                     workspace_path=snapshot.workspace_path,
                     sandbox_mode=snapshot.sandbox_mode,
                     ssrf_denylist=snapshot.ssrf_denylist,
+                    shell_timeout_max=snapshot.shell_timeout_max,
+                    env_allowlist=snapshot.env_allowlist,
                 ),
             )
-    return await _response(snapshot, registry)
+    return snapshot
 
 
 @router.post("/{name}/regenerate-token", response_model=DeviceTokenResponse)
@@ -138,6 +200,8 @@ async def _response(snapshot: devices.DeviceSnapshot, registry: DeviceRegistry) 
         workspace_path=snapshot.workspace_path,
         sandbox_mode=snapshot.sandbox_mode,
         ssrf_denylist=snapshot.ssrf_denylist,
+        shell_timeout_max=snapshot.shell_timeout_max,
+        env_allowlist=snapshot.env_allowlist,
         online=await registry.is_online(snapshot.id, user_id=snapshot.user_id),
         created_at=snapshot.created_at,
     )

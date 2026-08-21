@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -14,6 +14,7 @@ from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
     ConfigUpdateFrame,
     DeviceConfigFrame,
+    ShellMetadata,
     ToolCallFrame,
     ToolResultFrame,
     new_uuid7,
@@ -29,6 +30,10 @@ class DeviceUnavailableError(RuntimeError):
     pass
 
 
+class DeviceOutcomeUnknownError(RuntimeError):
+    """A call may have reached the device, but its result is not known."""
+
+
 class DeviceBusyError(RuntimeError):
     pass
 
@@ -38,8 +43,6 @@ class DeviceProtocolError(RuntimeError):
 
 
 UNAUTHORIZED_CLOSE_REASON = '{"code":"unauthorized"}'
-_EXPIRED_CALL_TOMBSTONE_MAX_ENTRIES = 4096
-_EXPIRED_CALL_TOMBSTONE_TTL_SECONDS = 300.0
 
 
 class DeviceTransport(Protocol):
@@ -63,19 +66,28 @@ class DeviceRouteSnapshot:
     device_name: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceLiveMetadata:
+    os: str
+    default_shell: str
+    available_shells: tuple[str, ...]
+
+
 @dataclass(slots=True)
 class _Connection:
     handle: ConnectionHandle
     user_id: UUID
     device_name: str
     transport: DeviceTransport
+    operating_system: str | None = None
+    default_shell: str | None = None
+    available_shells: tuple[str, ...] | None = None
     last_pong: float = field(default_factory=time.monotonic)
     expected_pong: UUID | None = None
     ready: bool = True
     config_epoch: int = 0
     config_update_in_flight: str | None = None
     pending: dict[UUID, _PendingCall] = field(default_factory=dict)
-    expired_calls: OrderedDict[UUID, float] = field(default_factory=OrderedDict)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -85,6 +97,8 @@ class _PendingCall:
     future: asyncio.Future[ToolResultFrame]
     byte_weight: int
     max_result_bytes: int
+    issued: bool = False
+    expired: bool = False
 
 
 @dataclass(slots=True)
@@ -159,6 +173,8 @@ class DeviceRegistry:
         transport: DeviceTransport,
         expected_revocation_epoch: int | None = None,
         ready: bool = True,
+        operating_system: str | None = None,
+        shells: ShellMetadata | None = None,
     ) -> ConnectionHandle | None:
         async with self._register_lock:
             async with self._lock:
@@ -175,6 +191,8 @@ class DeviceRegistry:
                             transport=transport,
                             expected_revocation_epoch=expected_revocation_epoch,
                             ready=ready,
+                            operating_system=operating_system,
+                            shells=shells,
                         )
             else:
                 result = await self._publish_registration(
@@ -184,6 +202,8 @@ class DeviceRegistry:
                     transport=transport,
                     expected_revocation_epoch=expected_revocation_epoch,
                     ready=ready,
+                    operating_system=operating_system,
+                    shells=shells,
                 )
             if result is None:
                 return None
@@ -217,14 +237,13 @@ class DeviceRegistry:
         transport: DeviceTransport,
         expected_revocation_epoch: int | None,
         ready: bool,
+        operating_system: str | None,
+        shells: ShellMetadata | None,
     ) -> tuple[ConnectionHandle, _Connection | None] | None:
         async with self._lock:
-            if (
-                self._closed
-                or (
-                    expected_revocation_epoch is not None
-                    and self._revocation_epoch_locked(device_id) != expected_revocation_epoch
-                )
+            if self._closed or (
+                expected_revocation_epoch is not None
+                and self._revocation_epoch_locked(device_id) != expected_revocation_epoch
             ):
                 return None
             generation = self._generations.get(device_id, 0) + 1
@@ -235,6 +254,9 @@ class DeviceRegistry:
                 user_id=user_id,
                 device_name=device_name,
                 transport=transport,
+                operating_system=operating_system,
+                default_shell=shells.default if shells is not None else None,
+                available_shells=tuple(shells.available) if shells is not None else None,
                 ready=ready,
             )
             previous = self._connections.get(device_id)
@@ -242,6 +264,31 @@ class DeviceRegistry:
             if previous is not None:
                 self.transfers.fence_handle(previous.handle)
             return handle, previous
+
+    async def get_live_metadata(
+        self,
+        device_id: UUID,
+        *,
+        user_id: UUID,
+    ) -> DeviceLiveMetadata | None:
+        """Return hello metadata only for the current ready generation."""
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if (
+                self._closed
+                or connection is None
+                or not connection.ready
+                or connection.user_id != user_id
+                or connection.operating_system is None
+                or connection.default_shell is None
+                or connection.available_shells is None
+            ):
+                return None
+            return DeviceLiveMetadata(
+                os=connection.operating_system,
+                default_shell=connection.default_shell,
+                available_shells=connection.available_shells,
+            )
 
     async def activate(self, handle: ConnectionHandle, payload: str) -> bool:
         """Write ``hello_ack`` before making a handshake generation routable."""
@@ -509,6 +556,8 @@ class DeviceRegistry:
         max_result_bytes: int,
         timeout_seconds: float,
         expected_device_name: str | None = None,
+        chat_session_id: UUID | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> ToolResultFrame:
         return await self._dispatch_tool(
             device_id=device_id,
@@ -519,6 +568,8 @@ class DeviceRegistry:
             timeout_seconds=timeout_seconds,
             expected_device_name=expected_device_name,
             route=None,
+            chat_session_id=chat_session_id,
+            on_issued=on_issued,
         )
 
     async def dispatch_tool_on_snapshot(
@@ -531,6 +582,8 @@ class DeviceRegistry:
         args: dict[str, object],
         max_result_bytes: int,
         timeout_seconds: float,
+        chat_session_id: UUID | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> ToolResultFrame:
         """Dispatch one private operation only through a captured route/config."""
         return await self._dispatch_tool(
@@ -542,6 +595,8 @@ class DeviceRegistry:
             timeout_seconds=timeout_seconds,
             expected_device_name=expected_device_name,
             route=route,
+            chat_session_id=chat_session_id,
+            on_issued=on_issued,
         )
 
     async def _dispatch_tool(
@@ -555,6 +610,8 @@ class DeviceRegistry:
         timeout_seconds: float,
         expected_device_name: str | None,
         route: DeviceRouteSnapshot | None,
+        chat_session_id: UUID | None,
+        on_issued: Callable[[], None] | None,
     ) -> ToolResultFrame:
         call_id = new_uuid7()
         future = asyncio.get_running_loop().create_future()
@@ -563,6 +620,7 @@ class DeviceRegistry:
             name=name,
             args=args,
             max_result_bytes=max_result_bytes,
+            chat_session_id=chat_session_id,
         )
         payload = frame.model_dump_json()
         if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
@@ -603,6 +661,8 @@ class DeviceRegistry:
                 payload,
                 expected_device_name=expected_device_name,
                 expected_config_epoch=(route.config_epoch if route is not None else None),
+                issued_call_id=call_id,
+                on_issued=on_issued,
             )
         except asyncio.CancelledError:
             await self._remove_pending(handle, call_id, future, remember_expired=True)
@@ -611,14 +671,17 @@ class DeviceRegistry:
             await self.unregister(handle)
             if future.done() and not future.cancelled():
                 future.exception()
-            raise DeviceUnavailableError("Device connection failed") from exc
+            raise DeviceOutcomeUnknownError("Device call outcome is unknown") from exc
         if not sent:
             await self._remove_pending(handle, call_id, future)
             raise DeviceUnavailableError("Device connection was replaced")
 
         try:
-            async with asyncio.timeout(timeout_seconds):
-                return await asyncio.shield(future)
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    return await asyncio.shield(future)
+            except TimeoutError as exc:
+                raise DeviceOutcomeUnknownError("Device call outcome is unknown") from exc
         finally:
             await self._remove_pending(handle, call_id, future, remember_expired=True)
 
@@ -638,7 +701,6 @@ class DeviceRegistry:
                 or connection.handle != handle
             ):
                 return False
-            self._expire_call_tombstones_locked(connection)
             pending = connection.pending.get(result.id)
             if pending is not None:
                 result_bytes = encoded_bytes
@@ -647,11 +709,12 @@ class DeviceRegistry:
                 if result_bytes > pending.max_result_bytes:
                     raise DeviceProtocolError("Tool result exceeded its reserved response credit")
                 connection.pending.pop(result.id)
-            if pending is not None:
                 self._release_pending_locked(connection.user_id, pending.byte_weight)
-            elif result.id in connection.expired_calls:
-                return True
-        if pending is None or pending.future.done():
+                if pending.expired:
+                    return True
+            else:
+                return False
+        if pending.future.done():
             return False
         pending.future.set_result(result)
         return True
@@ -663,6 +726,8 @@ class DeviceRegistry:
         *,
         expected_device_name: str | None = None,
         expected_config_epoch: int | None = None,
+        issued_call_id: UUID | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> bool:
         """Send only while ``handle`` remains the current device generation."""
         async with self._lock:
@@ -671,18 +736,58 @@ class DeviceRegistry:
                 return False
         try:
             async with connection.send_lock:
-                if not await self._can_send(
-                    connection,
-                    handle,
-                    expected_device_name=expected_device_name,
-                    expected_config_epoch=expected_config_epoch,
-                ):
-                    return False
+                if issued_call_id is not None:
+                    if not await self._mark_call_issued(
+                        connection,
+                        handle,
+                        issued_call_id,
+                        expected_device_name=expected_device_name,
+                        expected_config_epoch=expected_config_epoch,
+                        on_issued=on_issued,
+                    ):
+                        return False
+                else:
+                    if not await self._can_send(
+                        connection,
+                        handle,
+                        expected_device_name=expected_device_name,
+                        expected_config_epoch=expected_config_epoch,
+                    ):
+                        return False
+                    if on_issued is not None:
+                        on_issued()
                 await connection.transport.send_text(payload)
         except Exception:
             self._schedule_unregister(handle)
             raise
         return True
+
+    async def _mark_call_issued(
+        self,
+        connection: _Connection,
+        handle: ConnectionHandle,
+        call_id: UUID,
+        *,
+        expected_device_name: str | None,
+        expected_config_epoch: int | None,
+        on_issued: Callable[[], None] | None,
+    ) -> bool:
+        async with self._lock:
+            pending = connection.pending.get(call_id)
+            if (
+                not self._can_send_locked(
+                    connection,
+                    handle,
+                    expected_device_name=expected_device_name,
+                    expected_config_epoch=expected_config_epoch,
+                )
+                or pending is None
+            ):
+                return False
+            pending.issued = True
+            if on_issued is not None:
+                on_issued()
+            return True
 
     async def _can_send(
         self,
@@ -693,24 +798,36 @@ class DeviceRegistry:
         expected_config_epoch: int | None = None,
     ) -> bool:
         async with self._lock:
-            current = self._connections.get(handle.device_id)
-            return not (
-                self._closed
-                or current is not connection
-                or not current.ready
-                or current.handle != handle
-                or (
-                    expected_config_epoch is not None
-                    and current.config_epoch != expected_config_epoch
-                )
-                or (
-                    expected_device_name is not None
-                    and (
-                        current.device_name != expected_device_name
-                        or current.config_update_in_flight is not None
-                    )
+            return self._can_send_locked(
+                connection,
+                handle,
+                expected_device_name=expected_device_name,
+                expected_config_epoch=expected_config_epoch,
+            )
+
+    def _can_send_locked(
+        self,
+        connection: _Connection,
+        handle: ConnectionHandle,
+        *,
+        expected_device_name: str | None,
+        expected_config_epoch: int | None,
+    ) -> bool:
+        current = self._connections.get(handle.device_id)
+        return not (
+            self._closed
+            or current is not connection
+            or not current.ready
+            or current.handle != handle
+            or (expected_config_epoch is not None and current.config_epoch != expected_config_epoch)
+            or (
+                expected_device_name is not None
+                and (
+                    current.device_name != expected_device_name
+                    or current.config_update_in_flight is not None
                 )
             )
+        )
 
     async def send_binary(
         self,
@@ -798,14 +915,15 @@ class DeviceRegistry:
                 current = self._connections.get(device_id)
                 if current is not connection or current.handle != handle:
                     return False
-                connection.config_update_in_flight = device_name
+                if connection.config_update_in_flight is None:
+                    connection.config_update_in_flight = device_name
             async with connection.send_lock:
                 async with self._lock:
                     current = self._connections.get(device_id)
                     if (
                         current is not connection
                         or current.handle != handle
-                        or connection.config_update_in_flight != device_name
+                        or connection.config_update_in_flight is None
                     ):
                         return False
                 await connection.transport.send_text(frame.model_dump_json())
@@ -814,7 +932,7 @@ class DeviceRegistry:
                     if (
                         current is not connection
                         or current.handle != handle
-                        or connection.config_update_in_flight != device_name
+                        or connection.config_update_in_flight is None
                     ):
                         return False
                     previous_route = DeviceRouteSnapshot(
@@ -827,9 +945,7 @@ class DeviceRegistry:
                     connection.config_epoch += 1
                     connection.config_update_in_flight = None
         except asyncio.CancelledError:
-            cleanup = asyncio.create_task(
-                self._retire_ambiguous_config(connection, handle)
-            )
+            cleanup = asyncio.create_task(self._retire_ambiguous_config(connection, handle))
             try:
                 await await_future_cancellation_safe(cleanup)
             except asyncio.CancelledError:
@@ -839,6 +955,47 @@ class DeviceRegistry:
             await self._retire_ambiguous_config(connection, handle)
             return False
         return True
+
+    async def begin_config_update(
+        self,
+        *,
+        device_id: UUID,
+        user_id: UUID,
+    ) -> bool:
+        """Fence new tool calls before the corresponding DB policy commit."""
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if (
+                self._closed
+                or connection is None
+                or not connection.ready
+                or connection.user_id != user_id
+            ):
+                return False
+            if connection.config_update_in_flight is not None:
+                raise DeviceBusyError("Device configuration is already updating")
+            connection.config_update_in_flight = "__precommit__"
+            return True
+
+    async def abort_config_update(self, *, device_id: UUID, user_id: UUID) -> None:
+        """Release a pre-commit fence when the database mutation rolls back."""
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if connection is not None and connection.user_id == user_id:
+                if connection.config_update_in_flight == "__precommit__":
+                    connection.config_update_in_flight = None
+
+    async def retire_config_update(self, *, device_id: UUID, user_id: UUID) -> None:
+        """Retire a fenced generation when the policy commit outcome is unknown."""
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if (
+                connection is None
+                or connection.user_id != user_id
+            ):
+                return
+            handle = connection.handle
+        await self._retire_ambiguous_config(connection, handle)
 
     async def mark_pong(
         self,
@@ -893,7 +1050,10 @@ class DeviceRegistry:
                                 self._connections.pop(connection.handle.device_id)
         await self.transfers.close()
         await asyncio.gather(
-            *(self._retire(connection, close_code=1001, close_reason="server_shutdown") for connection in connections),
+            *(
+                self._retire(connection, close_code=1001, close_reason="server_shutdown")
+                for connection in connections
+            ),
             return_exceptions=True,
         )
         cleanup_tasks = tuple(self._cleanup_tasks)
@@ -914,10 +1074,11 @@ class DeviceRegistry:
             if connection is not None and connection.handle == handle:
                 current = connection.pending.get(call_id)
                 if current is not None and current.future is future:
-                    connection.pending.pop(call_id)
-                    self._release_pending_locked(connection.user_id, current.byte_weight)
-                    if remember_expired:
-                        self._remember_expired_call_locked(connection, call_id)
+                    if remember_expired and current.issued:
+                        current.expired = True
+                    else:
+                        connection.pending.pop(call_id)
+                        self._release_pending_locked(connection.user_id, current.byte_weight)
         if not future.done():
             future.cancel()
 
@@ -1010,7 +1171,12 @@ class DeviceRegistry:
                 self._release_pending_locked(connection.user_id, call.byte_weight)
         for future in pending:
             if not future.future.done():
-                future.future.set_exception(DeviceUnavailableError("Device disconnected"))
+                error: Exception
+                if future.issued:
+                    error = DeviceOutcomeUnknownError("Device call outcome is unknown")
+                else:
+                    error = DeviceUnavailableError("Device disconnected")
+                future.future.set_exception(error)
         if close_code is not None:
             try:
                 await connection.transport.close(close_code, close_reason)
@@ -1044,23 +1210,6 @@ class DeviceRegistry:
         usage.bytes -= byte_weight
         if usage.calls == 0:
             self._pending_by_user.pop(user_id)
-
-    def _remember_expired_call_locked(self, connection: _Connection, call_id: UUID) -> None:
-        self._expire_call_tombstones_locked(connection)
-        connection.expired_calls[call_id] = (
-            time.monotonic() + _EXPIRED_CALL_TOMBSTONE_TTL_SECONDS
-        )
-        connection.expired_calls.move_to_end(call_id)
-        while len(connection.expired_calls) > _EXPIRED_CALL_TOMBSTONE_MAX_ENTRIES:
-            connection.expired_calls.popitem(last=False)
-
-    @staticmethod
-    def _expire_call_tombstones_locked(connection: _Connection) -> None:
-        now = time.monotonic()
-        for call_id, expires_at in tuple(connection.expired_calls.items()):
-            if expires_at > now:
-                break
-            connection.expired_calls.pop(call_id, None)
 
     def _revocation_epoch_locked(self, device_id: UUID) -> int:
         now = time.monotonic()

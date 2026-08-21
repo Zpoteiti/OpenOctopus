@@ -170,8 +170,15 @@ old POST stream.
 ### ADR-014 · Crash recovery is passive — JIT repair at iteration start
 
 **Status:** accepted
+**Py6 clarification:** ADR-132 supersedes the old claim that an unpaired call
+was not executed. Without durable transport proof after a server crash, repair
+inserts `tool_execution_outcome_unknown`; it never invites an automatic replay.
 **Context:** If the server crashes mid-turn, DB may have an assistant message with unpaired `tool_use` blocks. Most LLM APIs reject history with unpaired tool_use, so the next call would fail.
-**Decision:** On every agent-loop iteration, before building context, scan the tail of history for unpaired `tool_use` blocks. For each missing result, insert a synthetic `tool_result` with `is_error=true`, `code="server_restart"`, and server-authored diagnostic text `[server restart: tool was not executed because the OpenOctopus server restarted before completing this tool batch]` in the normalized content-block array. Then proceed.
+**Decision:** On every agent-loop iteration, before building context, scan the
+tail of history for unpaired `tool_use` blocks. For each missing result, insert
+a synthetic `tool_result` with `is_error=true`,
+`code="tool_execution_outcome_unknown"`, and server-authored diagnostic text
+that the server restarted before recording the result. Then proceed.
 **Consequences:** No startup scan, no background worker. Dormant sessions stay dormant. When a session's next inbound message arrives, the repair runs as a no-op-unless-needed pre-pass. Covers crashes AND user-initiated cancellation (ADR-039). Partial completions (1 of 3 tool_uses completed) preserve the successful ones.
 
 ---
@@ -503,13 +510,12 @@ ADR-019.
 ### ADR-031 · Tool failures propagate as `tool_result` error content
 
 **Status:** accepted
-**Decision:** All tool failures (timeout, permission, bad args, panic) return a `tool_result` block with `is_error: true` and explanatory content. The agent observes the error in the next iteration and decides recovery. The loop does not break on tool failure. Device-side failures (target client disconnected mid-call, WS frame send failed, heartbeat timeout) are surfaced the same way with `code: device_unreachable` — no server-side retry, fail fast (ADR-096 details the WS-layer mechanics).
+**Decision:** All tool failures (timeout, permission, bad args, panic) return a `tool_result` block with `is_error: true` and explanatory content. The agent observes the error in the next iteration and decides recovery. The loop does not break on tool failure. A device call rejected before transport uses `tool_device_unreachable`; once the call is issued or may have been issued, disconnect, send failure, heartbeat loss, or result timeout uses `tool_execution_outcome_unknown`. Neither case is retried server-side (ADR-096 and ADR-132 define the transport boundary).
 OpenOctopus does not automatically retry tool calls based on error codes.
-`device_unreachable`, `client_shutting_down`, `exec_timeout`,
-`command_denied`, `cwd_outside_workspace`, `ssrf_blocked`, and
-`mcp_unavailable` can be recoverable if context changes;
-`server_restart` and `user_cancelled` are historical closure markers, not
-instructions to re-run skipped work automatically.
+`tool_device_unreachable`, `tool_client_shutting_down`, `tool_exec_timeout`,
+path-policy failures, and `network_ssrf_blocked` can be recoverable if context
+changes. `tool_execution_outcome_unknown`, historical `server_restart`, and
+`user_cancelled` are closure markers, not instructions to repeat side effects.
 **Consequences:** Agent can retry, ask the user, or give up. No centralized error-handling for tools. Trap-in-loop detection (ADR-036) catches agents that retry the same unreachable device repeatedly.
 
 ### ADR-032 · Persist immediately on every state transition
@@ -637,8 +643,11 @@ Once fired, in-flight tools complete (bounded by their own timeout), then the lo
 
 ### ADR-039 · Client-only tools live in `openoctopus_client`
 
-**Status:** accepted
-**Decision:** `exec` (and any future client-only tools) have their schemas in `openoctopus_client/src/tool_schemas.rs`. Clients report their tool schemas to the server at handshake time via `ClientToServer::RegisterTools.tool_schemas`.
+**Status:** accepted (superseded for Py6 by ADR-132)
+**Decision:** Py6 keeps client-only execution in `openoctopus_client`, but
+the server owns the three canonical source schemas and does not accept dynamic
+schema registration. The client matches the fixed names and performs strict
+second validation.
 **Consequences:** Server doesn't statically depend on openoctopus_client. Tool schemas cross the crate boundary via protocol (runtime), not imports (compile).
 
 ### ADR-040 · Server-only tools live in `openoctopus_server`
@@ -655,9 +664,9 @@ inventory table in `docs/TOOLS.md`.
   live in `openoctopus_server`. `message` and `file_transfer` are
   intrinsic-device tools: their source schemas contain marked
   `openoctopus_*device*` fields whose enums are extended at merge time.
-- **Client-only tools** (`exec`) live in `openoctopus_client`; clients advertise
-  schemas during device registration/handshake and the server routes calls
-  without importing client executors.
+- **Client-only tools** (`exec`, `write_stdin`, `list_exec_sessions`) execute in
+  `openoctopus_client`; their fixed schemas are server-canonical and the server
+  routes calls without importing client executors.
 - **MCP-wrapped tools/resources/prompts** are dynamic and run wherever the MCP is
   installed: admin shared-service server MCP or a user's paired device.
 
@@ -711,7 +720,11 @@ merge correctly.
 
 **Applies to:**
 - **Shared file tools** (`read_file`, `write_file`, etc.): server schema is canonical (ADR-038). Every paired device is an install site for the same schema. Merge injects `openoctopus_device` as a new property; enum = `["server", <paired_device_1>, <paired_device_2>, ...]`, appended to `required`. Paired-but-offline devices remain visible and fail at dispatch with `device_unreachable`.
-- **Client-only tools** (`exec`): schema owned by client (ADR-039), advertised at handshake. Merge injects `openoctopus_device`; enum = `[<paired_device_1>, <paired_device_2>, ...]` (no "server", per ADR-072). Paired-but-offline devices remain visible and fail at dispatch with `device_unreachable`.
+- **Client-only tools** (`exec`, `write_stdin`, `list_exec_sessions`): fixed
+  schemas are owned by the server (ADR-132). Merge injects
+  `openoctopus_device`; enum = `[<paired_device_1>, <paired_device_2>, ...]`
+  (no `server`, per ADR-072). Paired-but-offline devices remain visible and
+  fail at dispatch with `device_unreachable`.
 - **Server-only tools** (`cron`): single install site, no device-routing field. `web_fetch` is shared per ADR-052.
 - **Intrinsic-device server tools** (`file_transfer`, `message`): source schema already has its device field(s) — `openoctopus_src_device`/`openoctopus_dst_device` for `file_transfer`, `openoctopus_device` for `message` — with `enum: ["server"]` as a stub. Merge **extends** each such enum with paired device names — no new property injected. Paired-but-offline devices remain visible and fail at dispatch with `device_unreachable`.
 
@@ -1406,16 +1419,29 @@ All three live in `openoctopus_client/src/mcp/`. The worker stitches them togeth
 
 ### ADR-050 · Device config is first-class + editable
 
-**Status:** accepted
-**Decision:** Each device stores the full policy/config boundary on its row: `workspace_path`, `sandbox_mode`, `shell_timeout_max`, `ssrf_denylist`, `env_allowlist`, `command_denylist`, and `mcp_servers`. `sandbox_mode` is the only privilege level: `true` is restricted mode; `false` is trusted-device mode. Sessions cannot temporarily override it. `ssrf_denylist` and `command_denylist` are denylist fields so users can remove a blocking default entry when a real workflow needs it; `env_allowlist` stays an allowlist because secret env names are not enumerable.
+**Status:** accepted (superseded for Py6 by ADR-132)
+**Decision:** Each device stores the Py6 policy/config boundary on its row:
+`workspace_path`, `sandbox_mode`, `shell_timeout_max`, `ssrf_denylist`, and
+`env_allowlist`. `sandbox_mode` is the only privilege level: `true` is
+restricted mode; `false` is trusted-device mode. Sessions cannot temporarily
+override it. Py6 has no `command_denylist` or MCP device configuration.
 
-`shell_timeout_max` is a non-negative integer cap for exec hard timeouts; default is `600`, and `0` means this device owner permits no-hard-timeout exec sessions. All fields are editable via `PATCH /api/devices/{name}/config`. PATCH is a partial top-level update; omitted fields keep their existing values. `ssrf_denylist`, `env_allowlist`, `command_denylist`, and `mcp_servers` are whole-field replacements when supplied, not deep merges. Empty PATCH is a no-op that returns the current `Device` response and does not push `config_update`. When an online PATCH changes `mcp_servers`, the server first sends validation-only `config_validate`; after successful validation and DB commit, it pushes the authoritative change via `config_update`. Non-MCP config changes commit directly and then push `config_update`. `config_update` always includes the current canonical `device_name`, so online renames update the client's local display/log state without reconnecting. `workspace_path` must be a non-empty string and is stored verbatim; the server does not expand `~` or check client disk existence. REST responses redact every `mcp_servers.*.env.*` value as `"<redacted>"`; the database row and device WebSocket config keep the unredacted values.
+`shell_timeout_max` is a non-negative integer cap for exec hard timeouts;
+default is `600`, and `0` permits only explicitly bounded `timeout=0` calls.
+All fields are editable via `PATCH /api/devices/{name}/config`. PATCH is a
+partial top-level update; omitted fields keep their existing values.
+`ssrf_denylist` and `env_allowlist` are whole-field replacements when supplied,
+not deep merges. Empty PATCH is a no-op. `config_update` always includes the
+current canonical `device_name`; changes to shell policy are fenced, terminate
+old-policy exec sessions, then activate the committed config. `workspace_path`
+is stored verbatim; the server does not expand `~` or check client disk
+existence.
 **Consequences:** No "stored but unreachable" fields. The system prompt's "Your targets" section renders each device's current config directly.
 
 ### ADR-051 · Device policy is persistent; no session-level privilege escalation
 
 **Status:** accepted
-**Decision:** OpenOctopus does not implement session-scoped permission grants in Python-main. The device row is the permission boundary for every browser, channel, cron, and heartbeat session. If a session needs access that the current device policy blocks, the user changes that device's persistent config: flip `sandbox_mode`, remove an `ssrf_denylist` or `command_denylist` entry, or add an env name to `env_allowlist`.
+**Decision:** OpenOctopus does not implement session-scoped permission grants in Python-main. The device row is the permission boundary for every browser, channel, cron, and heartbeat session. If a session needs access that the current device policy blocks, the user changes that device's persistent config: flip `sandbox_mode`, remove an `ssrf_denylist` entry, or add an env name to `env_allowlist`. Py6 intentionally has no command denylist.
 **Consequences:** Permission behavior is predictable across channels and reconnects. There is no hidden grant state to expire, sync, audit, or replay. The tradeoff is coarser control: a policy change affects all sessions targeting that device until the user changes it back.
 
 ### ADR-052 · `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy
@@ -1438,19 +1464,24 @@ visible and fail at dispatch with `device_unreachable`.
 
 **Status:** accepted
 **Python-main clarification:** The full WS protocol contract carries forward
-unchanged. Python server implements the same JSON text frames + binary file
-transfer over a single WebSocket per device via FastAPI/websockets. Same
-frame catalog, same heartbeat (30s ping / ~70s timeout), same device-local
-FIFO dispatch. The wire spec in `docs/PROTOCOL.md` is binding for both
-implementations.
+through Protocol v2. Python server implements JSON text frames + binary file
+transfer over one WebSocket per device via FastAPI/websockets. Py6 removes the
+old dynamic MCP frames, adds fixed shell metadata and provider-hidden exec
+ownership, and makes exec-family calls immediate-or-busy while existing
+non-shell calls retain their bounded FIFO. `docs/PROTOCOL.md` is binding.
 **Context:** Devices need bidirectional, low-latency dispatch (server pushes tool calls, client pushes results, both sides push file bytes for `message`-with-files and `file_transfer`). Browser uses REST with best-effort POST streaming plus canonical GET polling (ADR-003, ADR-121); devices need WebSocket because they sit behind NAT and tool dispatch is bidirectional.
 **Decision:** A single WebSocket connection per device carries both control plane (JSON text frames) and bulk plane (binary frames). The full wire spec lives in `docs/PROTOCOL.md`; this ADR fixes the headline choices that other decisions reference:
 
 - **Endpoint:** `GET /ws/device` with `Authorization: Bearer <OPENOCTOPUS_DEVICE_TOKEN>`. Device tokens are never accepted in URL query parameters.
-- **Frame types (text/JSON):** `hello`, `hello_ack`, `tool_call`, `tool_result`, `register_mcp`, `config_validate`, `config_validate_result`, `config_update`, `transfer_begin`, `transfer_progress`, `transfer_end`, `ping`, `pong`, `error`.
+- **Frame types (text/JSON):** `hello`, `hello_ack`, `tool_call`, `tool_result`, `config_update`, `transfer_request`, `transfer_begin`, `transfer_ready`, `transfer_progress`, `transfer_end`, `ping`, `pong`, `error`.
 - **Correlation:** every request carries a UUID v7 `id`; responses echo it. Not strict JSON-RPC.
-- **Device-local FIFO dispatch.** A connected device owns one executor queue. Server-side session workers can enqueue calls concurrently, but the device executes one tool call at a time in FIFO order. This keeps device state transitions deterministic while allowing other sessions and other devices to proceed.
-- **Heartbeat.** Server sends `ping` every 30s. Two missed `pong` (~70s) → mark device offline, fail in-flight calls with `tool_result(is_error=true, code:device_unreachable)` (ADR-031). Client reconnects with exponential backoff using the same token; `hello` is idempotent.
+- **Device-local dispatch.** Existing non-shell calls use one bounded FIFO.
+  Exec-family calls never queue behind it: they start when the worker is free or
+  fail immediately with `tool_device_busy`. Other devices still proceed in parallel.
+- **Heartbeat.** Server sends `ping` every 30s. Two missed `pong` (~70s) mark
+  the device offline. Preflight calls become `tool_device_unreachable`; issued
+  calls become `tool_execution_outcome_unknown` (ADR-031/132). The client
+  reconnects with exponential backoff using the same token; `hello` is idempotent.
 - **No persistent in-flight queue.** Server does not retry on its own; if the client drops mid-call, the failure surfaces to the agent immediately. Agent decides next action.
 - **File transfer (Option A).** Bulk bytes flow over the same WS as binary frames, multiplexed by a 16-byte UUID header per frame. JSON `transfer_begin` opens the slot (carries direction, src/dst, and known metadata), `transfer_end` closes and acknowledges verification. For server-triggered Client Alpha uploads (`direction=client_to_server`), the server sends `transfer_begin` as a request, the client streams bytes and supplies the final `sha256` in `transfer_end`, and the server replies with the final acknowledgement. Multiple transfers can be in flight concurrently. For device→device transfers, the server is a pure bridge — reads sender's binary frames, forwards to receiver's WS without buffering the whole file. Current Alpha server workspace legs buffer within the workspace upload cap until streaming workspace reads/writes exist.
 - **JSON for M0–M3.** MessagePack/CBOR is a future optimization; not justified for current scale.
@@ -1471,7 +1502,9 @@ same env var name.
 **Context:** Devices need to identify themselves to the server. Must work for headless boxes (`./openoctopus_client` on a server), unattended phones, and dev laptops. No browser-side OAuth dance.
 **Decision:** Pairing is a one-shot token-issuance flow:
 
-1. **Token creation** (frontend, web UI). User opens "Devices" page, fills in `name`, optional `workspace_path`/`sandbox_mode`/`shell_timeout_max`/`ssrf_denylist`/`env_allowlist`/`command_denylist`/`mcp_servers`, submits.
+1. **Token creation** (frontend, web UI). User opens "Devices" page, fills in
+   `name`, optional `workspace_path`/`sandbox_mode`/`shell_timeout_max`/
+   `ssrf_denylist`/`env_allowlist`, and submits.
 2. **Server mints token.** `POST /api/devices` returns `{token: "openoctopus_dev_<base64>", ...}` ONCE. Token is shown verbatim in the UI with copy-to-clipboard. Never retrievable again — lost tokens require `POST /api/devices/{name}/regenerate-token` (ADR-091).
 3. **Client startup.** User exports `OPENOCTOPUS_DEVICE_TOKEN=openoctopus_dev_...` and runs `./openoctopus_client` (or whatever the installed binary is called). Token is the **only** identifier the client needs; everything else (workspace path, sandbox mode, SSRF/env/command policy, etc.) is fetched from the server's `hello_ack` frame at handshake.
 4. **Identity.** The token is the SSOT for device identity — primary key on `devices` (ADR-091). `(user_id, name)` UNIQUE means a user cannot have two devices with the same canonical routing label; the label is for REST/tool routing, while the token identifies the connection.
@@ -1922,11 +1955,11 @@ Absent, deliberately: `exec`, `python`, `eval`, any code-execution tool (on the 
 
 Admin is trusted. Agent is not. The shape of "admin explicitly installs; agent calls tools through protocol" keeps the blast radius bounded to what the MCP itself exposes.
 
-### ADR-073 · Client device policy gates — workspace paths, SSRF denylist, env allowlist, command denylist
+### ADR-073 · Client device policy gates — workspace paths, SSRF denylist, env allowlist
 
 **Status:** accepted
 **Context:** OpenOctopus gives the agent access to user devices. The product needs a simple, per-device policy that is predictable across browser and channel sessions. A session-scoped permission grant system was rejected for Python-main because it adds hidden runtime state, unclear replay semantics, and more UX complexity than the first rewrite needs. OS-level subprocess sandboxing (`bwrap`, `sandbox-exec`, AppContainer) is deferred to the later client sandbox milestone.
-**Decision:** Device policy is persisted on `devices` and enforced uniformly for every session targeting that device.
+**Decision:** Device policy is persisted on `devices` and enforced uniformly for every session targeting that device. Py6's shell policy has no command denylist or MCP fields.
 
 #### `sandbox_mode` controls the coarse device profile
 
@@ -1945,15 +1978,19 @@ Server-side `web_fetch` keeps its unconditional hard block-list and ignores devi
 
 #### Env policy remains an allowlist
 
-`exec` and client MCP subprocesses inherit only parent-process env names present in `device.env_allowlist`. The default is `PATH`, `HOME`, `LANG`, and `TERM`. This intentionally remains an allowlist because secret env names are not enumerable (`AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, `KUBECONFIG`, internal tokens, etc.).
+`exec` inherits only parent-process env names present in `device.env_allowlist`.
+The default is `PATH`, `HOME`, `LANG`, `TERM`, `SystemRoot`, `ComSpec`,
+`PATHEXT`, `TEMP`, `TMP`, and `USERPROFILE`. This remains an exact-name
+allowlist because secret env names are not enumerable (`AWS_SECRET_ACCESS_KEY`,
+`DATABASE_URL`, `KUBECONFIG`, internal tokens, etc.).
 
 `OPENOCTOPUS_DEVICE_TOKEN` is never forwarded into agent-run subprocesses even if a user accidentally adds a broad env pattern later; v1 env entries are exact names only.
 
-#### Commands use a denylist
+#### Commands are not denylisted in Py6
 
-`exec` checks `device.command_denylist` before spawn. Entries are command-name deny rules matched against the executable token after shell parsing / argv construction in the client implementation. The default list blocks obvious host-management or destructive commands (`shutdown`, `reboot`, `halt`, `poweroff`, `mkfs`, `dd`, `mount`, `umount`, `systemctl`, `service`). Users delete entries per device when they intentionally want that device to run them.
-
-This is a product guardrail, not a security sandbox. Without OS-level subprocess isolation, a permitted command can still read host files or open network connections through the OS. The docs and UI must say this plainly.
+Py6 does not implement `command_denylist`; a shell command on a trusted device
+runs with the user's OS privileges. This is intentionally not presented as a
+security sandbox. OS-level subprocess isolation is a later milestone.
 
 #### Client secret handling
 
@@ -2161,7 +2198,7 @@ Missing or empty env var → friendly stderr message + exit non-zero.
 
 ```
 openoctopus_client run           # default subcommand if invoked with no args
-openoctopus_client version       # print "openoctopus_client v0.X.Y (protocol v1)" and exit
+openoctopus_client version       # print the package version; current wire protocol is v2
 ```
 
 No other subcommands in Client Alpha. No `logout`, no `doctor` (failure modes
@@ -2362,7 +2399,8 @@ This means a stale-but-not-too-stale client (e.g. binary `v0.3.0` speaking proto
 - Pre-1.0 phase has a simple two-tier release rhythm; admins know `0.m+1.0` means "read the changelog before upgrading."
 - Protocol version stays stable across most binary releases — most stale-client situations are silent feature-skip, not hard breakage.
 - The 1.0 cutover is the natural "we're stable now" milestone; happens organically when the API has settled and we don't expect more breaking changes.
-- README documents both versions: "openoctopus_client v0.3.1 (protocol v1)" so users know which to compare against the server.
+- Release documentation records both binary and protocol versions so users can
+  compare a downloaded client with the server requirement.
 
 ### ADR-108 · Shared workspaces: id-based storage, `name@suffix` addressing
 
@@ -2562,7 +2600,7 @@ def canonicalize_device_name(raw: str) -> str:
   - `DELETE /api/devices/{name}` (user action via REST) — direct delete.
   - `DELETE /api/me` (account deletion) — cascade via ADR-058 deletes every device the user owned.
   - There is no implicit transition. Crashes, network blips, or token-rotation operations do NOT trigger state 3.
-- **`POST /api/devices/{name}/regenerate-token` is NOT a state-3 trigger.** It updates `devices.token` in place (ADR-091); the row stays, and `name`, `workspace_path`, `sandbox_mode`, `ssrf_denylist`, `env_allowlist`, `command_denylist`, `shell_timeout_max`, and `mcp_servers` are preserved. The old token is invalid immediately, the new plaintext token is returned exactly once, and the currently-live WS (if any) is closed with 4401 because the old credential no longer authenticates. The device drops to state 2 for the brief window before the user updates the client, then back to state 1 on reconnect with the new token.
+- **`POST /api/devices/{name}/regenerate-token` is NOT a state-3 trigger.** It updates the token credential in place (ADR-091); the row stays, and the current Py6 fields `name`, `workspace_path`, `sandbox_mode`, `ssrf_denylist`, `env_allowlist`, and `shell_timeout_max` are preserved. Py6 has no `command_denylist` or device MCP field. The old token is invalid immediately, the new plaintext token is returned exactly once, and the currently-live WS (if any) is closed with 4401 because the old credential no longer authenticates. The device drops to state 2 for the brief window before the user updates the client, then back to state 1 on reconnect with the new token.
 
 **Why state 2 stays in the enum.** Refusing to surface offline devices was rejected because: (a) the agent loses awareness of the user's configured topology between turns, and (b) a device coming back online mid-session would silently change tool availability — confusing UX. The ADR-031 "fail fast" pattern surfaces unreachable devices loudly so the agent can adapt.
 
@@ -3545,6 +3583,59 @@ no token recovery path. The protocol is explicit about who may send bytes and
 has a clean extension point for later transfer modes. The existing future
 shell/MCP and folder sections remain documentation for later milestones, not
 Py5 implementation requirements.
+
+---
+
+### ADR-132 · Py6 cross-platform client exec: fixed pipe + PTY contract
+
+**Status:** accepted (2026-08-18)
+
+**Decision:** Py6 adds exactly three fixed client-only tools: `exec`,
+`write_stdin`, and `list_exec_sessions`. The server owns their canonical
+schemas and routes them through Protocol v2 `tool_call`/`tool_result`; there is
+no dynamic `RegisterTools`, `caps.exec`, or exec REST endpoint. The injected
+`openoctopus_device` enum contains only paired trusted devices
+(`sandbox_mode=false`), never `server`.
+
+`exec` starts an independent shell process with `tty=false` pipes by default or
+`tty=true` POSIX PTY/Windows ConPTY. PTY is line-oriented only: it supports
+REPLs, TTY detection, SSH shells, and simple non-secret prompts, but not full
+TUI, screen canvas, resize, screenshots, or password/2FA/passphrase input. A
+PowerShell/REPL is started by the command itself (for example `command: "pwsh"`),
+not by an empty command. Pipe stdin is closed; only `chars="\u0003"` is an OS
+interrupt. PTY `chars` are written to the terminal and Ctrl-C is best effort.
+`wait_for` searches already unread output before waiting: stdout/stderr
+independently for pipes and normalized merged output for PTY. `wait_timeout_ms`
+without `wait_for` is invalid. Pipe SSH requires key + known_hosts with no
+prompt; first host-key confirmation requires PTY.
+
+Sessions are opaque UUIDv7 business handles, owned by a provider-hidden chat
+UUID, and limited to eight records per Client runtime. Output is bounded to
+50,000 Unicode characters per stream (head+tail), reports default to 10,000
+and max 50,000, and idle cleanup is 30 minutes. Ordinary WebSocket loss and
+server restart preserve sessions; token rotation, deletion, replacement,
+policy change, normal client shutdown, and hard lifecycle shutdown terminate
+them. Client restart/crash/power loss has no recovery guarantee.
+
+`yield_time_ms` is only a report window. `timeout` is the hard process lifetime
+(default 60 seconds, capped by `shell_timeout_max`); long-running REPL/SSH
+calls must set an explicit timeout. `command_denylist` is intentionally not
+implemented. `env_allowlist` is exact-name filtering and all `OPENOCTOPUS_*`
+variables are removed. The trusted-device gate is not an OS sandbox; OS-level
+isolation and client-side MCP are later milestones.
+
+PTY compatibility responses are fixed: `CSI 5 n` → `ESC[0n`, `CSI 6 n` →
+`ESC[1;1R`, and `CSI ? 6 n` → `ESC[?1;1R`. Unknown terminal queries are
+ignored; only a real write/flush failure terminates the session. POSIX uses an
+internal pre-thread forkpty helper; Windows uses `pywinpty==3.0.5` and ConPTY.
+Missing packaged PTY dependencies are a permanent startup failure; transient
+per-call allocation errors return `tool_pty_unavailable` without pipe fallback.
+
+**Consequences:** Provider-visible history contains only normal tool args and
+results; routing, chat ownership, policy epochs, and transport generations
+remain server-authoritative. Late issued results are consumed by
+generation-scoped tombstones, and every stop/cancellation path preserves
+tool-use/result pairing without claiming an ambiguous command was not run.
 
 ---
 

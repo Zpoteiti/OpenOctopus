@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -26,6 +27,7 @@ from openctopus_server.devices.transfer import (
     TransferResult,
     TransferRoute,
     TransferSink,
+    TransferUnavailableError,
 )
 
 
@@ -75,6 +77,38 @@ class TerminalDropTransport(Transport):
             and not frame.ack
             and frame.ok
         )
+
+
+@dataclass
+class FencedRouteTransport(Transport):
+    async def send_text(
+        self,
+        handle: object,
+        payload: str,
+        *,
+        expected_device_name: str | None = None,
+        expected_config_epoch: int | None = None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> bool:
+        del handle, payload, expected_device_name, expected_config_epoch, on_issued
+        return False
+
+
+@dataclass
+class IssuingTransport(Transport):
+    async def send_text(
+        self,
+        handle: object,
+        payload: str,
+        *,
+        expected_device_name: str | None = None,
+        expected_config_epoch: int | None = None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> bool:
+        del expected_device_name, expected_config_epoch
+        if on_issued is not None:
+            on_issued()
+        return await super().send_text(handle, payload)
 
 
 @dataclass
@@ -259,6 +293,111 @@ async def _send_client_relay(
         TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=7, sha256=digest),
     )
     return task, slot_id
+
+
+@pytest.mark.parametrize("direction", ["server_to_client", "client_to_server"])
+async def test_initial_route_fence_is_definitely_unavailable(direction: str) -> None:
+    transport = FencedRouteTransport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 1)
+    route = SimpleNamespace(handle=handle, config_epoch=7, device_name="laptop")
+    issued: list[None] = []
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    if direction == "server_to_client":
+        transfer = manager.start_server_to_client(
+            handle=handle,
+            route=route,
+            user_id=uuid4(),
+            src_path="source.txt",
+            dst_path="destination.txt",
+            source=Source([]),
+            total_bytes=0,
+            on_issued=lambda: issued.append(None),
+        )
+    else:
+        transfer = manager.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=uuid4(),
+            src_path="source.txt",
+            dst_path="destination.txt",
+            sink_factory=make_sink,
+            on_issued=lambda: issued.append(None),
+        )
+
+    with pytest.raises(TransferUnavailableError):
+        await transfer
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+    assert issued == []
+
+
+async def test_disconnect_after_initial_frame_is_outcome_unknown() -> None:
+    transport = IssuingTransport()
+    manager = _manager(transport)
+    handle = Handle(uuid4(), 1)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    issued: list[None] = []
+
+    transfer = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=handle,
+            user_id=uuid4(),
+            src_path="source.txt",
+            dst_path="destination.txt",
+            sink_factory=make_sink,
+            on_issued=lambda: issued.append(None),
+        )
+    )
+    await transport.text_event.wait()
+    assert issued == [None]
+    await manager.disconnect(handle)
+
+    with pytest.raises(TransferDisconnectedError):
+        await transfer
+    assert manager.active_slots == 0
+    assert manager._admission.active_count == 0
+
+
+async def test_cancel_while_waiting_for_transfer_admission_is_not_issued() -> None:
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=1,
+    )
+    manager = TransferManager(Transport(), admission=admission)
+    user_id = uuid4()
+    lease = await admission.acquire(user_id)
+    issued: list[None] = []
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    transfer = asyncio.create_task(
+        manager.start_client_to_server(
+            handle=Handle(uuid4(), 1),
+            user_id=user_id,
+            src_path="source.txt",
+            dst_path="destination.txt",
+            sink_factory=make_sink,
+            on_issued=lambda: issued.append(None),
+        )
+    )
+    await asyncio.sleep(0)
+    transfer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await transfer
+    await lease.aclose()
+
+    assert issued == []
+    assert manager.active_slots == 0
+    assert admission.active_count == 0
 
 
 async def test_admission_round_robins_users_and_releases_on_cancel() -> None:
@@ -1204,7 +1343,10 @@ async def test_committed_client_sender_accepts_only_its_late_timeout_until_tombs
         payload: str,
         *,
         route: TransferRoute | None,
+        on_issued: Callable[[], None] | None = None,
     ) -> bool:
+        if on_issued is not None:
+            on_issued()
         sent_routes.append(route)
         return await transport.send_text(sent_handle, payload)
 
@@ -1231,7 +1373,7 @@ async def test_committed_client_sender_accepts_only_its_late_timeout_until_tombs
         assert parse_server_frame(transport.text[-1][1]) == late_timeout.model_copy(
             update={"ack": True}
         )
-        assert sent_routes[-1] is route
+        assert sent_routes[-1] is None
         with pytest.raises(TransferProtocolError):
             await manager.handle_frame(
                 handle,

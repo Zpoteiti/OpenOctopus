@@ -15,10 +15,27 @@ from typing import Any
 
 COMMAND_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.02
+_WINPTY_NATIVE_FILES = frozenset(
+    {
+        "conpty.dll",
+        "openconsole.exe",
+        "winpty.dll",
+        "winpty-agent.exe",
+    }
+)
 
 
 class SmokeError(RuntimeError):
     pass
+
+
+def _assert_winpty_native_bundle(binary: Path) -> None:
+    names = {path.name.casefold() for path in binary.parent.rglob("*") if path.is_file()}
+    missing = sorted(_WINPTY_NATIVE_FILES - names)
+    if not any(name.startswith("_winpty.") and name.endswith(".pyd") for name in names):
+        missing.append("_winpty.*.pyd")
+    if missing:
+        raise SmokeError("frozen bundle is missing pywinpty native files: " + ", ".join(missing))
 
 
 @dataclass(frozen=True)
@@ -154,6 +171,9 @@ def _runtime_smoke_payload(
     run_seconds: float,
     run_peak_rss: int,
     run_peak_processes: int,
+    exec_seconds: float,
+    exec_peak_rss: int,
+    exec_peak_processes: int,
     conversion_seconds: float,
     conversion_peak_rss: int,
     conversion_peak_processes: int,
@@ -170,6 +190,11 @@ def _runtime_smoke_payload(
             "sampled_process_tree_peak_processes": run_peak_processes,
             "sampled_process_tree_peak_rss_bytes": run_peak_rss,
         },
+        "exec_backends": {
+            "seconds": round(exec_seconds, 6),
+            "sampled_process_tree_peak_processes": exec_peak_processes,
+            "sampled_process_tree_peak_rss_bytes": exec_peak_rss,
+        },
         "conversion_child": {
             "seconds": round(conversion_seconds, 6),
             "sampled_process_tree_peak_processes": conversion_peak_processes,
@@ -185,10 +210,15 @@ def main() -> int:
         fixture = corpus / "sample.html"
         if not fixture.is_file():
             raise SmokeError(f"document corpus is missing {fixture.name}")
+        if os.name == "nt":
+            _assert_winpty_native_bundle(binary)
         psutil = _psutil()
 
         version = _run(binary, "version", psutil=psutil)
-        if version.completed.returncode != 0 or version.completed.stdout != "0.0.1\n":
+        if (
+            version.completed.returncode != 0
+            or version.completed.stdout not in {"0.0.1\n", "0.0.1\r\n"}
+        ):
             raise SmokeError(
                 f"version failed: stdout={version.completed.stdout!r}; "
                 f"stderr={version.completed.stderr!r}"
@@ -210,6 +240,22 @@ def main() -> int:
                 f"run CLI failed: returncode={run.completed.returncode}; "
                 f"stdout={run.completed.stdout!r}; stderr={run.completed.stderr!r}"
             )
+
+        exec_backends = _run(binary, "_exec-backend-smoke", psutil=psutil)
+        try:
+            exec_payload = json.loads(exec_backends.completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise SmokeError("exec backend smoke did not write JSON") from exc
+        if (
+            exec_backends.completed.returncode != 0
+            or exec_backends.completed.stderr
+            or not isinstance(exec_payload, dict)
+            or exec_payload.get("ok") is not True
+            or exec_payload.get("pipe") is not True
+            or exec_payload.get("tty") is not True
+            or "openoctopus-exec-smoke" in exec_backends.completed.stdout
+        ):
+            raise SmokeError("exec backend smoke failed")
 
         conversion = _run(binary, "_spike-convert", str(fixture), psutil=psutil)
         try:
@@ -244,6 +290,9 @@ def main() -> int:
                     run_seconds=run.seconds,
                     run_peak_rss=run.peak_rss_bytes,
                     run_peak_processes=run.peak_processes,
+                    exec_seconds=exec_backends.seconds,
+                    exec_peak_rss=exec_backends.peak_rss_bytes,
+                    exec_peak_processes=exec_backends.peak_processes,
                     conversion_seconds=conversion.seconds,
                     conversion_peak_rss=conversion.peak_rss_bytes,
                     conversion_peak_processes=conversion.peak_processes,

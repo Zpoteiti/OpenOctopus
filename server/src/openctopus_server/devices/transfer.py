@@ -53,6 +53,12 @@ class TransferDisconnectedError(RuntimeError):
     code = "peer_disconnected"
 
 
+class TransferUnavailableError(RuntimeError):
+    """The initial route fence rejected a transfer before transport issue."""
+
+    code = "tool_device_unreachable"
+
+
 class TransferBusyError(TimeoutError):
     code = "workspace_transfer_busy"
 
@@ -78,6 +84,7 @@ class TransferTransport(Protocol):
         *,
         expected_device_name: str | None = None,
         expected_config_epoch: int | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> bool: ...
 
     async def send_binary(
@@ -371,6 +378,7 @@ class _TransferSlot:
     success_ack_delivered: bool = False
     fenced: bool = False
     finish_task: asyncio.Task[None] | None = None
+    on_issued: Callable[[], None] | None = None
 
 
 class TransferManager:
@@ -414,7 +422,7 @@ class TransferManager:
                 self._fence_slot(slot)
 
     def fence_route(self, route: TransferRoute) -> None:
-        """Synchronously prevent an old configuration snapshot from progressing."""
+        """Fence only slots that have not crossed their initial send boundary."""
 
         for slot in tuple(self._slots.values()):
             if slot.route == route:
@@ -449,6 +457,7 @@ class TransferManager:
         delete_source: DeleteSource | None = None,
         src_device: str = "server",
         dst_device: str | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> TransferResult:
         if mode not in {"copy", "move"}:
             raise ValueError("transfer mode must be copy or move")
@@ -471,6 +480,7 @@ class TransferManager:
             source_etag=_source_etag(source) if source is not None else None,
             delete_source=delete_source,
             mode=mode,
+            on_issued=on_issued,
         )
         try:
             if source_factory is not None:
@@ -532,6 +542,7 @@ class TransferManager:
         delete_source: DeleteSource | None = None,
         purpose: TransferPurpose = "file_transfer",
         mode: str = "copy",
+        on_issued: Callable[[], None] | None = None,
     ) -> TransferResult:
         if mode not in {"copy", "move"}:
             raise ValueError("transfer mode must be copy or move")
@@ -548,6 +559,7 @@ class TransferManager:
             sink_factory=sink_factory,
             delete_source=delete_source,
             mode=mode,
+            on_issued=on_issued,
         )
         slot.completion = asyncio.get_running_loop().create_future()
         try:
@@ -557,8 +569,14 @@ class TransferManager:
                 src_path=src_path,
                 dst_path=dst_path,
             )
-            if not await self._send_text(handle, request.model_dump_json(), route=slot.route):
-                raise TransferDisconnectedError("device connection was replaced")
+            if not await self._send_text(
+                handle,
+                request.model_dump_json(),
+                route=slot.route,
+                on_issued=self._initial_issue_callback(slot),
+            ):
+                raise TransferUnavailableError("device route was unavailable before send")
+            slot.route = None
             return await asyncio.shield(slot.completion)
         except asyncio.CancelledError:
             await self._abort(slot, "cancelled", send_frame=True)
@@ -627,14 +645,30 @@ class TransferManager:
         """Abort every slot owned by a stale/replaced socket generation."""
         slots = [slot for slot in self._slots.values() if _same_handle(slot.handle, handle)]
         await asyncio.gather(
-            *(self._abort(slot, "peer_disconnected", send_frame=False) for slot in slots),
+            *(
+                self._abort(
+                    slot,
+                    "peer_disconnected",
+                    send_frame=False,
+                    error=TransferDisconnectedError("device transfer outcome is unknown"),
+                )
+                for slot in slots
+            ),
             return_exceptions=True,
         )
 
     async def close(self) -> None:
         slots = list(self._slots.values())
         await asyncio.gather(
-            *(self._abort(slot, "server_shutdown", send_frame=False) for slot in slots),
+            *(
+                self._abort(
+                    slot,
+                    "server_shutdown",
+                    send_frame=False,
+                    error=TransferDisconnectedError("device transfer outcome is unknown"),
+                )
+                for slot in slots
+            ),
             return_exceptions=True,
         )
 
@@ -648,8 +682,10 @@ class TransferManager:
                 slot.handle,
                 slot.begin.model_dump_json(),
                 route=slot.route,
+                on_issued=self._initial_issue_callback(slot),
             ):
-                raise TransferDisconnectedError("device connection was replaced")
+                raise TransferUnavailableError("device route was unavailable before send")
+            slot.route = None
             async with asyncio.timeout(self._idle_timeout_seconds):
                 await asyncio.shield(slot.ready_future)
             if slot.state is not TransferState.READY:
@@ -726,7 +762,16 @@ class TransferManager:
             slot.committed_result = result
             await self._finish(slot, result)
         except asyncio.CancelledError:
-            await self._abort(slot, "cancelled", send_frame=False)
+            if slot.fenced:
+                error = _fenced_transfer_error(slot)
+                await self._abort(
+                    slot,
+                    error.code,
+                    send_frame=False,
+                    error=error,
+                )
+            else:
+                await self._abort(slot, "cancelled", send_frame=False)
         except BaseException as exc:
             # A peer terminal failure has already been acknowledged in
             # ``_handle_end``; do not emit a second non-ACK terminal frame.
@@ -787,7 +832,12 @@ class TransferManager:
             slot.state = TransferState.READY
             ready = TransferReadyFrame(id=slot.slot_id)
             if not await self._send_text(slot.handle, ready.model_dump_json(), route=slot.route):
-                await self._abort(slot, "peer_disconnected", send_frame=False)
+                await self._abort(
+                    slot,
+                    "peer_disconnected",
+                    send_frame=False,
+                    error=TransferDisconnectedError("device transfer outcome is unknown"),
+                )
                 return
             assert slot.sink is not None
             while True:
@@ -885,7 +935,16 @@ class TransferManager:
                 if current is not None:
                     asyncio.get_running_loop().call_soon(current.cancel)
         except asyncio.CancelledError:
-            await self._abort(slot, "cancelled", send_frame=False)
+            if slot.fenced:
+                error = _fenced_transfer_error(slot)
+                await self._abort(
+                    slot,
+                    error.code,
+                    send_frame=False,
+                    error=error,
+                )
+            else:
+                await self._abort(slot, "cancelled", send_frame=False)
         except BaseException as exc:
             code = _error_code(exc)
             if slot.end is not None and not slot.end.ack:
@@ -1009,6 +1068,7 @@ class TransferManager:
         sink_factory: SinkFactory | None = None,
         source_etag: str | None = None,
         mode: str = "copy",
+        on_issued: Callable[[], None] | None = None,
     ) -> _TransferSlot:
         try:
             device_id, generation = _handle_identity(handle)
@@ -1029,6 +1089,7 @@ class TransferManager:
                 commit_sink=commit_sink,
                 sink_factory=sink_factory,
                 mode=mode,
+                on_issued=on_issued,
             )
             async with self._lock:
                 self._expire_tombstones_locked()
@@ -1274,6 +1335,8 @@ class TransferManager:
         if slot.abort_event.is_set():
             slot.source_factory_task = None
             self._retire_source_factory(task)
+            if slot.fenced and slot.route is not None:
+                raise TransferUnavailableError("device route was unavailable before send")
             raise TransferDisconnectedError("device connection was replaced")
         if not done:
             slot.source_factory_task = None
@@ -1334,31 +1397,70 @@ class TransferManager:
         payload: str,
         *,
         route: TransferRoute | None,
+        on_issued: Callable[[], None] | None = None,
     ) -> bool:
-        if route is None:
-            result = await self._transport.send_text(handle, payload)
-        else:
-            result = await self._transport.send_text(
-                handle,
-                payload,
-                expected_device_name=route.device_name,
-                expected_config_epoch=route.config_epoch,
-            )
+        try:
+            if route is None:
+                if on_issued is None:
+                    result = await self._transport.send_text(handle, payload)
+                else:
+                    result = await self._transport.send_text(
+                        handle,
+                        payload,
+                        on_issued=on_issued,
+                    )
+            else:
+                if on_issued is None:
+                    result = await self._transport.send_text(
+                        handle,
+                        payload,
+                        expected_device_name=route.device_name,
+                        expected_config_epoch=route.config_epoch,
+                    )
+                else:
+                    result = await self._transport.send_text(
+                        handle,
+                        payload,
+                        expected_device_name=route.device_name,
+                        expected_config_epoch=route.config_epoch,
+                        on_issued=on_issued,
+                    )
+        except TransferDisconnectedError:
+            raise
+        except Exception as exc:
+            raise TransferDisconnectedError("device transfer outcome is unknown") from exc
         return result is not False
+
+    @staticmethod
+    def _initial_issue_callback(slot: _TransferSlot) -> Callable[[], None] | None:
+        if slot.route is None and slot.on_issued is None:
+            return None
+
+        def issued() -> None:
+            slot.route = None
+            if slot.on_issued is not None:
+                slot.on_issued()
+
+        return issued
 
     async def _send_binary(self, handle: object, slot_id: UUID, payload: bytes) -> bool:
         if len(payload) > MAX_BINARY_CHUNK_BYTES:
             raise TransferProtocolError("transfer chunk exceeds 64 KiB")
         slot = await self._get_slot(handle, slot_id)
-        if slot.route is None:
-            result = await self._transport.send_binary(handle, slot_id.bytes + payload)
-        else:
-            result = await self._transport.send_binary(
-                handle,
-                slot_id.bytes + payload,
-                expected_device_name=slot.route.device_name,
-                expected_config_epoch=slot.route.config_epoch,
-            )
+        try:
+            if slot.route is None:
+                result = await self._transport.send_binary(handle, slot_id.bytes + payload)
+            else:
+                result = await self._transport.send_binary(
+                    handle,
+                    slot_id.bytes + payload,
+                    expected_device_name=slot.route.device_name,
+                    expected_config_epoch=slot.route.config_epoch,
+                )
+        except TransferDisconnectedError:
+            raise
+        except Exception as exc:
+            raise TransferDisconnectedError("device transfer outcome is unknown") from exc
         return result is not False
 
     def _decode_binary(self, payload: bytes) -> tuple[UUID, bytes]:
@@ -1454,6 +1556,14 @@ def _same_handle(left: object, right: object) -> bool:
         return _handle_identity(left) == _handle_identity(right)
     except TypeError:
         return left == right
+
+
+def _fenced_transfer_error(
+    slot: _TransferSlot,
+) -> TransferUnavailableError | TransferDisconnectedError:
+    if slot.route is not None:
+        return TransferUnavailableError("device route was unavailable before send")
+    return TransferDisconnectedError("device transfer outcome is unknown")
 
 
 def _error_code(exc: BaseException) -> str:

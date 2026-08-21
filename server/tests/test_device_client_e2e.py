@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 from collections import deque
 from copy import deepcopy
@@ -235,19 +236,32 @@ def _client_environment(server_url: str, token: str) -> dict[str, str]:
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
         "http_proxy",
         "https_proxy",
         "all_proxy",
+        "ws_proxy",
+        "wss_proxy",
     ):
         environment.pop(key, None)
     environment["OPENOCTOPUS_SERVER_URL"] = server_url
     environment["OPENOCTOPUS_DEVICE_TOKEN"] = token
-    current_pythonpath = environment.get("PYTHONPATH")
-    paths = [str(_CLIENT_SOURCE)]
-    if current_pythonpath:
-        paths.append(current_pythonpath)
-    environment["PYTHONPATH"] = os.pathsep.join(paths)
+    if environment.get("OO_CLIENT_BIN"):
+        environment.pop("PYTHONPATH", None)
+    else:
+        current_pythonpath = environment.get("PYTHONPATH")
+        paths = [str(_CLIENT_SOURCE)]
+        if current_pythonpath:
+            paths.append(current_pythonpath)
+        environment["PYTHONPATH"] = os.pathsep.join(paths)
     return environment
+
+
+def _client_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
 
 
 async def _start_client(server_url: str, token: str) -> asyncio.subprocess.Process:
@@ -261,6 +275,7 @@ async def _start_client(server_url: str, token: str) -> asyncio.subprocess.Proce
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=_client_creationflags(),
         )
     return await asyncio.create_subprocess_exec(
         sys.executable,
@@ -272,6 +287,7 @@ async def _start_client(server_url: str, token: str) -> asyncio.subprocess.Proce
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        creationflags=_client_creationflags(),
     )
 
 
@@ -285,7 +301,13 @@ async def _stop_client(
     # SIGTERM here would race the permanent-error exit that this helper is
     # supposed to observe.
     if process.returncode is None and expected_returncode == 0:
-        process.send_signal(signal.SIGTERM)
+        if os.name == "nt":
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is None:
+                raise AssertionError("CTRL_BREAK_EVENT is unavailable on Windows")
+            process.send_signal(ctrl_break)
+        else:
+            process.send_signal(signal.SIGTERM)
     try:
         await asyncio.wait_for(process.wait(), timeout=8)
     except TimeoutError:

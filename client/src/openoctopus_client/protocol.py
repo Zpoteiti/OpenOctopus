@@ -23,7 +23,8 @@ CONTROL_FRAME_MAX_BYTES = 12 * 1024 * 1024
 MAX_BINARY_CHUNK_BYTES = 64 * 1024
 BINARY_SLOT_ID_BYTES = 16
 MAX_BINARY_FRAME_BYTES = BINARY_SLOT_ID_BYTES + MAX_BINARY_CHUNK_BYTES
-PROTOCOL_VERSION: Literal["1"] = "1"
+PROTOCOL_VERSION: Literal["2"] = "2"
+EXEC_TOOL_NAMES = frozenset({"exec", "write_stdin", "list_exec_sessions"})
 
 
 def _require_uuid7(value: UUID) -> UUID:
@@ -36,7 +37,7 @@ Uuid7 = Annotated[UUID, AfterValidator(_require_uuid7)]
 
 
 class ProtocolError(ValueError):
-    """A peer frame did not satisfy the Py5 protocol."""
+    """A peer frame did not satisfy Protocol v2."""
 
 
 class _Frame(BaseModel):
@@ -48,6 +49,10 @@ class DeviceConfig(_Frame):
     sandbox_mode: bool
     ssrf_denylist: Annotated[
         list[Annotated[str, Field(min_length=1, max_length=512)]], Field(max_length=256)
+    ]
+    shell_timeout_max: Annotated[int, Field(ge=0, le=86400)]
+    env_allowlist: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=128)]], Field(max_length=64)
     ]
 
     @field_validator("workspace_path")
@@ -68,27 +73,57 @@ class DeviceConfig(_Frame):
             raise ValueError("ssrf_denylist entries must not be blank")
         return value
 
+    @field_validator("env_allowlist")
+    @classmethod
+    def _validate_env_allowlist(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("env_allowlist entries must be unique")
+        for entry in value:
+            if (
+                entry.strip() != entry
+                or any(ord(character) < 0x20 for character in entry)
+                or "=" in entry
+                or entry.upper().startswith("OPENOCTOPUS_")
+            ):
+                raise ValueError("env_allowlist contains an invalid variable name")
+        return value
+
 
 class Capabilities(_Frame):
     shared_tools: Literal[True] = True
     web_fetch: Literal[True] = True
     file_transfer: list[Literal["send", "receive"]] = ["send", "receive"]
     http_relay: Literal[True] = True
-    exec: Literal[False] = False
-    mcp: Literal[False] = False
 
     def model_post_init(self, __context: Any) -> None:
         if self.file_transfer != ["send", "receive"]:
             raise ValueError("file_transfer must be send and receive")
 
 
+class ShellMetadata(_Frame):
+    default: Annotated[str, Field(min_length=1, max_length=32)]
+    available: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=32)]],
+        Field(min_length=1, max_length=16),
+    ]
+
+    @model_validator(mode="after")
+    def _validate_shells(self) -> ShellMetadata:
+        if len(self.available) != len(set(self.available)):
+            raise ValueError("shells.available must not contain duplicates")
+        if self.default not in self.available:
+            raise ValueError("shells.default must be listed in shells.available")
+        return self
+
+
 class Hello(_Frame):
     type: Literal["hello"] = "hello"
     id: Uuid7
-    version: Literal["1"] = PROTOCOL_VERSION
+    version: Literal["2"] = PROTOCOL_VERSION
     client_version: Annotated[str, Field(min_length=1, max_length=64)]
     os: Literal["linux", "darwin", "windows"]
     caps: Capabilities = Capabilities()
+    shells: ShellMetadata
 
     @classmethod
     def new(
@@ -96,8 +131,14 @@ class Hello(_Frame):
         *,
         client_version: str,
         operating_system: Literal["linux", "darwin", "windows"],
+        shells: ShellMetadata,
     ) -> Hello:
-        return cls(id=new_uuid7(), client_version=client_version, os=operating_system)
+        return cls(
+            id=new_uuid7(),
+            client_version=client_version,
+            os=operating_system,
+            shells=shells,
+        )
 
     @classmethod
     def new_with_id(
@@ -105,8 +146,14 @@ class Hello(_Frame):
         frame_id: UUID,
         client_version: str,
         operating_system: Literal["linux", "darwin", "windows"],
+        shells: ShellMetadata,
     ) -> Hello:
-        return cls(id=frame_id, client_version=client_version, os=operating_system)
+        return cls(
+            id=frame_id,
+            client_version=client_version,
+            os=operating_system,
+            shells=shells,
+        )
 
 
 class HelloAck(_Frame):
@@ -139,6 +186,13 @@ class ToolCall(_Frame):
     name: Annotated[str, Field(min_length=1, max_length=128)]
     args: dict[str, Any]
     max_result_bytes: Annotated[int, Field(ge=1, le=CONTROL_FRAME_MAX_BYTES)]
+    chat_session_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _require_exec_owner(self) -> ToolCall:
+        if self.name in EXEC_TOOL_NAMES and self.chat_session_id is None:
+            raise ValueError("exec tool calls require chat_session_id")
+        return self
 
 
 class _TextResultBlock(_Frame):

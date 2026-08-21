@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -15,6 +15,7 @@ from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
     ConnectionHandle,
     DeviceBusyError,
+    DeviceOutcomeUnknownError,
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
@@ -23,6 +24,7 @@ from openctopus_server.devices.transfer import (
     TransferDisconnectedError,
     TransferError,
     TransferIntegrityError,
+    TransferUnavailableError,
 )
 from openctopus_server.devices.workspace import (
     INTERNAL_WORKSPACE_ACTION,
@@ -170,6 +172,7 @@ class _TransferWorkspace(Protocol):
         src_path: str,
         dst_path: str,
         mode: str,
+        on_issued: Callable[[], None] | None = None,
     ) -> Any: ...
 
     async def authorize_transfer_source(
@@ -250,6 +253,7 @@ class _TransferRegistry(Protocol):
         args: dict[str, object],
         max_result_bytes: int,
         timeout_seconds: float,
+        on_issued: Callable[[], None] | None = None,
     ) -> Any: ...
 
 
@@ -262,6 +266,7 @@ class FileTransferTool(Tool):
     """
 
     routing_mode = ToolRoutingMode.INTRINSIC_DEVICE
+    manages_issue_boundary = True
 
     def __init__(
         self,
@@ -285,17 +290,24 @@ class FileTransferTool(Tool):
         except ValidationError as exc:
             return _error(ErrorCode.TOOL_INVALID_ARGS, f"Invalid file transfer arguments: {exc}")
 
+        mark_issued = _once(ctx.on_issued)
         try:
             outcome = await self.transfer(
                 parsed,
                 user_id=ctx.user_id,
                 device_targets=ctx.device_targets,
+                on_issued=mark_issued,
             )
         except (DeviceBusyError, TransferBusyError):
             return _error(ErrorCode.TOOL_DEVICE_BUSY, "Device transfer capacity is exhausted")
+        except (DeviceOutcomeUnknownError, TransferDisconnectedError):
+            return _error(
+                ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+                "Device transfer outcome is unknown; do not retry automatically",
+            )
         except TimeoutError:
             return _error(ErrorCode.WORKSPACE_TRANSFER_TIMEOUT, "File transfer timed out")
-        except (DeviceUnavailableError, TransferDisconnectedError):
+        except (DeviceUnavailableError, TransferUnavailableError):
             return _error(ErrorCode.TOOL_DEVICE_UNREACHABLE, "The paired device is unavailable")
         except TransferIntegrityError:
             return _error(
@@ -328,6 +340,7 @@ class FileTransferTool(Tool):
         *,
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None = None,
+        on_issued: Callable[[], None] | None = None,
     ) -> FileTransferOutcome:
         """Run one validated transfer and return its machine outcome.
 
@@ -343,11 +356,10 @@ class FileTransferTool(Tool):
         ):
             raise OpenOctopusError(
                 ErrorCode.TOOL_INVALID_ARGS,
-                "Client-to-client file transfer is not supported in Py5",
+                "Client-to-client file transfer is not supported in Py6",
             )
         if self._workspace is None and (
-            request.openoctopus_src_device == "server"
-            or request.openoctopus_dst_device == "server"
+            request.openoctopus_src_device == "server" or request.openoctopus_dst_device == "server"
         ):
             raise OpenOctopusError(ErrorCode.TOOL_INVALID_ARGS, "File transfer is not configured")
         if (
@@ -356,29 +368,45 @@ class FileTransferTool(Tool):
                 request.openoctopus_src_device == "server"
                 and request.openoctopus_dst_device == "server"
             )
-        ) or (
-            request.openoctopus_src_device != "server"
-            and self._devices is None
-        ):
+        ) or (request.openoctopus_src_device != "server" and self._devices is None):
             raise OpenOctopusError(ErrorCode.TOOL_INVALID_ARGS, "File transfer is not configured")
 
-        if request.openoctopus_src_device == "server" and request.openoctopus_dst_device == "server":
-            result = await self._server_to_server(request, user_id)
+        if (
+            request.openoctopus_src_device == "server"
+            and request.openoctopus_dst_device == "server"
+        ):
+            result = await self._server_to_server(request, user_id, on_issued)
         elif (
             request.openoctopus_src_device != "server"
             and request.openoctopus_dst_device == request.openoctopus_src_device
         ):
-            result = await self._client_to_client(request, user_id, device_targets)
+            result = await self._client_to_client(
+                request,
+                user_id,
+                device_targets,
+                on_issued,
+            )
         elif request.openoctopus_src_device == "server":
-            result = await self._server_to_client(request, user_id, device_targets)
+            result = await self._server_to_client(
+                request,
+                user_id,
+                device_targets,
+                on_issued,
+            )
         else:
-            result = await self._client_to_server(request, user_id, device_targets)
+            result = await self._client_to_server(
+                request,
+                user_id,
+                device_targets,
+                on_issued,
+            )
         return _coerce_transfer_outcome(result)
 
     async def _server_to_server(
         self,
         parsed: FileTransferRequest,
         user_id: UUID,
+        on_issued: Callable[[], None] | None,
     ) -> Any:
         workspace = self._require_workspace()
         if self._engine is None:
@@ -388,6 +416,7 @@ class FileTransferTool(Tool):
                 src_path=parsed.src_path,
                 dst_path=parsed.dst_path,
                 mode=parsed.mode,
+                on_issued=on_issued,
             )
         async with AsyncSession(self._engine, expire_on_commit=False) as db:
             return await workspace.transfer_server_to_server(
@@ -396,6 +425,7 @@ class FileTransferTool(Tool):
                 src_path=parsed.src_path,
                 dst_path=parsed.dst_path,
                 mode=parsed.mode,
+                on_issued=on_issued,
             )
 
     async def _server_to_client(
@@ -403,6 +433,7 @@ class FileTransferTool(Tool):
         parsed: FileTransferRequest,
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
+        on_issued: Callable[[], None] | None,
     ) -> Any:
         workspace = self._require_workspace()
         registry = self._require_registry()
@@ -447,6 +478,7 @@ class FileTransferTool(Tool):
             delete_source=delete_source if parsed.mode == "move" else None,
             src_device="server",
             dst_device=parsed.openoctopus_dst_device,
+            on_issued=on_issued,
         )
 
     async def _client_to_server(
@@ -454,6 +486,7 @@ class FileTransferTool(Tool):
         parsed: FileTransferRequest,
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
+        on_issued: Callable[[], None] | None,
     ) -> Any:
         workspace = self._require_workspace()
         registry = self._require_registry()
@@ -529,6 +562,7 @@ class FileTransferTool(Tool):
             commit_sink=commit_sink,
             delete_source=delete_source if parsed.mode == "move" else None,
             mode=parsed.mode,
+            on_issued=on_issued,
         )
 
     async def _client_to_client(
@@ -536,6 +570,7 @@ class FileTransferTool(Tool):
         parsed: FileTransferRequest,
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
+        on_issued: Callable[[], None] | None,
     ) -> FileTransferOutcome:
         """Ask one paired client to perform a coordinated local transfer."""
 
@@ -565,6 +600,7 @@ class FileTransferTool(Tool):
             },
             max_result_bytes=64 * 1024,
             timeout_seconds=60.0,
+            on_issued=on_issued,
         )
         if raw.is_error:
             _raise_transfer_client_error(raw.code)
@@ -629,6 +665,21 @@ def _error(code: ErrorCode, message: str) -> ToolResult:
     return ToolResult(content=f"[{code.value}] {message}", is_error=True, code=code)
 
 
+def _once(callback: Callable[[], None] | None) -> Callable[[], None] | None:
+    if callback is None:
+        return None
+    called = False
+
+    def call() -> None:
+        nonlocal called
+        if called:
+            return
+        called = True
+        callback()
+
+    return call
+
+
 def _coerce_transfer_outcome(result: Any) -> FileTransferOutcome:
     if isinstance(result, FileTransferOutcome):
         return result
@@ -644,6 +695,8 @@ def _raise_transfer_client_error(code: str | None) -> None:
         raise DeviceBusyError("Device transfer capacity is exhausted")
     if code == ErrorCode.TOOL_DEVICE_UNREACHABLE.value:
         raise DeviceUnavailableError("Device is unavailable")
+    if code == ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value:
+        raise DeviceOutcomeUnknownError("Device transfer outcome is unknown")
     error_code = _stable_client_transfer_error(code)
     if error_code is not None:
         raise OpenOctopusError(error_code, "Workspace device rejected the transfer")

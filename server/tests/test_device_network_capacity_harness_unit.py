@@ -19,6 +19,8 @@ from device_network_capacity_harness import (  # noqa: E402
     _SourcePeer,
 )
 
+from openctopus_server.devices.protocol import PROTOCOL_VERSION
+
 
 class _EndedSocket:
     def __aiter__(self) -> _EndedSocket:
@@ -34,6 +36,20 @@ class _DroppedSocket:
 
     async def __anext__(self) -> str:
         raise ConnectionClosedError(None, None, None)
+
+
+def test_source_peer_hello_tracks_the_current_protocol_contract() -> None:
+    peer = _SourcePeer(
+        _Identity(uuid4(), uuid4(), "device", "token"),
+        delay=0,
+        queue_capacity=2,
+    )
+
+    hello = peer._hello_frame()
+
+    assert hello.version == PROTOCOL_VERSION
+    assert hello.shells.default == "sh"
+    assert hello.shells.available == ["sh"]
 
 
 @pytest.mark.asyncio
