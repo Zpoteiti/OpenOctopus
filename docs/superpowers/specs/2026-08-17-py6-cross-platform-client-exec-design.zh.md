@@ -182,8 +182,10 @@ capability 协商。Client 在进入连接循环前自检当前平台的 PTY bac
 }
 ```
 
-`os` 是 `linux | darwin | windows`。`shells.available` 必须非空、无重复，且
-default 为其成员；仅用于提示和诊断，不是授权。Server 不持久化该列表。
+`os` 是 `linux | darwin | windows`。`shells.default` 和 `shells.available`
+只能使用 Py6 支持的 canonical 名称：`bash`、`sh`、`zsh`、`pwsh`、
+`powershell`、`powershell_x86`、`cmd`。`shells.available` 必须非空、无重复，
+且 default 为其成员；仅用于提示和诊断，不是授权。Server 不持久化该列表。
 
 `hello_ack.config`、`config_update.config` 包含 `workspace_path`、
 `sandbox_mode`、`ssrf_denylist`、`shell_timeout_max` 和 `env_allowlist`。Py6

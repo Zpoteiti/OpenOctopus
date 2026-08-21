@@ -72,6 +72,36 @@ class _PartialWriteHandle(_Handle):
         raise OSError("write failed after a partial write")
 
 
+class _CleanupIncompleteOnWaitHandle(_Handle):
+    async def wait(self) -> ProcessExit:
+        result = await super().wait()
+        self.cleanup_incomplete = True
+        return result
+
+
+class _CleanupIncompleteSpawnHandle(_Handle):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mark_cleanup_incomplete = True
+
+    async def terminate(self) -> ProcessExit:
+        result = await super().terminate()
+        self.cleanup_incomplete = self.mark_cleanup_incomplete
+        return result
+
+
+class _BlockingWriteHandle(_Handle):
+    def __init__(self) -> None:
+        super().__init__(tty=True)
+        self.write_started = asyncio.Event()
+        self.release_write = asyncio.Event()
+
+    async def write(self, data: bytes) -> None:
+        self.write_started.set()
+        await self.release_write.wait()
+        await super().write(data)
+
+
 class _TerminateFailureHandle(_Handle):
     def __init__(self) -> None:
         super().__init__()
@@ -166,6 +196,19 @@ class _DelayedLauncherWithBlockingTerminate:
                 return await super().terminate()
 
         self.handle = Handle()
+        return self.handle
+
+
+class _DelayedLauncherWithHandle:
+    def __init__(self, handle: _Handle) -> None:
+        self.started = asyncio.Event()
+        self.release_spawn = asyncio.Event()
+        self.handle = handle
+
+    async def launch(self, spec: ProcessSpec) -> ProcessHandle:
+        del spec
+        self.started.set()
+        await self.release_spawn.wait()
         return self.handle
 
 
@@ -453,6 +496,122 @@ def test_failed_termination_reports_cleanup_incomplete_and_retains_session() -> 
     asyncio.run(run())
 
 
+def test_natural_wait_cleanup_incomplete_is_propagated_before_final_removal() -> None:
+    async def run() -> None:
+        handle = _CleanupIncompleteOnWaitHandle()
+
+        class Launcher(_Launcher):
+            async def launch(self, spec: ProcessSpec) -> ProcessHandle:
+                del spec
+                self.handles.append(handle)
+                return handle
+
+        manager = ExecSessionManager(Launcher())
+        started = await manager.start(CHAT_ID, _request())
+        session_id = _session_id(started)
+        handle.exit.set_result(ProcessExit(0))
+
+        final = await manager.write(
+            CHAT_ID,
+            ExecWrite(session_id, None, False, 1_000, None, None, 10_000),
+        )
+
+        assert final.code == "tool_exec_failed"
+        assert "cleanup_incomplete=true" in cast(str, final.content)
+        listed = await manager.list_sessions(CHAT_ID)
+        assert str(session_id) in cast(str, listed.content)
+        await manager.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelled_spawn_with_terminate_failure_retains_cleanup_session() -> None:
+    async def run() -> None:
+        handle = _TerminateFailureHandle()
+        launcher = _DelayedLauncherWithHandle(handle)
+        manager = ExecSessionManager(launcher)
+        task = asyncio.create_task(manager.start(CHAT_ID, _request()))
+        await launcher.started.wait()
+        task.cancel()
+        launcher.release_spawn.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        session_id = next(iter(manager._sessions))
+        listed = await manager.list_sessions(CHAT_ID)
+        content = cast(str, listed.content)
+        assert str(session_id) in content
+        assert "status=terminating" in content
+        assert len(manager._sessions) == 1
+
+        handle.fail_terminate = False
+        handle.fail_wait_after_terminate = False
+        await manager.cleanup_idle()
+        assert len(manager._sessions) == 1
+        await manager.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelled_spawn_with_cleanup_incomplete_handle_is_retryable() -> None:
+    async def run() -> None:
+        handle = _CleanupIncompleteSpawnHandle()
+        launcher = _DelayedLauncherWithHandle(handle)
+        manager = ExecSessionManager(launcher, idle_seconds=0)
+        task = asyncio.create_task(manager.start(CHAT_ID, _request()))
+        await launcher.started.wait()
+        task.cancel()
+        launcher.release_spawn.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        session_id = next(iter(manager._sessions))
+        assert manager._sessions[session_id].cleanup_incomplete is True
+        handle.mark_cleanup_incomplete = False
+        await manager.cleanup_idle()
+        assert manager._sessions[session_id].cleanup_incomplete is False
+        await manager.write(
+            CHAT_ID,
+            ExecWrite(session_id, None, False, None, None, None, 10_000),
+        )
+        assert session_id not in manager._sessions
+        await manager.shutdown()
+
+    asyncio.run(run())
+
+
+def test_shutdown_can_finish_while_tty_write_is_in_flight() -> None:
+    async def run() -> None:
+        handle = _BlockingWriteHandle()
+
+        class Launcher(_Launcher):
+            async def launch(self, spec: ProcessSpec) -> ProcessHandle:
+                del spec
+                self.handles.append(handle)
+                return handle
+
+        manager = ExecSessionManager(Launcher())
+        started = await manager.start(CHAT_ID, _request(tty=True))
+        write_task = asyncio.create_task(
+            manager.write(
+                CHAT_ID,
+                ExecWrite(_session_id(started), "input\n", False, None, None, None, 10_000),
+            )
+        )
+        await handle.write_started.wait()
+
+        shutdown = asyncio.create_task(manager.shutdown())
+        assert await asyncio.wait_for(asyncio.shield(shutdown), 0.2) is True
+        assert handle.terminated is True
+
+        handle.release_write.set()
+        await write_task
+
+    asyncio.run(run())
+
+
 def test_wait_backend_failure_reports_failure_and_retains_session() -> None:
     async def run() -> None:
         class Launcher(_Launcher):
@@ -551,10 +710,13 @@ def test_shutdown_reports_incomplete_when_process_cleanup_cannot_converge() -> N
 
         launcher = Launcher()
         manager = ExecSessionManager(launcher)
-        await manager.start(CHAT_ID, _request())
+        started = await manager.start(CHAT_ID, _request())
+        session_id = _session_id(started)
 
         assert await manager.shutdown() is False
-        assert await manager.list_sessions(CHAT_ID) == ToolOutput("(no exec sessions)")
+        listed = await manager.list_sessions(CHAT_ID)
+        assert str(session_id) in cast(str, listed.content)
+        assert "status=terminating" in cast(str, listed.content)
 
     asyncio.run(run())
 
@@ -881,6 +1043,7 @@ def test_cancelled_spawn_is_reaped_even_when_cancelled_again() -> None:
             await task
         assert launcher.handle is not None
         assert launcher.handle.terminated is True
+        assert await manager.list_sessions(CHAT_ID) == ToolOutput("(no exec sessions)")
         await manager.shutdown()
 
     asyncio.run(run())
@@ -904,9 +1067,101 @@ def test_cancelled_spawn_reap_survives_another_cancel_during_terminate() -> None
             await task
         assert launcher.handle is not None
         assert launcher.handle.terminated is True
+        assert await manager.list_sessions(CHAT_ID) == ToolOutput("(no exec sessions)")
         await manager.shutdown()
 
     asyncio.run(run())
+
+
+def test_cancelled_spawn_second_cancel_during_handle_bind_still_reaps() -> None:
+    async def run() -> None:
+        handle = _Handle()
+        launcher = _DelayedLauncherWithHandle(handle)
+        bind_started = asyncio.Event()
+
+        class Manager(ExecSessionManager):
+            async def _bind_spawned_handle(
+                self,
+                session: object,
+                spawned_handle: ProcessHandle,
+            ) -> None:
+                bind_started.set()
+                await super()._bind_spawned_handle(cast(Any, session), spawned_handle)
+
+        manager = Manager(launcher)
+        task = asyncio.create_task(manager.start(CHAT_ID, _request()))
+        await launcher.started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        await manager._admission.acquire()
+        try:
+            launcher.release_spawn.set()
+            await bind_started.wait()
+            task.cancel()
+        finally:
+            manager._admission.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert handle.terminated is True
+        assert await manager.list_sessions(CHAT_ID) == ToolOutput("(no exec sessions)")
+        await manager.shutdown()
+
+    asyncio.run(run())
+
+
+def test_cancelled_spawn_repeated_cancel_during_failed_cleanup_still_marks_session() -> None:
+    async def run() -> None:
+        handle = _TerminateFailureHandle()
+        launcher = _DelayedLauncherWithHandle(handle)
+        bind_finished = asyncio.Event()
+        mark_started = asyncio.Event()
+        mark_finished = asyncio.Event()
+
+        class Manager(ExecSessionManager):
+            async def _bind_spawned_handle(
+                self,
+                session: object,
+                spawned_handle: ProcessHandle,
+            ) -> None:
+                await super()._bind_spawned_handle(cast(Any, session), spawned_handle)
+                bind_finished.set()
+
+            async def _mark_spawn_cleanup_incomplete(
+                self,
+                session: object,
+                spawned_handle: ProcessHandle,
+                reason: str,
+            ) -> None:
+                mark_started.set()
+                await super()._mark_spawn_cleanup_incomplete(
+                    cast(Any, session), spawned_handle, reason
+                )
+                mark_finished.set()
+
+        manager = Manager(launcher)
+        task = asyncio.create_task(manager.start(CHAT_ID, _request()))
+        await launcher.started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        launcher.release_spawn.set()
+        await bind_finished.wait()
+        await manager._admission.acquire()
+        try:
+            await mark_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        finally:
+            manager._admission.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert mark_finished.is_set()
+        session_id = next(iter(manager._sessions))
+        assert manager._sessions[session_id].cleanup_incomplete is True
+        assert manager._sessions[session_id].state == "terminating"
+        await manager.shutdown()
 
 
 def test_cancel_after_spawn_preserves_a_fully_activated_session() -> None:

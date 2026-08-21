@@ -17,6 +17,7 @@ from openctopus_server.db.models import (
     Workspace,
     WorkspaceMember,
 )
+from openctopus_server.devices.registry import DeviceLiveMetadata, DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import DirectoryPage
@@ -66,6 +67,7 @@ async def build_system_prompt(
     user: User,
     workspace_service: PromptWorkspaceService | None = None,
     skills_cache: SkillsCache | None = None,
+    device_registry: DeviceRegistry | None = None,
 ) -> str:
     discord = (
         await db.execute(select(DiscordConfig).where(DiscordConfig.user_id == user.id))
@@ -91,6 +93,15 @@ async def build_system_prompt(
         .all()
     )
     await db.commit()
+
+    live_metadata: dict[UUID, DeviceLiveMetadata] = {}
+    if device_registry is not None:
+        for device in devices:
+            if device.sandbox_mode:
+                continue
+            metadata = await device_registry.get_live_metadata(device.id, user_id=user.id)
+            if metadata is not None:
+                live_metadata[device.id] = metadata
 
     soul = "You are OpenOctopus, the user's personal AI partner."
     memory = ""
@@ -140,8 +151,16 @@ async def build_system_prompt(
         if device.sandbox_mode:
             device_lines.append(f"{line}; exec: unavailable")
         else:
+            metadata = live_metadata.get(device.id)
+            live_shells = ""
+            if metadata is not None:
+                live_shells = (
+                    f"; os: {metadata.os}; default_shell: {metadata.default_shell}; "
+                    f"available_shells: {', '.join(metadata.available_shells)}"
+                )
             device_lines.append(
                 f"{line}; exec: available; shell_timeout_max: {device.shell_timeout_max} seconds"
+                f"{live_shells}"
             )
     if any(not device.sandbox_mode for device in devices):
         device_lines.extend(

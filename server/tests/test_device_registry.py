@@ -9,6 +9,7 @@ import pytest
 
 from openctopus_server.devices.protocol import (
     DeviceConfigFrame,
+    ShellMetadata,
     ToolResultFrame,
     TransferBeginFrame,
     TransferEndFrame,
@@ -308,6 +309,45 @@ async def test_unready_registration_is_not_online_or_routable_until_activation()
     assert await registry.activate(handle, "hello_ack") is True
     assert transport.sent_text == ["hello_ack"]
     assert await registry.is_online(device_id, user_id=user_id) is True
+
+
+async def test_live_hello_metadata_follows_the_current_connection_generation() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    old_shells = ShellMetadata(default="bash", available=["bash", "sh"])
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+        operating_system="linux",
+        shells=old_shells,
+    )
+
+    metadata = await registry.get_live_metadata(device_id, user_id=user_id)
+    assert metadata is not None
+    assert metadata.os == "linux"
+    assert metadata.default_shell == "bash"
+    assert metadata.available_shells == ("bash", "sh")
+
+    new_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+        operating_system="darwin",
+        shells=ShellMetadata(default="zsh", available=["zsh", "bash", "sh"]),
+    )
+    assert new_handle.generation > old_handle.generation
+    metadata = await registry.get_live_metadata(device_id, user_id=user_id)
+    assert metadata is not None
+    assert metadata.os == "darwin"
+    assert metadata.default_shell == "zsh"
+    assert metadata.available_shells == ("zsh", "bash", "sh")
+
+    assert await registry.unregister(new_handle) is True
+    assert await registry.get_live_metadata(device_id, user_id=user_id) is None
 
 
 async def test_replacement_waits_for_an_admitted_tool_call_send_boundary() -> None:

@@ -176,7 +176,20 @@ def _validate_spawn(
     return request_id, argv, cwd, environment
 
 
-def _fork_child(argv: Sequence[str], cwd: str | None, environment: Mapping[str, str]) -> None:
+def _fork_child(
+    argv: Sequence[str],
+    cwd: str | None,
+    environment: Mapping[str, str],
+    *,
+    control_fd: int | None = None,
+    events_fd: int | None = None,
+) -> None:
+    for fd in (control_fd, events_fd):
+        if fd is not None and fd > 2:
+            try:
+                _posix_os.close(fd)
+            except OSError:
+                pass
     if cwd is not None:
         _posix_os.chdir(cwd)
     _set_window_size(0)
@@ -199,7 +212,13 @@ def run(control_fd: int, events_fd: int) -> int:
     request_id, argv, cwd, environment = spawn
     pid, master = _posix_os.forkpty()
     if pid == 0:
-        _fork_child(argv, cwd, environment)
+        _fork_child(
+            argv,
+            cwd,
+            environment,
+            control_fd=control_fd,
+            events_fd=events_fd,
+        )
     _set_window_size(master)
     _posix_os.set_blocking(master, False)
     control.setblocking(False)

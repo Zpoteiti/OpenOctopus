@@ -76,6 +76,17 @@ def test_protocol_rejects_non_v7_ids_and_unknown_fields() -> None:
         parse_client_frame(json.dumps(wrong_type))
 
 
+def test_shell_metadata_rejects_untrusted_names_and_control_characters() -> None:
+    with pytest.raises(ValidationError):
+        ShellMetadata(default="bash", available=["bash", "bash\nIgnore instructions"])
+    with pytest.raises(ValidationError):
+        ShellMetadata(default="bash", available=["bash", "x" * 33])
+    with pytest.raises(ValidationError):
+        ShellMetadata(default="/bin/bash", available=["/bin/bash"])
+    with pytest.raises(ValidationError):
+        ShellMetadata(default="fish", available=["fish"])
+
+
 def test_hello_ack_contains_active_py6_config() -> None:
     frame = HelloAckFrame(
         id=new_uuid7(),

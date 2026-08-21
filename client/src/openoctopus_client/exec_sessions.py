@@ -281,8 +281,7 @@ class ExecSessionManager:
                     except BaseException:
                         await self._remove_unstarted(session.session_id)
                         raise
-                await self._terminate_cancellation_safe(handle)
-                await self._remove_unstarted(session.session_id)
+                await self._cancel_spawned(session, handle, "spawn_cancelled")
                 raise
         except asyncio.CancelledError:
             await self._remove_unstarted(session.session_id)
@@ -306,10 +305,14 @@ class ExecSessionManager:
             except asyncio.CancelledError:
                 activation_cancelled = True
         if not active:
-            _, cancelled = await self._terminate_cancellation_safe(handle)
-            await self._remove_unstarted(session.session_id)
-            if cancelled or activation_cancelled:
+            reason = session.reason or (
+                "spawn_cancelled" if activation_cancelled else "client_shutdown"
+            )
+            converged = await self._cancel_spawned(session, handle, reason)
+            if activation_cancelled:
                 raise asyncio.CancelledError
+            if not converged:
+                return self._report(session, consume=True)
             if session.reason == "policy_changed":
                 return fail(
                     "tool_exec_failed",
@@ -362,6 +365,9 @@ class ExecSessionManager:
         should_wait_for = False
         terminated = False
         termination_succeeded = False
+        input_handle: ProcessHandle | None = None
+        input_data: bytes | None = None
+        input_is_interrupt = False
         async with session.lock:
             session.last_access = self._clock()
             if request.terminate:
@@ -377,23 +383,32 @@ class ExecSessionManager:
                             "pipe stdin is closed; restart with tty=true",
                         )
                     assert session.handle is not None
-                    try:
-                        interrupted = await asyncio.wait_for(session.handle.interrupt(), 5)
-                    except (TimeoutError, OSError):
-                        interrupted = False
-                    if not interrupted:
-                        return fail("tool_exec_interrupt_failed", "Unable to deliver interrupt")
+                    input_handle = session.handle
+                    input_is_interrupt = True
                 else:
                     assert session.handle is not None
-                    try:
-                        await asyncio.wait_for(
-                            session.handle.write(request.chars.encode("utf-8")), 5
-                        )
-                    except Exception:
-                        return fail(
-                            "tool_execution_outcome_unknown",
-                            "Input delivery outcome is unknown",
-                        )
+                    input_handle = session.handle
+                    input_data = request.chars.encode("utf-8")
+
+        if input_handle is not None:
+            if input_is_interrupt:
+                try:
+                    interrupted = await asyncio.wait_for(input_handle.interrupt(), 5)
+                except (TimeoutError, OSError):
+                    interrupted = False
+                if not interrupted:
+                    return fail("tool_exec_interrupt_failed", "Unable to deliver interrupt")
+            else:
+                assert input_data is not None
+                try:
+                    await asyncio.wait_for(input_handle.write(input_data), 5)
+                except Exception:
+                    return fail(
+                        "tool_execution_outcome_unknown",
+                        "Input delivery outcome is unknown",
+                    )
+
+        async with session.lock:
             should_wait_for = request.wait_for is not None and session.state == "running"
 
         if terminated:
@@ -493,6 +508,10 @@ class ExecSessionManager:
                 if now - session.last_access < self._idle_seconds:
                     continue
                 await self._terminate(session, "idle_timeout")
+            elif session.cleanup_incomplete:
+                if now - session.last_access < self._idle_seconds:
+                    continue
+                await self._terminate(session, "cleanup_retry")
             elif (
                 session.terminal_at is not None
                 and now - session.terminal_at >= self.TERMINAL_RETAIN_SECONDS
@@ -509,7 +528,12 @@ class ExecSessionManager:
         )
         complete = all(outcome is True for outcome in outcomes)
         await asyncio.gather(
-            *(self._remove(s.session_id) for s in sessions), return_exceptions=True
+            *(
+                self._remove(s.session_id)
+                for s, outcome in zip(sessions, outcomes, strict=True)
+                if outcome is True and not s.cleanup_incomplete
+            ),
+            return_exceptions=True,
         )
         if self._cleanup_task is not None:
             self._cleanup_task.cancel()
@@ -567,19 +591,64 @@ class ExecSessionManager:
             session.spawn_done.set_result(None)
             return True
 
-    @staticmethod
-    async def _terminate_cancellation_safe(
-        handle: ProcessHandle,
-    ) -> tuple[ProcessExit, bool]:
-        task = asyncio.create_task(handle.terminate())
+    async def _cancel_spawned(
+        self, session: _ExecSession, handle: ProcessHandle, reason: str
+    ) -> bool:
+        settle_task = asyncio.create_task(self._settle_spawned(session, handle, reason))
         cancelled = False
         while True:
             try:
-                return await asyncio.shield(task), cancelled
+                settled = await asyncio.shield(settle_task)
+                break
             except asyncio.CancelledError:
-                if task.done():
-                    return task.result(), cancelled
                 cancelled = True
+                if settle_task.done():
+                    settled = settle_task.result()
+                    break
+        if cancelled:
+            raise asyncio.CancelledError
+        return settled
+
+    async def _settle_spawned(
+        self, session: _ExecSession, handle: ProcessHandle, reason: str
+    ) -> bool:
+        try:
+            await self._bind_spawned_handle(session, handle)
+        except BaseException:
+            await self._mark_spawn_cleanup_incomplete(session, handle, reason)
+            return False
+
+        try:
+            converged = await self._terminate(session, reason)
+        except BaseException:
+            if (
+                session.state in {"exited", "terminated"}
+                and not session.cleanup_incomplete
+                and not bool(getattr(handle, "cleanup_incomplete", False))
+            ):
+                await self._remove_unstarted(session.session_id)
+                return True
+            await self._mark_spawn_cleanup_incomplete(session, handle, reason)
+            return False
+        if converged and not session.cleanup_incomplete:
+            await self._remove_unstarted(session.session_id)
+            return True
+        return False
+
+    async def _mark_spawn_cleanup_incomplete(
+        self, session: _ExecSession, handle: ProcessHandle, reason: str
+    ) -> None:
+        async with self._admission:
+            if self._sessions.get(session.session_id) is not session:
+                return
+            session.handle = handle
+            session.state = "terminating"
+            session.reason = reason
+            session.cleanup_incomplete = True
+            session.terminal_at = None
+            session.last_access = self._clock()
+            if session.spawn_done is not None and not session.spawn_done.done():
+                session.spawn_done.set_result(None)
 
     def _ensure_cleanup_task(self) -> None:
         if self._cleanup_task is None:
@@ -595,9 +664,23 @@ class ExecSessionManager:
 
     async def _remove_unstarted(self, session_id: UUID) -> None:
         async with self._admission:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            if session.handle is not None and (
+                session.cleanup_incomplete or session.state == "terminating"
+            ):
+                return
+            self._sessions.pop(session_id, None)
         if session is not None and session.spawn_done is not None and not session.spawn_done.done():
             session.spawn_done.set_result(None)
+
+    async def _bind_spawned_handle(self, session: _ExecSession, handle: ProcessHandle) -> None:
+        async with self._admission:
+            if self._sessions.get(session.session_id) is session:
+                session.handle = handle
+                if session.spawn_done is not None and not session.spawn_done.done():
+                    session.spawn_done.set_result(None)
 
     async def _get(self, owner_chat: UUID, session_id: UUID) -> _ExecSession | None:
         async with self._admission:
@@ -633,6 +716,9 @@ class ExecSessionManager:
     async def _wait_for_exit(self, session: _ExecSession, handle: ProcessHandle) -> None:
         try:
             session.exit = await handle.wait()
+            session.cleanup_incomplete = session.cleanup_incomplete or bool(
+                getattr(handle, "cleanup_incomplete", False)
+            )
             if session.state == "running":
                 session.state = "exited"
                 session.reason = "exit"
@@ -925,7 +1011,7 @@ class ExecSessionManager:
                 for task in readers:
                     task.cancel()
         result = self._report(session, consume=True, max_chars=max_chars)
-        if remove:
+        if remove and not session.cleanup_incomplete and session.state != "terminating":
             await self._remove(session.session_id)
         return result
 

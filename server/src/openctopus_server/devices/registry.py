@@ -14,6 +14,7 @@ from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
     ConfigUpdateFrame,
     DeviceConfigFrame,
+    ShellMetadata,
     ToolCallFrame,
     ToolResultFrame,
     new_uuid7,
@@ -65,12 +66,22 @@ class DeviceRouteSnapshot:
     device_name: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceLiveMetadata:
+    os: str
+    default_shell: str
+    available_shells: tuple[str, ...]
+
+
 @dataclass(slots=True)
 class _Connection:
     handle: ConnectionHandle
     user_id: UUID
     device_name: str
     transport: DeviceTransport
+    operating_system: str | None = None
+    default_shell: str | None = None
+    available_shells: tuple[str, ...] | None = None
     last_pong: float = field(default_factory=time.monotonic)
     expected_pong: UUID | None = None
     ready: bool = True
@@ -162,6 +173,8 @@ class DeviceRegistry:
         transport: DeviceTransport,
         expected_revocation_epoch: int | None = None,
         ready: bool = True,
+        operating_system: str | None = None,
+        shells: ShellMetadata | None = None,
     ) -> ConnectionHandle | None:
         async with self._register_lock:
             async with self._lock:
@@ -178,6 +191,8 @@ class DeviceRegistry:
                             transport=transport,
                             expected_revocation_epoch=expected_revocation_epoch,
                             ready=ready,
+                            operating_system=operating_system,
+                            shells=shells,
                         )
             else:
                 result = await self._publish_registration(
@@ -187,6 +202,8 @@ class DeviceRegistry:
                     transport=transport,
                     expected_revocation_epoch=expected_revocation_epoch,
                     ready=ready,
+                    operating_system=operating_system,
+                    shells=shells,
                 )
             if result is None:
                 return None
@@ -220,6 +237,8 @@ class DeviceRegistry:
         transport: DeviceTransport,
         expected_revocation_epoch: int | None,
         ready: bool,
+        operating_system: str | None,
+        shells: ShellMetadata | None,
     ) -> tuple[ConnectionHandle, _Connection | None] | None:
         async with self._lock:
             if self._closed or (
@@ -235,6 +254,9 @@ class DeviceRegistry:
                 user_id=user_id,
                 device_name=device_name,
                 transport=transport,
+                operating_system=operating_system,
+                default_shell=shells.default if shells is not None else None,
+                available_shells=tuple(shells.available) if shells is not None else None,
                 ready=ready,
             )
             previous = self._connections.get(device_id)
@@ -242,6 +264,31 @@ class DeviceRegistry:
             if previous is not None:
                 self.transfers.fence_handle(previous.handle)
             return handle, previous
+
+    async def get_live_metadata(
+        self,
+        device_id: UUID,
+        *,
+        user_id: UUID,
+    ) -> DeviceLiveMetadata | None:
+        """Return hello metadata only for the current ready generation."""
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if (
+                self._closed
+                or connection is None
+                or not connection.ready
+                or connection.user_id != user_id
+                or connection.operating_system is None
+                or connection.default_shell is None
+                or connection.available_shells is None
+            ):
+                return None
+            return DeviceLiveMetadata(
+                os=connection.operating_system,
+                default_shell=connection.default_shell,
+                available_shells=connection.available_shells,
+            )
 
     async def activate(self, handle: ConnectionHandle, payload: str) -> bool:
         """Write ``hello_ack`` before making a handshake generation routable."""

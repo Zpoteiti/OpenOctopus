@@ -806,6 +806,7 @@ class ChatRuntime:
                 add_compaction_continuation=not pending_rows,
                 workspace_service=self.workspace_service,
                 skills_cache=self.skills_cache,
+                device_registry=self.device_registry,
             )
             prospective_messages.extend(
                 {
@@ -911,6 +912,7 @@ class ChatRuntime:
                     config=config,
                     workspace_service=self.workspace_service,
                     skills_cache=self.skills_cache,
+                    device_registry=self.device_registry,
                 )
             await self._estimate_tokens(
                 system=system,

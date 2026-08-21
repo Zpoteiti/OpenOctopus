@@ -47,6 +47,12 @@ not ignored.
 }
 ```
 
+`shells.default` and every `shells.available` entry use one of the canonical
+Py6 shell names: `bash`, `sh`, `zsh`, `pwsh`, `powershell`,
+`powershell_x86`, or `cmd`. The available list is non-empty and unique, and
+the default must be one of its entries. This live metadata is used for
+prompting and diagnostics and is not persisted.
+
 Server responds with `hello_ack` containing the active Py6 device config:
 
 ```jsonc

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
+import sys
 
 import pytest
 
@@ -126,6 +128,37 @@ def test_posix_pty_helper_runs_a_command() -> None:
 
     output, returncode = asyncio.run(run())
     assert output == b"pty-ok\n"
+    assert returncode == 0
+
+
+def test_posix_pty_child_does_not_inherit_helper_control_sockets() -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX PTY helper")
+
+    async def run() -> tuple[bytes, int | None]:
+        scan_fds = (
+            "import os,stat\n"
+            "for fd in range(3,256):\n"
+            " try: mode=os.fstat(fd).st_mode\n"
+            " except OSError: continue\n"
+            " if stat.S_ISSOCK(mode): print(fd)"
+        )
+        handle = await spawn_pty(
+            build_argv(
+                "sh",
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(scan_fds)}",
+                login=False,
+                tty=True,
+            ),
+            cwd=None,
+            env=build_child_env(os.environ, ["PATH"]),
+        )
+        output = await handle.output.read()
+        result = await handle.wait()
+        return output, result.returncode
+
+    output, returncode = asyncio.run(run())
+    assert output == b""
     assert returncode == 0
 
 

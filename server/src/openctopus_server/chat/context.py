@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openctopus_server.chat.prompt import build_system_prompt
 from openctopus_server.chat.public_projection import provider_role
 from openctopus_server.db.models import Message, PendingMessage, Session, User
+from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.provider.anthropic import provider_fingerprint
@@ -37,6 +38,7 @@ async def build_provider_context(
     add_compaction_continuation: bool = True,
     workspace_service: PromptWorkspaceService | None = None,
     skills_cache: SkillsCache | None = None,
+    device_registry: DeviceRegistry | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     session = await db.get(Session, session_id)
     if session is None:
@@ -85,6 +87,7 @@ async def build_provider_context(
         user=user,
         workspace_service=workspace_service,
         skills_cache=skills_cache,
+        device_registry=device_registry,
     )
     return system, projected
 

@@ -49,6 +49,11 @@ class ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+_CANONICAL_SHELL_NAMES = frozenset(
+    {"bash", "sh", "zsh", "pwsh", "powershell", "powershell_x86", "cmd"}
+)
+
+
 class DeviceCapabilities(ProtocolModel):
     shared_tools: Literal[True] = True
     web_fetch: Literal[True] = True
@@ -75,6 +80,19 @@ class ShellMetadata(ProtocolModel):
 
     @model_validator(mode="after")
     def _validate_shells(self) -> ShellMetadata:
+        names = (self.default, *self.available)
+        if any(
+            len(name) > 32
+            or not all(
+                "a" <= character <= "z"
+                or "0" <= character <= "9"
+                or character == "_"
+                for character in name
+            )
+            or name not in _CANONICAL_SHELL_NAMES
+            for name in names
+        ):
+            raise ValueError("shell names must be canonical lowercase names")
         if len(self.available) != len(set(self.available)):
             raise ValueError("shells.available must not contain duplicates")
         if self.default not in self.available:

@@ -19,6 +19,7 @@ from openoctopus_client.connection import (
 from openoctopus_client.exec_sessions import ExecPolicy, ExecStart, ExecWrite
 from openoctopus_client.process import ShellInventory
 from openoctopus_client.protocol import (
+    ConfigUpdate,
     DeviceConfig,
     Hello,
     ShellMetadata,
@@ -167,7 +168,7 @@ async def test_runtime_routes_exec_with_hidden_chat_owner_and_active_policy(
 
 
 @pytest.mark.asyncio
-async def test_runtime_binds_calls_after_config_update_to_the_new_exec_policy(
+async def test_runtime_binds_file_calls_after_config_update_to_the_new_config(
     tmp_path: Path,
 ) -> None:
     manager = _RecordingExecManager()
@@ -186,13 +187,95 @@ async def test_runtime_binds_calls_after_config_update_to_the_new_exec_policy(
             "config": _config(tmp_path, timeout=120).model_dump(mode="json"),
         }
     )
-    socket = _Socket([_ack(tmp_path), update, _exec_call()])
+    file_call = ToolCall(
+        id=_CALL_ID,
+        name="read_file",
+        args={"path": "notes.txt"},
+        max_result_bytes=4096,
+    ).model_dump_json()
+    socket = _Socket([_ack(tmp_path), update, file_call])
 
     await runtime.run_connection(socket)
 
     assert [policy.shell_timeout_max for policy in manager.policies] == [600, 120]
     assert manager.policies[1].epoch > manager.policies[0].epoch
-    assert manager.starts[0][1].policy == manager.policies[1]
+    result = next(json.loads(frame) for frame in socket.sent if "tool_result" in frame)
+    assert result["content"] == "local"
+    assert manager.starts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("exec", {"command": "printf ok", "yield_time_ms": 1}),
+        ("write_stdin", {"session_id": str(_CALL_ID), "chars": "x"}),
+        ("list_exec_sessions", {}),
+    ],
+)
+async def test_exec_family_is_busy_immediately_during_config_activation(
+    tmp_path: Path,
+    name: str,
+    args: dict[str, object],
+) -> None:
+    policy_started = asyncio.Event()
+    release_policy = asyncio.Event()
+
+    class _BlockingPolicyManager(_RecordingExecManager):
+        async def apply_policy(self, policy: ExecPolicy) -> None:
+            self.policies.append(policy)
+            if len(self.policies) == 2:
+                policy_started.set()
+                await release_policy.wait()
+
+    manager = _BlockingPolicyManager()
+    runtime = ClientRuntime(
+        load_config(_environment()),
+        hello_factory=_hello,
+        tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
+        shell_inventory=_SHELLS,
+        exec_session_manager=manager,
+    )
+    update = ConfigUpdate(
+        id=_UPDATE_ID,
+        device_name="devbox",
+        config=_config(tmp_path, timeout=120),
+    ).model_dump_json()
+    call = ToolCall(
+        id=_CALL_ID,
+        name=name,
+        args=args,
+        chat_session_id=_CHAT_ID,
+        max_result_bytes=4096,
+    ).model_dump_json()
+    class _BlockingSocket(_Socket):
+        async def recv(self) -> str | None:
+            if self.frames:
+                return self.frames.pop(0)
+            await release_policy.wait()
+            return None
+
+    socket = _BlockingSocket([_ack(tmp_path), update, call])
+    connection = asyncio.create_task(runtime.run_connection(socket))
+
+    try:
+        await asyncio.wait_for(policy_started.wait(), 1)
+        for _ in range(100):
+            if any(json.loads(item).get("id") == str(_CALL_ID) for item in socket.sent):
+                break
+            await asyncio.sleep(0)
+        result = next(
+            json.loads(item)
+            for item in socket.sent
+            if json.loads(item).get("id") == str(_CALL_ID)
+        )
+        assert result["code"] == "tool_device_busy"
+        assert result["is_error"] is True
+        assert manager.starts == []
+        assert connection.done() is False
+    finally:
+        release_policy.set()
+        assert await asyncio.wait_for(connection, timeout=1) is CloseDisposition.RETRY
 
 
 @pytest.mark.asyncio

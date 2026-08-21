@@ -398,6 +398,8 @@ async def serve_device_socket(
                 transport=transport,
                 expected_revocation_epoch=registration_epoch,
                 ready=False,
+                operating_system=hello.os,
+                shells=hello.shells,
             )
             if handle is None:
                 await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)

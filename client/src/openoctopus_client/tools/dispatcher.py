@@ -1858,7 +1858,7 @@ def _rename_verify_and_hash_fd(
     """Rename exclusively and repair a digest only if the commit-race changed content."""
 
     _rename_transfer_no_replace(source, destination, source_fd)
-    if _transfer_identity(os.fstat(source_fd)) == initial:
+    if os.name != "nt" and _transfer_identity(os.fstat(source_fd)) == initial:
         return bytes_transferred, digest
     os.lseek(source_fd, 0, os.SEEK_SET)
     updated_digest = hashlib.sha256()

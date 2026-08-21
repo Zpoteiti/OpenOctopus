@@ -166,6 +166,7 @@ async def test_handshake_generation_is_not_routable_before_hello_ack_is_written(
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
 
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
+    assert await registry.get_live_metadata(snapshot.id, user_id=snapshot.user_id) is None
     with pytest.raises(DeviceUnavailableError):
         await registry.dispatch_tool(
             device_id=snapshot.id,
@@ -182,6 +183,11 @@ async def test_handshake_generation_is_not_routable_before_hello_ack_is_written(
             break
         await asyncio.sleep(0)
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is True
+    metadata = await registry.get_live_metadata(snapshot.id, user_id=snapshot.user_id)
+    assert metadata is not None
+    assert metadata.os == "linux"
+    assert metadata.default_shell == "bash"
+    assert metadata.available_shells == ("bash", "sh")
     disconnect.set()
     await asyncio.wait_for(serving, timeout=1)
 
@@ -204,6 +210,8 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
             transport: DeviceTransport,
             expected_revocation_epoch: int | None = None,
             ready: bool = True,
+            operating_system: str | None = None,
+            shells: ShellMetadata | None = None,
         ) -> ConnectionHandle | None:
             self.register_started.set()
             await self.release_register.wait()
@@ -214,6 +222,8 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
                 transport=transport,
                 expected_revocation_epoch=expected_revocation_epoch,
                 ready=ready,
+                operating_system=operating_system,
+                shells=shells,
             )
 
     snapshot = replace(_snapshot(), sandbox_mode=False)

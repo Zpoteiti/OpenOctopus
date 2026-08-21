@@ -598,6 +598,9 @@ class ClientRuntime:
                 elif isinstance(frame, ToolCall):
                     if self._tools is None:
                         raise ProtocolError("Tool call arrived before device configuration")
+                    if config_update_tasks and frame.name in EXEC_TOOL_NAMES:
+                        writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
+                        continue
                     dispatcher: ToolDispatcher = self._tools
                     if config_update_tasks:
                         dispatcher = _ConfigBoundDispatcher(config_update_tasks[-1])

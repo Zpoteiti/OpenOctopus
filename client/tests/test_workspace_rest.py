@@ -401,6 +401,52 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
     assert _json(result)["sha256"] == hashlib.sha256(b"after").hexdigest()
 
 
+def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "destination.bin"
+    before = b"before"
+    after = b"after!"
+    source.write_bytes(before)
+    source_fd = os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    monkeypatch.setattr(os, "name", "nt")
+    initial_info = os.fstat(source_fd)
+    initial = dispatcher_module._transfer_identity(initial_info)
+
+    def change_then_rename(
+        source_path: Path, destination_path: Path, descriptor: int
+    ) -> None:
+        del descriptor
+        source_path.write_bytes(after)
+        os.utime(
+            source_path,
+            ns=(initial_info.st_atime_ns, initial_info.st_mtime_ns),
+        )
+        os.rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_rename_transfer_no_replace",
+        change_then_rename,
+    )
+    try:
+        bytes_transferred, digest = dispatcher_module._rename_verify_and_hash_fd(
+            source,
+            destination,
+            source_fd,
+            initial,
+            len(before),
+            hashlib.sha256(before).hexdigest(),
+        )
+    finally:
+        os.close(source_fd)
+
+    assert destination.read_bytes() == after
+    assert bytes_transferred == len(after)
+    assert digest == hashlib.sha256(after).hexdigest()
+
+
 def test_workspace_rest_local_move_returns_result_after_cancel_follows_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
