@@ -203,6 +203,7 @@ def test_write_all_retries_partial_writes_and_eagain() -> None:
     assert waits == [9]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
 def test_pty_group_cleanup_waits_for_a_permission_denied_zombie_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -222,6 +223,7 @@ def test_pty_group_cleanup_waits_for_a_permission_denied_zombie_group(
     assert pty_worker_module._cleanup_group(123) is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
 def test_pty_group_cleanup_reports_a_persistent_permission_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -890,6 +892,7 @@ def test_terminate_posix_waits_for_a_permission_denied_zombie_group(
     assert complete is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
 def test_terminate_posix_reports_a_persistent_permission_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
