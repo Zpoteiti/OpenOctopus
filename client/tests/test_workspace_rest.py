@@ -409,7 +409,13 @@ def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
     before = b"before"
     after = b"after!"
     source.write_bytes(before)
-    source_fd = os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    host_is_windows = os.name == "nt"
+    source_fd = (
+        dispatcher_module._open_windows_transfer_source(source, delete_access=False)
+        if host_is_windows
+        else os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+    )
+    native_rename = dispatcher_module._rename_transfer_no_replace
     monkeypatch.setattr(os, "name", "nt")
     initial_info = os.fstat(source_fd)
     initial = dispatcher_module._transfer_identity(initial_info)
@@ -417,13 +423,15 @@ def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
     def change_then_rename(
         source_path: Path, destination_path: Path, descriptor: int
     ) -> None:
-        del descriptor
         source_path.write_bytes(after)
         os.utime(
             source_path,
             ns=(initial_info.st_atime_ns, initial_info.st_mtime_ns),
         )
-        os.rename(source_path, destination_path)
+        if host_is_windows:
+            native_rename(source_path, destination_path, descriptor)
+        else:
+            os.rename(source_path, destination_path)
 
     monkeypatch.setattr(
         dispatcher_module,

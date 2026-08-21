@@ -689,15 +689,28 @@ def test_workspace_upload_rejects_temp_symlink_swap(
         pytest.skip("symbolic links are unavailable on this platform")
     probe.unlink()
 
-    original_open_temp = transfer_module._open_temp
+    original_identity_after_close = transfer_module._identity_after_close
 
-    def swap_temp(path: Path) -> tuple[object, tuple[int, int, int, int, int]]:
-        handle, identity = original_open_temp(path)
+    def swap_temp_after_close(
+        path: Path,
+        open_identity: tuple[int, int, int, int, int],
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> tuple[int, int, int, int, int]:
         path.unlink()
         path.symlink_to(outside)
-        return handle, identity
+        return original_identity_after_close(
+            path,
+            open_identity,
+            expected_bytes,
+            expected_sha256,
+        )
 
-    monkeypatch.setattr(transfer_module, "_open_temp", swap_temp)
+    monkeypatch.setattr(
+        transfer_module,
+        "_identity_after_close",
+        swap_temp_after_close,
+    )
 
     async def exercise() -> list[dict[str, object]]:
         manager, writer, socket, writer_task = await _manager(tmp_path)
@@ -722,10 +735,7 @@ def test_workspace_upload_rejects_temp_symlink_swap(
                     sha256=hashlib.sha256(b"abc").hexdigest(),
                 )
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT)
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
@@ -1039,7 +1049,11 @@ def test_receive_rechecks_destination_before_exposing_completed_file(
                     sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 )
             )
-            await asyncio.sleep(0.05)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)

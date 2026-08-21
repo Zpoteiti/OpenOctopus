@@ -25,9 +25,9 @@ jobs:
         working-directory: client
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -53,6 +53,7 @@ jobs:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
+          set -o pipefail
           mkdir -p metrics
           python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
 
@@ -61,11 +62,12 @@ jobs:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
+          set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
       - name: Upload bundle and metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: py6-client-linux-x64
           path: |
@@ -91,9 +93,9 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -119,6 +121,7 @@ jobs:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
+          set -o pipefail
           mkdir -p metrics
           python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
 
@@ -126,13 +129,77 @@ jobs:
         env:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
-        run: python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
+        run: |
+          set -o pipefail
+          python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
       - name: Upload native bundle and metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: py6-client-macos-${{ matrix.arch }}
+          path: |
+            client/dist/openoctopus-client
+            client/metrics
+          if-no-files-found: warn
+
+  windows-native:
+    name: windows-x64
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: client
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: client/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev,build]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Type check
+        run: python -m mypy --strict src tests
+
+      - name: Test, including native Windows process contracts
+        run: python -m pytest -v
+
+      - name: Build native one-folder bundle
+        run: python -m PyInstaller --noconfirm --clean openoctopus_client.spec
+
+      - name: Smoke test native frozen bundle
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          New-Item -ItemType Directory -Force -Path metrics | Out-Null
+          python tests/frozen_smoke.py | Tee-Object -FilePath metrics/frozen-smoke.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test native frozen runtime
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          python tests/frozen_runtime_smoke.py | Tee-Object -FilePath metrics/frozen-runtime-smoke.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload native bundle and metrics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: py6-client-windows-x64
           path: |
             client/dist/openoctopus-client
             client/metrics
@@ -156,20 +223,20 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U openoctopus -d openoctopus"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Download frozen client bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: py6-client-linux-x64
           path: client
