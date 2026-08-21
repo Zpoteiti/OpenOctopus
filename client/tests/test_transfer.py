@@ -1059,7 +1059,11 @@ def test_receive_rechecks_destination_before_exposing_completed_file(
                     sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 )
             )
-            await asyncio.sleep(0.05)
+            for _ in range(100):
+                if manager.active_count == 0:
+                    break
+                await asyncio.sleep(0.001)
+            await writer.drain()
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
