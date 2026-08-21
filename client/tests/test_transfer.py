@@ -741,10 +741,7 @@ def test_workspace_upload_rejects_temp_symlink_swap(
                     sha256=hashlib.sha256(b"abc").hexdigest(),
                 )
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT)
             return [json.loads(item) for item in socket.sent if isinstance(item, str)]
         finally:
             await _stop(manager, writer, writer_task)
