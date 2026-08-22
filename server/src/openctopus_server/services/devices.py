@@ -133,6 +133,20 @@ async def get_owned(db: AsyncSession, *, user_id: UUID, name: str) -> DeviceSnap
     return _snapshot(device)
 
 
+async def get_owned_by_id(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    device_id: UUID,
+) -> DeviceSnapshot:
+    device = await db.scalar(
+        select(Device).where(Device.user_id == user_id, Device.id == device_id)
+    )
+    if device is None:
+        raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")
+    return _snapshot(device)
+
+
 def parse_stored_mcp_servers(value: object) -> tuple[McpServerConfig, ...]:
     try:
         return parse_mcp_server_configs(value)
@@ -254,7 +268,7 @@ async def commit_config_candidate(
     db: AsyncSession,
     *,
     user_id: UUID,
-    name: str,
+    device_id: UUID,
     base_config_revision: int,
     fields: set[str],
     new_name: str | None,
@@ -268,7 +282,7 @@ async def commit_config_candidate(
     built_in_names: tuple[str, ...] = (),
 ) -> tuple[DeviceSnapshot, bool]:
     """Commit a prevalidated full Device candidate in one short transaction."""
-    device = await _owned_for_update(db, user_id=user_id, name=name)
+    device = await _owned_by_id_for_update(db, user_id=user_id, device_id=device_id)
     if device.config_revision != base_config_revision:
         raise DeviceError(ErrorCode.DEVICE_CONFIG_CONFLICT, "Device config revision is stale")
     await _lock_owner_mcp_catalogs(db, user_id)
@@ -469,6 +483,22 @@ async def delete(db: AsyncSession, *, user_id: UUID, name: str) -> DeviceSnapsho
 async def _owned_for_update(db: AsyncSession, *, user_id: UUID, name: str) -> Device:
     device = await db.scalar(
         select(Device).where(Device.user_id == user_id, Device.name == name).with_for_update()
+    )
+    if device is None:
+        raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")
+    return device
+
+
+async def _owned_by_id_for_update(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    device_id: UUID,
+) -> Device:
+    device = await db.scalar(
+        select(Device)
+        .where(Device.user_id == user_id, Device.id == device_id)
+        .with_for_update()
     )
     if device is None:
         raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")

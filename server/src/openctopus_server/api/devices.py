@@ -106,7 +106,7 @@ async def patch_device(
             db,
             registry,
             user_id=user_id,
-            name=name,
+            device_id=device_id,
             patch=patch,
         )
     return await _config_response(snapshot, registry)
@@ -117,10 +117,10 @@ async def _build_validate_and_commit(
     registry: DeviceRegistry,
     *,
     user_id: UUID,
-    name: str,
+    device_id: UUID,
     patch: DevicePatchRequest,
 ) -> devices.DeviceSnapshot:
-    current = await devices.get_owned(db, user_id=user_id, name=name)
+    current = await devices.get_owned_by_id(db, user_id=user_id, device_id=device_id)
     if current.config_revision != patch.base_config_revision:
         raise DeviceError(ErrorCode.DEVICE_CONFIG_CONFLICT, "Device config revision is stale")
     if "mcp_servers" in patch.model_fields_set and patch.mcp_servers is None:
@@ -186,7 +186,6 @@ async def _build_validate_and_commit(
             db,
             registry,
             user_id=user_id,
-            name=name,
             patch=patch,
             current=current,
             candidate_mcp=candidate_mcp,
@@ -207,7 +206,6 @@ async def _commit_and_activate_candidate(
     registry: DeviceRegistry,
     *,
     user_id: UUID,
-    name: str,
     patch: DevicePatchRequest,
     current: devices.DeviceSnapshot,
     candidate_mcp: tuple[object, ...],
@@ -243,7 +241,7 @@ async def _commit_and_activate_candidate(
                 snapshot, changed = await devices.commit_config_candidate(
                     db,
                     user_id=user_id,
-                    name=name,
+                    device_id=current.id,
                     base_config_revision=patch.base_config_revision,
                     fields=set(patch.model_fields_set)
                     - {"base_config_revision", "mcp_servers"},

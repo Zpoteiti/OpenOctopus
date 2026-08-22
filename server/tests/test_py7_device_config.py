@@ -626,6 +626,92 @@ async def test_offline_add_and_failed_remote_validation_do_not_save(
         assert row.config_revision == 1
 
 
+@pytest.mark.parametrize("mode", ["non_mcp", "offline_removal"])
+async def test_patch_does_not_mutate_replacement_device_with_reused_name(
+    async_client: Any,
+    test_app: Any,
+    pg_engine: Any,
+    mode: str,
+) -> None:
+    stored_mcp = {
+        "name": "corp",
+        "transport": "stdio",
+        "command": "corp-mcp",
+        "args": [],
+        "cwd": None,
+        "env": {},
+        "enabled_capabilities": [],
+    }
+    owner = await _register(async_client)
+    original = await _create_device(async_client, owner)
+    original_id = UUID(original["id"])
+    if mode == "offline_removal":
+        async with AsyncSession(pg_engine) as db:
+            row = await db.get(Device, original_id)
+            assert row is not None
+            row.mcp_servers = [stored_mcp]
+            await db.commit()
+
+    class _ReplacingRegistry(_ConfigRegistry):
+        replacement_id: UUID | None = None
+
+        async def begin_config_update(
+            self,
+            *,
+            device_id: UUID,
+            user_id: UUID,
+            expected_handle: object | None = None,
+        ) -> bool:
+            del expected_handle
+            assert device_id == original_id
+            async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+                removed = await devices.delete(db, user_id=user_id, name="laptop")
+                assert removed.id == original_id
+                replacement, _ = await devices.create(
+                    db,
+                    user_id=user_id,
+                    name="laptop",
+                    workspace_path="~/replacement",
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                    shell_timeout_max=600,
+                    env_allowlist=None,
+                )
+                self.replacement_id = replacement.id
+                if mode == "offline_removal":
+                    row = await db.get(Device, replacement.id)
+                    assert row is not None
+                    row.mcp_servers = [stored_mcp]
+                    await db.commit()
+            return False
+
+    registry = _ReplacingRegistry()
+    test_app.dependency_overrides[get_device_registry] = lambda: registry
+    patch = (
+        {"base_config_revision": 1, "mcp_servers": []}
+        if mode == "offline_removal"
+        else {"base_config_revision": 1, "workspace_path": "~/requested"}
+    )
+
+    response = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/laptop/config",
+        json=patch,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "device_not_found"
+    assert registry.replacement_id is not None
+    async with AsyncSession(pg_engine) as db:
+        replacement = await db.get(Device, registry.replacement_id)
+        assert replacement is not None
+        assert replacement.workspace_path == "~/replacement"
+        assert replacement.mcp_servers == ([stored_mcp] if mode == "offline_removal" else [])
+        assert replacement.config_revision == 1
+
+
 class _Transport:
     def __init__(self) -> None:
         self.sent: asyncio.Queue[str] = asyncio.Queue()

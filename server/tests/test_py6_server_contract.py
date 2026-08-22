@@ -752,7 +752,7 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
         created_at=datetime.now(UTC),
     )
 
-    async def get_owned(*_args: object, **_kwargs: object) -> DeviceSnapshot:
+    async def get_owned_by_id(*_args: object, **_kwargs: object) -> DeviceSnapshot:
         return replace(snapshot, restrict_to_workspace=True)
 
     async def commit(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
@@ -760,7 +760,7 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
         await release.wait()
         return snapshot, True
 
-    monkeypatch.setattr(devices, "get_owned", get_owned)
+    monkeypatch.setattr(devices, "get_owned_by_id", get_owned_by_id)
     monkeypatch.setattr(devices, "commit_config_candidate", commit)
 
     class _DB:
@@ -794,7 +794,7 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
             db=_DB(),  # type: ignore[arg-type]
             registry=registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
+            device_id=device_id,
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 restrict_to_workspace=False,
@@ -863,7 +863,6 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
@@ -932,7 +931,6 @@ async def test_patch_ambiguous_commit_retires_the_fenced_generation(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
@@ -1013,7 +1011,6 @@ async def test_candidate_transition_deadline_cleans_a_stalled_precommit(
             db,  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
@@ -1102,7 +1099,6 @@ async def test_candidate_transition_deadline_retires_an_ambiguous_commit(
             db,  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
@@ -1180,7 +1176,6 @@ async def test_candidate_transition_deadline_ends_only_after_push_handoff(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
@@ -1256,7 +1251,6 @@ async def test_candidate_transition_retires_when_push_never_takes_handoff(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
-            name="laptop",
             patch=DevicePatchRequest(
                 base_config_revision=1,
                 workspace_path="~/new-workspace",
