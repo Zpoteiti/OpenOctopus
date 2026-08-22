@@ -464,6 +464,53 @@ async def test_device_rename_revalidates_owner_provider_schema_limit_atomically(
         assert row.config_revision == 1
 
 
+async def test_device_rename_duplicate_maps_autoflush_conflict(
+    async_client: Any,
+    test_app: Any,
+    pg_engine: Any,
+) -> None:
+    registry = _ConfigRegistry()
+    test_app.dependency_overrides[get_device_registry] = lambda: registry
+    owner = await _register(async_client)
+    laptop = await _create_device(async_client, owner)
+    desktop_response = await _request_as(
+        async_client,
+        owner,
+        "POST",
+        "/api/devices",
+        json={"name": "desktop"},
+    )
+    assert desktop_response.status_code == 201
+
+    response = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/laptop/config",
+        json={"base_config_revision": 1, "name": "desktop"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "device_name_taken",
+        "message": "Device name is already in use",
+    }
+    async with AsyncSession(pg_engine) as db:
+        laptop_row = await db.get(Device, UUID(laptop["id"]))
+        assert laptop_row is not None
+        rows = list(
+            (
+                await db.scalars(
+                    select(Device).where(Device.user_id == laptop_row.user_id)
+                )
+            ).all()
+        )
+    assert sorted((row.name, row.config_revision) for row in rows) == [
+        ("desktop", 1),
+        ("laptop", 1),
+    ]
+
+
 async def test_online_add_validates_before_saving_and_stale_revision_does_not_send(
     async_client: Any,
     test_app: Any,

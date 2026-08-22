@@ -307,13 +307,14 @@ async def commit_config_candidate(
     if mcp_servers is not None or "name" in fields:
         if catalog_for_device is None:
             catalog_for_device = parse_stored_mcp_catalog(device.mcp_catalog)
-        owner_rows = list(
-            (
-                await db.scalars(
-                    select(Device).where(Device.user_id == user_id).order_by(Device.id)
-                )
-            ).all()
-        )
+        with db.no_autoflush:
+            owner_rows = list(
+                (
+                    await db.scalars(
+                        select(Device).where(Device.user_id == user_id).order_by(Device.id)
+                    )
+                ).all()
+            )
         owner_catalogs: dict[str, PersistedMcpCatalog] = {}
         try:
             for row in owner_rows:

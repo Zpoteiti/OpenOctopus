@@ -177,7 +177,9 @@ def test_fetch_schema_advertises_hard_max_chars() -> None:
         "100.64.1.2",
         "169.254.1.2",
         "192.0.0.8",
+        "192.0.0.11",
         "192.0.2.1",
+        "192.88.99.2",
         "198.18.0.1",
         "198.51.100.1",
         "203.0.113.1",
@@ -186,8 +188,13 @@ def test_fetch_schema_advertises_hard_max_chars() -> None:
         "0.0.0.0",
         "::1",
         "::ffff:127.0.0.1",
+        "::ffff:93.184.216.34",
         "64:ff9b:1::1",
         "100::1",
+        "100:0:0:1::1",
+        "2001:1::4",
+        "2001:2::1",
+        "2001:5::1",
         "2001:db8::1",
         "2002::1",
         "3fff::1",
@@ -202,13 +209,48 @@ async def test_fetch_blocks_non_public_dns_targets(address: str) -> None:
 
     tool = _web_fetch_tool(
         resolver=resolve,
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "unsafe",
+                headers={"content-type": "text/plain"},
+            )
+        ),
     )
 
     result = await tool.execute({"url": "http://unsafe.example"}, _ctx())
 
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "192.0.0.9",
+        "192.0.0.10",
+        "2001:1::1",
+        "2001:1::2",
+        "2001:1::3",
+        "2001:3::1",
+        "2001:4:112::1",
+        "2001:20::1",
+        "2001:30::1",
+    ],
+)
+async def test_fetch_allows_globally_reachable_special_purpose_targets(address: str) -> None:
+    tool = _web_fetch_tool(
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[address]),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "public",
+                headers={"content-type": "text/plain"},
+            )
+        ),
+    )
+
+    result = await tool.execute({"url": "https://public-special.example"}, _ctx())
+
+    assert result == ToolResult(content="public")
 
 
 async def test_fetch_rejects_mixed_public_and_private_dns_answers() -> None:
@@ -247,10 +289,14 @@ async def test_fetch_uses_one_dns_snapshot_per_hop_and_connects_to_that_ip() -> 
     assert captured_url == f"http://{PUBLIC_IP}/path"
 
 
-async def test_fetch_explicit_empty_denylist_allows_private_target() -> None:
+@pytest.mark.parametrize(
+    "address",
+    ["10.1.2.3", "100:0:0:1::1", "::ffff:93.184.216.34"],
+)
+async def test_fetch_explicit_empty_denylist_allows_any_target(address: str) -> None:
     tool = _web_fetch_tool(
         denylist=[],
-        resolver=lambda hostname, port: asyncio.sleep(0, result=["10.1.2.3"]),
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[address]),
         transport=httpx.MockTransport(
             lambda request: _streaming_text_response(
                 "internal",

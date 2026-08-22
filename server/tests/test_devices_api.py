@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -18,6 +19,10 @@ from openctopus_server.api import devices as devices_api
 from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import Device
 from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.network_policy import (
+    DEFAULT_SSRF_DENYLIST,
+    DEFAULT_SSRF_DENYLIST_JSON,
+)
 from openctopus_server.services import devices
 from openctopus_server.services.devices import DeviceSnapshot
 
@@ -89,6 +94,19 @@ async def _request_as(
     headers = dict(kwargs.pop("headers", {}))
     headers["Authorization"] = f"Bearer {identity['jwt']}"
     return await client.request(method, url, headers=headers, **kwargs)
+
+
+def test_device_ssrf_defaults_match_model_and_schema_documentation() -> None:
+    expected_sql = f"'{DEFAULT_SSRF_DENYLIST_JSON}'::jsonb"
+    column_default = Device.__table__.c.ssrf_denylist.server_default
+
+    assert len(DEFAULT_SSRF_DENYLIST) == len(set(DEFAULT_SSRF_DENYLIST)) <= 256
+    assert column_default is not None
+    assert str(column_default.arg) == expected_sql
+    schema = (
+        Path(__file__).resolve().parents[2] / "docs" / "SCHEMA.md"
+    ).read_text(encoding="utf-8")
+    assert f"        {expected_sql}," in schema
 
 
 @pytest.mark.parametrize(

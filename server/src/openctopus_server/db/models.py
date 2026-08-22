@@ -17,6 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func, text
 
 from openctopus_server.db.base import Base
+from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST_JSON
 
 
 class SystemConfig(Base):
@@ -207,9 +208,7 @@ class Device(Base):
     ssrf_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text(
-            '\'["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.0.2.0/24","192.168.0.0/16","198.18.0.0/15","198.51.100.0/24","203.0.113.0/24","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","64:ff9b:1::/48","100::/64","2001::/23","2001:db8::/32","2002::/16","3fff::/20","5f00::/16","fc00::/7","fe80::/10","ff00::/8"]\'::jsonb'
-        ),
+        server_default=text(f"'{DEFAULT_SSRF_DENYLIST_JSON}'::jsonb"),
     )
     shell_timeout_max: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("600")

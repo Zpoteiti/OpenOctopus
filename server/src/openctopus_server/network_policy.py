@@ -1,12 +1,61 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ConfigError
+
+type IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _subnet_of(network: IpNetwork, parent: IpNetwork) -> bool:
+    if isinstance(network, ipaddress.IPv4Network):
+        return isinstance(parent, ipaddress.IPv4Network) and network.subnet_of(parent)
+    return isinstance(parent, ipaddress.IPv6Network) and network.subnet_of(parent)
+
+
+def _network_without(parent: str, exclusions: tuple[str, ...]) -> tuple[str, ...]:
+    base = ipaddress.ip_network(parent)
+    remaining: list[IpNetwork] = [base]
+    for value in exclusions:
+        exclusion = ipaddress.ip_network(value)
+        if not _subnet_of(exclusion, base):
+            raise ValueError("default SSRF exception must be inside its parent network")
+        next_remaining: list[IpNetwork] = []
+        for network in remaining:
+            if not _subnet_of(exclusion, network):
+                next_remaining.append(network)
+            elif isinstance(network, ipaddress.IPv4Network):
+                assert isinstance(exclusion, ipaddress.IPv4Network)
+                next_remaining.extend(network.address_exclude(exclusion))
+            else:
+                assert isinstance(exclusion, ipaddress.IPv6Network)
+                next_remaining.extend(network.address_exclude(exclusion))
+        remaining = next_remaining
+    remaining.sort(key=lambda network: (int(network.network_address), network.prefixlen))
+    return tuple(network.with_prefixlen for network in remaining)
+
+
+_IPV4_IETF_PROTOCOL_ASSIGNMENTS = _network_without(
+    "192.0.0.0/24",
+    ("192.0.0.9/32", "192.0.0.10/32"),
+)
+_IPV6_IETF_PROTOCOL_ASSIGNMENTS = _network_without(
+    "2001::/23",
+    (
+        "2001:1::1/128",
+        "2001:1::2/128",
+        "2001:1::3/128",
+        "2001:3::/32",
+        "2001:4:112::/48",
+        "2001:20::/28",
+        "2001:30::/28",
+    ),
+)
 
 DEFAULT_SSRF_DENYLIST = (
     "0.0.0.0/8",
@@ -15,8 +64,9 @@ DEFAULT_SSRF_DENYLIST = (
     "127.0.0.0/8",
     "169.254.0.0/16",
     "172.16.0.0/12",
-    "192.0.0.0/24",
+    *_IPV4_IETF_PROTOCOL_ASSIGNMENTS,
     "192.0.2.0/24",
+    "192.88.99.2/32",
     "192.168.0.0/16",
     "198.18.0.0/15",
     "198.51.100.0/24",
@@ -25,9 +75,11 @@ DEFAULT_SSRF_DENYLIST = (
     "240.0.0.0/4",
     "::/128",
     "::1/128",
+    "::ffff:0.0.0.0/96",
     "64:ff9b:1::/48",
     "100::/64",
-    "2001::/23",
+    "100:0:0:1::/64",
+    *_IPV6_IETF_PROTOCOL_ASSIGNMENTS,
     "2001:db8::/32",
     "2002::/16",
     "3fff::/20",
@@ -36,12 +88,11 @@ DEFAULT_SSRF_DENYLIST = (
     "fe80::/10",
     "ff00::/8",
 )
+DEFAULT_SSRF_DENYLIST_JSON = json.dumps(DEFAULT_SSRF_DENYLIST, separators=(",", ":"))
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _MAX_ENTRIES = 256
 _MAX_ENTRY_BYTES = 512
-
-type IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
 @dataclass(frozen=True, slots=True)
