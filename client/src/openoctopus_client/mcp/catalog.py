@@ -5,6 +5,7 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 from uuid import UUID
@@ -80,6 +81,7 @@ class McpEntryRoute:
     raw_name: str
     invocation_identity: str
     final_name: str
+    input_schema: dict[str, Any]
     enabled: bool
 
 
@@ -567,6 +569,7 @@ def bind_server_entries(
             raw_name=entry.raw_name,
             invocation_identity=entry.invocation_identity,
             final_name=entry.final_name,
+            input_schema=deepcopy(entry.input_schema),
             enabled=entry.enabled,
         )
         for entry in persisted.entries

@@ -15,6 +15,8 @@ from uuid import UUID
 import httpx
 from fastmcp.client.messages import MessageHandler
 from fastmcp.client.transports import ClientTransport, SSETransport, StreamableHttpTransport
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
 from mcp import types
 from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl, ValidationError
@@ -675,6 +677,16 @@ class McpServerRuntime:
         try:
             async with asyncio.timeout(self._invocation_timeout):
                 if route.surface == "tool":
+                    try:
+                        validate_json_schema(
+                            instance=dict(arguments),
+                            schema=route.input_schema,
+                        )
+                    except JsonSchemaValidationError:
+                        return fail(
+                            "tool_invalid_args",
+                            "MCP tool arguments do not match the configured input schema",
+                        )
                     request = types.ClientRequest(
                         root=types.CallToolRequest(
                             params=types.CallToolRequestParams(
