@@ -10,17 +10,28 @@ from openctopus_server.errors.exceptions import ConfigError
 
 DEFAULT_SSRF_DENYLIST = (
     "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
     "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
     "224.0.0.0/4",
     "240.0.0.0/4",
     "::/128",
     "::1/128",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "100.64.0.0/10",
-    "169.254.0.0/16",
-    "169.254.169.254/32",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2001::/23",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+    "5f00::/16",
     "fc00::/7",
     "fe80::/10",
     "ff00::/8",
@@ -44,11 +55,16 @@ class SsrfPolicy:
         return hostname in self.hosts or (hostname, port) in self.host_ports
 
     def denies_address(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int) -> bool:
+        candidates = [address]
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-            return self.denies_address(address.ipv4_mapped, port)
-        normalized = str(address)
-        return (normalized, port) in self.host_ports or any(
-            address.version == network.version and address in network for network in self.networks
+            candidates.append(address.ipv4_mapped)
+        return any(
+            (str(candidate), port) in self.host_ports
+            or any(
+                candidate.version == network.version and candidate in network
+                for network in self.networks
+            )
+            for candidate in candidates
         )
 
 

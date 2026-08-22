@@ -343,7 +343,7 @@ CREATE TABLE IF NOT EXISTS devices (
     restrict_to_workspace BOOLEAN   NOT NULL DEFAULT TRUE,
     shell_timeout_max  INTEGER      NOT NULL DEFAULT 600 CHECK (shell_timeout_max BETWEEN 0 AND 86400),
     ssrf_denylist      JSONB        NOT NULL DEFAULT
-        '["0.0.0.0/8","127.0.0.0/8","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10","ff00::/8"]'::jsonb,
+        '["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.0.2.0/24","192.168.0.0/16","198.18.0.0/15","198.51.100.0/24","203.0.113.0/24","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","64:ff9b:1::/48","100::/64","2001::/23","2001:db8::/32","2002::/16","3fff::/20","5f00::/16","fc00::/7","fe80::/10","ff00::/8"]'::jsonb,
     env_allowlist      JSONB        NOT NULL DEFAULT
         '["PATH","HOME","LANG","TERM","SystemRoot","ComSpec","PATHEXT","TEMP","TMP","USERPROFILE"]'::jsonb,
     mcp_servers        JSONB        NOT NULL DEFAULT '[]'::jsonb,

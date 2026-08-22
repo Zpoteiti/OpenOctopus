@@ -214,7 +214,7 @@ def _resolve_secret_map(
             continue
         if not same_sink or key not in current:
             raise DeviceError(
-                ErrorCode.DEVICE_INVALID_REQUEST,
+                ErrorCode.CONFIG_VALIDATION_FAILED,
                 "A redacted MCP secret can only retain the same key at the same sink",
             )
         resolved[key] = current[key]
@@ -283,13 +283,14 @@ async def commit_config_candidate(
         shell_timeout_max=shell_timeout_max,
         env_allowlist=env_allowlist,
     )
+    catalog_for_device: PersistedMcpCatalog | None = None
     if mcp_servers is not None:
-        existing_catalog = parse_stored_mcp_catalog(device.mcp_catalog)
+        catalog_for_device = parse_stored_mcp_catalog(device.mcp_catalog)
         try:
             candidate_catalog = build_persisted_catalog(
                 mcp_servers,
                 source_catalog,
-                existing_catalog=existing_catalog,
+                existing_catalog=catalog_for_device,
                 built_in_names=built_in_names,
                 entry_id_factory=new_uuid7,
             )
@@ -301,7 +302,11 @@ async def commit_config_candidate(
             device.mcp_servers = stored
             device.mcp_catalog = catalog_payload
             changed = True
+        catalog_for_device = candidate_catalog
 
+    if mcp_servers is not None or "name" in fields:
+        if catalog_for_device is None:
+            catalog_for_device = parse_stored_mcp_catalog(device.mcp_catalog)
         owner_rows = list(
             (
                 await db.scalars(
@@ -313,7 +318,7 @@ async def commit_config_candidate(
         try:
             for row in owner_rows:
                 owner_catalogs[row.name] = (
-                    candidate_catalog
+                    catalog_for_device
                     if row.id == device.id
                     else parse_stored_mcp_catalog(row.mcp_catalog)
                 )

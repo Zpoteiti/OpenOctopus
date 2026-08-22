@@ -6,18 +6,28 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.models import Device
+from openctopus_server.devices import mcp_catalog as mcp_catalog_module
 from openctopus_server.devices.dependencies import get_device_registry
-from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
+from openctopus_server.devices.mcp_catalog import (
+    EMPTY_CATALOG_DIGEST,
+    build_persisted_catalog,
+    canonical_json_bytes,
+    merge_owner_catalogs,
+)
+from openctopus_server.devices.mcp_models import parse_mcp_server_configs
 from openctopus_server.devices.protocol import (
     ConfigValidateResultFrame,
     DeviceConfigFrame,
     McpValidationFailure,
     SourceMcpCatalog,
     SourceMcpServerCatalog,
+    SourceMcpTool,
+    new_uuid7,
 )
 from openctopus_server.devices.registry import (
     ConnectionHandle,
@@ -292,10 +302,44 @@ async def test_secret_marker_exact_noop_does_not_validate_or_increment_revision(
     assert "super-secret" not in response.text
 
 
-async def test_secret_marker_cannot_move_to_another_sink(
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {
+            "name": "github",
+            "transport": "stdio",
+            "command": "new-command",
+            "args": [],
+            "cwd": None,
+            "env": {"TOKEN": "<redacted>"},
+            "enabled_capabilities": [],
+        },
+        {
+            "name": "github_renamed",
+            "transport": "stdio",
+            "command": "old-command",
+            "args": [],
+            "cwd": None,
+            "env": {"TOKEN": "<redacted>"},
+            "enabled_capabilities": [],
+        },
+        {
+            "name": "github",
+            "transport": "stdio",
+            "command": "old-command",
+            "args": [],
+            "cwd": None,
+            "env": {"TOKEN": "<redacted>", "NEW_TOKEN": "<redacted>"},
+            "enabled_capabilities": [],
+        },
+    ],
+    ids=("cross-sink", "rename", "new-key"),
+)
+async def test_secret_marker_invalid_reuse_returns_422(
     async_client: Any,
     test_app: Any,
     pg_engine: Any,
+    candidate: dict[str, object],
 ) -> None:
     registry = _ConfigRegistry()
     registry.online = True
@@ -325,21 +369,11 @@ async def test_secret_marker_cannot_move_to_another_sink(
         "/api/devices/laptop/config",
         json={
             "base_config_revision": 1,
-            "mcp_servers": [
-                {
-                    "name": "github",
-                    "transport": "stdio",
-                    "command": "new-command",
-                    "args": [],
-                    "cwd": None,
-                    "env": {"TOKEN": "<redacted>"},
-                    "enabled_capabilities": [],
-                }
-            ],
+            "mcp_servers": [candidate],
         },
     )
 
-    assert response.status_code in {400, 422}
+    assert response.status_code == 422
     assert "super-secret" not in response.text
     assert registry.validations == []
 
@@ -347,6 +381,87 @@ async def test_secret_marker_cannot_move_to_another_sink(
         row = await db.scalar(select(Device).where(Device.id == UUID(device["id"])))
         assert row is not None
         assert row.mcp_servers[0]["command"] == "old-command"
+
+
+async def test_device_rename_revalidates_owner_provider_schema_limit_atomically(
+    async_client: Any,
+    test_app: Any,
+    pg_engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _ConfigRegistry()
+    test_app.dependency_overrides[get_device_registry] = lambda: registry
+    owner = await _register(async_client)
+    device = await _create_device(async_client, owner)
+    configs = parse_mcp_server_configs(
+        [
+            {
+                "name": "demo",
+                "transport": "stdio",
+                "command": "demo-mcp",
+                "args": [],
+                "cwd": None,
+                "env": {},
+                "enabled_capabilities": None,
+            }
+        ]
+    )
+    catalog = build_persisted_catalog(
+        configs,
+        SourceMcpCatalog(
+            version=1,
+            servers=[
+                SourceMcpServerCatalog(
+                    name="demo",
+                    tools=[
+                        SourceMcpTool(
+                            raw_name="search",
+                            input_schema={"type": "object", "properties": {}},
+                        )
+                    ],
+                )
+            ],
+        ),
+        entry_id_factory=new_uuid7,
+    )
+    short_payload = [
+        tool.model_dump(mode="json", exclude_none=True)
+        for tool in merge_owner_catalogs({"laptop": catalog})
+    ]
+    long_name = "l" * 64
+    long_payload = [
+        tool.model_dump(mode="json", exclude_none=True)
+        for tool in merge_owner_catalogs({long_name: catalog})
+    ]
+    short_size = len(canonical_json_bytes(short_payload))
+    assert len(canonical_json_bytes(long_payload)) > short_size
+    monkeypatch.setattr(
+        mcp_catalog_module,
+        "OWNER_PROVIDER_SCHEMA_BYTES_MAX",
+        short_size,
+    )
+    async with AsyncSession(pg_engine) as db:
+        row = await db.scalar(select(Device).where(Device.id == UUID(device["id"])))
+        assert row is not None
+        row.mcp_servers = [config.storage_dict() for config in configs]
+        row.mcp_catalog = catalog.model_dump(mode="json")
+        await db.commit()
+
+    response = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/laptop/config",
+        json={"base_config_revision": 1, "name": long_name},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mcp_owner_schema_limit"
+    async with AsyncSession(pg_engine) as db:
+        row = await db.scalar(select(Device).where(Device.id == UUID(device["id"])))
+        assert row is not None
+        assert row.name == "laptop"
+        assert row.config_revision == 1
 
 
 async def test_online_add_validates_before_saving_and_stale_revision_does_not_send(

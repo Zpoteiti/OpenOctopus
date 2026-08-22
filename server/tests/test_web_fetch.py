@@ -176,11 +176,21 @@ def test_fetch_schema_advertises_hard_max_chars() -> None:
         "192.168.1.2",
         "100.64.1.2",
         "169.254.1.2",
+        "192.0.0.8",
+        "192.0.2.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
         "224.0.0.1",
         "240.0.0.1",
         "0.0.0.0",
         "::1",
         "::ffff:127.0.0.1",
+        "64:ff9b:1::1",
+        "100::1",
+        "2001:db8::1",
+        "2002::1",
+        "3fff::1",
         "fc00::1",
         "fe80::1",
         "ff02::1",
@@ -252,6 +262,20 @@ async def test_fetch_explicit_empty_denylist_allows_private_target() -> None:
     result = await tool.execute({"url": "http://internal.example"}, _ctx())
 
     assert result == ToolResult(content="internal")
+
+
+async def test_fetch_applies_explicit_mapped_ipv6_rule_before_ipv4_normalization() -> None:
+    mapped = "::ffff:93.184.216.34"
+    tool = _web_fetch_tool(
+        denylist=[f"{mapped}/128"],
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[mapped]),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
+    )
+
+    result = await tool.execute({"url": "https://mapped.example"}, _ctx())
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.NETWORK_SSRF_BLOCKED
 
 
 async def test_fetch_applies_hostname_port_rule_before_dns() -> None:

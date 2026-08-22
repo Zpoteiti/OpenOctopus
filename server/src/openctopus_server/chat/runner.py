@@ -3,7 +3,7 @@ import inspect
 import json
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -29,13 +29,17 @@ from openctopus_server.chat.context import (
     project_message_rows,
     project_provider_messages,
 )
+from openctopus_server.chat.device_snapshot import (
+    OwnerDeviceSnapshot,
+    load_owner_device_snapshot,
+)
 from openctopus_server.chat.public_projection import message_response
 from openctopus_server.chat.repair import repair_unpaired_tool_uses
 from openctopus_server.chat.stream import StreamSubscriber
 from openctopus_server.chat.token_estimator import estimate_request_tokens
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.config import get_settings
-from openctopus_server.db.models import Device, Message, PendingMessage, Session, TurnRun
+from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.mcp_routes import (
     OwnerMcpDevice,
@@ -53,7 +57,6 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig, load_provider_config
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
-from openctopus_server.services.devices import parse_stored_mcp_catalog
 from openctopus_server.services.messages import (
     cancel_tool_batch,
     capture_pending_for_turn,
@@ -136,6 +139,31 @@ class _CompletedProviderTurn:
 @dataclass(frozen=True, slots=True)
 class _UnhandledProviderFailure:
     pass
+
+
+def _build_owner_tool_state(
+    devices: Sequence[OwnerDeviceSnapshot],
+    *,
+    tool_registry: ToolRegistry,
+) -> tuple[dict[str, UUID], OwnerMcpSnapshot, list[dict[str, Any]]]:
+    device_targets = {device.name: device.id for device in devices}
+    mcp_snapshot = build_owner_mcp_snapshot(
+        [
+            OwnerMcpDevice(
+                device_id=device.id,
+                name=device.name,
+                config_revision=device.config_revision,
+                catalog=device.mcp_catalog,
+            )
+            for device in devices
+        ],
+        built_in_names=tool_registry.tool_names,
+    )
+    registry_schemas = tool_registry.get_tool_schemas(
+        device_names=device_targets.keys(),
+        mcp_snapshot=mcp_snapshot,
+    )
+    return device_targets, mcp_snapshot, registry_schemas
 
 
 _UNHANDLED_PROVIDER_FAILURE = _UnhandledProviderFailure()
@@ -779,6 +807,8 @@ class ChatRuntime:
             session = await db.get(Session, turn.session_id)
             if session is None:
                 raise RuntimeError("Session disappeared while preparing a turn")
+            user_id = session.user_id
+            owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
             active_rows = list(
                 (
                     await db.execute(
@@ -818,6 +848,7 @@ class ChatRuntime:
                 workspace_service=self.workspace_service,
                 skills_cache=self.skills_cache,
                 device_registry=self.device_registry,
+                device_snapshot=owner_devices,
             )
             prospective_messages.extend(
                 {
@@ -831,40 +862,9 @@ class ChatRuntime:
                 current_fingerprint=provider_fingerprint(config),
                 add_compaction_continuation=False,
             )
-            user_id = session.user_id
-            device_rows = list(
-                (
-                    await db.execute(
-                        select(
-                            Device.id,
-                            Device.name,
-                            Device.config_revision,
-                            Device.mcp_catalog,
-                        )
-                        .where(Device.user_id == user_id)
-                        .order_by(Device.created_at, Device.id)
-                    )
-                )
-                .tuples()
-                .all()
-            )
-            device_targets = {name: device_id for device_id, name, _, _ in device_rows}
-            mcp_snapshot = build_owner_mcp_snapshot(
-                [
-                    OwnerMcpDevice(
-                        device_id=device_id,
-                        name=name,
-                        config_revision=config_revision,
-                        catalog=parse_stored_mcp_catalog(catalog),
-                    )
-                    for device_id, name, config_revision, catalog in device_rows
-                ],
-                built_in_names=self.tool_registry.tool_names,
-            )
-
-        registry_schemas = self.tool_registry.get_tool_schemas(
-            device_names=device_targets.keys(),
-            mcp_snapshot=mcp_snapshot,
+        device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
+            owner_devices,
+            tool_registry=self.tool_registry,
         )
 
         should_compact = False
@@ -931,6 +931,7 @@ class ChatRuntime:
         if compacted:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 config = await load_provider_config(db)
+                owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
                 system, provider_messages = await build_provider_context(
                     db,
                     session_id=turn.session_id,
@@ -938,7 +939,12 @@ class ChatRuntime:
                     workspace_service=self.workspace_service,
                     skills_cache=self.skills_cache,
                     device_registry=self.device_registry,
+                    device_snapshot=owner_devices,
                 )
+            device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
+                owner_devices,
+                tool_registry=self.tool_registry,
+            )
             await self._estimate_tokens(
                 system=system,
                 messages=provider_messages,

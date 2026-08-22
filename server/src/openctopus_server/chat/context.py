@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.chat.device_snapshot import OwnerDeviceSnapshot
 from openctopus_server.chat.prompt import build_system_prompt
 from openctopus_server.chat.public_projection import provider_role
 from openctopus_server.db.models import Message, PendingMessage, Session, User
@@ -39,6 +40,7 @@ async def build_provider_context(
     workspace_service: PromptWorkspaceService | None = None,
     skills_cache: SkillsCache | None = None,
     device_registry: DeviceRegistry | None = None,
+    device_snapshot: Sequence[OwnerDeviceSnapshot] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     session = await db.get(Session, session_id)
     if session is None:
@@ -88,6 +90,7 @@ async def build_provider_context(
         workspace_service=workspace_service,
         skills_cache=skills_cache,
         device_registry=device_registry,
+        device_snapshot=device_snapshot,
     )
     return system, projected
 
