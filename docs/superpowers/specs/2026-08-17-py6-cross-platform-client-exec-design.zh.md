@@ -1,5 +1,9 @@
 # Py6 跨平台客户端 Exec v2 设计
 
+> **历史 milestone：** Py7 已取代本文中的 `sandbox_mode` trusted-only gate、
+> Protocol v2、首次连接重试和 deferred Client MCP 约定。当前契约见
+> [Py7 Client Workspace Restriction 与 Client MCP 设计](2026-08-22-py7-client-workspace-mcp-design.zh.md)。
+
 **状态：** 已接受 v2（2026-08-18）
 **里程碑：** Py6 Client shell execution
 **依赖：** 已接受并实现的 Py5 Python 客户端/设备文件切片

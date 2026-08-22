@@ -1,5 +1,9 @@
 # Py5 Python Client and Device Files Design
 
+> **Historical milestone:** Py7 supersedes this document's `sandbox_mode`,
+> Protocol v1, and deferred Device MCP assumptions. The current contract is
+> [Py7 Client Workspace Restriction 与 Client MCP 设计](2026-08-22-py7-client-workspace-mcp-design.zh.md).
+
 **Status:** accepted (2026-08-10)
 **Milestone:** Py5 Client Alpha
 **Depends on:** implemented Py4 workspace/files/message slice and the completed

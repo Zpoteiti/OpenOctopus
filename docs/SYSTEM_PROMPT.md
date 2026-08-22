@@ -173,15 +173,17 @@ Hosts every workspace listed above. File tool calls with
 openoctopus_device="server" target a workspace by path prefix.
 
 ### laptop
-fs_policy: trusted (sandbox_mode=false).
+workspace_root: /home/alice/openoctopus/workspace;
+restrict_to_workspace: false.
 exec available: pipe by default, PTY with `tty=true`; default hard timeout 60s,
 device cap 600s. Long-running REPL/SSH commands must set an explicit timeout;
 `yield_time_ms` never extends the hard timeout. Password/2FA/passphrase input
 is unsupported. No server-side quota — Alice manages her own disk.
 
 ### phone
-fs_policy: trusted (sandbox_mode=false).
 Workspace root: /data/data/com.openoctopus/files/.
+restrict_to_workspace: true (structured file paths and initial exec cwd only;
+not an OS sandbox).
 exec available: pipe by default or line-oriented PTY with `tty=true`.
 Current connectivity is checked at tool execution time.
 
@@ -209,6 +211,10 @@ Current connectivity is checked at tool execution time.
   `tool_execution_outcome_unknown`, inspect the session or external state and do
   not replay the command. Never request or enter passwords, 2FA codes, or
   passphrases; ask the user to take over.
+- **MCP.** Device MCP tools may remain visible from their last-good catalog
+  while a Device or its MCP runtime is unavailable. Treat MCP failures as normal
+  tool results. Never blindly replay a call whose result says its execution
+  outcome is unknown.
 - **Replying.** Plain text output delivers to the current session
   channel automatically. Use the `message` tool when you need to
   send files (media), inline buttons, or reach a different
@@ -344,14 +350,19 @@ the public DTO layer does not own a second grammar.
 ### Devices
 - Execution targets (where shell / file tools can run).
 - The server always appears. Clients appear if registered to this user.
-- Per-device attributes: stable name, `sandbox_mode`, workspace root,
+- Per-device attributes: stable name, `restrict_to_workspace`, workspace root,
   `shell_timeout_max`, `env_allowlist`, and declared capabilities. Exec is
-  exposed only for paired devices with `sandbox_mode=false`; `server` is never
-  an exec target. It runs with the device user's OS privileges, not an OS
-  sandbox. `command_denylist` is not a Py6 control.
+  exposed for every paired device; `server` is never an exec target. The
+  restriction only guards OpenOctopus-resolved file paths and an exec/PTY
+  process's initial working directory. Shell and stdio MCP run with the Device
+  user's OS privileges and network access, not an OS sandbox.
 - Online/offline state and last-seen timestamps are volatile, server-authoritative
   execution state. Tool dispatch checks them out of band and reports failure;
   they do not churn the system-prompt prefix.
+- Device MCP schema comes from the persisted last-good catalog. Runtime
+  availability and Protocol v3 registration are out-of-band state, so MCP
+  crash/recovery or Device connect/disconnect does not remove or add names in
+  the prompt prefix.
 - **No explicit tool listing** — the agent's tool schemas already enumerate which tools exist and their `device` enum tells the agent which devices each tool can target.
 
 ### Operating Notes
