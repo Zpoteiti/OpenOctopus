@@ -1,0 +1,425 @@
+{
+  "valid": [
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "hello",
+        "id": "0190d5a7-0000-7000-8000-000000000001",
+        "version": "3",
+        "client_version": "0.0.1",
+        "os": "linux",
+        "caps": {
+          "shared_tools": true,
+          "web_fetch": true,
+          "file_transfer": ["send", "receive"],
+          "http_relay": true
+        },
+        "shells": {"default": "bash", "available": ["bash", "sh"]}
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "hello_ack",
+        "id": "0190d5a7-0000-7000-8000-000000000001",
+        "device_name": "laptop",
+        "config_revision": 7,
+        "config": {
+          "workspace_path": "/home/me/work",
+          "restrict_to_workspace": true,
+          "ssrf_denylist": ["10.0.0.0/8"],
+          "shell_timeout_max": 600,
+          "env_allowlist": ["PATH", "HOME"],
+          "mcp_servers": [
+            {
+              "name": "corp",
+              "transport": "streamable_http",
+              "url": "https://mcp.example.test/mcp?tenant=A",
+              "headers": {"authorization": "Bearer fake-token"},
+              "enabled_capabilities": ["mcp_corp_search"]
+            }
+          ]
+        },
+        "mcp_catalog": {
+          "version": 1,
+          "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "servers": [
+            {
+              "name": "corp",
+              "entries": [
+                {
+                  "entry_id": "0190d5a7-0000-7000-8000-000000000010",
+                  "server": "corp",
+                  "surface": "tool",
+                  "raw_name": "search",
+                  "invocation_identity": "search",
+                  "final_name": "mcp_corp_search",
+                  "provider_description": "MCP tool from 'corp'. Search records",
+                  "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                  },
+                  "output_schema": {"type": "object"},
+                  "enabled": true
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_applied",
+        "id": "0190d5a7-0000-7000-8000-000000000002",
+        "config_revision": 8
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "config_applied_ack",
+        "id": "0190d5a7-0000-7000-8000-000000000002",
+        "config_revision": 8
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "config_update",
+        "id": "0190d5a7-0000-7000-8000-000000000003",
+        "device_name": "laptop",
+        "config_revision": 8,
+        "config": {
+          "workspace_path": "/home/me/work",
+          "restrict_to_workspace": true,
+          "ssrf_denylist": [],
+          "shell_timeout_max": 600,
+          "env_allowlist": ["PATH"],
+          "mcp_servers": []
+        },
+        "mcp_catalog": {
+          "version": 1,
+          "digest": "d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
+          "servers": []
+        }
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "config_validate",
+        "id": "0190d5a7-0000-7000-8000-000000000004",
+        "base_config_revision": 8,
+        "candidate_config": {
+          "workspace_path": "/home/me/work",
+          "restrict_to_workspace": true,
+          "ssrf_denylist": [],
+          "shell_timeout_max": 600,
+          "env_allowlist": ["PATH"],
+          "mcp_servers": [
+            {
+              "name": "local",
+              "transport": "stdio",
+              "command": "python",
+              "args": ["-m", "fake_mcp"],
+              "cwd": null,
+              "env": {"FAKE_TOKEN": "fake-secret"},
+              "enabled_capabilities": []
+            }
+          ]
+        },
+        "validate_servers": ["local"],
+        "deadline_ms": 300000
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_validate_result",
+        "id": "0190d5a7-0000-7000-8000-000000000004",
+        "ok": true,
+        "source_catalog": {
+          "version": 1,
+          "servers": [
+            {
+              "name": "local",
+              "tools": [
+                {
+                  "raw_name": "search",
+                  "description": "Search records",
+                  "input_schema": {"type": "object", "properties": {}},
+                  "output_schema": null
+                }
+              ],
+              "resources": [],
+              "resource_templates": [],
+              "prompts": []
+            }
+          ]
+        },
+        "failures": []
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_validate_result",
+        "id": "0190d5a7-0000-7000-8000-000000000005",
+        "ok": false,
+        "failures": [
+          {
+            "name": "local",
+            "stage": "initialize",
+            "code": "mcp_spawn_failed",
+            "message": "MCP initialization failed"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "config_validate_cancel",
+        "id": "0190d5a7-0000-7000-8000-000000000004"
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "register_mcp",
+        "id": "0190d5a7-0000-7000-8000-000000000006",
+        "config_revision": 8,
+        "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "servers": [
+          {
+            "name": "corp",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000020",
+            "state": "ready",
+            "code": null,
+            "source_catalog": {
+              "tools": [
+                {
+                  "raw_name": "search",
+                  "description": "Search records",
+                  "input_schema": {"type": "object", "properties": {}},
+                  "output_schema": null
+                }
+              ],
+              "resources": [],
+              "resource_templates": [],
+              "prompts": []
+            }
+          },
+          {
+            "name": "offline",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000021",
+            "state": "unavailable",
+            "code": "mcp_spawn_failed"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "register_mcp_ack",
+        "id": "0190d5a7-0000-7000-8000-000000000006",
+        "config_revision": 8,
+        "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "results": [
+          {
+            "name": "corp",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000020",
+            "accepted": true,
+            "code": null
+          },
+          {
+            "name": "offline",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000021",
+            "accepted": false,
+            "code": "mcp_spawn_failed"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "tool_call",
+        "id": "0190d5a7-0000-7000-8000-000000000007",
+        "name": "mcp_corp_search",
+        "args": {"query": "status"},
+        "max_result_bytes": 1048576,
+        "chat_session_id": "00000000-0000-4000-8000-000000000030",
+        "mcp_route": {
+          "entry_id": "0190d5a7-0000-7000-8000-000000000010",
+          "config_revision": 8,
+          "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "runtime_generation": "0190d5a7-0000-7000-8000-000000000020"
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "hello",
+        "id": "0190d5a7-0000-7000-8000-000000000001",
+        "version": "2",
+        "client_version": "0.0.1",
+        "os": "linux",
+        "caps": {
+          "shared_tools": true,
+          "web_fetch": true,
+          "file_transfer": ["send", "receive"],
+          "http_relay": true
+        },
+        "shells": {"default": "bash", "available": ["bash"]}
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_applied",
+        "id": "0190d5a7-0000-7000-8000-000000000002",
+        "config_revision": 8,
+        "unexpected": true
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_validate_result",
+        "id": "0190d5a7-0000-7000-8000-000000000004",
+        "ok": true,
+        "source_catalog": null,
+        "failures": []
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "config_validate_result",
+        "id": "0190d5a7-0000-7000-8000-000000000004",
+        "ok": false,
+        "source_catalog": {"version": 1, "servers": []},
+        "failures": [
+          {
+            "name": "local",
+            "stage": "discovery",
+            "code": "config_validation_failed",
+            "message": "Discovery failed"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "register_mcp",
+        "id": "0190d5a7-0000-7000-8000-000000000006",
+        "config_revision": 8,
+        "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "servers": [
+          {
+            "name": "corp",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000020",
+            "state": "ready",
+            "code": null,
+            "source_catalog": null
+          }
+        ]
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "register_mcp",
+        "id": "0190d5a7-0000-7000-8000-000000000006",
+        "config_revision": 8,
+        "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "servers": [
+          {
+            "name": "corp",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000020",
+            "state": "unavailable",
+            "code": null,
+            "source_catalog": null
+          }
+        ]
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "register_mcp_ack",
+        "id": "0190d5a7-0000-7000-8000-000000000006",
+        "config_revision": 8,
+        "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "results": [
+          {
+            "name": "corp",
+            "runtime_generation": "0190d5a7-0000-7000-8000-000000000020",
+            "accepted": true,
+            "code": "unexpected"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "tool_call",
+        "id": "0190d5a7-0000-7000-8000-000000000007",
+        "name": "mcp_corp_search",
+        "args": {},
+        "max_result_bytes": 1024
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "tool_call",
+        "id": "0190d5a7-0000-7000-8000-000000000007",
+        "name": "read_file",
+        "args": {},
+        "max_result_bytes": 1024,
+        "mcp_route": {
+          "entry_id": "0190d5a7-0000-7000-8000-000000000010",
+          "config_revision": 8,
+          "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "runtime_generation": "0190d5a7-0000-7000-8000-000000000020"
+        }
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "config_applied_ack",
+        "id": "00000000-0000-4000-8000-000000000001",
+        "config_revision": 8
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "tool_call",
+        "id": "0190d5a7-0000-7000-8000-000000000007",
+        "name": "mcp_corp_search",
+        "args": {"openoctopus_device": "laptop"},
+        "max_result_bytes": 1024,
+        "mcp_route": {
+          "entry_id": "0190d5a7-0000-7000-8000-000000000010",
+          "config_revision": 8,
+          "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "runtime_generation": "0190d5a7-0000-7000-8000-000000000020"
+        }
+      }
+    }
+  ]
+}

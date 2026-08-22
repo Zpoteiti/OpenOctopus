@@ -17,7 +17,7 @@ CALL_ID = UUID("0190d5a7-0000-7000-8000-000000000002")
 CHAT_ID = UUID("00000000-0000-4000-8000-000000000003")
 
 
-def test_protocol_v2_hello_advertises_shells_without_exec_capability() -> None:
+def test_protocol_v3_hello_advertises_shells_without_exec_capability() -> None:
     hello = Hello.new(
         client_version="0.0.1",
         operating_system="linux",
@@ -38,7 +38,7 @@ def test_protocol_v2_hello_advertises_shells_without_exec_capability() -> None:
         "os": "linux",
         "shells": {"available": ["bash", "sh"], "default": "bash"},
         "type": "hello",
-        "version": "2",
+        "version": "3",
     }
 
 

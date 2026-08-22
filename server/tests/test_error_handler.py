@@ -92,3 +92,18 @@ def test_error_status_map_covers_workspace_tool_codes():
     }
 
     assert {code: ERROR_STATUS[code] for code in expected} == expected
+
+
+def test_error_status_map_covers_mcp_config_codes():
+    from openctopus_server.errors.http import ERROR_STATUS
+
+    expected = {
+        ErrorCode.MCP_SPAWN_FAILED: 422,
+        ErrorCode.MCP_MESSAGE_TOO_LARGE: 422,
+        ErrorCode.MCP_WITHIN_SERVER_COLLISION: 409,
+        ErrorCode.MCP_SCHEMA_COLLISION: 409,
+        ErrorCode.MCP_OWNER_SCHEMA_LIMIT: 409,
+        ErrorCode.MCP_SECRET_TRANSPORT_INSECURE: 409,
+    }
+
+    assert {code: ERROR_STATUS[code] for code in expected} == expected

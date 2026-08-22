@@ -63,6 +63,9 @@ class ErrorCode(StrEnum):
     TOOL_DB_ERROR = "tool_db_error"
     TOOL_CRON_JOB_NOT_FOUND = "tool_cron_job_not_found"
     TOOL_MCP_UNAVAILABLE = "tool_mcp_unavailable"
+    TOOL_MCP_ERROR = "tool_mcp_error"
+    TOOL_MCP_MESSAGE_TOO_LARGE = "tool_mcp_message_too_large"
+    TOOL_MCP_INVALID_RESULT = "tool_mcp_invalid_result"
     # Network
     NETWORK_SSRF_BLOCKED = "network_ssrf_blocked"
     NETWORK_DNS_FAILED = "network_dns_failed"
@@ -76,7 +79,10 @@ class ErrorCode(StrEnum):
     # MCP
     MCP_WITHIN_SERVER_COLLISION = "mcp_within_server_collision"
     MCP_SCHEMA_COLLISION = "mcp_schema_collision"
+    MCP_OWNER_SCHEMA_LIMIT = "mcp_owner_schema_limit"
     MCP_SPAWN_FAILED = "mcp_spawn_failed"
+    MCP_MESSAGE_TOO_LARGE = "mcp_message_too_large"
+    MCP_SECRET_TRANSPORT_INSECURE = "mcp_secret_transport_insecure"
     # Auth
     AUTH_UNAUTHORIZED = "auth_unauthorized"
     AUTH_LAST_ADMIN_REQUIRED = "auth_last_admin_required"
