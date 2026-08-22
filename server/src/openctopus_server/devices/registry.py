@@ -13,8 +13,14 @@ from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
     ConfigUpdateFrame,
+    ConfigValidateCancelFrame,
+    ConfigValidateFrame,
+    ConfigValidateResultFrame,
     DeviceConfigFrame,
+    McpValidationFailure,
+    PersistedMcpCatalog,
     ShellMetadata,
+    SourceMcpCatalog,
     ToolCallFrame,
     ToolResultFrame,
     new_uuid7,
@@ -39,6 +45,16 @@ class DeviceBusyError(RuntimeError):
 
 
 class DeviceProtocolError(RuntimeError):
+    pass
+
+
+class DeviceValidationError(RuntimeError):
+    def __init__(self, failures: tuple[McpValidationFailure, ...]) -> None:
+        super().__init__("Device MCP validation failed")
+        self.failures = failures
+
+
+class DeviceSecretTransportError(RuntimeError):
     pass
 
 
@@ -73,6 +89,13 @@ class DeviceLiveMetadata:
     available_shells: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigValidation:
+    id: UUID
+    handle: ConnectionHandle
+    source_catalog: SourceMcpCatalog
+
+
 @dataclass(slots=True)
 class _Connection:
     handle: ConnectionHandle
@@ -87,6 +110,9 @@ class _Connection:
     ready: bool = True
     config_epoch: int = 0
     config_update_in_flight: str | None = None
+    secret_transport_safe: bool = False
+    config_validation: _PendingValidation | None = None
+    validation_tombstones: OrderedDict[UUID, None] = field(default_factory=OrderedDict)
     pending: dict[UUID, _PendingCall] = field(default_factory=dict)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -99,6 +125,14 @@ class _PendingCall:
     max_result_bytes: int
     issued: bool = False
     expired: bool = False
+
+
+@dataclass(slots=True)
+class _PendingValidation:
+    id: UUID
+    future: asyncio.Future[ConfigValidateResultFrame]
+    validate_servers: tuple[str, ...]
+    issued: bool = False
 
 
 @dataclass(slots=True)
@@ -175,6 +209,7 @@ class DeviceRegistry:
         ready: bool = True,
         operating_system: str | None = None,
         shells: ShellMetadata | None = None,
+        secret_transport_safe: bool = False,
     ) -> ConnectionHandle | None:
         async with self._register_lock:
             async with self._lock:
@@ -193,6 +228,7 @@ class DeviceRegistry:
                             ready=ready,
                             operating_system=operating_system,
                             shells=shells,
+                            secret_transport_safe=secret_transport_safe,
                         )
             else:
                 result = await self._publish_registration(
@@ -204,6 +240,7 @@ class DeviceRegistry:
                     ready=ready,
                     operating_system=operating_system,
                     shells=shells,
+                    secret_transport_safe=secret_transport_safe,
                 )
             if result is None:
                 return None
@@ -239,6 +276,7 @@ class DeviceRegistry:
         ready: bool,
         operating_system: str | None,
         shells: ShellMetadata | None,
+        secret_transport_safe: bool,
     ) -> tuple[ConnectionHandle, _Connection | None] | None:
         async with self._lock:
             if self._closed or (
@@ -258,6 +296,7 @@ class DeviceRegistry:
                 default_shell=shells.default if shells is not None else None,
                 available_shells=tuple(shells.available) if shells is not None else None,
                 ready=ready,
+                secret_transport_safe=secret_transport_safe,
             )
             previous = self._connections.get(device_id)
             self._connections[device_id] = replacement
@@ -411,22 +450,217 @@ class DeviceRegistry:
                 and connection.handle == handle
             )
 
+    async def validate_config(
+        self,
+        *,
+        device_id: UUID,
+        user_id: UUID,
+        expected_device_name: str,
+        base_config_revision: int,
+        candidate_config: DeviceConfigFrame,
+        validate_servers: tuple[str, ...],
+        timeout_seconds: float = 300.0,
+    ) -> ConfigValidation:
+        """Run one generation-scoped candidate validation without changing active config."""
+        validation_id = new_uuid7()
+        future: asyncio.Future[ConfigValidateResultFrame] = (
+            asyncio.get_running_loop().create_future()
+        )
+        pending = _PendingValidation(
+            id=validation_id,
+            future=future,
+            validate_servers=validate_servers,
+        )
+        async with self._lock:
+            connection = self._connections.get(device_id)
+            if (
+                self._closed
+                or connection is None
+                or not connection.ready
+                or connection.user_id != user_id
+                or connection.device_name != expected_device_name
+                or connection.config_update_in_flight is not None
+            ):
+                raise DeviceUnavailableError("Device is not connected")
+            if _config_contains_secrets(candidate_config) and not connection.secret_transport_safe:
+                raise DeviceSecretTransportError("Secret-bearing MCP config requires WSS")
+            if connection.config_validation is not None:
+                raise DeviceBusyError("Device MCP validation is already in progress")
+            connection.config_validation = pending
+            handle = connection.handle
+
+        frame = ConfigValidateFrame(
+            id=validation_id,
+            base_config_revision=base_config_revision,
+            candidate_config=candidate_config,
+            validate_servers=list(validate_servers),
+            deadline_ms=300_000,
+        )
+        payload = frame.model_dump_json()
+        if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
+            await self._expire_validation(connection, pending)
+            raise DeviceProtocolError("MCP validation frame exceeds the text-frame limit")
+        try:
+            async with connection.send_lock:
+                async with self._lock:
+                    current = self._connections.get(device_id)
+                    if (
+                        self._closed
+                        or current is not connection
+                        or current.handle != handle
+                        or current.config_validation is not pending
+                    ):
+                        raise DeviceUnavailableError("Device connection was replaced")
+                    pending.issued = True
+                await connection.transport.send_text(payload)
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    result = await asyncio.shield(future)
+            except TimeoutError:
+                await self._expire_validation(connection, pending)
+                await self._send_validation_cancel(connection, handle, validation_id)
+                raise
+        except asyncio.CancelledError:
+            await self._expire_validation(connection, pending)
+            if pending.issued:
+                cleanup = asyncio.create_task(
+                    self._send_validation_cancel(connection, handle, validation_id)
+                )
+                try:
+                    await await_future_cancellation_safe(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            raise
+        except (DeviceUnavailableError, TimeoutError):
+            raise
+        except Exception as exc:
+            await self._expire_validation(connection, pending)
+            self._schedule_unregister(handle)
+            raise DeviceOutcomeUnknownError("MCP validation outcome is unknown") from exc
+        finally:
+            await self._clear_validation(connection, pending)
+
+        if not result.ok:
+            raise DeviceValidationError(tuple(result.failures))
+        source_catalog = result.source_catalog
+        if source_catalog is None:
+            raise DeviceProtocolError("Successful MCP validation omitted its source catalog")
+        source_names = {server.name for server in source_catalog.servers}
+        if source_names != set(validate_servers):
+            raise DeviceValidationError(
+                (
+                    McpValidationFailure(
+                        name=validate_servers[0],
+                        stage="discovery",
+                        code="config_validation_failed",
+                        message="MCP validation returned the wrong server set",
+                    ),
+                )
+            )
+        return ConfigValidation(
+            id=validation_id,
+            handle=handle,
+            source_catalog=source_catalog,
+        )
+
+    async def resolve_config_validate_result(
+        self,
+        handle: ConnectionHandle,
+        result: ConfigValidateResultFrame,
+    ) -> bool:
+        """Resolve a current candidate or consume a bounded late-result tombstone."""
+        async with self._lock:
+            connection = self._connections.get(handle.device_id)
+            if (
+                self._closed
+                or connection is None
+                or connection.handle != handle
+                or not connection.ready
+            ):
+                return False
+            pending = connection.config_validation
+            if pending is None or pending.id != result.id:
+                if result.id in connection.validation_tombstones:
+                    connection.validation_tombstones.move_to_end(result.id)
+                    return True
+                return False
+            connection.config_validation = None
+        if not pending.future.done():
+            pending.future.set_result(result)
+        return True
+
+    async def discard_validated_config(self, validation: ConfigValidation) -> None:
+        """Tell the exact still-current generation to close its temporary runtimes."""
+        async with self._lock:
+            connection = self._connections.get(validation.handle.device_id)
+            if connection is None or connection.handle != validation.handle:
+                return
+        await self._send_validation_cancel(
+            connection,
+            validation.handle,
+            validation.id,
+        )
+
+    async def _expire_validation(
+        self,
+        connection: _Connection,
+        pending: _PendingValidation,
+    ) -> None:
+        async with self._lock:
+            if connection.config_validation is pending:
+                connection.config_validation = None
+            if pending.issued:
+                self._remember_validation_tombstone(connection, pending.id)
+        if not pending.future.done():
+            pending.future.cancel()
+
+    async def _clear_validation(
+        self,
+        connection: _Connection,
+        pending: _PendingValidation,
+    ) -> None:
+        async with self._lock:
+            if connection.config_validation is pending:
+                connection.config_validation = None
+
+    def _remember_validation_tombstone(self, connection: _Connection, frame_id: UUID) -> None:
+        connection.validation_tombstones[frame_id] = None
+        connection.validation_tombstones.move_to_end(frame_id)
+        while len(connection.validation_tombstones) > 64:
+            connection.validation_tombstones.popitem(last=False)
+
+    async def _send_validation_cancel(
+        self,
+        connection: _Connection,
+        handle: ConnectionHandle,
+        validation_id: UUID,
+    ) -> None:
+        frame = ConfigValidateCancelFrame(id=validation_id)
+        try:
+            async with connection.send_lock:
+                async with self._lock:
+                    if self._connections.get(handle.device_id) is not connection:
+                        return
+                await connection.transport.send_text(frame.model_dump_json())
+        except Exception:
+            self._schedule_unregister(handle)
+
     @asynccontextmanager
     async def config_update_lock(
         self,
         *,
         user_id: UUID,
         device_name: str,
+        device_id: UUID | None = None,
     ) -> AsyncIterator[None]:
-        """Serialize commit-and-push cycles for one user's device configs.
+        """Serialize one Device's validate/commit/push cycle across renames.
 
-        A rename changes the URL name, so a name-keyed lock would let a second
-        PATCH overtake the first under the new name.  The per-user lock keeps
-        commit and wire order aligned across that boundary.  It never holds a
-        DB transaction while waiting on the transport and is removed when idle.
+        API callers provide the immutable Device ID.  ``user_id`` remains the
+        fallback for internal callers that have not resolved a Device yet.
+        The lock never represents a database lock and is removed when idle.
         """
         del device_name
-        key = user_id
+        key = device_id or user_id
         async with self._lock:
             entry = self._config_locks.get(key)
             if entry is None:
@@ -894,6 +1128,10 @@ class DeviceRegistry:
         user_id: UUID,
         device_name: str,
         config: DeviceConfigFrame,
+        config_revision: int = 1,
+        mcp_catalog: PersistedMcpCatalog | None = None,
+        frame_id: UUID | None = None,
+        expected_handle: ConnectionHandle | None = None,
     ) -> bool:
         async with self._lock:
             connection = self._connections.get(device_id)
@@ -902,13 +1140,24 @@ class DeviceRegistry:
                 or connection is None
                 or not connection.ready
                 or connection.user_id != user_id
+                or (expected_handle is not None and connection.handle != expected_handle)
             ):
                 return False
             handle = connection.handle
         frame = ConfigUpdateFrame(
-            id=new_uuid7(),
+            id=frame_id or new_uuid7(),
             device_name=device_name,
+            config_revision=config_revision,
             config=config,
+            mcp_catalog=(
+                mcp_catalog
+                if mcp_catalog is not None
+                else PersistedMcpCatalog(
+                    version=1,
+                    digest="d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
+                    servers=[],
+                )
+            ),
         )
         try:
             async with self._lock:
@@ -961,6 +1210,7 @@ class DeviceRegistry:
         *,
         device_id: UUID,
         user_id: UUID,
+        expected_handle: ConnectionHandle | None = None,
     ) -> bool:
         """Fence new tool calls before the corresponding DB policy commit."""
         async with self._lock:
@@ -970,6 +1220,7 @@ class DeviceRegistry:
                 or connection is None
                 or not connection.ready
                 or connection.user_id != user_id
+                or (expected_handle is not None and connection.handle != expected_handle)
             ):
                 return False
             if connection.config_update_in_flight is not None:
@@ -989,10 +1240,7 @@ class DeviceRegistry:
         """Retire a fenced generation when the policy commit outcome is unknown."""
         async with self._lock:
             connection = self._connections.get(device_id)
-            if (
-                connection is None
-                or connection.user_id != user_id
-            ):
+            if connection is None or connection.user_id != user_id:
                 return
             handle = connection.handle
         await self._retire_ambiguous_config(connection, handle)
@@ -1165,6 +1413,8 @@ class DeviceRegistry:
     ) -> None:
         await self.transfers.disconnect(connection.handle)
         async with self._lock:
+            validation = connection.config_validation
+            connection.config_validation = None
             pending = list(connection.pending.values())
             connection.pending.clear()
             for call in pending:
@@ -1177,6 +1427,13 @@ class DeviceRegistry:
                 else:
                     error = DeviceUnavailableError("Device disconnected")
                 future.future.set_exception(error)
+        if validation is not None and not validation.future.done():
+            error = (
+                DeviceOutcomeUnknownError("MCP validation outcome is unknown")
+                if validation.issued
+                else DeviceUnavailableError("Device disconnected")
+            )
+            validation.future.set_exception(error)
         if close_code is not None:
             try:
                 await connection.transport.close(close_code, close_reason)
@@ -1233,3 +1490,12 @@ class DeviceRegistry:
         while len(self._revocation_epochs) > self._revocation_epoch_max_entries:
             self._revocation_epochs.popitem(last=False)
         return epoch
+
+
+def _config_contains_secrets(config: DeviceConfigFrame) -> bool:
+    for server in config.mcp_servers:
+        payload = server.storage_dict()
+        values = payload.get("env", payload.get("headers", {}))
+        if isinstance(values, dict) and any(bool(value) for value in values.values()):
+            return True
+    return False

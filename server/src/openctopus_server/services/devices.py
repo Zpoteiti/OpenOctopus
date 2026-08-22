@@ -9,12 +9,27 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from pydantic import ValidationError
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.models import Device
-from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
+from openctopus_server.devices.mcp_catalog import (
+    EMPTY_CATALOG_DIGEST,
+    McpCatalogError,
+    build_persisted_catalog,
+    merge_owner_catalogs,
+)
+from openctopus_server.devices.mcp_models import (
+    McpServerConfig,
+    PersistedMcpCatalog,
+    RemoteMcpServerConfigBase,
+    SourceMcpCatalog,
+    StdioMcpServerConfig,
+    parse_mcp_server_configs,
+)
+from openctopus_server.devices.protocol import new_uuid7
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import DeviceError
 from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
@@ -111,60 +126,222 @@ async def owned_id(db: AsyncSession, *, user_id: UUID, name: str) -> UUID | None
     return device_id if isinstance(device_id, UUID) else None
 
 
-async def create(
-    db: AsyncSession,
+async def get_owned(db: AsyncSession, *, user_id: UUID, name: str) -> DeviceSnapshot:
+    device = await db.scalar(select(Device).where(Device.user_id == user_id, Device.name == name))
+    if device is None:
+        raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")
+    return _snapshot(device)
+
+
+def parse_stored_mcp_servers(value: object) -> tuple[McpServerConfig, ...]:
+    try:
+        return parse_mcp_server_configs(value)
+    except ValueError as exc:
+        raise DeviceError(
+            ErrorCode.CONFIG_VALIDATION_FAILED, "Stored MCP config is invalid"
+        ) from exc
+
+
+def parse_stored_mcp_catalog(value: object) -> PersistedMcpCatalog:
+    try:
+        catalog = PersistedMcpCatalog.model_validate(value, strict=True)
+    except ValidationError as exc:
+        raise DeviceError(
+            ErrorCode.CONFIG_VALIDATION_FAILED, "Stored MCP catalog is invalid"
+        ) from exc
+    return catalog
+
+
+def resolve_mcp_secret_markers(
+    current: tuple[McpServerConfig, ...],
+    candidate: tuple[McpServerConfig, ...],
+) -> tuple[McpServerConfig, ...]:
+    """Resolve REST redaction markers without allowing them to cross a secret sink."""
+    current_by_name = {server.name: server for server in current}
+    resolved: list[dict[str, object]] = []
+    for server in candidate:
+        payload = server.storage_dict()
+        previous = current_by_name.get(server.name)
+        if isinstance(server, StdioMcpServerConfig):
+            marker_values = payload["env"]
+            assert isinstance(marker_values, dict)
+            old_values: dict[str, str] = {}
+            same_sink = isinstance(previous, StdioMcpServerConfig) and _mcp_sink(
+                previous
+            ) == _mcp_sink(server)
+            if isinstance(previous, StdioMcpServerConfig) and same_sink:
+                old_values = {key: value.get_secret_value() for key, value in previous.env.items()}
+            payload["env"] = _resolve_secret_map(marker_values, old_values, same_sink=same_sink)
+        elif isinstance(server, RemoteMcpServerConfigBase):
+            marker_values = payload["headers"]
+            assert isinstance(marker_values, dict)
+            old_values = {}
+            same_sink = isinstance(previous, RemoteMcpServerConfigBase) and _mcp_sink(
+                previous
+            ) == _mcp_sink(server)
+            if isinstance(previous, RemoteMcpServerConfigBase) and same_sink:
+                old_values = {
+                    key: value.get_secret_value() for key, value in previous.headers.items()
+                }
+            payload["headers"] = _resolve_secret_map(marker_values, old_values, same_sink=same_sink)
+        resolved.append(payload)
+    try:
+        return parse_mcp_server_configs(resolved)
+    except ValueError as exc:
+        raise DeviceError(
+            ErrorCode.DEVICE_INVALID_REQUEST, "MCP server configuration is invalid"
+        ) from exc
+
+
+def _resolve_secret_map(
+    candidate: dict[str, object],
+    current: dict[str, str],
     *,
-    user_id: UUID,
-    name: str,
-    workspace_path: str,
-    restrict_to_workspace: bool,
-    ssrf_denylist: list[str] | None,
-    shell_timeout_max: int = 600,
-    env_allowlist: list[str] | None = None,
-) -> tuple[DeviceSnapshot, str]:
-    canonical_name = canonicalize_name(name)
-    _validate_workspace_path(workspace_path)
-    _validate_ssrf_denylist(ssrf_denylist)
-    _validate_shell_timeout_max(shell_timeout_max)
-    _validate_env_allowlist(env_allowlist)
-    token = mint_token()
-    device = Device(
-        user_id=user_id,
-        name=canonical_name,
-        token_hash=token_digest(token),
-        token_hint=token_hint(token),
-        workspace_path=workspace_path,
-        restrict_to_workspace=restrict_to_workspace,
-        ssrf_denylist=_initial_ssrf_denylist(ssrf_denylist),
-        shell_timeout_max=shell_timeout_max,
-        env_allowlist=_initial_env_allowlist(env_allowlist),
+    same_sink: bool,
+) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for key, value in candidate.items():
+        if not isinstance(value, str):
+            raise DeviceError(ErrorCode.DEVICE_INVALID_REQUEST, "MCP secret value is invalid")
+        if value != "<redacted>":
+            resolved[key] = value
+            continue
+        if not same_sink or key not in current:
+            raise DeviceError(
+                ErrorCode.DEVICE_INVALID_REQUEST,
+                "A redacted MCP secret can only retain the same key at the same sink",
+            )
+        resolved[key] = current[key]
+    return resolved
+
+
+def _mcp_sink(server: McpServerConfig) -> tuple[object, ...]:
+    if isinstance(server, StdioMcpServerConfig):
+        return (
+            server.name,
+            server.transport,
+            server.command,
+            tuple(server.args),
+            server.cwd,
+        )
+    assert isinstance(server, RemoteMcpServerConfigBase)
+    return (server.name, server.transport, server.url)
+
+
+def changed_mcp_servers(
+    current: tuple[McpServerConfig, ...],
+    candidate: tuple[McpServerConfig, ...],
+) -> tuple[str, ...]:
+    current_by_name = {server.name: server.storage_dict() for server in current}
+    return tuple(
+        server.name
+        for server in candidate
+        if current_by_name.get(server.name) != server.storage_dict()
     )
-    db.add(device)
-    await _commit_or_name_conflict(db)
-    return _snapshot(device), token
 
 
-async def patch(
+def mcp_configs_storage(configs: tuple[McpServerConfig, ...]) -> list[dict[str, object]]:
+    return [server.storage_dict() for server in configs]
+
+
+async def commit_config_candidate(
     db: AsyncSession,
     *,
     user_id: UUID,
     name: str,
+    base_config_revision: int,
     fields: set[str],
     new_name: str | None,
     workspace_path: str | None,
     restrict_to_workspace: bool | None,
     ssrf_denylist: list[str] | None,
-    shell_timeout_max: int | None = None,
-    env_allowlist: list[str] | None = None,
+    shell_timeout_max: int | None,
+    env_allowlist: list[str] | None,
+    mcp_servers: tuple[McpServerConfig, ...] | None,
+    source_catalog: SourceMcpCatalog,
+    built_in_names: tuple[str, ...] = (),
 ) -> tuple[DeviceSnapshot, bool]:
+    """Commit a prevalidated full Device candidate in one short transaction."""
     device = await _owned_for_update(db, user_id=user_id, name=name)
+    if device.config_revision != base_config_revision:
+        raise DeviceError(ErrorCode.DEVICE_CONFIG_CONFLICT, "Device config revision is stale")
+    await _lock_owner_mcp_catalogs(db, user_id)
+
+    changed = _apply_non_mcp_fields(
+        device,
+        fields=fields,
+        new_name=new_name,
+        workspace_path=workspace_path,
+        restrict_to_workspace=restrict_to_workspace,
+        ssrf_denylist=ssrf_denylist,
+        shell_timeout_max=shell_timeout_max,
+        env_allowlist=env_allowlist,
+    )
+    if mcp_servers is not None:
+        existing_catalog = parse_stored_mcp_catalog(device.mcp_catalog)
+        try:
+            candidate_catalog = build_persisted_catalog(
+                mcp_servers,
+                source_catalog,
+                existing_catalog=existing_catalog,
+                built_in_names=built_in_names,
+                entry_id_factory=new_uuid7,
+            )
+        except McpCatalogError as exc:
+            raise _mcp_catalog_device_error(exc) from exc
+        stored = mcp_configs_storage(mcp_servers)
+        catalog_payload = candidate_catalog.model_dump(mode="json")
+        if device.mcp_servers != stored or device.mcp_catalog != catalog_payload:
+            device.mcp_servers = stored
+            device.mcp_catalog = catalog_payload
+            changed = True
+
+        owner_rows = list(
+            (
+                await db.scalars(
+                    select(Device).where(Device.user_id == user_id).order_by(Device.id)
+                )
+            ).all()
+        )
+        owner_catalogs: dict[str, PersistedMcpCatalog] = {}
+        try:
+            for row in owner_rows:
+                owner_catalogs[row.name] = (
+                    candidate_catalog
+                    if row.id == device.id
+                    else parse_stored_mcp_catalog(row.mcp_catalog)
+                )
+            merge_owner_catalogs(owner_catalogs, built_in_names=built_in_names)
+        except McpCatalogError as exc:
+            raise _mcp_catalog_device_error(exc) from exc
+
+    if not changed:
+        snapshot = _snapshot(device)
+        await db.rollback()
+        return snapshot, False
+    device.config_revision += 1
+    await _commit_patch_or_name_conflict(db, device_id=device.id)
+    return _snapshot(device), True
+
+
+def _apply_non_mcp_fields(
+    device: Device,
+    *,
+    fields: set[str],
+    new_name: str | None,
+    workspace_path: str | None,
+    restrict_to_workspace: bool | None,
+    ssrf_denylist: list[str] | None,
+    shell_timeout_max: int | None,
+    env_allowlist: list[str] | None,
+) -> bool:
     changed = False
     if "name" in fields:
         if new_name is None:
             raise _invalid("Device name must be a string")
-        canonical_name = canonicalize_name(new_name)
-        if device.name != canonical_name:
-            device.name = canonical_name
+        candidate = canonicalize_name(new_name)
+        if device.name != candidate:
+            device.name = candidate
             changed = True
     if "workspace_path" in fields:
         if workspace_path is None:
@@ -202,10 +379,56 @@ async def patch(
         if device.env_allowlist != candidate_allowlist:
             device.env_allowlist = candidate_allowlist
             changed = True
-    if changed:
-        device.config_revision += 1
-    await _commit_patch_or_name_conflict(db, device_id=device.id)
-    return _snapshot(device), changed
+    return changed
+
+
+async def _lock_owner_mcp_catalogs(db: AsyncSession, user_id: UUID) -> None:
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"openoctopus:mcp_owner:{user_id}"},
+    )
+
+
+def _mcp_catalog_device_error(exc: McpCatalogError) -> DeviceError:
+    try:
+        code = ErrorCode(exc.code)
+    except ValueError:
+        code = ErrorCode.CONFIG_VALIDATION_FAILED
+    return DeviceError(code, exc.message)
+
+
+async def create(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    name: str,
+    workspace_path: str,
+    restrict_to_workspace: bool,
+    ssrf_denylist: list[str] | None,
+    shell_timeout_max: int = 600,
+    env_allowlist: list[str] | None = None,
+) -> tuple[DeviceSnapshot, str]:
+    canonical_name = canonicalize_name(name)
+    _validate_workspace_path(workspace_path)
+    _validate_ssrf_denylist(ssrf_denylist)
+    _validate_shell_timeout_max(shell_timeout_max)
+    _validate_env_allowlist(env_allowlist)
+    await _lock_owner_mcp_catalogs(db, user_id)
+    token = mint_token()
+    device = Device(
+        user_id=user_id,
+        name=canonical_name,
+        token_hash=token_digest(token),
+        token_hint=token_hint(token),
+        workspace_path=workspace_path,
+        restrict_to_workspace=restrict_to_workspace,
+        ssrf_denylist=_initial_ssrf_denylist(ssrf_denylist),
+        shell_timeout_max=shell_timeout_max,
+        env_allowlist=_initial_env_allowlist(env_allowlist),
+    )
+    db.add(device)
+    await _commit_or_name_conflict(db)
+    return _snapshot(device), token
 
 
 async def regenerate_token(
@@ -224,6 +447,7 @@ async def regenerate_token(
 
 async def delete(db: AsyncSession, *, user_id: UUID, name: str) -> DeviceSnapshot:
     device = await _owned_for_update(db, user_id=user_id, name=name)
+    await _lock_owner_mcp_catalogs(db, user_id)
     snapshot = _snapshot(device)
     await db.delete(device)
     await db.commit()

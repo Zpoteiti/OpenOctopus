@@ -1,7 +1,7 @@
 from fastapi import Request
 
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.errors.exceptions import DeviceError, WorkspaceError
 from openctopus_server.errors.http import openoctopus_error_handler
 
 
@@ -48,6 +48,24 @@ def test_error_status_map_covers_all_new_codes():
     assert ERROR_STATUS[ErrorCode.AUTH_LAST_ADMIN_REQUIRED] == 409
     assert ERROR_STATUS[ErrorCode.USER_NOT_FOUND] == 404
     assert ERROR_STATUS[ErrorCode.CONFIG_VALIDATION_FAILED] == 400
+    assert ERROR_STATUS[ErrorCode.DEVICE_CONFIG_CONFLICT] == 409
+    assert ERROR_STATUS[ErrorCode.DEVICE_OFFLINE] == 409
+
+
+async def test_mcp_config_validation_uses_422_without_changing_admin_validation() -> None:
+    response = await openoctopus_error_handler(
+        Request(
+            {
+                "type": "http",
+                "method": "PATCH",
+                "path": "/api/devices/laptop/config",
+                "headers": [],
+            }
+        ),
+        DeviceError(ErrorCode.CONFIG_VALIDATION_FAILED, "MCP config is invalid"),
+    )
+
+    assert response.status_code == 422
 
 
 def test_error_status_map_covers_workspace_codes():

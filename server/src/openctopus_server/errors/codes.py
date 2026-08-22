@@ -6,6 +6,8 @@ class ErrorCode(StrEnum):
     DEVICE_NOT_FOUND = "device_not_found"
     DEVICE_INVALID_REQUEST = "device_invalid_request"
     DEVICE_NAME_TAKEN = "device_name_taken"
+    DEVICE_CONFIG_CONFLICT = "device_config_conflict"
+    DEVICE_OFFLINE = "device_offline"
     # Workspace
     WORKSPACE_NOT_FOUND = "workspace_not_found"
     WORKSPACE_PERMISSION_DENIED = "workspace_permission_denied"

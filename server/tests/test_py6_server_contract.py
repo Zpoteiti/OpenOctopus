@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -111,10 +111,10 @@ class _FileTool(Tool):
         return ToolResult(content="server")
 
 
-def test_v2_hello_requires_shell_inventory() -> None:
+def test_v3_hello_requires_shell_inventory() -> None:
     hello = HelloFrame(
         id=new_uuid7(),
-        version="2",
+        version="3",
         client_version="0.0.1",
         os="linux",
         caps=DeviceCapabilities(),
@@ -729,7 +729,7 @@ async def test_transfer_disconnect_is_outcome_unknown_at_agent_and_rest_boundari
 async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from openctopus_server.api.devices import patch_device
+    from openctopus_server.api.devices import _build_validate_and_commit
     from openctopus_server.dto.device import DevicePatchRequest
     from openctopus_server.services.devices import DeviceSnapshot
 
@@ -748,18 +748,21 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
         created_at=datetime.now(UTC),
     )
 
-    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
-        return device_id
+    async def get_owned(*_args: object, **_kwargs: object) -> DeviceSnapshot:
+        return replace(snapshot, restrict_to_workspace=True)
 
-    async def patch(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
+    async def commit(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
         committed.set()
         await release.wait()
         return snapshot, True
 
-    monkeypatch.setattr(devices, "owned_id", owned_id)
-    monkeypatch.setattr(devices, "patch", patch)
+    monkeypatch.setattr(devices, "get_owned", get_owned)
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
 
     class _DB:
+        async def rollback(self) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
@@ -783,12 +786,15 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
 
     registry = _Registry()
     request = asyncio.create_task(
-        patch_device(
-            "laptop",
-            DevicePatchRequest(restrict_to_workspace=False),
-            user=SimpleNamespace(id=user_id),  # type: ignore[arg-type]
+        _build_validate_and_commit(
             db=_DB(),  # type: ignore[arg-type]
             registry=registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                restrict_to_workspace=False,
+            ),
         )
     )
     await committed.wait()
@@ -803,7 +809,8 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
 async def test_patch_db_close_failure_still_activates_committed_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from openctopus_server.api.devices import _patch_and_activate
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
     from openctopus_server.dto.device import DevicePatchRequest
     from openctopus_server.services.devices import DeviceSnapshot
 
@@ -820,14 +827,10 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
         created_at=datetime.now(UTC),
     )
 
-    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
-        return device_id
-
-    async def patch(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
+    async def commit(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
         return snapshot, True
 
-    monkeypatch.setattr(devices, "owned_id", owned_id)
-    monkeypatch.setattr(devices, "patch", patch)
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
 
     class _DB:
         async def close(self) -> None:
@@ -852,12 +855,19 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
 
     registry = _Registry()
     with pytest.raises(RuntimeError, match="close failed after commit"):
-        await _patch_and_activate(
+        await _commit_and_activate_candidate(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
             name="laptop",
-            patch=DevicePatchRequest(workspace_path="~/new-workspace"),
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=replace(snapshot, workspace_path="~/old-workspace"),
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=None,
         )
 
     assert registry.aborted == 0
@@ -867,12 +877,14 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
 async def test_patch_ambiguous_commit_retires_the_fenced_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from openctopus_server.api.devices import _patch_and_activate
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
     from openctopus_server.dto.device import DevicePatchRequest
+    from openctopus_server.services.devices import DevicePatchCommitOutcomeUnknownError
 
     device_id = uuid4()
     user_id = uuid4()
-    row = SimpleNamespace(
+    snapshot = devices.DeviceSnapshot(
         id=device_id,
         user_id=user_id,
         name="laptop",
@@ -880,32 +892,17 @@ async def test_patch_ambiguous_commit_retires_the_fenced_generation(
         workspace_path="~/old-workspace",
         restrict_to_workspace=False,
         ssrf_denylist=[],
-        shell_timeout_max=600,
-        env_allowlist=[],
-        config_revision=1,
         created_at=datetime.now(UTC),
     )
-    durable_workspace = "~/old-workspace"
     db_closed = False
 
-    async def owned_id(*_args: object, **_kwargs: object) -> UUID:
-        return device_id
+    async def commit(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        cause = OSError("commit acknowledgement lost")
+        raise DevicePatchCommitOutcomeUnknownError(cause, device_id=device_id)
 
-    async def owned_for_update(*_args: object, **_kwargs: object) -> object:
-        return row
-
-    monkeypatch.setattr(devices, "owned_id", owned_id)
-    monkeypatch.setattr(devices, "_owned_for_update", owned_for_update)
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
 
     class _DB:
-        async def commit(self) -> None:
-            nonlocal durable_workspace
-            durable_workspace = row.workspace_path
-            raise OSError("commit acknowledgement lost")
-
-        async def rollback(self) -> None:
-            raise AssertionError("an ambiguous commit must not be treated as rolled back")
-
         async def close(self) -> None:
             nonlocal db_closed
             db_closed = True
@@ -927,15 +924,21 @@ async def test_patch_ambiguous_commit_retires_the_fenced_generation(
 
     registry = _Registry()
     with pytest.raises(OSError, match="commit acknowledgement lost"):
-        await _patch_and_activate(
+        await _commit_and_activate_candidate(
             _DB(),  # type: ignore[arg-type]
             registry,  # type: ignore[arg-type]
             user_id=user_id,
             name="laptop",
-            patch=DevicePatchRequest(workspace_path="~/new-workspace"),
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=snapshot,
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=None,
         )
 
-    assert durable_workspace == "~/new-workspace"
     assert registry.aborted == 0
     assert registry.retired == 1
 
