@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -26,15 +27,35 @@ from openoctopus_client.connection import (
     reconnect_disposition_from_exception,
     retry_after_from_exception,
 )
+from openoctopus_client.mcp.models import (
+    McpServerConfig,
+    PersistedMcpCatalogEntry,
+    PersistedMcpServerCatalog,
+    SourceMcpCatalog,
+    SourceMcpServerCatalog,
+    SourceMcpTool,
+    StdioMcpServerConfig,
+)
+from openoctopus_client.mcp.runtime import (
+    CandidateValidation,
+    McpRuntimeState,
+    McpServerRuntime,
+)
+from openoctopus_client.mcp.supervisor import McpSupervisor
 from openoctopus_client.protocol import (
+    AcceptedMcpRegistration,
     ConfigAppliedAck,
     ConfigUpdate,
+    ConfigValidate,
+    ConfigValidateCancel,
     ErrorFrame,
     Hello,
     HelloAck,
+    McpRoute,
     PersistedMcpCatalog,
     Ping,
     ProtocolError,
+    RegisterMcpAck,
     ShellMetadata,
     ToolCall,
     ToolResult,
@@ -91,6 +112,7 @@ def _device_config(
     ssrf_denylist: list[str],
     shell_timeout_max: int = 600,
     env_allowlist: list[str] | None = None,
+    mcp_servers: list[McpServerConfig] | None = None,
 ) -> ProtocolDeviceConfig:
     return ProtocolDeviceConfig(
         workspace_path=workspace_path,
@@ -98,6 +120,7 @@ def _device_config(
         ssrf_denylist=ssrf_denylist,
         shell_timeout_max=shell_timeout_max,
         env_allowlist=env_allowlist or ["PATH", "HOME"],
+        mcp_servers=mcp_servers or [],
     )
 
 
@@ -601,7 +624,7 @@ def test_runtime_becomes_ready_only_after_matching_config_applied_ack(tmp_path: 
     runtime, socket, disposition = asyncio.run(exercise())
 
     sent = [json.loads(frame) for frame in socket.sent]
-    assert [frame["type"] for frame in sent] == ["hello", "config_applied"]
+    assert [frame["type"] for frame in sent] == ["hello", "config_applied", "register_mcp"]
     assert sent[1] == {
         "type": "config_applied",
         "id": "0190d5a7-0000-7000-8000-000000000001",
@@ -688,6 +711,414 @@ def test_runtime_acknowledges_config_update_after_local_activation(tmp_path: Pat
     assert runtime._config_revision == 2
     assert runtime._active_config is not None
     assert runtime._active_config.workspace_path == str(tmp_path / "updated")
+
+
+def test_runtime_validates_promotes_registers_and_dispatches_mcp(tmp_path: Path) -> None:
+    class CandidateRuntime:
+        def __init__(self, config: McpServerConfig) -> None:
+            self.config = config
+            self.generation = UUID("0190d5a7-0000-7000-8000-000000000030")
+            self.state = McpRuntimeState.AWAITING_ACK
+            self.code: str | None = None
+            self.permanent_failure = False
+            self.source_catalog = SourceMcpServerCatalog(
+                name="corp",
+                tools=[
+                    SourceMcpTool(
+                        raw_name="echo",
+                        description="Echo",
+                        input_schema={"type": "object", "properties": {}},
+                    )
+                ],
+            )
+            self.routes: Mapping[UUID, object] = {}
+            self.closed = False
+
+        def bind_persisted(
+            self, persisted: PersistedMcpServerCatalog
+        ) -> Mapping[UUID, object]:
+            self.routes = {entry.entry_id: object() for entry in persisted.entries}
+            return self.routes
+
+        def mark_ready(self, generation: UUID) -> None:
+            assert generation == self.generation
+            self.state = McpRuntimeState.READY
+
+        async def invoke(
+            self,
+            entry_id: UUID,
+            arguments: Mapping[str, Any],
+            *,
+            runtime_generation: UUID,
+        ) -> ToolOutput:
+            assert entry_id == expected_entry_id
+            assert arguments == {"value": "hello"}
+            assert runtime_generation == self.generation
+            return ToolOutput("mcp-ok")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def exercise() -> tuple[list[dict[str, Any]], CloseDisposition, CandidateRuntime]:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+        validation_id = UUID("0190d5a7-0000-7000-8000-000000000002")
+        server_config = StdioMcpServerConfig(
+            name="corp",
+            transport="stdio",
+            command="mcp",
+            args=[],
+            cwd=None,
+            env={},
+        )
+        candidate_config = _device_config(
+            workspace_path=str(tmp_path),
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+            mcp_servers=[server_config],
+        )
+        persisted_server = PersistedMcpServerCatalog(
+            name="corp",
+            entries=[
+                PersistedMcpCatalogEntry(
+                    entry_id=expected_entry_id,
+                    server="corp",
+                    surface="tool",
+                    raw_name="echo",
+                    invocation_identity="echo",
+                    final_name="mcp_corp_echo",
+                    provider_description="Echo",
+                    input_schema={"type": "object", "properties": {}},
+                    enabled=True,
+                )
+            ],
+        )
+        persisted = PersistedMcpCatalog(
+            version=1,
+            digest="a" * 64,
+            servers=[persisted_server],
+        )
+        candidate_runtime = CandidateRuntime(server_config)
+
+        async def validator(
+            configs: Sequence[McpServerConfig], **_kwargs: object
+        ) -> CandidateValidation:
+            assert list(configs) == [server_config]
+            return CandidateValidation(
+                source_catalog=SourceMcpCatalog(
+                    version=1,
+                    servers=[candidate_runtime.source_catalog],
+                ),
+                failures=(),
+                runtimes={"corp": cast(McpServerRuntime, candidate_runtime)},
+            )
+
+        def unexpected_runtime(_config: McpServerConfig) -> McpServerRuntime:
+            raise AssertionError("matching candidate must be promoted")
+
+        supervisor = McpSupervisor(
+            runtime_factory=unexpected_runtime,
+            candidate_validator=cast(
+                Callable[..., Awaitable[CandidateValidation]], validator
+            ),
+        )
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.received: asyncio.Queue[str | None] = asyncio.Queue()
+                self.received.put_nowait(
+                    _hello_ack_json(
+                        hello_id,
+                        _device_config(
+                            workspace_path=str(tmp_path),
+                            restrict_to_workspace=True,
+                            ssrf_denylist=[],
+                        ),
+                    )
+                )
+                self.register_count = 0
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                self.sent.append(payload)
+                frame = json.loads(payload)
+                if frame["type"] == "config_applied":
+                    self.received.put_nowait(
+                        ConfigAppliedAck(
+                            id=UUID(frame["id"]),
+                            config_revision=frame["config_revision"],
+                        ).model_dump_json()
+                    )
+                elif frame["type"] == "register_mcp":
+                    self.register_count += 1
+                    results: list[Any] = []
+                    if frame["servers"]:
+                        snapshot = frame["servers"][0]
+                        results = [
+                            AcceptedMcpRegistration(
+                                name="corp",
+                                runtime_generation=UUID(snapshot["runtime_generation"]),
+                                accepted=True,
+                                code=None,
+                            )
+                        ]
+                    self.received.put_nowait(
+                        RegisterMcpAck(
+                            id=UUID(frame["id"]),
+                            config_revision=frame["config_revision"],
+                            catalog_digest=frame["catalog_digest"],
+                            results=results,
+                        ).model_dump_json()
+                    )
+                    if self.register_count == 1:
+                        self.received.put_nowait(
+                            ConfigValidate(
+                                id=validation_id,
+                                base_config_revision=1,
+                                candidate_config=candidate_config,
+                                validate_servers=["corp"],
+                                deadline_ms=300000,
+                            ).model_dump_json()
+                        )
+                    else:
+                        self.received.put_nowait(
+                            ToolCall(
+                                id=UUID("0190d5a7-0000-7000-8000-000000000004"),
+                                name="mcp_corp_echo",
+                                args={"value": "hello"},
+                                max_result_bytes=4096,
+                                mcp_route=McpRoute(
+                                    entry_id=expected_entry_id,
+                                    config_revision=2,
+                                    catalog_digest="a" * 64,
+                                    runtime_generation=candidate_runtime.generation,
+                                ),
+                            ).model_dump_json()
+                        )
+                elif frame["type"] == "config_validate_result":
+                    assert frame["ok"] is True
+                    self.received.put_nowait(
+                        ConfigUpdate(
+                            id=validation_id,
+                            device_name="device",
+                            config_revision=2,
+                            config=candidate_config,
+                            mcp_catalog=persisted,
+                        ).model_dump_json()
+                    )
+                elif frame["type"] == "tool_result":
+                    self.received.put_nowait(None)
+
+            async def recv(self) -> str | None:
+                return await self.received.get()
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+            mcp_supervisor=supervisor,
+        )
+        disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=2)
+        return [json.loads(frame) for frame in socket.sent], disposition, candidate_runtime
+
+    expected_entry_id = UUID("0190d5a7-0000-7000-8000-000000000003")
+    sent, disposition, candidate_runtime = asyncio.run(exercise())
+    assert [frame["type"] for frame in sent] == [
+        "hello",
+        "config_applied",
+        "register_mcp",
+        "config_validate_result",
+        "config_applied",
+        "register_mcp",
+        "tool_result",
+    ]
+    assert sent[-1]["content"] == "mcp-ok"
+    assert candidate_runtime.state is McpRuntimeState.AWAITING_ACK
+    assert not candidate_runtime.closed
+    assert disposition is CloseDisposition.RETRY
+
+
+def test_mcp_call_may_converge_after_its_connection_worker_stops() -> None:
+    async def exercise() -> None:
+        class Supervisor:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def invoke(self, call: ToolCall) -> ToolOutput:
+                del call
+                self.started.set()
+                await self.release.wait()
+                return ToolOutput("late")
+
+            async def shutdown(self) -> None:
+                return None
+
+        supervisor = Supervisor()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            mcp_supervisor=cast(McpSupervisor, supervisor),
+        )
+        writer = SerializedWriter()
+        worker = _ToolWorker(runtime, writer)
+        call = ToolCall(
+            id=UUID("0190d5a7-0000-7000-8000-000000000005"),
+            name="mcp_corp_echo",
+            args={},
+            max_result_bytes=4096,
+            mcp_route=McpRoute(
+                entry_id=UUID("0190d5a7-0000-7000-8000-000000000006"),
+                config_revision=1,
+                catalog_digest="a" * 64,
+                runtime_generation=UUID("0190d5a7-0000-7000-8000-000000000007"),
+            ),
+        )
+        assert worker.enqueue(call, runtime._mcp_dispatcher)
+        await supervisor.started.wait()
+
+        assert await worker.stop()
+        pending = list(runtime._mcp_invocation_tasks)
+        assert len(pending) == 1
+        assert not pending[0].done()
+        supervisor.release.set()
+        await pending[0]
+        await runtime._shutdown_mcp()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_handles_repeated_validation_cancellation_without_stale_suppression(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> tuple[list[dict[str, Any]], CloseDisposition]:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000041")
+        ping_id = UUID("0190d5a7-0000-7000-8000-000000000042")
+        server_config = StdioMcpServerConfig(
+            name="corp",
+            transport="stdio",
+            command="mcp",
+            args=[],
+            cwd=None,
+            env={},
+        )
+        candidate_config = _device_config(
+            workspace_path=str(tmp_path),
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+            mcp_servers=[server_config],
+        )
+        started = [asyncio.Event() for _index in range(8)]
+        cancelled = [asyncio.Event() for _index in range(8)]
+        validation_calls = 0
+
+        async def validator(
+            _configs: Sequence[McpServerConfig], **_kwargs: object
+        ) -> CandidateValidation:
+            nonlocal validation_calls
+            index = validation_calls
+            validation_calls += 1
+            started[index].set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled[index].set()
+                raise
+            raise AssertionError("validation fixture must be cancelled")
+
+        supervisor = McpSupervisor(
+            candidate_validator=cast(
+                Callable[..., Awaitable[CandidateValidation]], validator
+            )
+        )
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.received: asyncio.Queue[str | None | asyncio.Event] = asyncio.Queue()
+                self.received.put_nowait(
+                    _hello_ack_json(
+                        hello_id,
+                        _device_config(
+                            workspace_path=str(tmp_path),
+                            restrict_to_workspace=True,
+                            ssrf_denylist=[],
+                        ),
+                    )
+                )
+                self.seeded = False
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                self.sent.append(payload)
+                frame = json.loads(payload)
+                if frame["type"] == "config_applied":
+                    self.received.put_nowait(
+                        ConfigAppliedAck(
+                            id=UUID(frame["id"]),
+                            config_revision=frame["config_revision"],
+                        ).model_dump_json()
+                    )
+                elif frame["type"] == "register_mcp":
+                    self.received.put_nowait(
+                        RegisterMcpAck(
+                            id=UUID(frame["id"]),
+                            config_revision=frame["config_revision"],
+                            catalog_digest=frame["catalog_digest"],
+                            results=[],
+                        ).model_dump_json()
+                    )
+                    if not self.seeded:
+                        self.seeded = True
+                        for index in range(8):
+                            validation_id = UUID(
+                                f"0190d5a7-0000-7000-8000-{50 + index:012d}"
+                            )
+                            self.received.put_nowait(
+                                ConfigValidate(
+                                    id=validation_id,
+                                    base_config_revision=1,
+                                    candidate_config=candidate_config,
+                                    validate_servers=["corp"],
+                                    deadline_ms=300000,
+                                ).model_dump_json()
+                            )
+                            self.received.put_nowait(started[index])
+                            self.received.put_nowait(
+                                ConfigValidateCancel(id=validation_id).model_dump_json()
+                            )
+                            self.received.put_nowait(cancelled[index])
+                        self.received.put_nowait(Ping(id=ping_id).model_dump_json())
+                elif frame["type"] == "pong":
+                    self.received.put_nowait(None)
+
+            async def recv(self) -> str | None:
+                while True:
+                    item = await self.received.get()
+                    if isinstance(item, asyncio.Event):
+                        await item.wait()
+                        continue
+                    return item
+
+            async def close(self, code: int, reason: str) -> None:
+                del code, reason
+
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+            mcp_supervisor=supervisor,
+        )
+        disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=2)
+        await runtime._shutdown_mcp()
+        return [json.loads(frame) for frame in socket.sent], disposition
+
+    sent, disposition = asyncio.run(exercise())
+    assert sum(frame["type"] == "config_validate_result" for frame in sent) == 0
+    assert any(frame["type"] == "pong" for frame in sent)
+    assert disposition is CloseDisposition.RETRY
 
 
 def test_runtime_shutdown_wakes_recv_and_closes_with_1001(tmp_path: Path) -> None:
@@ -1068,6 +1499,7 @@ def test_fake_websocket_lifecycle_acks_pings_and_dispatches_tool(tmp_path: Path)
     assert {frame["type"] for frame in sent} == {
         "hello",
         "config_applied",
+        "register_mcp",
         "pong",
         "tool_result",
     }
@@ -1293,6 +1725,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
             def __init__(self) -> None:
                 self.sent: list[str | bytes] = []
                 self.config_applied_gate = _ConfigAppliedGate()
+                self.terminal_transfer_sent = asyncio.Event()
                 self.frames: list[str | bytes | None] = [
                     json.dumps(
                         {
@@ -1332,6 +1765,20 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
             async def send(self, payload: str | bytes) -> None:
                 self.sent.append(payload)
                 await self.config_applied_gate.observe_send(payload)
+                if isinstance(payload, str):
+                    frame = json.loads(payload)
+                    if frame["type"] == "register_mcp":
+                        self.frames.insert(
+                            -1,
+                            RegisterMcpAck(
+                                id=UUID(frame["id"]),
+                                config_revision=frame["config_revision"],
+                                catalog_digest=frame["catalog_digest"],
+                                results=[],
+                                ).model_dump_json(),
+                            )
+                    elif frame["type"] == "transfer_end":
+                        self.terminal_transfer_sent.set()
 
             async def recv(self) -> str | bytes | None:
                 await asyncio.sleep(0)
@@ -1344,15 +1791,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
                     ):
                         await asyncio.sleep(0)
                 if frame is None:
-                    async def wait_for_terminal_transfer() -> None:
-                        while not any(
-                            isinstance(sent, str)
-                            and json.loads(sent)["type"] == "transfer_end"
-                            for sent in self.sent
-                        ):
-                            await asyncio.sleep(0)
-
-                    await asyncio.wait_for(wait_for_terminal_transfer(), timeout=5)
+                    await asyncio.wait_for(self.terminal_transfer_sent.wait(), timeout=5)
                 return frame
 
             async def close(self, code: int, reason: str) -> None:

@@ -7,9 +7,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import pytest
 from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from mcp import types
+from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl, SecretStr
 
 from openoctopus_client.mcp.models import (
@@ -21,13 +23,18 @@ from openoctopus_client.mcp.models import (
     StreamableHttpMcpServerConfig,
 )
 from openoctopus_client.mcp.runtime import (
+    McpRuntimeError,
+    McpRuntimeEvent,
     McpRuntimeState,
     McpServerRuntime,
     build_runtime_client,
     retry_backoff_seconds,
     validate_candidate,
 )
-from openoctopus_client.mcp.transport import BoundedStdioTransport
+from openoctopus_client.mcp.transport import (
+    BoundedStdioTransport,
+    McpMessageTooLargeError,
+)
 from openoctopus_client.protocol import new_uuid7
 
 
@@ -218,6 +225,69 @@ def _config(name: str = "local") -> StdioMcpServerConfig:
     )
 
 
+def test_runtime_public_message_handler_emits_bounded_change_and_failure_events() -> None:
+    async def exercise() -> list[McpRuntimeEvent]:
+        runtime = McpServerRuntime(_config(), client_factory=_FakeBuilder())
+        handler = runtime.message_handler
+        await handler.on_tool_list_changed(types.ToolListChangedNotification())
+        await handler.on_tool_list_changed(types.ToolListChangedNotification())
+        await handler.on_resource_list_changed(types.ResourceListChangedNotification())
+        await handler.on_prompt_list_changed(types.PromptListChangedNotification())
+        await handler.on_exception(RuntimeError("secret must not be retained"))
+        return [await runtime.next_event() for _index in range(4)]
+
+    assert [event.kind for event in asyncio.run(exercise())] == [
+        "tools_changed",
+        "resources_changed",
+        "prompts_changed",
+        "transport_failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_idle_http_message_limit_failure_keeps_specific_code_and_retries() -> None:
+    client = _FakeClient(_FakeSession())
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    await runtime.message_handler.on_exception(
+        McpMessageTooLargeError("secret raw detail")
+    )
+
+    await runtime.mark_transport_unavailable()
+
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+    assert runtime.code == "tool_mcp_message_too_large"
+    assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_sdk_close_preserves_handler_message_limit_failure() -> None:
+    session = _FakeSession(
+        discovery_error=McpError(
+            types.ErrorData(
+                code=types.CONNECTION_CLOSED,
+                message="Connection closed",
+            )
+        )
+    )
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: _FakeClient(session)),
+    )
+    await runtime.message_handler.on_exception(
+        McpMessageTooLargeError("secret raw detail")
+    )
+
+    with pytest.raises(McpRuntimeError) as caught:
+        await runtime.start()
+
+    assert caught.value.failure.code == "mcp_message_too_large"
+    assert "secret raw detail" not in caught.value.failure.message
+
+
 def _entry(
     *,
     surface: str,
@@ -305,6 +375,12 @@ def test_build_runtime_client_uses_only_explicit_transport(monkeypatch: pytest.M
     assert streamable.transport.url == "https://example.test/mcp?visible=config"
     assert streamable.transport.headers == {"authorization": "Bearer secret"}
     assert streamable.transport.httpx_client_factory is not None
+    http_client = cast(
+        Callable[..., httpx.AsyncClient],
+        streamable.transport.httpx_client_factory,
+    )(follow_redirects=True)
+    assert http_client.follow_redirects is False
+    asyncio.run(http_client.aclose())
     assert isinstance(sse.transport, SSETransport)
     assert sse.transport.httpx_client_factory is not None
 
@@ -382,6 +458,58 @@ async def test_candidate_cleanup_failure_cannot_leak_third_party_exception() -> 
     assert outcome.ok is False
     assert sentinel not in repr(outcome.failures)
     assert builder.clients["local"].closed is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_failure_reports_cleanup_blocked_runtime_to_owner() -> None:
+    retained: list[McpServerRuntime] = []
+    builder = _FakeBuilder(
+        lambda _name: _FakeClient(
+            _FakeSession(),
+            enter_error=RuntimeError("connect failed"),
+            close_error=RuntimeError("cleanup failed"),
+        )
+    )
+
+    outcome = await validate_candidate(
+        [_config()],
+        client_factory=builder,
+        cleanup_sink=retained.extend,
+    )
+
+    assert not outcome.ok
+    assert len(retained) == 1
+    assert retained[0].state is McpRuntimeState.CLEANUP_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_cancelled_candidate_reports_cleanup_blocked_runtime_to_owner() -> None:
+    retained: list[McpServerRuntime] = []
+    builder = _FakeBuilder(
+        lambda _name: _FakeClient(
+            _FakeSession(),
+            enter_delay=60,
+            close_error=RuntimeError("cleanup failed"),
+        )
+    )
+    task = asyncio.create_task(
+        validate_candidate(
+            [_config()],
+            client_factory=builder,
+            cleanup_sink=retained.extend,
+        )
+    )
+    for _attempt in range(20):
+        if builder.clients:
+            break
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(retained) == 1
+    assert retained[0].state is McpRuntimeState.CLEANUP_BLOCKED
 
 
 @pytest.mark.asyncio
@@ -506,6 +634,174 @@ async def test_transport_failure_closes_attempt_before_backoff() -> None:
     assert client.closed is True
     assert runtime.state is McpRuntimeState.UNAVAILABLE
     assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_sdk_connection_closed_is_outcome_unknown_and_unavailable() -> None:
+    session = _FakeSession()
+    session.send_error = McpError(
+        types.ErrorData(code=types.CONNECTION_CLOSED, message="Connection closed")
+    )
+    client = _FakeClient(session)
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert output.code == "tool_execution_outcome_unknown"
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+    assert client.closed
+    assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_third_party_minus_32000_is_not_misclassified_as_disconnect() -> None:
+    session = _FakeSession()
+    session.send_error = McpError(
+        types.ErrorData(
+            code=types.CONNECTION_CLOSED,
+            message="application-specific failure",
+        )
+    )
+    client = _FakeClient(session)
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert output.code == "tool_mcp_error"
+    assert runtime.state is McpRuntimeState.READY
+    assert not client.closed
+
+
+@pytest.mark.asyncio
+async def test_stdio_message_limit_survives_sdk_connection_closed_translation() -> None:
+    session = _FakeSession()
+    session.send_error = McpError(
+        types.ErrorData(code=types.CONNECTION_CLOSED, message="Connection closed")
+    )
+    client = _FakeClient(session)
+    client.transport.terminal_error = McpMessageTooLargeError("secret raw detail")
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert output.code == "tool_mcp_message_too_large"
+    assert "secret raw detail" not in str(output.content)
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_invocation_auth_failure_suspends_without_backoff(status_code: int) -> None:
+    request = httpx.Request("POST", "https://mcp.invalid/mcp")
+    response = httpx.Response(status_code, request=request)
+    session = _FakeSession()
+    session.send_error = httpx.HTTPStatusError(
+        "secret upstream response",
+        request=request,
+        response=response,
+    )
+    client = _FakeClient(session)
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert output.code == "tool_execution_outcome_unknown"
+    assert "secret upstream response" not in str(output.content)
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+    assert runtime.permanent_failure
+    assert runtime.enter_backoff(jitter=0.5) is None
+
+
+@pytest.mark.asyncio
+async def test_ready_registration_resets_retry_backoff_history() -> None:
+    sessions = [_FakeSession(), _FakeSession()]
+    clients = [_FakeClient(session) for session in sessions]
+    created = 0
+
+    def client_factory(_name: str) -> _FakeClient:
+        nonlocal created
+        client = clients[created]
+        created += 1
+        return client
+
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(client_factory),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+    sessions[0].send_error = ConnectionError("first drop")
+    await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    assert runtime.enter_backoff(jitter=0.5) == 1
+
+    runtime.begin_retry()
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+    sessions[1].send_error = ConnectionError("later drop")
+    await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_retries_cleanup_blocked_client() -> None:
+    session = _FakeSession()
+
+    class RetryCleanupClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__(session)
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.transport.cleanup_incomplete = self.close_calls == 1
+            self.closed = True
+
+    client = RetryCleanupClient()
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+
+    await runtime.close()
+    assert runtime.state.value == "cleanup_blocked"
+    await runtime.close()
+
+    assert client.close_calls == 2
+    assert runtime.state is McpRuntimeState.ABSENT
 
 
 @pytest.mark.asyncio

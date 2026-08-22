@@ -20,6 +20,7 @@ from openoctopus_client.mcp.transport import (
     BoundedStdioTransport,
     McpMessageTooLargeError,
     McpTransportClosingError,
+    McpTransportError,
     UnsupportedMcpContentEncodingError,
     build_mcp_environment,
     create_fastmcp_client,
@@ -258,6 +259,24 @@ async def test_sse_limit_resets_after_each_complete_event(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_sse_content_length_may_exceed_per_event_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("openoctopus_client.mcp.transport.MCP_MESSAGE_BYTES_MAX", 9)
+    body = b"data:x\n\ndata:y\n\n"
+    inner = _ResponseTransport(
+        [body],
+        headers={
+            "Content-Type": "text/event-stream",
+            "Content-Length": str(len(body)),
+        },
+    )
+    async with httpx.AsyncClient(transport=BoundedHttpTransport(inner)) as client:
+        response = await client.get("https://mcp.invalid/sse")
+        assert await response.aread() == body
+
+
+@pytest.mark.asyncio
 async def test_http_client_factory_forces_identity_and_does_not_follow_redirects() -> None:
     inner = _ResponseTransport(
         [], headers={"Location": "https://mcp.invalid/redirected"}, status_code=307
@@ -314,6 +333,27 @@ async def test_real_legacy_sse_transport_initializes_explicitly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_sse_clean_eof_reports_idle_transport_failure() -> None:
+    fake = _SseMcpTransport()
+    messages: asyncio.Queue[object] = asyncio.Queue()
+
+    async def handler(message: object) -> None:
+        messages.put_nowait(message)
+
+    transport = SSETransport(
+        "https://mcp.invalid/sse",
+        httpx_client_factory=partial(create_mcp_http_client, _transport=fake),
+    )
+    client = create_fastmcp_client(transport, message_handler=handler)
+
+    async with client:
+        await client.session.list_tools()
+        fake.stream.queue.put_nowait(None)
+        message = await asyncio.wait_for(messages.get(), timeout=2)
+        assert isinstance(message, McpTransportError)
+
+
+@pytest.mark.asyncio
 async def test_real_stdio_initialize_and_raw_session_apis() -> None:
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_stdio.py"
     transport = BoundedStdioTransport(
@@ -347,7 +387,45 @@ async def test_real_stdio_initialize_and_raw_session_apis() -> None:
     }
     assert result.structuredContent == {"unexpected": True}
     assert transport.cleanup_incomplete is False
+    assert transport.terminal_error is None
     assert transport.process is not None and transport.process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_clean_stdio_eof_reports_idle_failure_but_normal_close_does_not() -> None:
+    code = """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+response = {
+    "jsonrpc": "2.0",
+    "id": request["id"],
+    "result": {
+        "protocolVersion": request["params"]["protocolVersion"],
+        "capabilities": {},
+        "serverInfo": {"name": "exit-after-init", "version": "1"},
+    },
+}
+sys.stdout.write(json.dumps(response) + "\\n")
+sys.stdout.flush()
+sys.stdin.readline()
+"""
+    messages: asyncio.Queue[object] = asyncio.Queue()
+
+    async def handler(message: object) -> None:
+        messages.put_nowait(message)
+
+    transport = BoundedStdioTransport(command=sys.executable, args=("-c", code))
+    client = create_fastmcp_client(transport, message_handler=handler)
+
+    async with client:
+        message = await asyncio.wait_for(messages.get(), timeout=2)
+        assert isinstance(message, McpTransportError)
+    await asyncio.sleep(0)
+
+    assert messages.empty()
+    assert isinstance(transport.terminal_error, McpTransportError)
 
 
 @pytest.mark.asyncio
@@ -420,6 +498,29 @@ async def test_incomplete_stdio_cleanup_blocks_replacement(
     assert transport.cleanup_incomplete is True
     with pytest.raises(McpTransportClosingError):
         await transport._start()
+
+
+@pytest.mark.asyncio
+async def test_second_stdio_close_retries_incomplete_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = BoundedStdioTransport(command=sys.executable, args=("-c", "pass"))
+    cleanup_calls = 0
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        transport.cleanup_incomplete = cleanup_calls == 1
+        transport._cleanup_blocked = transport.cleanup_incomplete
+
+    monkeypatch.setattr(transport, "_cleanup", cleanup)
+
+    await transport.close()
+    assert transport.cleanup_incomplete
+    await transport.close()
+
+    assert cleanup_calls == 2
+    assert not transport.cleanup_incomplete
 
 
 def test_fastmcp_client_has_disabled_sdk_timeouts() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -11,6 +12,7 @@ from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 import httpx
+from fastmcp.client.messages import MessageHandler
 from fastmcp.client.transports import ClientTransport, SSETransport, StreamableHttpTransport
 from mcp import types
 from mcp.shared.exceptions import McpError
@@ -58,6 +60,55 @@ CANDIDATE_TIMEOUT_SECONDS = 300.0
 VALIDATION_PARALLELISM = 4
 
 type ValidationStage = Literal["connect", "discovery", "binding", "candidate", "cleanup"]
+type McpRuntimeEventKind = Literal[
+    "tools_changed",
+    "resources_changed",
+    "prompts_changed",
+    "transport_failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class McpRuntimeEvent:
+    kind: McpRuntimeEventKind
+
+
+class McpRuntimeMessageHandler(MessageHandler):
+    """Translate public FastMCP message hooks into bounded runtime signals."""
+
+    def __init__(self, emit: Callable[[McpRuntimeEventKind], None]) -> None:
+        self._emit = emit
+        self._message_too_large = False
+
+    @property
+    def message_too_large(self) -> bool:
+        return self._message_too_large
+
+    def clear_terminal_failure(self) -> None:
+        self._message_too_large = False
+
+    async def on_tool_list_changed(
+        self, message: types.ToolListChangedNotification
+    ) -> None:
+        del message
+        self._emit("tools_changed")
+
+    async def on_resource_list_changed(
+        self, message: types.ResourceListChangedNotification
+    ) -> None:
+        del message
+        self._emit("resources_changed")
+
+    async def on_prompt_list_changed(
+        self, message: types.PromptListChangedNotification
+    ) -> None:
+        del message
+        self._emit("prompts_changed")
+
+    async def on_exception(self, message: Exception) -> None:
+        if isinstance(message, McpMessageTooLargeError):
+            self._message_too_large = True
+        self._emit("transport_failed")
 
 
 class RuntimeSession(CatalogSession, Protocol):
@@ -130,11 +181,21 @@ def _runtime_http_client(
     headers: dict[str, str] | None = None,
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
+    **kwargs: Any,
 ) -> httpx.AsyncClient:
-    return create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+    return create_mcp_http_client(
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        **kwargs,
+    )
 
 
-def build_runtime_client(config: McpServerConfig) -> RuntimeClient:
+def build_runtime_client(
+    config: McpServerConfig,
+    *,
+    message_handler: McpRuntimeMessageHandler | None = None,
+) -> RuntimeClient:
     """Build exactly the transport selected by the validated tagged union."""
 
     transport: ClientTransport
@@ -162,7 +223,10 @@ def build_runtime_client(config: McpServerConfig) -> RuntimeClient:
         )
     else:  # pragma: no cover - the strict tagged union is exhaustive
         raise TypeError("unsupported MCP transport")
-    return cast(RuntimeClient, create_fastmcp_client(transport))
+    return cast(
+        RuntimeClient,
+        create_fastmcp_client(transport, message_handler=message_handler),
+    )
 
 
 def retry_backoff_seconds(attempt: int, *, jitter: float) -> float:
@@ -200,6 +264,14 @@ def _is_permanent_failure(error: BaseException) -> bool:
     return isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {401, 403}
 
 
+def _is_sdk_connection_closed(error: BaseException) -> bool:
+    return bool(
+        isinstance(error, McpError)
+        and error.error.code == types.CONNECTION_CLOSED
+        and error.error.message == "Connection closed"
+    )
+
+
 @dataclass(slots=True)
 class CandidateValidation:
     source_catalog: SourceMcpCatalog | None
@@ -221,7 +293,7 @@ class McpServerRuntime:
         self,
         config: McpServerConfig,
         *,
-        client_factory: RuntimeClientFactory = build_runtime_client,
+        client_factory: RuntimeClientFactory | None = None,
         connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
         discovery_timeout: float = DISCOVERY_TIMEOUT_SECONDS,
         invocation_timeout: float = INVOCATION_TIMEOUT_SECONDS,
@@ -244,6 +316,35 @@ class McpServerRuntime:
         self._close_task: asyncio.Task[None] | None = None
         self._close_failed = False
         self._retry_attempt = 0
+        self._event_kinds: set[McpRuntimeEventKind] = set()
+        self._event_order: deque[McpRuntimeEventKind] = deque()
+        self._event_ready = asyncio.Event()
+        self._message_handler = McpRuntimeMessageHandler(self._emit_event)
+
+    @property
+    def message_handler(self) -> McpRuntimeMessageHandler:
+        return self._message_handler
+
+    def _emit_event(self, kind: McpRuntimeEventKind) -> None:
+        if kind not in self._event_kinds:
+            self._event_kinds.add(kind)
+            self._event_order.append(kind)
+            self._event_ready.set()
+
+    async def next_event(self) -> McpRuntimeEvent:
+        while not self._event_order:
+            await self._event_ready.wait()
+            self._event_ready.clear()
+        kind = self._event_order.popleft()
+        self._event_kinds.remove(kind)
+        if self._event_order:
+            self._event_ready.set()
+        return McpRuntimeEvent(kind=kind)
+
+    def _clear_events(self) -> None:
+        self._event_kinds.clear()
+        self._event_order.clear()
+        self._event_ready.clear()
 
     @property
     def source_catalog(self) -> SourceMcpServerCatalog | None:
@@ -254,7 +355,10 @@ class McpServerRuntime:
         return dict(self._routes)
 
     async def _run_close_task(self) -> None:
-        if self._close_task is None:
+        if self._close_task is None or (
+            self._close_task.done() and self._cleanup_incomplete()
+        ):
+            self._close_failed = False
             client = self._client
 
             async def close_client() -> None:
@@ -287,14 +391,33 @@ class McpServerRuntime:
             )
         )
 
+    def _effective_terminal_error(
+        self,
+        error: BaseException | None,
+    ) -> BaseException | None:
+        if error is not None and not _is_sdk_connection_closed(error):
+            return error
+        if self._message_handler.message_too_large:
+            return McpMessageTooLargeError("MCP inbound message exceeded its raw byte limit")
+        client = self._client
+        terminal_error = (
+            getattr(client.transport, "terminal_error", None)
+            if client is not None
+            else None
+        )
+        if isinstance(terminal_error, McpMessageTooLargeError):
+            return terminal_error
+        return error
+
     async def _fail_start(
         self,
         stage: ValidationStage,
         error: BaseException,
     ) -> McpRuntimeError:
-        failure = _safe_failure(self.config.name, stage, error)
+        effective_error = self._effective_terminal_error(error) or error
+        failure = _safe_failure(self.config.name, stage, effective_error)
         self.last_failure = failure
-        self.permanent_failure = _is_permanent_failure(error)
+        self.permanent_failure = _is_permanent_failure(effective_error)
         try:
             await self._run_close_task()
         finally:
@@ -310,7 +433,11 @@ class McpServerRuntime:
         if self.state is not McpRuntimeState.STARTING:
             raise RuntimeError("MCP runtime attempt has already started")
         try:
-            self._client = self._client_factory(self.config)
+            self._client = (
+                build_runtime_client(self.config, message_handler=self._message_handler)
+                if self._client_factory is None
+                else self._client_factory(self.config)
+            )
             async with asyncio.timeout(self._connect_timeout):
                 await self._client.__aenter__()
         except asyncio.CancelledError:
@@ -362,6 +489,7 @@ class McpServerRuntime:
             raise RuntimeError("MCP runtime has no discovered catalog")
         self.state = McpRuntimeState.READY
         self.code = None
+        self._retry_attempt = 0
 
     async def refresh(self) -> bool:
         client = self._client
@@ -378,9 +506,10 @@ class McpServerRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            failure = _safe_failure(self.config.name, "discovery", exc)
+            effective_error = self._effective_terminal_error(exc) or exc
+            failure = _safe_failure(self.config.name, "discovery", effective_error)
             self.last_failure = failure
-            self.permanent_failure = _is_permanent_failure(exc)
+            self.permanent_failure = _is_permanent_failure(effective_error)
             await self._close_unavailable(failure.code)
             raise McpRuntimeError(failure) from None
         if canonical_json_bytes(fresh) != canonical_json_bytes(previous):
@@ -418,6 +547,36 @@ class McpServerRuntime:
         self._routes.clear()
         self._close_task = None
         self._close_failed = False
+        self._message_handler.clear_terminal_failure()
+        self._clear_events()
+
+    async def mark_transport_unavailable(self) -> None:
+        if self.state not in {
+            McpRuntimeState.DISCOVERING,
+            McpRuntimeState.AWAITING_ACK,
+            McpRuntimeState.READY,
+        }:
+            return
+        terminal_error = self._effective_terminal_error(None)
+        code = (
+            "tool_mcp_message_too_large"
+            if isinstance(terminal_error, McpMessageTooLargeError)
+            else "tool_mcp_unavailable"
+        )
+        message = (
+            f"MCP server '{self.config.name}' exceeded the inbound message limit"
+            if code == "tool_mcp_message_too_large"
+            else f"MCP server '{self.config.name}' transport became unavailable"
+        )
+        failure = McpValidationFailure(
+            server=self.config.name,
+            stage="connect",
+            code=code,
+            message=message,
+        )
+        self.last_failure = failure
+        self.permanent_failure = False
+        await self._close_unavailable(code)
 
     def _pre_send_failure(self) -> ToolOutput:
         return fail(
@@ -502,7 +661,22 @@ class McpServerRuntime:
                 "The MCP response exceeded the raw message limit after the request may have "
                 "been sent; do not retry blindly",
             )
-        except McpError:
+        except McpError as exc:
+            if _is_sdk_connection_closed(exc):
+                terminal_error = self._effective_terminal_error(exc)
+                if isinstance(terminal_error, McpMessageTooLargeError):
+                    await self._close_unavailable("tool_mcp_message_too_large")
+                    return fail(
+                        "tool_mcp_message_too_large",
+                        "The MCP response exceeded the raw message limit after the request may "
+                        "have been sent; do not retry blindly",
+                    )
+                await self._close_unavailable("tool_execution_outcome_unknown")
+                return fail(
+                    "tool_execution_outcome_unknown",
+                    "The MCP connection closed after the request may have been sent; do not "
+                    "retry blindly",
+                )
             return fail("tool_mcp_error", "The MCP server returned a protocol error")
         except ValidationError:
             return fail("tool_mcp_invalid_result", "The MCP server returned an invalid result")
@@ -510,6 +684,15 @@ class McpServerRuntime:
             return fail("tool_mcp_error", "The MCP invocation arguments are invalid")
         except asyncio.CancelledError:
             raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {401, 403}:
+                self.permanent_failure = True
+            await self._close_unavailable("tool_execution_outcome_unknown")
+            return fail(
+                "tool_execution_outcome_unknown",
+                "The MCP connection failed after the request may have been sent; do not retry "
+                "blindly",
+            )
         except Exception:
             await self._close_unavailable("tool_execution_outcome_unknown")
             return fail(
@@ -534,6 +717,7 @@ class McpServerRuntime:
                 self.code = None
                 self._client = None
                 self._routes.clear()
+                self._clear_events()
 
 
 async def _close_runtimes(runtimes: Sequence[McpServerRuntime]) -> None:
@@ -558,11 +742,12 @@ async def _close_runtimes(runtimes: Sequence[McpServerRuntime]) -> None:
 async def validate_candidate(
     configs: Sequence[McpServerConfig],
     *,
-    client_factory: RuntimeClientFactory = build_runtime_client,
+    client_factory: RuntimeClientFactory | None = None,
     connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
     discovery_timeout: float = DISCOVERY_TIMEOUT_SECONDS,
     candidate_timeout: float = CANDIDATE_TIMEOUT_SECONDS,
     max_parallel: int = VALIDATION_PARALLELISM,
+    cleanup_sink: Callable[[Sequence[McpServerRuntime]], None] | None = None,
 ) -> CandidateValidation:
     """Initialize and discover changed configs without touching active runtimes."""
 
@@ -581,6 +766,19 @@ async def validate_candidate(
         )
         for config in configs
     }
+
+    async def close_and_report_cleanup() -> None:
+        try:
+            await _close_runtimes(tuple(runtimes.values()))
+        finally:
+            if cleanup_sink is not None:
+                cleanup_sink(
+                    tuple(
+                        runtime
+                        for runtime in runtimes.values()
+                        if runtime.state is McpRuntimeState.CLEANUP_BLOCKED
+                    )
+                )
 
     async def validate_one(
         runtime: McpServerRuntime,
@@ -611,7 +809,7 @@ async def validate_candidate(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks.values(), return_exceptions=True)
-        await _close_runtimes(tuple(runtimes.values()))
+        await close_and_report_cleanup()
         raise
 
     sources = [source for source, _failure in results if source is not None]
@@ -630,7 +828,7 @@ async def validate_candidate(
                     )
                 )
     if failures:
-        await _close_runtimes(tuple(runtimes.values()))
+        await close_and_report_cleanup()
         return CandidateValidation(
             source_catalog=None,
             failures=tuple(sorted(failures, key=lambda failure: failure.server)),
@@ -639,7 +837,7 @@ async def validate_candidate(
     try:
         catalog = canonicalize_source_catalog(SourceMcpCatalog(version=1, servers=sources))
     except McpCatalogError as exc:
-        await _close_runtimes(tuple(runtimes.values()))
+        await close_and_report_cleanup()
         failure = _safe_failure(configs[0].name, "candidate", exc)
         return CandidateValidation(source_catalog=None, failures=(failure,), runtimes={})
     return CandidateValidation(

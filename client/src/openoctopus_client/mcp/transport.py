@@ -28,6 +28,7 @@ from fastmcp import Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.client.transports.base import SessionKwargs
 from mcp import ClientSession, types
+from mcp.client.session import MessageHandlerFnT
 from mcp.shared.message import SessionMessage
 
 from openoctopus_client.process import (
@@ -163,8 +164,9 @@ class _BoundedEntityStream(httpx.AsyncByteStream):
 
 
 class _BoundedSseStream(httpx.AsyncByteStream):
-    def __init__(self, inner: httpx.AsyncByteStream) -> None:
+    def __init__(self, inner: httpx.AsyncByteStream, *, report_eof: bool) -> None:
         self._inner = inner
+        self._report_eof = report_eof
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         event_size = 0
@@ -206,6 +208,8 @@ class _BoundedSseStream(httpx.AsyncByteStream):
                 else:
                     line_has_content = True
             yield chunk
+        if self._report_eof:
+            raise McpTransportError("MCP SSE stream ended unexpectedly")
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -214,8 +218,14 @@ class _BoundedSseStream(httpx.AsyncByteStream):
 class BoundedHttpTransport(httpx.AsyncBaseTransport):
     """Apply raw entity/SSE limits before HTTPX or MCP decode the body."""
 
-    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        inner: httpx.AsyncBaseTransport | None = None,
+        *,
+        report_sse_eof: bool = False,
+    ) -> None:
         self._inner = inner or httpx.AsyncHTTPTransport(verify=True)
+        self._report_sse_eof = report_sse_eof
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         response = await self._inner.handle_async_request(request)
@@ -225,18 +235,21 @@ class BoundedHttpTransport(httpx.AsyncBaseTransport):
             raise UnsupportedMcpContentEncodingError(
                 "MCP responses must use identity content encoding"
             )
+        content_type = response.headers.get("content-type", "").partition(";")[0].strip()
         content_length = response.headers.get("content-length")
-        if content_length is not None:
+        if content_type.casefold() != "text/event-stream" and content_length is not None:
             with contextlib.suppress(ValueError):
                 if int(content_length) > MCP_MESSAGE_BYTES_MAX:
                     await response.aclose()
                     raise McpMessageTooLargeError(
                         "MCP HTTP response exceeds the raw byte limit"
                     )
-        content_type = response.headers.get("content-type", "").partition(";")[0].strip()
         stream: httpx.AsyncByteStream
         if content_type.casefold() == "text/event-stream":
-            stream = _BoundedSseStream(cast(httpx.AsyncByteStream, response.stream))
+            stream = _BoundedSseStream(
+                cast(httpx.AsyncByteStream, response.stream),
+                report_eof=self._report_sse_eof and request.method == "GET",
+            )
         else:
             stream = _BoundedEntityStream(cast(httpx.AsyncByteStream, response.stream))
         response.stream = stream
@@ -269,7 +282,7 @@ def create_mcp_http_client(
         follow_redirects=False,
         trust_env=False,
         verify=True,
-        transport=BoundedHttpTransport(_transport),
+        transport=BoundedHttpTransport(_transport, report_sse_eof=True),
     )
 
 
@@ -324,7 +337,11 @@ async def _discard_log_notification(params: types.LoggingMessageNotificationPara
     del params
 
 
-def create_fastmcp_client(transport: ClientTransport) -> Client[ClientTransport]:
+def create_fastmcp_client(
+    transport: ClientTransport,
+    *,
+    message_handler: MessageHandlerFnT | None = None,
+) -> Client[ClientTransport]:
     """Construct FastMCP with all SDK-internal deadlines disabled."""
 
     install_mcp_log_discard_boundary()
@@ -333,6 +350,7 @@ def create_fastmcp_client(transport: ClientTransport) -> Client[ClientTransport]
         timeout=None,
         init_timeout=0,
         log_handler=_discard_log_notification,
+        message_handler=message_handler,
     )
 
 
@@ -361,6 +379,7 @@ class BoundedStdioTransport(ClientTransport):
         self._cleanup_blocked = False
         self._connecting = False
         self._cleanup_task: asyncio.Task[None] | None = None
+        self._closing = False
         self._reader_task: asyncio.Task[None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._read_sender: MemoryObjectSendStream[SessionMessage | Exception] | None = None
@@ -378,6 +397,7 @@ class BoundedStdioTransport(ClientTransport):
             raise McpTransportClosingError("stdio transport is already connected")
         self._connecting = True
         self.cleanup_incomplete = False
+        self._closing = False
         self.terminal_error = None
         self._cleanup_task = None
         if self._provided_stderr_sink is None:
@@ -440,6 +460,10 @@ class BoundedStdioTransport(ClientTransport):
                     raise McpMessageTooLargeError("MCP stdio record exceeds the raw byte limit")
             if buffer:
                 raise McpTransportError("MCP stdio stream ended with an incomplete record")
+            if not self._closing:
+                error = McpTransportError("MCP stdio stream ended unexpectedly")
+                self.terminal_error = error
+                await self._publish_error(error)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -631,7 +655,10 @@ class BoundedStdioTransport(ClientTransport):
     async def close(self) -> None:
         """Close once while deferring caller cancellation until cleanup finishes."""
 
-        if self._cleanup_task is None:
+        self._closing = True
+        if self._cleanup_task is None or (
+            self._cleanup_task.done() and self.cleanup_incomplete
+        ):
             self._cleanup_task = asyncio.create_task(self._cleanup(), name="mcp-stdio-cleanup")
         cancelled = False
         while not self._cleanup_task.done():
