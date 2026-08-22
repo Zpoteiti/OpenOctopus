@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 import unicodedata
@@ -9,7 +10,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import ValidationError
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -144,8 +144,14 @@ def parse_stored_mcp_servers(value: object) -> tuple[McpServerConfig, ...]:
 
 def parse_stored_mcp_catalog(value: object) -> PersistedMcpCatalog:
     try:
-        catalog = PersistedMcpCatalog.model_validate(value, strict=True)
-    except ValidationError as exc:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        catalog = PersistedMcpCatalog.model_validate_json(encoded, strict=True)
+    except (TypeError, ValueError) as exc:
         raise DeviceError(
             ErrorCode.CONFIG_VALIDATION_FAILED, "Stored MCP catalog is invalid"
         ) from exc

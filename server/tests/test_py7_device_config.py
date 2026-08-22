@@ -25,6 +25,7 @@ from openctopus_server.devices.registry import (
     DeviceUnavailableError,
     DeviceValidationError,
 )
+from openctopus_server.services import devices
 
 
 async def _register(client: Any, *, email: str = "owner@test.com") -> dict[str, Any]:
@@ -94,6 +95,42 @@ class _ConfigRegistry:
     async def push_config(self, **kwargs: Any) -> bool:
         self.pushes.append(kwargs)
         return True
+
+
+def test_stored_catalog_accepts_the_jsonb_uuid_representation() -> None:
+    catalog = devices.parse_stored_mcp_catalog(
+        {
+            "version": 1,
+            "digest": "09c6199190ca1fe4d56e1b344d85f9b2967742df1a24ccf3757a3e755292cc90",
+            "servers": [
+                {
+                    "name": "demo",
+                    "entries": [
+                        {
+                            "entry_id": "0198e2c8-592a-7000-8000-000000000010",
+                            "server": "demo",
+                            "surface": "tool",
+                            "raw_name": "search",
+                            "invocation_identity": "search",
+                            "final_name": "mcp_demo_search",
+                            "provider_description": "Search with demo.",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                            "output_schema": None,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert catalog.servers[0].entries[0].entry_id == UUID(
+        "0198e2c8-592a-7000-8000-000000000010"
+    )
 
 
 async def _create_device(async_client: Any, owner: dict[str, Any]) -> dict[str, Any]:
