@@ -46,8 +46,21 @@ from openctopus_server.api import device_ws
 from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import Device, User
 from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.mcp_catalog import canonical_json_bytes, with_catalog_digest
+from openctopus_server.devices.mcp_models import (
+    PersistedMcpCatalog,
+    PersistedMcpCatalogEntry,
+    PersistedMcpServerCatalog,
+)
+from openctopus_server.devices.mcp_routes import (
+    OwnerMcpDevice,
+    build_owner_mcp_snapshot,
+)
 from openctopus_server.devices.protocol import (
     PROTOCOL_VERSION,
+    ConfigAppliedAckFrame,
+    ConfigAppliedFrame,
+    ConfigUpdateFrame,
     DeviceCapabilities,
     HelloAckFrame,
     HelloFrame,
@@ -68,7 +81,7 @@ from openctopus_server.devices.registry import (
     DeviceRegistry,
     DeviceUnavailableError,
 )
-from openctopus_server.services.devices import token_digest, token_hint
+from openctopus_server.services.devices import parse_stored_mcp_catalog, token_digest, token_hint
 
 _DEFAULT_CONNECTIONS = 8
 _DEFAULT_DISPATCH_CONCURRENCY = 32
@@ -120,6 +133,7 @@ class _Identity:
 class _Rows:
     user_ids: tuple[UUID, ...]
     device_ids: tuple[UUID, ...]
+    offline_device_ids: tuple[UUID, ...]
     identities: tuple[_Identity, ...]
 
 
@@ -208,6 +222,22 @@ class _SourcePeer:
         frame = parse_server_frame(raw)
         if not isinstance(frame, HelloAckFrame) or frame.device_name != self.identity.device_name:
             raise RuntimeError("hello_ack identity mismatch")
+        await self.websocket.send(
+            ConfigAppliedFrame(
+                id=frame.id,
+                config_revision=frame.config_revision,
+            ).model_dump_json()
+        )
+        raw_ack = await asyncio.wait_for(self.websocket.recv(), timeout=timeout)
+        if not isinstance(raw_ack, str):
+            raise RuntimeError("config_applied_ack was not text")
+        ack = parse_server_frame(raw_ack)
+        if (
+            not isinstance(ack, ConfigAppliedAckFrame)
+            or ack.id != frame.id
+            or ack.config_revision != frame.config_revision
+        ):
+            raise RuntimeError("config_applied_ack mismatch")
         self.reader = asyncio.create_task(self.read_frames())
         self.worker = asyncio.create_task(self.write_results())
 
@@ -237,6 +267,15 @@ class _SourcePeer:
                 elif isinstance(frame, ToolCallFrame):
                     await self.queue.put(frame)
                     self.queue_high_water = max(self.queue_high_water, self.queue.qsize())
+                elif isinstance(frame, ConfigUpdateFrame):
+                    await self.send(
+                        ConfigAppliedFrame(
+                            id=frame.id,
+                            config_revision=frame.config_revision,
+                        ).model_dump_json()
+                    )
+                elif isinstance(frame, ConfigAppliedAckFrame):
+                    continue
                 elif isinstance(frame, TransferBeginFrame):
                     await self._begin_transfer(frame)
                 elif isinstance(frame, TransferEndFrame):
@@ -380,9 +419,14 @@ async def _delete_rows(engine: AsyncEngine, rows: _Rows | None) -> None:
             await connection.execute(delete(model).where(model.id.in_(ids)))
 
 
-async def _create_rows(engine: AsyncEngine, config: NetworkHarnessConfig) -> _Rows:
+async def _create_rows(
+    engine: AsyncEngine,
+    config: NetworkHarnessConfig,
+    *,
+    sample: Callable[[], None],
+) -> _Rows:
     assert config.users is not None
-    prefix = f"py5-cap-{uuid4().hex[:16]}"
+    prefix = f"py7-cap-{uuid4().hex[:16]}"
     users = [
         User(
             id=uuid4(),
@@ -413,17 +457,130 @@ async def _create_rows(engine: AsyncEngine, config: NetworkHarnessConfig) -> _Ro
                 ssrf_denylist=[],
             )
         )
-    rows = _Rows(user_ids, tuple(device.id for device in devices), tuple(identities))
+    offline_devices: list[Device] = []
+    for index in range(config.connections):
+        user_id = user_ids[index % config.users]
+        device_id = uuid4()
+        catalog = with_catalog_digest(
+            PersistedMcpCatalog(
+                version=1,
+                digest="0" * 64,
+                servers=[
+                    PersistedMcpServerCatalog(
+                        name="offline",
+                        entries=[
+                            PersistedMcpCatalogEntry(
+                                entry_id=new_uuid7(),
+                                server="offline",
+                                surface="tool",
+                                raw_name="probe",
+                                invocation_identity="probe",
+                                final_name="mcp_offline_probe",
+                                provider_description="Probe one bounded offline MCP catalog.",
+                                input_schema={
+                                    "type": "object",
+                                    "properties": {},
+                                    "additionalProperties": False,
+                                },
+                                enabled=True,
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+        offline_devices.append(
+            Device(
+                id=device_id,
+                user_id=user_id,
+                name=f"{prefix}-offline-{index}",
+                token_hash=token_digest(f"{prefix}-offline-token-{index}"),
+                token_hint="capacity-offline",
+                workspace_path="/tmp/openoctopus-capacity-harness",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+                mcp_servers=[
+                    {
+                        "name": "offline",
+                        "transport": "stdio",
+                        "command": "offline-capacity-mcp",
+                        "args": [],
+                        "cwd": None,
+                        "env": {},
+                        "enabled_capabilities": None,
+                    }
+                ],
+                mcp_catalog=catalog.model_dump(mode="json"),
+            )
+        )
+    all_devices = [*devices, *offline_devices]
+    sample()
+    rows = _Rows(
+        user_ids,
+        tuple(device.id for device in all_devices),
+        tuple(device.id for device in offline_devices),
+        tuple(identities),
+    )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as db:
             db.add_all(users)
             await db.commit()
-            db.add_all(devices)
+            sample()
+            db.add_all(all_devices)
             await db.commit()
+            sample()
     except Exception:
         await _delete_rows(engine, rows)
         raise
     return rows
+
+
+async def _offline_catalog_metrics(
+    engine: AsyncEngine,
+    rows: _Rows,
+    *,
+    sample: Callable[[], None],
+) -> dict[str, int]:
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        devices = list(
+            (
+                await db.scalars(
+                    select(Device).where(Device.id.in_(rows.offline_device_ids))
+                )
+            ).all()
+        )
+    sample()
+    by_user: dict[UUID, list[OwnerMcpDevice]] = {}
+    for device in devices:
+        catalog = parse_stored_mcp_catalog(device.mcp_catalog)
+        by_user.setdefault(device.user_id, []).append(
+            OwnerMcpDevice(
+                device_id=device.id,
+                name=device.name,
+                config_revision=device.config_revision,
+                catalog=catalog,
+            )
+        )
+    sample()
+    schema_high_water = 0
+    route_high_water = 0
+    bytes_high_water = 0
+    for owner_devices in by_user.values():
+        snapshot = build_owner_mcp_snapshot(owner_devices)
+        schema_high_water = max(schema_high_water, len(snapshot.schemas))
+        route_high_water = max(route_high_water, len(snapshot.routes))
+        bytes_high_water = max(
+            bytes_high_water,
+            len(canonical_json_bytes(snapshot.schemas)),
+        )
+        sample()
+    return {
+        "devices": len(devices),
+        "owners": len(by_user),
+        "schemas_high_water": schema_high_water,
+        "routes_high_water": route_high_water,
+        "schema_bytes_high_water": bytes_high_water,
+    }
 
 
 async def _verify_hashes(engine: AsyncEngine, rows: _Rows) -> bool:
@@ -526,6 +683,13 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
     dispatch_baseline = baseline
     online_connections_before_shutdown = 0
     live_peer_readers_before_shutdown = 0
+    offline_catalog_metrics = {
+        "devices": 0,
+        "owners": 0,
+        "schemas_high_water": 0,
+        "routes_high_water": 0,
+        "schema_bytes_high_water": 0,
+    }
     started = time.perf_counter()
     original_heartbeat = device_ws._heartbeat
 
@@ -553,13 +717,18 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         lambda: registry.transfers.active_slots,
     )
     try:
-        rows = await _create_rows(engine, config)
+        await sampler.start()
+        rows = await _create_rows(engine, config, sample=sampler._record)  # noqa: SLF001
         auth_hashes = await _verify_hashes(engine, rows)
+        offline_catalog_metrics = await _offline_catalog_metrics(
+            engine,
+            rows,
+            sample=sampler._record,  # noqa: SLF001
+        )
         app = FastAPI()
         app.include_router(device_ws.router)
         app.dependency_overrides[get_device_registry] = lambda: registry
         server, server_task, base_url, listener = await _start_server(app, config.connections)
-        await sampler.start()
         peers = [
             _SourcePeer(
                 identity,
@@ -725,6 +894,11 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         and transfer_bytes_received == config.connections * _TRANSFER_BYTES
         and sampler.peak_transfer_count > 0,
         "bulk_calls_complete_or_documented": successful == len(bulk) or documented,
+        "offline_catalog_projection_is_bounded": offline_catalog_metrics["devices"]
+        == config.connections
+        and offline_catalog_metrics["owners"] == config.users
+        and offline_catalog_metrics["schemas_high_water"] == 1
+        and offline_catalog_metrics["routes_high_water"] <= config.connections,
         "registry_pending_and_transfers_clean": registry.pending_count == 0
         and registry.transfers.active_slots == 0
         and registry.transfers._admission.waiting_count == 0,  # noqa: SLF001
@@ -741,12 +915,14 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         "transport": "real_fastapi_uvicorn_websocket",
         "network_exercised": True,
         "transfers_exercised": True,
+        "offline_catalogs_exercised": True,
         "authentication": "PostgreSQL devices.token_hash lookup in /ws/device",
         "client_kind": "lightweight source-protocol peers; not PyInstaller bundles",
         "provider_turns_exercised": False,
         "limitations": [
-            "Peers implement hello, ping/pong, bounded read_file, and bounded server-to-client transfer.",
+            "Peers implement Protocol v3 config acknowledgement, ping/pong, bounded read_file, and bounded server-to-client transfer.",
             "No frozen client processes or provider turns are part of this evidence.",
+            "MCP runtime high-water is zero here; separate native/frozen Client E2E starts real runtimes.",
             "FIFO and busy/unreachable edge probes remain covered by the in-memory harness.",
         ],
         "connections": config.connections,
@@ -762,6 +938,7 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
         "pong_count": pong_count,
         "heartbeat_peers": heartbeat_peers,
         "successful_transfers": successful_transfers,
+        "offline_catalog_devices": offline_catalog_metrics["devices"],
         "transfer_bytes_received": transfer_bytes_received,
         "in_flight_pings_at_shutdown": in_flight_pings,
         "peer_errors": [peer.error for peer in peers if peer.error is not None],
@@ -774,6 +951,18 @@ async def run_network_harness(config: NetworkHarnessConfig = NetworkHarnessConfi
             "registry_pending_high_water": sampler.peak_pending_count, "source_peer_queue_high_water": sampler.peak_queue_high_water,
             "transfer_active_high_water": sampler.peak_transfer_count,
             "transfer_bytes_received": transfer_bytes_received,
+            "offline_catalog_routes_high_water": offline_catalog_metrics[
+                "routes_high_water"
+            ],
+            "offline_catalog_schemas_high_water": offline_catalog_metrics[
+                "schemas_high_water"
+            ],
+            "offline_catalog_schema_bytes_high_water": offline_catalog_metrics[
+                "schema_bytes_high_water"
+            ],
+            # These lightweight protocol peers intentionally do not start MCP
+            # runtimes. Frozen/native Client E2E is the non-zero runtime gate.
+            "mcp_runtime_high_water": 0,
             "online_connections_before_shutdown": online_connections_before_shutdown,
             "online_connections_after_cleanup": online_connections_after_cleanup,
             "source_peer_queue_capacity": _DEFAULT_QUEUE_CAPACITY, "rss_before_bytes": baseline.rss_bytes,

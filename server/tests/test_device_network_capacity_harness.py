@@ -39,6 +39,36 @@ async def test_real_network_capacity_smoke(
     # Eight transfers exceed the configured admission's two active plus two
     # waiting slots unless the harness bounds launches at the active limit.
     monkeypatch.setattr(capacity_harness, "_TRANSFER_MAX_CONCURRENCY", 2)
+    sampler_started = False
+    catalog_samples = 0
+    original_sampler_start = capacity_harness._MetricsSampler.start
+    original_offline_catalog_metrics = capacity_harness._offline_catalog_metrics
+
+    async def observed_sampler_start(sampler: capacity_harness._MetricsSampler) -> None:
+        nonlocal sampler_started
+        sampler_started = True
+        await original_sampler_start(sampler)
+
+    async def observed_offline_catalog_metrics(*args: object, **kwargs: object) -> dict[str, int]:
+        nonlocal catalog_samples
+        assert sampler_started, "capacity sampler must cover offline catalog projection"
+        sample = kwargs.get("sample")
+        assert callable(sample), "catalog projection must expose explicit peak samples"
+
+        def observed_sample() -> None:
+            nonlocal catalog_samples
+            catalog_samples += 1
+            sample()
+
+        kwargs["sample"] = observed_sample
+        return await original_offline_catalog_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(capacity_harness._MetricsSampler, "start", observed_sampler_start)
+    monkeypatch.setattr(
+        capacity_harness,
+        "_offline_catalog_metrics",
+        observed_offline_catalog_metrics,
+    )
     result = await run_network_harness(
         NetworkHarnessConfig(
             connections=8,
@@ -48,9 +78,11 @@ async def test_real_network_capacity_smoke(
         )
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
+    assert catalog_samples >= 3
     assert result["network_exercised"] is True
     assert result["transfers_exercised"] is True
+    assert result["offline_catalogs_exercised"] is True
     assert result["transport"] == "real_fastapi_uvicorn_websocket"
     assert result["client_kind"] == "lightweight source-protocol peers; not PyInstaller bundles"
     assert result["provider_turns_exercised"] is False
@@ -61,6 +93,7 @@ async def test_real_network_capacity_smoke(
     assert result["cross_user_result_errors"] == 0
     assert result["cross_user_dispatch_rejected"] is True
     assert result["successful_transfers"] == 8
+    assert result["offline_catalog_devices"] == 8
     assert result["transfer_bytes_received"] > 0
     assert result["heartbeat_peers"] == result["authenticated_connections"]
     assert 0 <= result["in_flight_pings_at_shutdown"] <= result["authenticated_connections"]
@@ -72,6 +105,10 @@ async def test_real_network_capacity_smoke(
     assert metrics["source_peer_queue_high_water"] <= metrics["source_peer_queue_capacity"]
     assert metrics["transfer_active_high_water"] > 0
     assert metrics["transfer_bytes_received"] == result["transfer_bytes_received"]
+    assert metrics["offline_catalog_routes_high_water"] == 2
+    assert metrics["offline_catalog_schemas_high_water"] == 1
+    assert metrics["offline_catalog_schema_bytes_high_water"] > 0
+    assert metrics["mcp_runtime_high_water"] == 0
     assert metrics["online_connections_before_shutdown"] == 8
     assert metrics["online_connections_after_cleanup"] == 0
     assert metrics["after_cleanup"]["pending_calls"] == 0

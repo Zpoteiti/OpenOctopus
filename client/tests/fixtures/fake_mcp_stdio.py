@@ -40,7 +40,16 @@ for raw_line in sys.stdin:
                     {
                         "name": "environment",
                         "description": "Return selected child environment values.",
-                        "inputSchema": {"type": "object"},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                }
+                            },
+                            "required": ["keys"],
+                        },
                     }
                 ]
             },

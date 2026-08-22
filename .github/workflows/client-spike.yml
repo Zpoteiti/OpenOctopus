@@ -69,7 +69,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py6-client-linux-x64
+          name: py7-client-linux-x64
           path: |
             client/dist/openoctopus-client
             client/metrics
@@ -137,7 +137,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py6-client-macos-${{ matrix.arch }}
+          name: py7-client-macos-${{ matrix.arch }}
           path: |
             client/dist/openoctopus-client
             client/metrics
@@ -199,7 +199,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py6-client-windows-x64
+          name: py7-client-windows-x64
           path: |
             client/dist/openoctopus-client
             client/metrics
@@ -238,7 +238,7 @@ jobs:
       - name: Download frozen client bundle
         uses: actions/download-artifact@v7
         with:
-          name: py6-client-linux-x64
+          name: py7-client-linux-x64
           path: client
 
       - name: Install server dependencies
@@ -269,15 +269,17 @@ jobs:
           done
           python -c "from minio import Minio; Minio('localhost:9000', access_key='openoctopus', secret_key='change-me-object-storage-secret', secure=False).make_bucket('openoctopus')"
 
-      - name: Run frozen device, tool, transfer, and relay E2E
+      - name: Run frozen device, MCP, tool, transfer, and relay E2E
         env:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           PY5_REAL_E2E: "1"
           PY6_REAL_E2E: "1"
+          PY7_REAL_E2E: "1"
         run: |
           chmod +x "$OO_CLIENT_BIN"
           test -x "$OO_CLIENT_BIN"
           pytest -v \
             tests/test_device_client_e2e.py::test_real_chat_runtime_source_client_read_write_and_offline \
             tests/test_device_client_transfer_e2e.py::test_real_file_transfer_and_device_workspace_relay \
-            tests/test_py6_client_exec_e2e.py::test_real_client_exec_pipe_tty_reconnect_and_chat_isolation
+            tests/test_py6_client_exec_e2e.py::test_real_client_exec_pipe_tty_reconnect_and_chat_isolation \
+            tests/test_py7_client_mcp_e2e.py::test_real_client_validates_registers_and_runs_all_mcp_surfaces

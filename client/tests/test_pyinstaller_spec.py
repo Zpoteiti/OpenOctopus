@@ -25,6 +25,7 @@ def _run_windows_spec(native_files: Collection[str]) -> None:
     hooks = types.ModuleType("PyInstaller.utils.hooks")
     hooks.collect_data_files = lambda *args, **kwargs: []  # type: ignore[attr-defined]
     hooks.collect_dynamic_libs = lambda *args, **kwargs: []  # type: ignore[attr-defined]
+    hooks.copy_metadata = lambda *args, **kwargs: []  # type: ignore[attr-defined]
 
     def collect_all(package: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
         assert package == "winpty"
