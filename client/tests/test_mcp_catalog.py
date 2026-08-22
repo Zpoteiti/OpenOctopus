@@ -217,6 +217,56 @@ async def test_discovery_rejects_repeated_cursor_page_and_capability_bounds(
 
 
 @pytest.mark.asyncio
+async def test_discovery_rejects_malformed_tool_input_schema() -> None:
+    session = FakeSession(
+        types.ServerCapabilities(tools=types.ToolsCapability()),
+        tools=lambda cursor: _result(
+            types.ListToolsResult(
+                tools=[
+                    types.Tool(
+                        name="invalid",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {"value": {"type": "not-a-json-schema-type"}},
+                        },
+                    )
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(McpCatalogError, match="input schema is invalid"):
+        await discover_server_catalog("demo", session)
+
+
+@pytest.mark.asyncio
+async def test_discovery_accepts_valid_local_schema_ref() -> None:
+    session = FakeSession(
+        types.ServerCapabilities(tools=types.ToolsCapability()),
+        tools=lambda cursor: _result(
+            types.ListToolsResult(
+                tools=[
+                    types.Tool(
+                        name="local_ref",
+                        inputSchema={
+                            "type": "object",
+                            "$defs": {"value": {"type": "integer"}},
+                            "properties": {"value": {"$ref": "#/$defs/value"}},
+                        },
+                    )
+                ]
+            )
+        ),
+    )
+
+    discovered = await discover_server_catalog("demo", session)
+
+    assert discovered.tools[0].input_schema["properties"] == {
+        "value": {"$ref": "#/$defs/value"}
+    }
+
+
+@pytest.mark.asyncio
 async def test_discovery_enforces_page_cursor_and_cross_surface_item_limits_early() -> None:
     async def endless_tools(cursor: str | None) -> types.ListToolsResult:
         page = 0 if cursor is None else int(cursor)

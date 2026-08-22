@@ -11,6 +11,8 @@ from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import uritemplate
+from jsonschema import SchemaError as JsonSchemaSchemaError
+from jsonschema.validators import validator_for
 from mcp import types
 from pydantic import AnyUrl, BaseModel, TypeAdapter, ValidationError
 
@@ -259,6 +261,10 @@ def _validate_capability_value(value: object) -> None:
 
 def _validate_tool_schema(schema: dict[str, Any]) -> None:
     _validate_capability_value(schema)
+    try:
+        validator_for(schema).check_schema(schema)
+    except JsonSchemaSchemaError:
+        raise _validation_error("MCP tool input schema is invalid") from None
     if schema.get("type") != "object":
         raise _validation_error("MCP tool input schema must have top-level type object")
     properties = schema.get("properties")
