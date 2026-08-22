@@ -25,11 +25,14 @@ from openoctopus_client.exec_sessions import ExecPolicy, ExecSessionManager
 from openoctopus_client.process import ShellInventory, discover_shells
 from openoctopus_client.protocol import (
     EXEC_TOOL_NAMES,
+    ConfigApplied,
+    ConfigAppliedAck,
     ConfigUpdate,
     DeviceConfig,
     ErrorFrame,
     Hello,
     HelloAck,
+    PersistedMcpCatalog,
     Ping,
     Pong,
     ProtocolError,
@@ -57,7 +60,6 @@ from openoctopus_client.writer import SerializedWriter, TextWebSocket, WriterOve
 LOGGER = logging.getLogger(__name__)
 _TOOL_QUEUE_MAX = 64
 _TOOL_QUEUE_BYTES_MAX = 32 * 1024 * 1024
-_CONFIG_UPDATE_BACKLOG_MAX = 16
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _SHUTDOWN_WATCHDOG_SECONDS = 15.0
 _HELLO_ACK_TIMEOUT_SECONDS = 10.0
@@ -302,6 +304,9 @@ class ClientRuntime:
         self._tool_dispatcher_factory = tool_dispatcher_factory or self._default_dispatcher
         self._stopping = asyncio.Event()
         self._active_config: DeviceConfig | None = None
+        self._config_revision: int | None = None
+        self._mcp_catalog: PersistedMcpCatalog | None = None
+        self._ever_ready = False
         self._device_name: str | None = None
         self._tools: ToolDispatcher | None = None
         self._transfer_manager: TransferManager | None = None
@@ -400,8 +405,14 @@ class ClientRuntime:
                             suffix,
                         )
                         return 78
+                    if not self._ever_ready:
+                        LOGGER.error("The initial device connection is unreachable")
+                        return 1
                 if disposition == CloseDisposition.SHUTDOWN or self._stopping.is_set():
                     return 0
+                if disposition == CloseDisposition.RETRY and not self._ever_ready:
+                    LOGGER.error("The initial device connection is unreachable")
+                    return 1
                 if not failed_attempt:
                     attempt = 0
                     retry_after = None if disposition is not None else retry_after
@@ -449,11 +460,15 @@ class ClientRuntime:
         transfer_manager: TransferManager | None = None
         transfer_failure_task: asyncio.Task[str | bytes | None] | None = None
         config_update_tasks: list[asyncio.Task[_PreparedConfig]] = []
+        config_update_frames: dict[asyncio.Task[_PreparedConfig], ConfigUpdate] = {}
+        pending_config_ack: ConfigUpdate | None = None
+        config_ack_deadline: float | None = None
         config_bound_transfer_tasks: list[asyncio.Task[None]] = []
         receive_task: asyncio.Task[str | bytes | None] | None = None
         stopping_task = asyncio.create_task(self._stopping.wait())
         hello = self._hello_factory()
         acknowledged = False
+        pending_hello_ack: HelloAck | None = None
         shutdown_requested = False
         hello_deadline = asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
         try:
@@ -485,7 +500,8 @@ class ClientRuntime:
                 raise ProtocolError("Timed out sending hello")
             await hello_drain
             while True:
-                receive_task = asyncio.create_task(websocket.recv())
+                if receive_task is None:
+                    receive_task = asyncio.create_task(websocket.recv())
                 wait_set: set[asyncio.Task[object]] = {
                     receive_task,
                     worker_failure_task,
@@ -499,6 +515,12 @@ class ClientRuntime:
                 timeout = None
                 if not acknowledged:
                     timeout = max(0.0, hello_deadline - asyncio.get_running_loop().time())
+                elif pending_config_ack is not None:
+                    assert config_ack_deadline is not None
+                    timeout = max(
+                        0.0,
+                        config_ack_deadline - asyncio.get_running_loop().time(),
+                    )
                 done, _ = await asyncio.wait(
                     wait_set,
                     timeout=timeout,
@@ -508,6 +530,8 @@ class ClientRuntime:
                     receive_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await receive_task
+                    if pending_config_ack is not None:
+                        raise ProtocolError("Timed out waiting for config applied acknowledgement")
                     raise ProtocolError("Timed out waiting for hello acknowledgement")
                 if stopping_task in done:
                     shutdown_requested = True
@@ -537,14 +561,25 @@ class ClientRuntime:
                     for update_task in completed_updates:
                         update_task.result()
                         config_update_tasks.remove(update_task)
+                        update = config_update_frames.pop(update_task)
+                        if pending_config_ack is not None:
+                            raise ProtocolError("Concurrent configuration updates are not allowed")
+                        writer.enqueue_normal(
+                            encode_frame(
+                                ConfigApplied(
+                                    id=update.id,
+                                    config_revision=update.config_revision,
+                                )
+                            )
+                        )
+                        pending_config_ack = update
+                        config_ack_deadline = (
+                            asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
+                        )
                     for transfer_task in completed_transfers:
                         transfer_task.result()
                         config_bound_transfer_tasks.remove(transfer_task)
                     if receive_task not in done:
-                        receive_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await receive_task
-                        receive_task = None
                         continue
                 payload = receive_task.result()
                 receive_task = None
@@ -557,20 +592,40 @@ class ClientRuntime:
                     continue
                 frame = decode_server_frame(payload)
                 if not acknowledged:
-                    if not isinstance(frame, HelloAck) or frame.id != hello.id:
-                        raise ProtocolError("Expected matching hello acknowledgement")
-                    await self._install_config(
-                        frame.device_name,
-                        frame.config,
-                        generation=config_generation,
-                    )
+                    if pending_hello_ack is None:
+                        if not isinstance(frame, HelloAck) or frame.id != hello.id:
+                            raise ProtocolError("Expected matching hello acknowledgement")
+                        await self._install_config(
+                            frame.device_name,
+                            frame.config,
+                            generation=config_generation,
+                        )
+                        writer.enqueue_normal(
+                            encode_frame(
+                                ConfigApplied(
+                                    id=frame.id,
+                                    config_revision=frame.config_revision,
+                                )
+                            )
+                        )
+                        pending_hello_ack = frame
+                        hello_deadline = (
+                            asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
+                        )
+                        continue
+                    if (
+                        not isinstance(frame, ConfigAppliedAck)
+                        or frame.id != pending_hello_ack.id
+                        or frame.config_revision != pending_hello_ack.config_revision
+                    ):
+                        raise ProtocolError("Expected matching config applied acknowledgement")
                     assert self._active_config is not None
                     transfer_manager = TransferManager(
                         TransferConfigSnapshot.from_values(
                             Path(self._active_config.workspace_path),
-                            restrict_to_workspace=frame.config.restrict_to_workspace,
-                            ssrf_denylist=frame.config.ssrf_denylist,
-                            device_name=frame.device_name,
+                            restrict_to_workspace=self._active_config.restrict_to_workspace,
+                            ssrf_denylist=self._active_config.ssrf_denylist,
+                            device_name=pending_hello_ack.device_name,
                         ),
                         writer,
                         path_locks=self._path_locks,
@@ -579,22 +634,47 @@ class ClientRuntime:
                     transfer_failure_task = asyncio.create_task(
                         _wait_for_transfer_failure(transfer_manager.failed)
                     )
+                    self._config_revision = pending_hello_ack.config_revision
+                    self._mcp_catalog = pending_hello_ack.mcp_catalog
                     acknowledged = True
+                    self._ever_ready = True
                     continue
+                if pending_config_ack is not None:
+                    if (
+                        isinstance(frame, ConfigAppliedAck)
+                        and frame.id == pending_config_ack.id
+                        and frame.config_revision == pending_config_ack.config_revision
+                    ):
+                        self._config_revision = pending_config_ack.config_revision
+                        self._mcp_catalog = pending_config_ack.mcp_catalog
+                        pending_config_ack = None
+                        config_ack_deadline = None
+                        continue
+                    if isinstance(frame, Ping):
+                        writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
+                        continue
+                    if isinstance(frame, ErrorFrame):
+                        continue
+                    raise ProtocolError("Expected matching config applied acknowledgement")
                 if isinstance(frame, Ping):
                     writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
                 elif isinstance(frame, ConfigUpdate):
-                    if len(config_update_tasks) >= _CONFIG_UPDATE_BACKLOG_MAX:
-                        raise _RetryableConfigError("Device configuration backlog is full")
-                    config_update_tasks.append(
-                        self._schedule_config_update(
-                            frame.device_name,
-                            frame.config,
-                            generation=config_generation,
-                            previous=config_update_tasks[-1] if config_update_tasks else None,
-                            transfer_manager=transfer_manager,
-                        )
+                    if config_update_tasks or pending_config_ack is not None:
+                        raise ProtocolError("Concurrent configuration updates are not allowed")
+                    if (
+                        self._config_revision is None
+                        or frame.config_revision <= self._config_revision
+                    ):
+                        raise ProtocolError("Configuration revision is not newer")
+                    update_task = self._schedule_config_update(
+                        frame.device_name,
+                        frame.config,
+                        generation=config_generation,
+                        previous=None,
+                        transfer_manager=transfer_manager,
                     )
+                    config_update_tasks.append(update_task)
+                    config_update_frames[update_task] = frame
                 elif isinstance(frame, ToolCall):
                     if self._tools is None:
                         raise ProtocolError("Tool call arrived before device configuration")
