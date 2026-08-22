@@ -110,8 +110,14 @@ def _server_projection(server: PersistedMcpServerCatalog) -> bytes:
 
 def _has_secrets(configs: Sequence[McpServerConfig]) -> bool:
     return any(
-        (isinstance(config, StdioMcpServerConfig) and bool(config.env))
-        or (isinstance(config, RemoteMcpServerConfigBase) and bool(config.headers))
+        (
+            isinstance(config, StdioMcpServerConfig)
+            and any(secret.get_secret_value() for secret in config.env.values())
+        )
+        or (
+            isinstance(config, RemoteMcpServerConfigBase)
+            and any(secret.get_secret_value() for secret in config.headers.values())
+        )
         for config in configs
     )
 

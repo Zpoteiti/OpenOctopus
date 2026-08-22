@@ -17,6 +17,7 @@ from openoctopus_client.mcp.models import (
     SourceMcpServerCatalog,
     SourceMcpTool,
     StdioMcpServerConfig,
+    StreamableHttpMcpServerConfig,
 )
 from openoctopus_client.mcp.runtime import (
     CandidateValidation,
@@ -1036,6 +1037,71 @@ def test_insecure_server_origin_rejects_secret_activation_and_validation() -> No
         assert [failure.name for failure in result.failures] == ["public"]
         assert result.failures[0].code == "mcp_secret_transport_insecure"
         assert factory.created == []
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        StdioMcpServerConfig(
+            name="corp",
+            transport="stdio",
+            command="mcp",
+            args=[],
+            cwd=None,
+            env={"OPTIONAL_TOKEN": SecretStr("")},
+        ),
+        StreamableHttpMcpServerConfig(
+            name="corp",
+            transport="streamable_http",
+            url="https://mcp.invalid/mcp",
+            headers={"x-optional-token": SecretStr("")},
+        ),
+    ],
+    ids=["empty-env", "empty-header"],
+)
+def test_insecure_server_origin_allows_empty_secret_values(
+    server: McpServerConfig,
+) -> None:
+    async def exercise() -> None:
+        factory = _RuntimeFactory()
+        supervisor = McpSupervisor(
+            runtime_factory=factory,
+            secret_transport_safe=False,
+        )
+        supervisor.attach_connection()
+
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(server),
+            catalog=_catalog(_persisted("corp", new_uuid7())),
+        )
+
+        assert len(factory.created) == 1
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_insecure_server_origin_rejects_nonempty_remote_header() -> None:
+    async def exercise() -> None:
+        supervisor = McpSupervisor(secret_transport_safe=False)
+        supervisor.attach_connection()
+        server = StreamableHttpMcpServerConfig(
+            name="corp",
+            transport="streamable_http",
+            url="https://mcp.invalid/mcp",
+            headers={"authorization": SecretStr("secret")},
+        )
+
+        with pytest.raises(ProtocolError, match="HTTPS"):
+            await supervisor.activate_authoritative(
+                revision=1,
+                config=_device_config(server),
+                catalog=_catalog(_persisted("corp", new_uuid7())),
+            )
         await supervisor.shutdown()
 
     asyncio.run(exercise())
