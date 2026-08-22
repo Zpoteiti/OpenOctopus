@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -21,7 +21,10 @@ _FIXTURE_PATH = (
 
 
 def _fixtures() -> dict[str, list[dict[str, Any]]]:
-    return json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))
+    return cast(
+        dict[str, list[dict[str, Any]]],
+        json.loads(_FIXTURE_PATH.read_text(encoding="utf-8")),
+    )
 
 
 def test_shared_protocol_v3_golden_frames_round_trip() -> None:
