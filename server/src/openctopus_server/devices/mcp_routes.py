@@ -196,7 +196,7 @@ def _validate_top_level_args(schema: ProviderMcpTool, args: Mapping[str, Any]) -
     if missing:
         raise _selection_error(
             "tool_missing_required_field",
-            f"Missing required MCP field: {sorted(missing)[0]}",
+            "A required MCP field is missing",
         )
     source_properties = set(properties) - {DEVICE_FIELD_NAME}
     if schema.input_schema.get("additionalProperties") is False:
@@ -204,7 +204,7 @@ def _validate_top_level_args(schema: ProviderMcpTool, args: Mapping[str, Any]) -
         if extra:
             raise _selection_error(
                 "tool_invalid_args",
-                f"Unknown MCP field: {sorted(extra)[0]}",
+                "The MCP call contains an unknown field",
             )
 
 

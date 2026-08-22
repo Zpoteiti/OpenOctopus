@@ -37,6 +37,11 @@ from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.config import get_settings
 from openctopus_server.db.models import Device, Message, PendingMessage, Session, TurnRun
 from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.mcp_routes import (
+    OwnerMcpDevice,
+    OwnerMcpSnapshot,
+    build_owner_mcp_snapshot,
+)
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.provider.anthropic import (
@@ -48,6 +53,7 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig, load_provider_config
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
+from openctopus_server.services.devices import parse_stored_mcp_catalog
 from openctopus_server.services.messages import (
     cancel_tool_batch,
     capture_pending_for_turn,
@@ -115,6 +121,7 @@ class _PreparedTurn:
     tools: list[dict[str, Any]]
     user_id: UUID
     device_targets: dict[str, UUID]
+    mcp_snapshot: OwnerMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +130,7 @@ class _CompletedProviderTurn:
     assistant: Message
     user_id: UUID
     device_targets: dict[str, UUID]
+    mcp_snapshot: OwnerMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +498,7 @@ class ChatRuntime:
                                 session_id=turn.session_id,
                             ),
                             device_targets=completed.device_targets,
+                            mcp_snapshot=completed.mcp_snapshot,
                             device_registry=self.device_registry,
                             on_issued=issued.set,
                         )
@@ -703,6 +712,7 @@ class ChatRuntime:
                     fingerprint = result.fingerprint
                     prepared_user_id = prepared.user_id
                     prepared_device_targets = prepared.device_targets
+                    prepared_mcp_snapshot = prepared.mcp_snapshot
                     del prepared, provider, result
                 except Exception as exc:
                     try:
@@ -734,6 +744,7 @@ class ChatRuntime:
             assistant=assistant,
             user_id=prepared_user_id,
             device_targets=prepared_device_targets,
+            mcp_snapshot=prepared_mcp_snapshot,
         )
 
     async def _session_owner_id(self, session_id: UUID) -> UUID:
@@ -824,7 +835,12 @@ class ChatRuntime:
             device_rows = list(
                 (
                     await db.execute(
-                        select(Device.name, Device.id)
+                        select(
+                            Device.id,
+                            Device.name,
+                            Device.config_revision,
+                            Device.mcp_catalog,
+                        )
                         .where(Device.user_id == user_id)
                         .order_by(Device.created_at, Device.id)
                     )
@@ -832,10 +848,23 @@ class ChatRuntime:
                 .tuples()
                 .all()
             )
-            device_targets = dict(device_rows)
+            device_targets = {name: device_id for device_id, name, _, _ in device_rows}
+            mcp_snapshot = build_owner_mcp_snapshot(
+                [
+                    OwnerMcpDevice(
+                        device_id=device_id,
+                        name=name,
+                        config_revision=config_revision,
+                        catalog=parse_stored_mcp_catalog(catalog),
+                    )
+                    for device_id, name, config_revision, catalog in device_rows
+                ],
+                built_in_names=self.tool_registry.tool_names,
+            )
 
         registry_schemas = self.tool_registry.get_tool_schemas(
             device_names=device_targets.keys(),
+            mcp_snapshot=mcp_snapshot,
         )
 
         should_compact = False
@@ -923,6 +952,7 @@ class ChatRuntime:
             tools=registry_schemas,
             user_id=user_id,
             device_targets=device_targets,
+            mcp_snapshot=mcp_snapshot,
         )
 
     async def _estimate_tokens(

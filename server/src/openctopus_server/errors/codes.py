@@ -68,6 +68,7 @@ class ErrorCode(StrEnum):
     TOOL_MCP_ERROR = "tool_mcp_error"
     TOOL_MCP_MESSAGE_TOO_LARGE = "tool_mcp_message_too_large"
     TOOL_MCP_INVALID_RESULT = "tool_mcp_invalid_result"
+    TOOL_RESULT_TOO_LARGE = "tool_result_too_large"
     # Network
     NETWORK_SSRF_BLOCKED = "network_ssrf_blocked"
     NETWORK_DNS_FAILED = "network_dns_failed"

@@ -68,6 +68,7 @@
   "TOOL_NO_MATCH": "tool_no_match",
   "TOOL_PATH_OUTSIDE_WORKSPACE": "tool_path_outside_workspace",
   "TOOL_PTY_UNAVAILABLE": "tool_pty_unavailable",
+  "TOOL_RESULT_TOO_LARGE": "tool_result_too_large",
   "TOOL_SHELL_LOGIN_UNSUPPORTED": "tool_shell_login_unsupported",
   "TOOL_SHELL_UNAVAILABLE": "tool_shell_unavailable",
   "TOOL_UNSUPPORTED_MEDIA": "tool_unsupported_media",
