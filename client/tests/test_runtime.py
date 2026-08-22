@@ -79,14 +79,14 @@ def _hello_with_id(
 def _device_config(
     *,
     workspace_path: str,
-    sandbox_mode: bool,
+    restrict_to_workspace: bool,
     ssrf_denylist: list[str],
     shell_timeout_max: int = 600,
     env_allowlist: list[str] | None = None,
 ) -> ProtocolDeviceConfig:
     return ProtocolDeviceConfig(
         workspace_path=workspace_path,
-        sandbox_mode=sandbox_mode,
+        restrict_to_workspace=restrict_to_workspace,
         ssrf_denylist=ssrf_denylist,
         shell_timeout_max=shell_timeout_max,
         env_allowlist=env_allowlist or ["PATH", "HOME"],
@@ -156,7 +156,7 @@ def test_protocol_uses_active_py6_shapes_and_uuidv7_hello() -> None:
                 "device_name": "alice-laptop",
                 "config": {
                     "workspace_path": "~/openoctopus/workspace",
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": ["127.0.0.0/8"],
                     "shell_timeout_max": 600,
                     "env_allowlist": ["PATH", "HOME"],
@@ -205,13 +205,13 @@ def test_protocol_requires_uuidv7_ids_and_result_credit() -> None:
     update = ConfigUpdate(
         id=call_id,
         device_name="alice-laptop",
-        config=_device_config(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[]),
+        config=_device_config(workspace_path="/tmp", restrict_to_workspace=True, ssrf_denylist=[]),
     )
     assert update.id == call_id
     with pytest.raises(ProtocolError):
         decode_server_frame(
             '{"type":"config_update","device_name":"alice","config":'
-            '{"workspace_path":"/tmp","sandbox_mode":true,"ssrf_denylist":[]}}'
+            '{"workspace_path":"/tmp","restrict_to_workspace":true,"ssrf_denylist":[]}}'
         )
     with pytest.raises(ValueError):
         ToolResult(
@@ -228,11 +228,15 @@ def test_protocol_requires_uuidv7_ids_and_result_credit() -> None:
 def test_protocol_rejects_nul_config_and_invalid_transfer_purpose_fields() -> None:
     call_id = UUID("0190d5a7-0000-7000-8000-000000000002")
     with pytest.raises(ValueError, match="NUL"):
-        _device_config(workspace_path="/tmp/work\x00space", sandbox_mode=True, ssrf_denylist=[])
+        _device_config(
+            workspace_path="/tmp/work\x00space",
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+        )
     with pytest.raises(ValueError, match="blank"):
-        _device_config(workspace_path="   ", sandbox_mode=True, ssrf_denylist=[])
+        _device_config(workspace_path="   ", restrict_to_workspace=True, ssrf_denylist=[])
     with pytest.raises(ValueError, match="blank"):
-        _device_config(workspace_path="/tmp", sandbox_mode=True, ssrf_denylist=[" \t"])
+        _device_config(workspace_path="/tmp", restrict_to_workspace=True, ssrf_denylist=[" \t"])
     with pytest.raises(ValueError):
         TransferRequest(id=call_id, purpose="workspace_upload", src_path="source")
     with pytest.raises(ValueError):
@@ -426,7 +430,7 @@ def test_runtime_retries_a_malformed_frame_after_handshake() -> None:
                         "device_name": "laptop",
                         "config": {
                             "workspace_path": "~/openoctopus/workspace",
-                            "sandbox_mode": True,
+                            "restrict_to_workspace": True,
                             "ssrf_denylist": [],
                             "shell_timeout_max": 600,
                             "env_allowlist": ["PATH", "HOME"],
@@ -567,7 +571,7 @@ def test_remote_eof_cancels_a_writer_stuck_sending_control(
                             "device_name": "device",
                             "config": {
                                 "workspace_path": str(tmp_path),
-                                "sandbox_mode": True,
+                                "restrict_to_workspace": True,
                                 "ssrf_denylist": [],
                                 "shell_timeout_max": 600,
                                 "env_allowlist": ["PATH", "HOME"],
@@ -614,7 +618,7 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
                             "device_name": "device",
                             "config": {
                                 "workspace_path": str(tmp_path),
-                                "sandbox_mode": True,
+                                "restrict_to_workspace": True,
                                 "ssrf_denylist": [],
                                 "shell_timeout_max": 600,
                                 "env_allowlist": ["PATH", "HOME"],
@@ -649,7 +653,9 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
         runtime = ClientRuntime(
             load_config(_environment()),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
-            tool_dispatcher_factory=lambda workspace, sandbox_mode, denylist: FailingDispatcher(),
+            tool_dispatcher_factory=lambda workspace,
+            restrict_to_workspace,
+            denylist: FailingDispatcher(),
         )
         with pytest.raises(RuntimeError, match="dispatcher failed"):
             await asyncio.wait_for(runtime.run_connection(socket), timeout=1)
@@ -682,7 +688,7 @@ def test_remote_disconnect_bounds_cleanup_when_binary_send_blocks(
                             "device_name": "device",
                             "config": {
                                 "workspace_path": str(tmp_path),
-                                "sandbox_mode": True,
+                                "restrict_to_workspace": True,
                                 "ssrf_denylist": [],
                                 "shell_timeout_max": 600,
                                 "env_allowlist": ["PATH", "HOME"],
@@ -782,7 +788,7 @@ async def _run_fake_lifecycle(workspace: Path) -> tuple[_RecordingSocket, CloseD
                     "device_name": "alice-laptop",
                     "config": {
                         "workspace_path": str(workspace),
-                        "sandbox_mode": True,
+                        "restrict_to_workspace": True,
                         "ssrf_denylist": [],
                         "shell_timeout_max": 600,
                         "env_allowlist": ["PATH", "HOME"],
@@ -855,7 +861,7 @@ def test_runtime_answers_ping_while_receiver_reservation_is_slow(
                         "device_name": "device",
                         "config": {
                             "workspace_path": str(tmp_path),
-                            "sandbox_mode": True,
+                            "restrict_to_workspace": True,
                             "ssrf_denylist": [],
                             "shell_timeout_max": 600,
                             "env_allowlist": ["PATH", "HOME"],
@@ -941,7 +947,7 @@ def test_runtime_acknowledges_peer_failure_during_slow_receiver_reservation(
                         "device_name": "device",
                         "config": {
                             "workspace_path": str(tmp_path),
-                            "sandbox_mode": True,
+                            "restrict_to_workspace": True,
                             "ssrf_denylist": [],
                             "shell_timeout_max": 600,
                             "env_allowlist": ["PATH", "HOME"],
@@ -1034,7 +1040,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
                             "device_name": "device",
                             "config": {
                                 "workspace_path": str(tmp_path),
-                                "sandbox_mode": True,
+                                "restrict_to_workspace": True,
                                 "ssrf_denylist": [],
                                 "shell_timeout_max": 600,
                                 "env_allowlist": ["PATH", "HOME"],
@@ -1115,7 +1121,11 @@ def test_runtime_rejects_tool_output_that_exceeds_result_credit(tmp_path: Path) 
     asyncio.run(
         runtime._install_config(
             "device",
-            _device_config(workspace_path=str(tmp_path), sandbox_mode=True, ssrf_denylist=[]),
+            _device_config(
+                workspace_path=str(tmp_path),
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
         )
     )
     (tmp_path / "large.txt").write_text("x" * 1_000)
@@ -1160,7 +1170,7 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
                                 "device_name": "device",
                                 "config": {
                                     "workspace_path": str(tmp_path / "old"),
-                                    "sandbox_mode": True,
+                                    "restrict_to_workspace": True,
                                     "ssrf_denylist": [],
                                     "shell_timeout_max": 600,
                                     "env_allowlist": ["PATH", "HOME"],
@@ -1184,7 +1194,7 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
                                 "device_name": "device",
                                 "config": {
                                     "workspace_path": str(tmp_path / "new"),
-                                    "sandbox_mode": True,
+                                    "restrict_to_workspace": True,
                                     "ssrf_denylist": [],
                                     "shell_timeout_max": 600,
                                     "env_allowlist": ["PATH", "HOME"],
@@ -1212,8 +1222,10 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
         runtime = ClientRuntime(
             load_config(_environment()),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
-            tool_dispatcher_factory=lambda workspace, sandbox_mode, denylist: BlockingDispatcher(
-                workspace.name
+            tool_dispatcher_factory=(
+                lambda workspace, restrict_to_workspace, denylist: BlockingDispatcher(
+                    workspace.name
+                )
             ),
         )
         task = asyncio.create_task(runtime.run_connection(socket))
@@ -1265,8 +1277,12 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                 del name, args
                 return ToolOutput(self.label)
 
-        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
-            del sandbox_mode, denylist
+        def make_dispatcher(
+            workspace: Path,
+            restrict_to_workspace: bool,
+            denylist: list[str],
+        ) -> Dispatcher:
+            del restrict_to_workspace, denylist
             if workspace.name == "new":
                 update_started.set()
                 release_update.wait(timeout=2)
@@ -1282,7 +1298,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                             device_name="device",
                             config=_device_config(
                                 workspace_path=str(tmp_path / "old"),
-                                sandbox_mode=True,
+                                restrict_to_workspace=True,
                                 ssrf_denylist=[],
                             ),
                         ).model_dump_json(),
@@ -1291,7 +1307,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
                             device_name="device",
                             config=_device_config(
                                 workspace_path=str(tmp_path / "new"),
-                                sandbox_mode=True,
+                                restrict_to_workspace=True,
                                 ssrf_denylist=[],
                             ),
                         ).model_dump_json(),
@@ -1371,8 +1387,12 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
                 del name, args
                 return ToolOutput("unused")
 
-        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
-            del sandbox_mode, denylist
+        def make_dispatcher(
+            workspace: Path,
+            restrict_to_workspace: bool,
+            denylist: list[str],
+        ) -> Dispatcher:
+            del restrict_to_workspace, denylist
             if workspace.name != "initial":
                 release_preparation.wait(timeout=2)
             return Dispatcher()
@@ -1383,7 +1403,7 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(tmp_path / "initial"),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json(),
@@ -1393,7 +1413,7 @@ def test_config_update_backlog_is_bounded_and_overflow_is_retryable(tmp_path: Pa
                     device_name="device",
                     config=_device_config(
                         workspace_path=str(tmp_path / f"update-{index}"),
-                        sandbox_mode=True,
+                        restrict_to_workspace=True,
                         ssrf_denylist=[],
                     ),
                 ).model_dump_json()
@@ -1492,7 +1512,7 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(tmp_path),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json()
@@ -1541,8 +1561,12 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
                 del name, args
                 return ToolOutput("unused")
 
-        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
-            del sandbox_mode, denylist
+        def make_dispatcher(
+            workspace: Path,
+            restrict_to_workspace: bool,
+            denylist: list[str],
+        ) -> Dispatcher:
+            del restrict_to_workspace, denylist
             if workspace.name == "new":
                 update_started.set()
                 release_update.wait(timeout=2)
@@ -1580,7 +1604,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(old_workspace),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json()
@@ -1591,7 +1615,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(new_workspace),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json()
@@ -1654,8 +1678,12 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
                 del name, args
                 return ToolOutput("unused")
 
-        def make_dispatcher(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Dispatcher:
-            del sandbox_mode, denylist
+        def make_dispatcher(
+            workspace: Path,
+            restrict_to_workspace: bool,
+            denylist: list[str],
+        ) -> Dispatcher:
+            del restrict_to_workspace, denylist
             if workspace.name == "new":
                 update_started.set()
                 release_update.wait(timeout=2)
@@ -1692,7 +1720,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(old_workspace),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json()
@@ -1703,7 +1731,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
                 device_name="device",
                 config=_device_config(
                     workspace_path=str(new_workspace),
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             ).model_dump_json()
@@ -1769,8 +1797,8 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
     async def exercise() -> BaseException:
         hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
 
-        def reject(workspace: Path, sandbox_mode: bool, denylist: list[str]) -> Any:
-            del workspace, sandbox_mode, denylist
+        def reject(workspace: Path, restrict_to_workspace: bool, denylist: list[str]) -> Any:
+            del workspace, restrict_to_workspace, denylist
             raise ToolFailure(
                 "workspace_permission_denied",
                 f"cannot inspect {tmp_path / 'private-secret'}",
@@ -1783,7 +1811,7 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
                     device_name="device",
                     config=_device_config(
                         workspace_path=str(tmp_path),
-                        sandbox_mode=True,
+                        restrict_to_workspace=True,
                         ssrf_denylist=[],
                     ),
                 ).model_dump_json()
@@ -1836,7 +1864,7 @@ def test_tool_worker_waits_for_timed_out_thread_before_dequeuing_next_call(
         # the timeout path; the events below prove the residual thread exists.
         monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
         dispatcher = dispatcher_module.ClientToolDispatcher(
-            tmp_path, sandbox_mode=True, ssrf_denylist=[]
+            tmp_path, restrict_to_workspace=True, ssrf_denylist=[]
         )
         runtime = ClientRuntime(load_config(_environment()))
         writer = Writer()
@@ -1974,7 +2002,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_read(
 
         monkeypatch.setattr(dispatcher_module, "_read_regular", blocked_read)
         dispatcher = dispatcher_module.ClientToolDispatcher(
-            tmp_path, sandbox_mode=True, ssrf_denylist=[]
+            tmp_path, restrict_to_workspace=True, ssrf_denylist=[]
         )
 
         def hard_exit(code: int) -> None:
@@ -2040,7 +2068,7 @@ def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
                         "device_name": "device",
                         "config": {
                             "workspace_path": "/tmp/workspace",
-                            "sandbox_mode": True,
+                            "restrict_to_workspace": True,
                             "ssrf_denylist": [],
                             "shell_timeout_max": 600,
                             "env_allowlist": ["PATH", "HOME"],

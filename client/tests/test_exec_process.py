@@ -4,15 +4,18 @@ import asyncio
 import os
 import shlex
 import sys
+from pathlib import Path
 
 import pytest
 
 import openoctopus_client.process as process_module
 from openoctopus_client.process import (
+    InvalidProcessArgumentsError,
     ShellUnavailableError,
     build_argv,
     build_child_env,
     discover_shells,
+    resolve_cwd,
     spawn_pipe,
     spawn_pty,
 )
@@ -70,6 +73,23 @@ def test_login_is_rejected_for_sh(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_discovery_has_a_valid_default() -> None:
     shells = discover_shells()
     assert shells.default in shells.available
+
+
+def test_working_directory_uses_workspace_restriction_only_for_initial_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    child = workspace / "child"
+    child.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    assert resolve_cwd(None, workspace, restrict_to_workspace=True) == workspace
+    assert resolve_cwd("child", workspace, restrict_to_workspace=True) == child
+    with pytest.raises(InvalidProcessArgumentsError):
+        resolve_cwd(str(outside), workspace, restrict_to_workspace=True)
+    assert resolve_cwd(str(outside), workspace, restrict_to_workspace=False) == outside
 
 
 def test_pipe_runs_with_closed_stdin_and_drains_both_streams() -> None:

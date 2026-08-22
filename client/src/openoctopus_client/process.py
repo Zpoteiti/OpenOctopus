@@ -271,17 +271,25 @@ def build_child_env(parent: Mapping[str, str], allowlist: Sequence[str]) -> dict
     }
 
 
-def resolve_cwd(value: str | None, workspace: Path) -> Path:
+def resolve_cwd(
+    value: str | None,
+    workspace: Path,
+    *,
+    restrict_to_workspace: bool,
+) -> Path:
+    from openoctopus_client.tools.common import ToolFailure
+    from openoctopus_client.tools.paths import WorkspacePaths
+
     if value is None:
-        return workspace
+        return workspace.resolve()
     if "\x00" in value or not value.strip():
         raise InvalidProcessArgumentsError("working_dir is invalid")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = workspace / path
-    if not path.is_dir():
-        raise InvalidProcessArgumentsError("working_dir must be an existing directory")
-    return path
+    supplied = Path(value).expanduser()
+    try:
+        paths = WorkspacePaths(workspace, restrict_to_workspace=restrict_to_workspace)
+        return paths.resolve(str(supplied), directory=True)
+    except ToolFailure as exc:
+        raise InvalidProcessArgumentsError("working_dir is invalid") from exc
 
 
 class OutputReader(Protocol):

@@ -54,7 +54,7 @@ def test_shell_metadata_requires_unique_nonempty_members_and_default() -> None:
 def test_device_config_validates_exec_policy() -> None:
     config = DeviceConfig(
         workspace_path="/tmp/workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         shell_timeout_max=600,
         env_allowlist=["PATH", "HOME"],
@@ -70,7 +70,7 @@ def test_device_config_validates_exec_policy() -> None:
     with pytest.raises(ValueError):
         DeviceConfig(
             workspace_path="/tmp/workspace",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
             ssrf_denylist=[],
             shell_timeout_max=600,
             env_allowlist=["PATH", "PATH"],
@@ -78,10 +78,24 @@ def test_device_config_validates_exec_policy() -> None:
     with pytest.raises(ValueError):
         DeviceConfig(
             workspace_path="/tmp/workspace",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
             ssrf_denylist=[],
             shell_timeout_max=600,
             env_allowlist=["OPENOCTOPUS_DEVICE_TOKEN"],
+        )
+
+
+def test_device_config_strictly_rejects_legacy_sandbox_mode() -> None:
+    with pytest.raises(ValueError):
+        DeviceConfig.model_validate(
+            {
+                "workspace_path": "/tmp/workspace",
+                "sandbox_mode": True,
+                "ssrf_denylist": [],
+                "shell_timeout_max": 600,
+                "env_allowlist": ["PATH"],
+            },
+            strict=True,
         )
 
 

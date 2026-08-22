@@ -41,23 +41,26 @@ failures exit instead of retrying forever.
 
 ## Local policy and conversion
 
-The server sends `workspace_path`, `sandbox_mode`, `ssrf_denylist`,
+The server sends `workspace_path`, `restrict_to_workspace`, `ssrf_denylist`,
 `shell_timeout_max`, and `env_allowlist` during the WebSocket handshake. A
 leading `~` expands against the local user's home.
-In sandbox mode, file paths must stay under the workspace root; trusted mode
-allows paths outside it, but special files and symlink/reparse escapes remain
-blocked for bounded operations. `ssrf_denylist` applies to the client
-`web_fetch` path. This is application policy, not an OS security sandbox.
-Shell tools are exposed only when `sandbox_mode=false`. Commands use closed
-stdin pipes by default; `tty=true` selects a line-oriented POSIX PTY or Windows
-ConPTY for REPLs and simple prompts. Full-screen TUI and secret input are not
-supported.
+When `restrict_to_workspace=true`, structured file paths and an exec/PTY
+process's initial working directory must stay under the workspace root. When it
+is false, absolute paths outside the workspace are allowed, but special files
+and symlink/reparse escapes remain blocked for bounded operations. Shell
+commands themselves are unrestricted in both modes. `ssrf_denylist` applies
+independently to client `web_fetch`. This is application policy, not an OS
+security sandbox. Commands use closed stdin pipes by default; `tty=true`
+selects a line-oriented POSIX PTY or Windows ConPTY for REPLs and simple
+prompts. Full-screen TUI and secret input are not supported.
 
 PDF, DOCX, XLSX, PPTX, and downloaded HTML conversion runs locally in a helper
 process. Inputs are limited to 8 MiB, output to 128,000 characters, and PDF
 requests to at most 20 pages. Each conversion has a 20-second deadline;
 Linux applies a 2 GiB address-space limit and CPU limit. The helper receives no
-device token or arbitrary parent environment variables.
+device token or arbitrary parent environment variables. It reopens the
+canonical path without following links where the OS supports it and verifies
+the file identity captured before the worker started.
 
 `SIGINT` and `SIGTERM` cancel active work. Process backends use a fixed
 two-second graceful-termination window before force-kill, while the complete

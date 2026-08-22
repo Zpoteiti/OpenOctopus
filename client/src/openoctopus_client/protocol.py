@@ -46,7 +46,7 @@ class _Frame(BaseModel):
 
 class DeviceConfig(_Frame):
     workspace_path: Annotated[str, Field(min_length=1, max_length=4096)]
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: Annotated[
         list[Annotated[str, Field(min_length=1, max_length=512)]], Field(max_length=256)
     ]

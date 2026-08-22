@@ -109,6 +109,18 @@ def test_spike_convert_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
     }
 
 
+def test_conversion_worker_rejects_a_replaced_document(tmp_path: Path) -> None:
+    document = tmp_path / "document.html"
+    document.write_text("original", encoding="utf-8")
+    identity = document_convert._document_identity(document)
+    replacement = tmp_path / "replacement.html"
+    replacement.write_text("replacement", encoding="utf-8")
+    os.replace(replacement, document)
+
+    with pytest.raises(ConversionError, match="changed"):
+        document_convert._read_limited(document, expected_identity=identity)
+
+
 def test_spike_convert_rejects_windows_drive_ooxml_member() -> None:
     document = BytesIO()
     with ZipFile(document, "w", ZIP_DEFLATED) as archive:

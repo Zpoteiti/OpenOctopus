@@ -86,8 +86,6 @@ class ExecToolDispatcher:
             return fail("tool_not_available", f"This client does not implement {name}")
         if chat_session_id is None:
             return fail("tool_invalid_args", "Exec tool ownership is invalid")
-        if self._policy.sandbox_mode:
-            return fail("tool_device_unreachable", "Exec is unavailable on this device")
         try:
             if name == "exec":
                 return await self._exec(args, chat_session_id)

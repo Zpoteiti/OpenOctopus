@@ -145,13 +145,15 @@ class ClientToolDispatcher:
         self,
         workspace: Path,
         *,
-        sandbox_mode: bool,
+        restrict_to_workspace: bool,
         ssrf_denylist: list[str],
         path_locks: PathLocks | None = None,
     ) -> None:
-        self._paths = WorkspacePaths(workspace, sandbox_mode=sandbox_mode)
+        self._paths = WorkspacePaths(
+            workspace,
+            restrict_to_workspace=restrict_to_workspace,
+        )
         self._locks = path_locks or PathLocks()
-        self._sandbox_mode = sandbox_mode
         self._denylist = tuple(ssrf_denylist)
         self._blocking_tasks: set[asyncio.Task[Any]] = set()
 
@@ -1343,7 +1345,6 @@ async def _fetch_bounded(url: str, denylist: tuple[str, ...]) -> tuple[bytes, st
                 )
             host = target.host.rstrip(".").lower()
             port = target.port or (443 if target.scheme == "https" else 80)
-            await _validated_addresses(host, port, denylist)
             addresses = await _validated_addresses(host, port, denylist)
             address = addresses[0]
             pinned = target.copy_with(host=address)

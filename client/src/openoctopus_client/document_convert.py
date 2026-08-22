@@ -26,6 +26,7 @@ MIN_RATIO_CHECK_BYTES = 1024 * 1024
 _WORKER_TERMINATE_GRACE_SECONDS = 0.25
 
 type ConversionFormat = Literal["pdf", "docx", "xlsx", "pptx", "html"]
+type DocumentIdentity = tuple[int, int, int, int]
 
 
 class ConversionError(Exception):
@@ -36,7 +37,13 @@ class ConversionError(Exception):
 
 
 def convert_path(path: Path, *, pages: str | None) -> str:
-    return _run_worker_request({"path": str(path), "pages": pages})
+    return _run_worker_request(
+        {
+            "path": str(path),
+            "pages": pages,
+            "identity": list(_document_identity(path)),
+        }
+    )
 
 
 def convert_html_bytes(data: bytes, *, base_url: str | None = None) -> str:
@@ -55,7 +62,10 @@ def convert_html_bytes(data: bytes, *, base_url: str | None = None) -> str:
 
 
 async def convert_path_async(path: Path, *, pages: str | None) -> str:
-    return await _run_worker_request_async({"path": str(path), "pages": pages})
+    identity = await asyncio.to_thread(_document_identity, path)
+    return await _run_worker_request_async(
+        {"path": str(path), "pages": pages, "identity": list(identity)}
+    )
 
 
 async def convert_html_bytes_async(data: bytes, *, base_url: str | None = None) -> str:
@@ -210,10 +220,14 @@ def conversion_worker_main() -> int:
             raise ConversionError("tool_invalid_args", "Document conversion request is invalid")
         _apply_linux_limits()
         base_url: str | None = None
-        if set(request) == {"path", "pages"} and isinstance(request["path"], str):
+        if (
+            set(request) == {"path", "pages", "identity"}
+            and isinstance(request["path"], str)
+            and (identity := _parse_document_identity(request["identity"])) is not None
+        ):
             path = Path(request["path"])
             name = path.name
-            data = _read_limited(path)
+            data = _read_limited(path, expected_identity=identity)
         elif (
             set(request) == {"name", "data", "base_url", "pages"}
             and request["name"] == "document.html"
@@ -253,7 +267,33 @@ def conversion_worker_main() -> int:
     return return_code
 
 
-def _read_limited(path: Path) -> bytes:
+def _document_identity(path: Path) -> DocumentIdentity:
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ConversionError("tool_content_conversion_failed", "Document does not exist") from exc
+    except OSError as exc:
+        raise ConversionError(
+            "tool_content_conversion_failed", "Document could not be read"
+        ) from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ConversionError(
+            "tool_content_conversion_failed", "Document is not a regular file"
+        )
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _parse_document_identity(value: object) -> DocumentIdentity | None:
+    if (
+        not isinstance(value, list)
+        or len(value) != 4
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+    ):
+        return None
+    return cast(DocumentIdentity, tuple(value))
+
+
+def _read_limited(path: Path, *, expected_identity: DocumentIdentity) -> bytes:
     flags = os.O_RDONLY
     for name in ("O_BINARY", "O_NOFOLLOW", "O_NONBLOCK"):
         flags |= int(getattr(os, name, 0))
@@ -266,9 +306,14 @@ def _read_limited(path: Path) -> bytes:
             "tool_content_conversion_failed", "Document could not be read"
         ) from exc
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
             raise ConversionError(
                 "tool_content_conversion_failed", "Document is not a regular file"
+            )
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != expected_identity:
+            raise ConversionError(
+                "tool_content_conversion_failed", "Document changed before conversion"
             )
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1

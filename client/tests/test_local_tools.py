@@ -45,7 +45,7 @@ def _make_directory_link(link: Path, target: Path) -> None:
 def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
 
     written = _run(tools, "write_file", path="notes/a.txt", content="one\n  two\n")
     assert written.is_error is False
@@ -74,7 +74,7 @@ def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> N
 
 def test_repeated_read_file_returns_content_and_force_is_not_an_argument(tmp_path: Path) -> None:
     (tmp_path / "notes.txt").write_text("same\n", encoding="utf-8")
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     first = _run(tools, "read_file", path="notes.txt")
     second = _run(tools, "read_file", path="notes.txt")
@@ -92,7 +92,7 @@ def test_paths_reject_escape_and_symlink_traversal(tmp_path: Path) -> None:
     outside.mkdir()
     (outside / "secret.txt").write_text("secret")
     _make_directory_link(workspace / "link", outside)
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
 
     escaped = _run(tools, "read_file", path="../outside/secret.txt")
     symlinked = _run(tools, "read_file", path="link/secret.txt")
@@ -106,9 +106,9 @@ def test_workspace_root_and_nul_text_are_rejected(tmp_path: Path) -> None:
     link = tmp_path / "workspace-link"
     _make_directory_link(link, workspace)
     with pytest.raises(ToolFailure, match="symbolic link"):
-        ClientToolDispatcher(link, sandbox_mode=True, ssrf_denylist=[])
+        ClientToolDispatcher(link, restrict_to_workspace=True, ssrf_denylist=[])
 
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
     assert _run(tools, "write_file", path="nul.txt", content="a\x00b").code == "tool_invalid_args"
     (workspace / "binary.txt").write_bytes(b"a\x00b")
     assert _run(tools, "read_file", path="binary.txt").code == "tool_invalid_args"
@@ -119,10 +119,10 @@ def test_delete_folder_rejects_workspace_and_filesystem_roots(tmp_path: Path) ->
     workspace.mkdir()
     (workspace / "keep.txt").write_text("keep", encoding="utf-8")
 
-    sandboxed = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
-    trusted = ClientToolDispatcher(workspace, sandbox_mode=False, ssrf_denylist=[])
+    restricted = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
+    trusted = ClientToolDispatcher(workspace, restrict_to_workspace=False, ssrf_denylist=[])
 
-    assert _run(sandboxed, "delete_folder", path=".").code == "workspace_invalid_request"
+    assert _run(restricted, "delete_folder", path=".").code == "workspace_invalid_request"
     assert _run(trusted, "delete_folder", path=workspace.anchor).code == (
         "workspace_invalid_request"
     )
@@ -138,7 +138,7 @@ def test_discovery_grep_and_notebook_edit(tmp_path: Path) -> None:
     (workspace / "book.ipynb").write_text(
         '{"cells":[{"cell_type":"code","metadata":{},"source":"x=1","outputs":[]}]}'
     )
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
 
     found = _run(tools, "find_files", path=".", type="py")
     assert found.content == "a.py"
@@ -161,7 +161,7 @@ def test_grep_normal_page_reports_the_next_offset_without_calling_it_truncated(
     (tmp_path / "matches.txt").write_text(
         "hit one\nhit two\nhit three\n", encoding="utf-8"
     )
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     first = _run(
         tools,
@@ -193,7 +193,7 @@ def test_notebook_edit_rejects_invalid_complete_notebook_shapes(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "book.ipynb").write_text(content)
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
 
     result = _run(tools, "notebook_edit", path="book.ipynb", cell_index=0, new_source="new")
 
@@ -215,7 +215,7 @@ def test_web_fetch_maps_httpx_timeout_and_transport_errors(
         raise httpx.ConnectError("failed")
 
     monkeypatch.setattr(dispatcher_module, "_fetch_bounded", timeout)
-    tools = ClientToolDispatcher(Path.cwd(), sandbox_mode=False, ssrf_denylist=[])
+    tools = ClientToolDispatcher(Path.cwd(), restrict_to_workspace=False, ssrf_denylist=[])
     timed_out = _run(tools, "web_fetch", url="https://example.com")
     assert timed_out.code == "network_timeout"
 
@@ -231,7 +231,7 @@ def test_mutations_detect_external_changes_before_commit(
     workspace.mkdir()
     target = workspace / "notes.txt"
     target.write_text("old")
-    tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
     original = dispatcher_module._apply_text_edit
 
     def apply_and_race(*args: Any, **kwargs: Any) -> tuple[str, int, bool]:
@@ -250,7 +250,7 @@ def test_cancelled_mutation_keeps_path_lock_until_worker_finishes(tmp_path: Path
     async def exercise() -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        tools = ClientToolDispatcher(workspace, sandbox_mode=True, ssrf_denylist=[])
+        tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
         started = threading.Event()
         release = threading.Event()
         original = tools._atomic_write
@@ -285,13 +285,13 @@ def test_cancelled_mutation_keeps_path_lock_until_worker_finishes(tmp_path: Path
 
 
 def test_unknown_tool_is_not_available(tmp_path: Path) -> None:
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     output = _run(tools, "exec", command="id")
     assert output.code == "tool_not_available"
 
 
 def test_tool_arguments_reject_unknown_fields_including_patch_items(tmp_path: Path) -> None:
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     read = _run(tools, "read_file", path="notes.txt", untrusted=True)
     patch = _run(
@@ -305,7 +305,7 @@ def test_tool_arguments_reject_unknown_fields_including_patch_items(tmp_path: Pa
 
 
 def test_apply_patch_rejects_repeated_canonical_paths(tmp_path: Path) -> None:
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     output = _run(
         tools,
@@ -324,7 +324,7 @@ def test_path_resolution_runs_outside_the_event_loop_thread(
 ) -> None:
     async def exercise() -> None:
         (tmp_path / "notes.txt").write_text("content\n", encoding="utf-8")
-        tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+        tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         resolve_threads: list[int] = []
         original = tools._paths.resolve
@@ -349,7 +349,7 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
     async def exercise() -> None:
         source = tmp_path / "source.txt"
         source.write_text("payload", encoding="utf-8")
-        tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+        tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         open_threads: list[int] = []
         original_open = dispatcher_module._open_transfer_source
@@ -395,7 +395,7 @@ def test_filesystem_errors_are_stable_and_do_not_leak_paths(
     failure: OSError,
     code: str,
 ) -> None:
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     def reject(path: str, *, directory: bool | None) -> Path:
         del path, directory
@@ -423,7 +423,7 @@ def test_apply_patch_stops_preparing_files_when_cumulative_limit_is_exceeded(
 
     monkeypatch.setattr(dispatcher_module, "MAX_TEXT_EDIT_BYTES", 10)
     monkeypatch.setattr(dispatcher_module, "_capture_regular", capture)
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     result = _run(
         tools,
         "apply_patch",
@@ -451,7 +451,7 @@ def test_nonrecursive_list_does_not_sort_the_unbounded_directory_iterator(
         return cast(Any, original_sorted)(iterable, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "sorted", reject_sorted)
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     output = _run(tools, "list_dir", path=".", max_entries=2)
 
     assert output.is_error is False
@@ -500,8 +500,16 @@ def test_transfer_source_open_requests_nonblocking_mode(
     assert flags_seen[0] & nonblocking
 
 
-def test_web_fetch_enforces_client_denylist_before_connecting(tmp_path: Path) -> None:
-    tools = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=["127.0.0.0/8"])
+@pytest.mark.parametrize("restrict_to_workspace", [True, False])
+def test_web_fetch_policy_is_independent_of_workspace_restriction(
+    tmp_path: Path,
+    restrict_to_workspace: bool,
+) -> None:
+    tools = ClientToolDispatcher(
+        tmp_path,
+        restrict_to_workspace=restrict_to_workspace,
+        ssrf_denylist=["127.0.0.0/8"],
+    )
 
     output = _run(tools, "web_fetch", url="http://127.0.0.1:9/", maxChars=100)
 
@@ -511,7 +519,7 @@ def test_web_fetch_enforces_client_denylist_before_connecting(tmp_path: Path) ->
 def test_web_fetch_hostname_denylist_is_case_insensitive(tmp_path: Path) -> None:
     tools = ClientToolDispatcher(
         tmp_path,
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         ssrf_denylist=["LOCALHOST"],
     )
 
@@ -545,7 +553,7 @@ def test_web_fetch_blocks_ipv4_mapped_ipv6_literals_and_dns_answers(
     monkeypatch.setattr(asyncio.BaseEventLoop, "getaddrinfo", fake_getaddrinfo)
     tools = ClientToolDispatcher(
         tmp_path,
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         ssrf_denylist=["127.0.0.0/8", "169.254.0.0/16"],
     )
 
@@ -603,4 +611,4 @@ def test_web_fetch_revalidates_original_host_on_redirect(
     result = asyncio.run(dispatcher_module._fetch_bounded("https://public.example/root/", ()))
 
     assert result[0] == b"ok"
-    assert calls == ["public.example", "public.example", "public.example", "public.example"]
+    assert calls == ["public.example", "public.example"]

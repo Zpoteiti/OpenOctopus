@@ -26,7 +26,7 @@ from openoctopus_client.tools.common import ToolOutput, fail
 @dataclass(frozen=True, slots=True)
 class ExecPolicy:
     workspace: Path
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     shell_timeout_max: int
     env_allowlist: tuple[str, ...]
     available_shells: tuple[str, ...]
@@ -248,7 +248,10 @@ class ExecSessionManager:
 
         try:
             cwd = await asyncio.to_thread(
-                resolve_cwd, request.working_dir, request.policy.workspace
+                resolve_cwd,
+                request.working_dir,
+                request.policy.workspace,
+                restrict_to_workspace=request.policy.restrict_to_workspace,
             )
             session.cwd = cwd
             argv = tuple(

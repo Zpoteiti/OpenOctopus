@@ -55,7 +55,7 @@ def _hello() -> Hello:
 def _config(workspace: Path, *, timeout: int = 600) -> DeviceConfig:
     return DeviceConfig(
         workspace_path=str(workspace),
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         shell_timeout_max=timeout,
         env_allowlist=["PATH", "HOME"],

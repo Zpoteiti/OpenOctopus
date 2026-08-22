@@ -568,7 +568,7 @@ class ClientRuntime:
                     transfer_manager = TransferManager(
                         TransferConfigSnapshot.from_values(
                             Path(self._active_config.workspace_path),
-                            sandbox_mode=frame.config.sandbox_mode,
+                            restrict_to_workspace=frame.config.restrict_to_workspace,
                             ssrf_denylist=frame.config.ssrf_denylist,
                             device_name=frame.device_name,
                         ),
@@ -730,11 +730,11 @@ class ClientRuntime:
                 self._cancel_shutdown_watchdog()
 
     def _default_dispatcher(
-        self, workspace: Path, sandbox_mode: bool, denylist: list[str]
+        self, workspace: Path, restrict_to_workspace: bool, denylist: list[str]
     ) -> LocalToolDispatcher:
         return ClientToolDispatcher(
             workspace,
-            sandbox_mode=sandbox_mode,
+            restrict_to_workspace=restrict_to_workspace,
             ssrf_denylist=denylist,
             path_locks=self._path_locks,
         )
@@ -868,7 +868,7 @@ class ClientRuntime:
     ) -> _PreparedConfig:
         key = (
             candidate.workspace,
-            candidate.config.sandbox_mode,
+            candidate.config.restrict_to_workspace,
             candidate.config.shell_timeout_max,
             tuple(candidate.config.env_allowlist),
             self._shell_inventory.available,
@@ -881,7 +881,7 @@ class ClientRuntime:
                 self._exec_policy_epoch += 1
                 policy = ExecPolicy(
                     workspace=candidate.workspace,
-                    sandbox_mode=candidate.config.sandbox_mode,
+                    restrict_to_workspace=candidate.config.restrict_to_workspace,
                     shell_timeout_max=candidate.config.shell_timeout_max,
                     env_allowlist=tuple(candidate.config.env_allowlist),
                     available_shells=self._shell_inventory.available,
@@ -1039,7 +1039,7 @@ def _prepare_config_candidate(
     workspace = _prepare_workspace(config.workspace_path)
     dispatcher = factory(
         workspace,
-        config.sandbox_mode,
+        config.restrict_to_workspace,
         config.ssrf_denylist,
     )
     return _PreparedConfigCandidate(
@@ -1053,7 +1053,7 @@ def _prepare_config_candidate(
 def _transfer_snapshot(prepared: _PreparedConfig) -> TransferConfigSnapshot:
     return TransferConfigSnapshot.from_values(
         prepared.workspace,
-        sandbox_mode=prepared.config.sandbox_mode,
+        restrict_to_workspace=prepared.config.restrict_to_workspace,
         ssrf_denylist=prepared.config.ssrf_denylist,
         device_name=prepared.device_name,
     )
