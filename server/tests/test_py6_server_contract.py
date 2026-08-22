@@ -21,7 +21,6 @@ from openctopus_server.devices.protocol import (
     new_uuid7,
 )
 from openctopus_server.devices.registry import (
-    DeviceBusyError,
     DeviceOutcomeUnknownError,
     DeviceRegistry,
     DeviceUnavailableError,
@@ -196,7 +195,7 @@ async def test_dispatch_includes_hidden_chat_session_id_and_late_result_is_consu
     assert await registry.unregister(handle) is True
 
 
-async def test_late_result_holds_bounded_pending_credit_until_consumed() -> None:
+async def test_late_result_tombstone_does_not_hold_pending_credit() -> None:
     registry = DeviceRegistry(pending_calls_max=1, pending_calls_max_per_user=1)
     device_id = uuid4()
     user_id = uuid4()
@@ -221,10 +220,11 @@ async def test_late_result_holds_bounded_pending_credit_until_consumed() -> None
     payload = json.loads(transport.sent[-1])
     with pytest.raises(DeviceOutcomeUnknownError):
         await first
-    assert registry.pending_count == 1
+    assert registry.pending_count == 0
 
-    with pytest.raises(DeviceBusyError):
-        await registry.dispatch_tool(
+    transport.event.clear()
+    second = asyncio.create_task(
+        registry.dispatch_tool(
             device_id=device_id,
             user_id=user_id,
             name="read_file",
@@ -232,6 +232,10 @@ async def test_late_result_holds_bounded_pending_credit_until_consumed() -> None
             max_result_bytes=1000,
             timeout_seconds=0.01,
         )
+    )
+    await transport.event.wait()
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await second
 
     late = ToolResultFrame(id=UUID(payload["id"]), content="ok", is_error=False)
     assert await registry.resolve_tool_result(handle, late) is True

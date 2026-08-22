@@ -10,19 +10,32 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
+from openctopus_server.devices.mcp_routes import (
+    AcceptedMcpBinding,
+    FrozenMcpEntryRoute,
+    McpRegistrationCandidate,
+)
 from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
+    ConfigAppliedAckFrame,
+    ConfigAppliedFrame,
     ConfigUpdateFrame,
     ConfigValidateCancelFrame,
     ConfigValidateFrame,
     ConfigValidateResultFrame,
     DeviceConfigFrame,
+    HelloAckFrame,
+    McpRoute,
     McpValidationFailure,
     PersistedMcpCatalog,
+    RegisterMcpAckFrame,
+    RejectedMcpRegistration,
     ShellMetadata,
     SourceMcpCatalog,
     ToolCallFrame,
     ToolResultFrame,
+    encode_server_frame,
     new_uuid7,
 )
 from openctopus_server.devices.transfer import (
@@ -58,7 +71,12 @@ class DeviceSecretTransportError(RuntimeError):
     pass
 
 
+class DeviceMcpUnavailableError(RuntimeError):
+    pass
+
+
 UNAUTHORIZED_CLOSE_REASON = '{"code":"unauthorized"}'
+MCP_REGISTRATION_WAIT_SECONDS = 9.0
 
 
 class DeviceTransport(Protocol):
@@ -108,12 +126,22 @@ class _Connection:
     last_pong: float = field(default_factory=time.monotonic)
     expected_pong: UUID | None = None
     ready: bool = True
+    config_revision: int = 1
+    catalog_digest: str = EMPTY_CATALOG_DIGEST
     config_epoch: int = 0
+    mcp_epoch: int = 0
     config_update_in_flight: str | None = None
+    config_update_done: asyncio.Event | None = None
+    config_apply: _PendingConfigApply | None = None
     secret_transport_safe: bool = False
     config_validation: _PendingValidation | None = None
     validation_tombstones: OrderedDict[UUID, None] = field(default_factory=OrderedDict)
     pending: dict[UUID, _PendingCall] = field(default_factory=dict)
+    call_tombstones: OrderedDict[UUID, int] = field(default_factory=OrderedDict)
+    mcp_registration_in_flight: UUID | None = None
+    mcp_registration_done: asyncio.Event | None = None
+    mcp_registration_deadline: float | None = None
+    accepted_mcp_bindings: dict[str, AcceptedMcpBinding] = field(default_factory=dict)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -124,7 +152,6 @@ class _PendingCall:
     byte_weight: int
     max_result_bytes: int
     issued: bool = False
-    expired: bool = False
 
 
 @dataclass(slots=True)
@@ -133,6 +160,22 @@ class _PendingValidation:
     future: asyncio.Future[ConfigValidateResultFrame]
     validate_servers: tuple[str, ...]
     issued: bool = False
+
+
+@dataclass(slots=True)
+class _PendingConfigApply:
+    id: UUID
+    config_revision: int
+    future: asyncio.Future[ConfigAppliedFrame]
+    issued: bool = False
+    ack_issuing: bool = False
+
+
+@dataclass(slots=True)
+class _PublicationFence:
+    user_id: UUID
+    handle: ConnectionHandle
+    released: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(slots=True)
@@ -182,6 +225,7 @@ class DeviceRegistry:
         self._revocation_epoch_ttl_seconds = revocation_epoch_ttl_seconds
         self._revocation_epochs: OrderedDict[UUID, tuple[int, float]] = OrderedDict()
         self._config_locks: dict[UUID, _ConfigLockEntry] = {}
+        self._publication_fences: dict[UUID, _PublicationFence] = {}
         self._cleanup_tasks: set[asyncio.Task[bool]] = set()
         self._retirement_tasks: dict[UUID, set[asyncio.Task[None]]] = {}
         self.transfers = TransferManager(
@@ -210,8 +254,10 @@ class DeviceRegistry:
         operating_system: str | None = None,
         shells: ShellMetadata | None = None,
         secret_transport_safe: bool = False,
+        config_revision: int = 1,
+        catalog_digest: str = EMPTY_CATALOG_DIGEST,
     ) -> ConnectionHandle | None:
-        async with self._register_lock:
+        async with self._publication_open(device_id):
             async with self._lock:
                 if self._closed:
                     return None
@@ -229,6 +275,8 @@ class DeviceRegistry:
                             operating_system=operating_system,
                             shells=shells,
                             secret_transport_safe=secret_transport_safe,
+                            config_revision=config_revision,
+                            catalog_digest=catalog_digest,
                         )
             else:
                 result = await self._publish_registration(
@@ -241,6 +289,8 @@ class DeviceRegistry:
                     operating_system=operating_system,
                     shells=shells,
                     secret_transport_safe=secret_transport_safe,
+                    config_revision=config_revision,
+                    catalog_digest=catalog_digest,
                 )
             if result is None:
                 return None
@@ -265,6 +315,26 @@ class DeviceRegistry:
                 raise
         return handle
 
+    @asynccontextmanager
+    async def _publication_open(self, device_id: UUID) -> AsyncIterator[None]:
+        """Serialize handle publication after any short durable transition."""
+        while True:
+            await self._register_lock.acquire()
+            try:
+                async with self._lock:
+                    fence = self._publication_fences.get(device_id)
+            except BaseException:
+                self._register_lock.release()
+                raise
+            if fence is None:
+                break
+            self._register_lock.release()
+            await fence.released.wait()
+        try:
+            yield
+        finally:
+            self._register_lock.release()
+
     async def _publish_registration(
         self,
         *,
@@ -277,6 +347,8 @@ class DeviceRegistry:
         operating_system: str | None,
         shells: ShellMetadata | None,
         secret_transport_safe: bool,
+        config_revision: int,
+        catalog_digest: str,
     ) -> tuple[ConnectionHandle, _Connection | None] | None:
         async with self._lock:
             if self._closed or (
@@ -296,10 +368,17 @@ class DeviceRegistry:
                 default_shell=shells.default if shells is not None else None,
                 available_shells=tuple(shells.available) if shells is not None else None,
                 ready=ready,
+                config_revision=config_revision,
+                catalog_digest=catalog_digest,
                 secret_transport_safe=secret_transport_safe,
             )
             previous = self._connections.get(device_id)
             self._connections[device_id] = replacement
+            if not ready:
+                self._publication_fences[device_id] = _PublicationFence(
+                    user_id=user_id,
+                    handle=handle,
+                )
             if previous is not None:
                 self.transfers.fence_handle(previous.handle)
             return handle, previous
@@ -329,8 +408,17 @@ class DeviceRegistry:
                 available_shells=connection.available_shells,
             )
 
-    async def activate(self, handle: ConnectionHandle, payload: str) -> bool:
-        """Write ``hello_ack`` before making a handshake generation routable."""
+    async def activate(
+        self,
+        handle: ConnectionHandle,
+        frame: HelloAckFrame,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> bool:
+        """Complete hello config apply before publishing a routable generation."""
+        future: asyncio.Future[ConfigAppliedFrame] = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_consume_future_exception)
+        pending = _PendingConfigApply(frame.id, frame.config_revision, future)
         async with self._lock:
             connection = self._connections.get(handle.device_id)
             if (
@@ -338,28 +426,83 @@ class DeviceRegistry:
                 or connection is None
                 or connection.handle != handle
                 or connection.ready
+                or connection.config_apply is not None
+                or connection.config_revision != frame.config_revision
+                or connection.catalog_digest != frame.mcp_catalog.digest
+                or (
+                    _config_contains_secrets(frame.config)
+                    and not connection.secret_transport_safe
+                )
             ):
                 return False
+            connection.config_apply = pending
         try:
             async with connection.send_lock:
                 async with self._lock:
-                    current = self._connections.get(handle.device_id)
                     if (
-                        self._closed
-                        or current is not connection
-                        or current.handle != handle
-                        or current.ready
+                        self._connections.get(handle.device_id) is not connection
+                        or connection.config_apply is not pending
                     ):
                         return False
-                await connection.transport.send_text(payload)
+                    pending.issued = True
+                await connection.transport.send_text(encode_server_frame(frame))
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.shield(future)
+            ack = ConfigAppliedAckFrame(id=frame.id, config_revision=frame.config_revision)
+            async with connection.send_lock:
                 async with self._lock:
-                    current = self._connections.get(handle.device_id)
-                    if self._closed or current is not connection or current.handle != handle:
+                    if (
+                        self._connections.get(handle.device_id) is not connection
+                        or connection.config_apply is not pending
+                    ):
                         return False
+                    pending.ack_issuing = True
+                await connection.transport.send_text(encode_server_frame(ack))
+                async with self._lock:
+                    if (
+                        self._connections.get(handle.device_id) is not connection
+                        or connection.config_apply is not pending
+                    ):
+                        return False
+                    connection.device_name = frame.device_name
+                    connection.config_apply = None
                     connection.ready = True
-        except Exception:
-            self._schedule_unregister(handle)
+                    self._release_publication_fence_locked(
+                        handle.device_id,
+                        user_id=connection.user_id,
+                        expected_handle=handle,
+                    )
+            return True
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(self._retire_ambiguous_config(connection, handle))
+            try:
+                await await_future_cancellation_safe(cleanup)
+            except asyncio.CancelledError:
+                pass
             raise
+        except Exception:
+            await self._retire_ambiguous_config(connection, handle)
+            return False
+
+    async def resolve_config_applied(
+        self,
+        handle: ConnectionHandle,
+        frame: ConfigAppliedFrame,
+    ) -> bool:
+        async with self._lock:
+            connection = self._connections.get(handle.device_id)
+            if self._closed or connection is None or connection.handle != handle:
+                return False
+            pending = connection.config_apply
+            if (
+                pending is None
+                or pending.id != frame.id
+                or pending.config_revision != frame.config_revision
+                or not pending.issued
+                or pending.future.done()
+            ):
+                return False
+        pending.future.set_result(frame)
         return True
 
     async def registration_epoch(self, device_id: UUID) -> int:
@@ -368,16 +511,25 @@ class DeviceRegistry:
 
     async def unregister(self, handle: ConnectionHandle) -> bool:
         async with self._lock:
-            connection = self._connections.get(handle.device_id)
-            if connection is None or connection.handle != handle:
-                return False
-        async with connection.lifecycle_lock:
-            async with connection.send_lock:
-                async with self._lock:
-                    current = self._connections.get(handle.device_id)
-                    if current is None or current.handle != handle:
-                        return False
-                    self._connections.pop(handle.device_id)
+            current = self._connections.get(handle.device_id)
+            if current is not None and current.handle == handle and not current.ready:
+                self._release_publication_fence_locked(
+                    handle.device_id,
+                    user_id=current.user_id,
+                    expected_handle=handle,
+                )
+        async with self._publication_open(handle.device_id):
+            async with self._lock:
+                connection = self._connections.get(handle.device_id)
+                if connection is None or connection.handle != handle:
+                    return False
+            async with connection.lifecycle_lock:
+                async with connection.send_lock:
+                    async with self._lock:
+                        current = self._connections.get(handle.device_id)
+                        if current is None or current.handle != handle:
+                            return False
+                        self._connections.pop(handle.device_id)
         retirement = self._track_retirement(
             handle.device_id,
             self._retire(connection),
@@ -386,7 +538,7 @@ class DeviceRegistry:
         return True
 
     async def revoke(self, device_id: UUID) -> bool:
-        async with self._register_lock:
+        async with self._publication_open(device_id):
             async with self._lock:
                 connection = self._connections.get(device_id)
             if connection is None:
@@ -450,6 +602,31 @@ class DeviceRegistry:
                 and connection.handle == handle
             )
 
+    async def can_register_mcp(self, handle: ConnectionHandle) -> bool:
+        """Accept registration while the config ACK is serialized, but not yet published."""
+        async with self._lock:
+            connection = self._connections.get(handle.device_id)
+            pending = connection.config_apply if connection is not None else None
+            return (
+                not self._closed
+                and connection is not None
+                and connection.handle == handle
+                and (
+                    connection.ready
+                    or (pending is not None and pending.ack_issuing)
+                )
+            )
+
+    async def is_registered(self, handle: ConnectionHandle) -> bool:
+        """Return whether this exact generation is still published, ready or not."""
+        async with self._lock:
+            connection = self._connections.get(handle.device_id)
+            return (
+                not self._closed
+                and connection is not None
+                and connection.handle == handle
+            )
+
     async def validate_config(
         self,
         *,
@@ -496,7 +673,7 @@ class DeviceRegistry:
             validate_servers=list(validate_servers),
             deadline_ms=300_000,
         )
-        payload = frame.model_dump_json()
+        payload = encode_server_frame(frame)
         if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
             await self._expire_validation(connection, pending)
             raise DeviceProtocolError("MCP validation frame exceeds the text-frame limit")
@@ -581,7 +758,7 @@ class DeviceRegistry:
             pending = connection.config_validation
             if pending is None or pending.id != result.id:
                 if result.id in connection.validation_tombstones:
-                    connection.validation_tombstones.move_to_end(result.id)
+                    connection.validation_tombstones.pop(result.id)
                     return True
                 return False
             connection.config_validation = None
@@ -606,13 +783,18 @@ class DeviceRegistry:
         connection: _Connection,
         pending: _PendingValidation,
     ) -> None:
+        retire = False
         async with self._lock:
             if connection.config_validation is pending:
                 connection.config_validation = None
             if pending.issued:
-                self._remember_validation_tombstone(connection, pending.id)
+                retire = not self._remember_validation_tombstone(connection, pending.id)
+                if retire and self._connections.get(connection.handle.device_id) is connection:
+                    connection.ready = False
         if not pending.future.done():
             pending.future.cancel()
+        if retire:
+            self._schedule_unregister(connection.handle)
 
     async def _clear_validation(
         self,
@@ -623,11 +805,14 @@ class DeviceRegistry:
             if connection.config_validation is pending:
                 connection.config_validation = None
 
-    def _remember_validation_tombstone(self, connection: _Connection, frame_id: UUID) -> None:
+    def _remember_validation_tombstone(self, connection: _Connection, frame_id: UUID) -> bool:
+        if frame_id not in connection.validation_tombstones and len(
+            connection.validation_tombstones
+        ) >= 64:
+            return False
         connection.validation_tombstones[frame_id] = None
         connection.validation_tombstones.move_to_end(frame_id)
-        while len(connection.validation_tombstones) > 64:
-            connection.validation_tombstones.popitem(last=False)
+        return True
 
     async def _send_validation_cancel(
         self,
@@ -780,6 +965,137 @@ class DeviceRegistry:
                 and current.handle == handle
             )
 
+    async def publish_mcp_registration(
+        self,
+        handle: ConnectionHandle,
+        candidate: McpRegistrationCandidate,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> bool:
+        """ACK one aggregate registration before atomically publishing its bindings."""
+        frame_id = candidate.ack.id
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        connection: _Connection | None = None
+        try:
+            async with asyncio.timeout_at(deadline):
+                while True:
+                    config_done: asyncio.Event | None = None
+                    async with self._lock:
+                        connection = self._connections.get(handle.device_id)
+                        pending = connection.config_apply if connection is not None else None
+                        if (
+                            self._closed
+                            or connection is None
+                            or connection.handle != handle
+                            or not (
+                                connection.ready
+                                or (pending is not None and pending.ack_issuing)
+                            )
+                        ):
+                            return False
+                        if connection.config_update_in_flight is not None:
+                            config_done = connection.config_update_done
+                            assert config_done is not None
+                        else:
+                            if connection.mcp_registration_in_flight is not None:
+                                raise DeviceBusyError(
+                                    "Device MCP registration is already in progress"
+                                )
+                            registration_done = asyncio.Event()
+                            connection.mcp_registration_in_flight = frame_id
+                            connection.mcp_registration_done = registration_done
+                            connection.mcp_registration_deadline = deadline
+                            break
+                    assert config_done is not None
+                    await config_done.wait()
+
+                assert connection is not None
+                async with connection.send_lock:
+                    async with self._lock:
+                        current = self._connections.get(handle.device_id)
+                        if (
+                            current is not connection
+                            or not current.ready
+                            or current.config_update_in_flight is not None
+                            or current.mcp_registration_in_flight != frame_id
+                        ):
+                            return False
+                        stale = (
+                            current.config_revision != candidate.ack.config_revision
+                            or current.catalog_digest != candidate.ack.catalog_digest
+                            or any(
+                                result.code == "mcp_registration_stale"
+                                for result in candidate.ack.results
+                            )
+                        )
+                        acknowledgement = (
+                            _stale_mcp_registration_ack(candidate.ack)
+                            if stale
+                            else candidate.ack
+                        )
+                    await connection.transport.send_text(
+                        encode_server_frame(acknowledgement)
+                    )
+                    async with self._lock:
+                        current = self._connections.get(handle.device_id)
+                        if (
+                            current is not connection
+                            or not current.ready
+                            or current.mcp_registration_in_flight != frame_id
+                        ):
+                            return False
+                        current.accepted_mcp_bindings = {
+                            binding.name: binding
+                            for binding in (() if stale else candidate.bindings)
+                        }
+                        current.mcp_epoch += 1
+                        self._finish_mcp_registration_locked(current, frame_id)
+            return True
+        except asyncio.CancelledError:
+            if connection is not None:
+                cleanup = asyncio.create_task(
+                    self._retire_ambiguous_config(connection, handle)
+                )
+                try:
+                    await await_future_cancellation_safe(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            raise
+        except Exception:
+            if connection is not None:
+                await self._retire_ambiguous_config(connection, handle)
+            return False
+        finally:
+            async with self._lock:
+                if connection is not None:
+                    self._finish_mcp_registration_locked(connection, frame_id)
+
+    async def dispatch_mcp_tool(
+        self,
+        *,
+        route: FrozenMcpEntryRoute,
+        user_id: UUID,
+        name: str,
+        args: dict[str, object],
+        max_result_bytes: int,
+        timeout_seconds: float,
+        chat_session_id: UUID | None = None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> ToolResultFrame:
+        return await self._dispatch_tool(
+            device_id=route.device_id,
+            user_id=user_id,
+            name=name,
+            args=args,
+            max_result_bytes=max_result_bytes,
+            timeout_seconds=timeout_seconds,
+            expected_device_name=route.device_name,
+            route=None,
+            frozen_mcp_route=route,
+            chat_session_id=chat_session_id,
+            on_issued=on_issued,
+        )
+
     async def dispatch_tool(
         self,
         *,
@@ -802,6 +1118,7 @@ class DeviceRegistry:
             timeout_seconds=timeout_seconds,
             expected_device_name=expected_device_name,
             route=None,
+            frozen_mcp_route=None,
             chat_session_id=chat_session_id,
             on_issued=on_issued,
         )
@@ -829,6 +1146,7 @@ class DeviceRegistry:
             timeout_seconds=timeout_seconds,
             expected_device_name=expected_device_name,
             route=route,
+            frozen_mcp_route=None,
             chat_session_id=chat_session_id,
             on_issued=on_issued,
         )
@@ -844,22 +1162,12 @@ class DeviceRegistry:
         timeout_seconds: float,
         expected_device_name: str | None,
         route: DeviceRouteSnapshot | None,
+        frozen_mcp_route: FrozenMcpEntryRoute | None,
         chat_session_id: UUID | None,
         on_issued: Callable[[], None] | None,
     ) -> ToolResultFrame:
         call_id = new_uuid7()
         future = asyncio.get_running_loop().create_future()
-        frame = ToolCallFrame(
-            id=call_id,
-            name=name,
-            args=args,
-            max_result_bytes=max_result_bytes,
-            chat_session_id=chat_session_id,
-        )
-        payload = frame.model_dump_json()
-        if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
-            raise DeviceProtocolError("Tool call exceeds the 12 MiB text-frame limit")
-        byte_weight = len(payload.encode("utf-8")) + max_result_bytes
         async with self._lock:
             connection = self._connections.get(device_id)
             if (
@@ -867,7 +1175,6 @@ class DeviceRegistry:
                 or connection is None
                 or not connection.ready
                 or connection.user_id != user_id
-                or connection.config_update_in_flight is not None
                 or (
                     route is not None
                     and (
@@ -875,12 +1182,50 @@ class DeviceRegistry:
                         or connection.config_epoch != route.config_epoch
                     )
                 )
+            ):
+                raise DeviceUnavailableError("Device is not connected")
+            if (
+                connection.config_update_in_flight is not None
                 or (
                     expected_device_name is not None
                     and connection.device_name != expected_device_name
                 )
             ):
+                if frozen_mcp_route is not None:
+                    raise DeviceMcpUnavailableError("MCP route is not currently available")
                 raise DeviceUnavailableError("Device is not connected")
+            expected_mcp_epoch: int | None = None
+            wire_mcp_route: McpRoute | None = None
+            if frozen_mcp_route is not None:
+                binding = connection.accepted_mcp_bindings.get(frozen_mcp_route.server)
+                if (
+                    name != frozen_mcp_route.final_name
+                    or frozen_mcp_route.device_id != device_id
+                    or binding is None
+                    or binding.config_revision != frozen_mcp_route.config_revision
+                    or binding.catalog_digest != frozen_mcp_route.catalog_digest
+                    or frozen_mcp_route.entry_id not in binding.entry_ids
+                ):
+                    raise DeviceMcpUnavailableError("MCP route is not currently available")
+                wire_mcp_route = McpRoute(
+                    entry_id=frozen_mcp_route.entry_id,
+                    config_revision=binding.config_revision,
+                    catalog_digest=binding.catalog_digest,
+                    runtime_generation=binding.runtime_generation,
+                )
+                expected_mcp_epoch = connection.mcp_epoch
+            frame = ToolCallFrame(
+                id=call_id,
+                name=name,
+                args=args,
+                max_result_bytes=max_result_bytes,
+                chat_session_id=chat_session_id,
+                mcp_route=wire_mcp_route,
+            )
+            payload = encode_server_frame(frame)
+            if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
+                raise DeviceProtocolError("Tool call exceeds the 12 MiB text-frame limit")
+            byte_weight = len(payload.encode("utf-8")) + max_result_bytes
             self._reserve_pending_locked(user_id, byte_weight)
             connection.pending[call_id] = _PendingCall(
                 future=future,
@@ -895,6 +1240,7 @@ class DeviceRegistry:
                 payload,
                 expected_device_name=expected_device_name,
                 expected_config_epoch=(route.config_epoch if route is not None else None),
+                expected_mcp_epoch=expected_mcp_epoch,
                 issued_call_id=call_id,
                 on_issued=on_issued,
             )
@@ -908,6 +1254,13 @@ class DeviceRegistry:
             raise DeviceOutcomeUnknownError("Device call outcome is unknown") from exc
         if not sent:
             await self._remove_pending(handle, call_id, future)
+            if frozen_mcp_route is not None:
+                async with self._lock:
+                    current = self._connections.get(device_id)
+                    if current is connection and current.ready:
+                        raise DeviceMcpUnavailableError(
+                            "MCP route changed before the call was issued"
+                        )
             raise DeviceUnavailableError("Device connection was replaced")
 
         try:
@@ -944,10 +1297,16 @@ class DeviceRegistry:
                     raise DeviceProtocolError("Tool result exceeded its reserved response credit")
                 connection.pending.pop(result.id)
                 self._release_pending_locked(connection.user_id, pending.byte_weight)
-                if pending.expired:
-                    return True
             else:
-                return False
+                credit = connection.call_tombstones.pop(result.id, None)
+                if credit is None:
+                    return False
+                result_bytes = encoded_bytes
+                if result_bytes is None:
+                    result_bytes = len(result.model_dump_json(exclude_none=True).encode("utf-8"))
+                if result_bytes > credit:
+                    raise DeviceProtocolError("Tool result exceeded its reserved response credit")
+                return True
         if pending.future.done():
             return False
         pending.future.set_result(result)
@@ -960,6 +1319,7 @@ class DeviceRegistry:
         *,
         expected_device_name: str | None = None,
         expected_config_epoch: int | None = None,
+        expected_mcp_epoch: int | None = None,
         issued_call_id: UUID | None = None,
         on_issued: Callable[[], None] | None = None,
     ) -> bool:
@@ -977,6 +1337,7 @@ class DeviceRegistry:
                         issued_call_id,
                         expected_device_name=expected_device_name,
                         expected_config_epoch=expected_config_epoch,
+                        expected_mcp_epoch=expected_mcp_epoch,
                         on_issued=on_issued,
                     ):
                         return False
@@ -986,6 +1347,7 @@ class DeviceRegistry:
                         handle,
                         expected_device_name=expected_device_name,
                         expected_config_epoch=expected_config_epoch,
+                        expected_mcp_epoch=expected_mcp_epoch,
                     ):
                         return False
                     if on_issued is not None:
@@ -1004,6 +1366,7 @@ class DeviceRegistry:
         *,
         expected_device_name: str | None,
         expected_config_epoch: int | None,
+        expected_mcp_epoch: int | None,
         on_issued: Callable[[], None] | None,
     ) -> bool:
         async with self._lock:
@@ -1014,6 +1377,7 @@ class DeviceRegistry:
                     handle,
                     expected_device_name=expected_device_name,
                     expected_config_epoch=expected_config_epoch,
+                    expected_mcp_epoch=expected_mcp_epoch,
                 )
                 or pending is None
             ):
@@ -1030,6 +1394,7 @@ class DeviceRegistry:
         *,
         expected_device_name: str | None,
         expected_config_epoch: int | None = None,
+        expected_mcp_epoch: int | None = None,
     ) -> bool:
         async with self._lock:
             return self._can_send_locked(
@@ -1037,6 +1402,7 @@ class DeviceRegistry:
                 handle,
                 expected_device_name=expected_device_name,
                 expected_config_epoch=expected_config_epoch,
+                expected_mcp_epoch=expected_mcp_epoch,
             )
 
     def _can_send_locked(
@@ -1046,6 +1412,7 @@ class DeviceRegistry:
         *,
         expected_device_name: str | None,
         expected_config_epoch: int | None,
+        expected_mcp_epoch: int | None,
     ) -> bool:
         current = self._connections.get(handle.device_id)
         return not (
@@ -1054,6 +1421,7 @@ class DeviceRegistry:
             or not current.ready
             or current.handle != handle
             or (expected_config_epoch is not None and current.config_epoch != expected_config_epoch)
+            or (expected_mcp_epoch is not None and current.mcp_epoch != expected_mcp_epoch)
             or (
                 expected_device_name is not None
                 and (
@@ -1132,7 +1500,23 @@ class DeviceRegistry:
         mcp_catalog: PersistedMcpCatalog | None = None,
         frame_id: UUID | None = None,
         expected_handle: ConnectionHandle | None = None,
+        timeout_seconds: float = 10.0,
     ) -> bool:
+        catalog = mcp_catalog or PersistedMcpCatalog(
+            version=1,
+            digest=EMPTY_CATALOG_DIGEST,
+            servers=[],
+        )
+        frame = ConfigUpdateFrame(
+            id=frame_id or new_uuid7(),
+            device_name=device_name,
+            config_revision=config_revision,
+            config=config,
+            mcp_catalog=catalog,
+        )
+        future: asyncio.Future[ConfigAppliedFrame] = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_consume_future_exception)
+        pending = _PendingConfigApply(frame.id, frame.config_revision, future)
         async with self._lock:
             connection = self._connections.get(device_id)
             if (
@@ -1142,46 +1526,63 @@ class DeviceRegistry:
                 or connection.user_id != user_id
                 or (expected_handle is not None and connection.handle != expected_handle)
             ):
-                return False
-            handle = connection.handle
-        frame = ConfigUpdateFrame(
-            id=frame_id or new_uuid7(),
-            device_name=device_name,
-            config_revision=config_revision,
-            config=config,
-            mcp_catalog=(
-                mcp_catalog
-                if mcp_catalog is not None
-                else PersistedMcpCatalog(
-                    version=1,
-                    digest="d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
-                    servers=[],
+                self._release_publication_fence_locked(
+                    device_id,
+                    user_id=user_id,
+                    expected_handle=expected_handle,
                 )
-            ),
-        )
-        try:
-            async with self._lock:
-                current = self._connections.get(device_id)
-                if current is not connection or current.handle != handle:
-                    return False
+                return False
+            if connection.config_apply is not None:
+                raise DeviceBusyError("Device configuration apply is already in progress")
+            handle = connection.handle
+            insecure_secret_transport = (
+                _config_contains_secrets(config) and not connection.secret_transport_safe
+            )
+            if not insecure_secret_transport:
                 if connection.config_update_in_flight is None:
                     connection.config_update_in_flight = device_name
+                    connection.config_update_done = asyncio.Event()
+                connection.config_apply = pending
+            self._release_publication_fence_locked(
+                device_id,
+                user_id=user_id,
+                expected_handle=handle,
+            )
+        if insecure_secret_transport:
+            await self._retire_ambiguous_config(connection, handle)
+            return False
+        try:
             async with connection.send_lock:
                 async with self._lock:
                     current = self._connections.get(device_id)
                     if (
                         current is not connection
                         or current.handle != handle
-                        or connection.config_update_in_flight is None
+                        or connection.config_apply is not pending
                     ):
                         return False
-                await connection.transport.send_text(frame.model_dump_json())
+                    pending.issued = True
+                await connection.transport.send_text(encode_server_frame(frame))
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.shield(future)
+            ack = ConfigAppliedAckFrame(id=frame.id, config_revision=frame.config_revision)
+            async with connection.send_lock:
                 async with self._lock:
                     current = self._connections.get(device_id)
                     if (
                         current is not connection
                         or current.handle != handle
-                        or connection.config_update_in_flight is None
+                        or connection.config_apply is not pending
+                    ):
+                        return False
+                    pending.ack_issuing = True
+                await connection.transport.send_text(encode_server_frame(ack))
+                async with self._lock:
+                    current = self._connections.get(device_id)
+                    if (
+                        current is not connection
+                        or current.handle != handle
+                        or connection.config_apply is not pending
                     ):
                         return False
                     previous_route = DeviceRouteSnapshot(
@@ -1191,8 +1592,14 @@ class DeviceRegistry:
                     )
                     self.transfers.fence_route(previous_route)
                     connection.device_name = device_name
+                    connection.config_revision = config_revision
+                    connection.catalog_digest = catalog.digest
                     connection.config_epoch += 1
+                    connection.mcp_epoch += 1
+                    connection.accepted_mcp_bindings.clear()
+                    connection.config_apply = None
                     connection.config_update_in_flight = None
+                    self._finish_config_update_locked(connection)
         except asyncio.CancelledError:
             cleanup = asyncio.create_task(self._retire_ambiguous_config(connection, handle))
             try:
@@ -1213,20 +1620,62 @@ class DeviceRegistry:
         expected_handle: ConnectionHandle | None = None,
     ) -> bool:
         """Fence new tool calls before the corresponding DB policy commit."""
-        async with self._lock:
-            connection = self._connections.get(device_id)
-            if (
-                self._closed
-                or connection is None
-                or not connection.ready
-                or connection.user_id != user_id
-                or (expected_handle is not None and connection.handle != expected_handle)
-            ):
+        wait_budget_deadline = (
+            asyncio.get_running_loop().time() + MCP_REGISTRATION_WAIT_SECONDS
+        )
+        while True:
+            registration_done: asyncio.Event | None = None
+            registration_deadline: float | None = None
+            registration_handle: ConnectionHandle | None = None
+            async with self._publication_open(device_id):
+                async with self._lock:
+                    connection = self._connections.get(device_id)
+                    if (
+                        self._closed
+                        or connection is None
+                        or not connection.ready
+                        or connection.user_id != user_id
+                        or (expected_handle is not None and connection.handle != expected_handle)
+                    ):
+                        return False
+                    if (
+                        connection.config_update_in_flight is not None
+                        or device_id in self._publication_fences
+                    ):
+                        raise DeviceBusyError("Device configuration is already updating")
+                    if connection.mcp_registration_in_flight is not None:
+                        registration_done = connection.mcp_registration_done
+                        registration_deadline = connection.mcp_registration_deadline
+                        registration_handle = connection.handle
+                        assert registration_done is not None
+                        assert registration_deadline is not None
+                    else:
+                        connection.config_update_in_flight = "__precommit__"
+                        connection.config_update_done = asyncio.Event()
+                        self._publication_fences[device_id] = _PublicationFence(
+                            user_id=user_id,
+                            handle=connection.handle,
+                        )
+                        return True
+            assert registration_done is not None
+            assert registration_deadline is not None
+            assert registration_handle is not None
+            try:
+                async with asyncio.timeout_at(
+                    min(registration_deadline, wait_budget_deadline)
+                ):
+                    await registration_done.wait()
+            except TimeoutError:
+                async with self._lock:
+                    current = self._connections.get(device_id)
+                    if (
+                        current is not None
+                        and current.handle == registration_handle
+                        and current.mcp_registration_done is registration_done
+                    ):
+                        current.ready = False
+                        self._schedule_unregister(current.handle)
                 return False
-            if connection.config_update_in_flight is not None:
-                raise DeviceBusyError("Device configuration is already updating")
-            connection.config_update_in_flight = "__precommit__"
-            return True
 
     async def abort_config_update(self, *, device_id: UUID, user_id: UUID) -> None:
         """Release a pre-commit fence when the database mutation rolls back."""
@@ -1235,15 +1684,62 @@ class DeviceRegistry:
             if connection is not None and connection.user_id == user_id:
                 if connection.config_update_in_flight == "__precommit__":
                     connection.config_update_in_flight = None
+                    self._finish_config_update_locked(connection)
+            self._release_publication_fence_locked(device_id, user_id=user_id)
 
     async def retire_config_update(self, *, device_id: UUID, user_id: UUID) -> None:
         """Retire a fenced generation when the policy commit outcome is unknown."""
         async with self._lock:
             connection = self._connections.get(device_id)
+            self._release_publication_fence_locked(device_id, user_id=user_id)
             if connection is None or connection.user_id != user_id:
                 return
             handle = connection.handle
         await self._retire_ambiguous_config(connection, handle)
+
+    def _release_publication_fence_locked(
+        self,
+        device_id: UUID,
+        *,
+        user_id: UUID,
+        expected_handle: ConnectionHandle | None = None,
+    ) -> None:
+        fence = self._publication_fences.get(device_id)
+        if (
+            fence is None
+            or fence.user_id != user_id
+            or (expected_handle is not None and fence.handle != expected_handle)
+        ):
+            return
+        self._publication_fences.pop(device_id, None)
+        fence.released.set()
+
+    @staticmethod
+    def _finish_config_update_locked(connection: _Connection) -> None:
+        done = connection.config_update_done
+        connection.config_update_done = None
+        if done is not None:
+            done.set()
+
+    @staticmethod
+    def _finish_mcp_registration_locked(connection: _Connection, frame_id: UUID) -> None:
+        if connection.mcp_registration_in_flight != frame_id:
+            return
+        done = connection.mcp_registration_done
+        connection.mcp_registration_in_flight = None
+        connection.mcp_registration_done = None
+        connection.mcp_registration_deadline = None
+        if done is not None:
+            done.set()
+
+    @staticmethod
+    def _finish_all_mcp_registration_locked(connection: _Connection) -> None:
+        done = connection.mcp_registration_done
+        connection.mcp_registration_in_flight = None
+        connection.mcp_registration_done = None
+        connection.mcp_registration_deadline = None
+        if done is not None:
+            done.set()
 
     async def mark_pong(
         self,
@@ -1289,6 +1785,10 @@ class DeviceRegistry:
                 if self._closed:
                     return
                 self._closed = True
+                publication_fences = tuple(self._publication_fences.values())
+                self._publication_fences.clear()
+                for fence in publication_fences:
+                    fence.released.set()
                 connections = list(self._connections.values())
             for connection in connections:
                 async with connection.lifecycle_lock:
@@ -1317,18 +1817,27 @@ class DeviceRegistry:
         *,
         remember_expired: bool = False,
     ) -> None:
+        retire = False
         async with self._lock:
             connection = self._connections.get(handle.device_id)
             if connection is not None and connection.handle == handle:
                 current = connection.pending.get(call_id)
                 if current is not None and current.future is future:
                     if remember_expired and current.issued:
-                        current.expired = True
+                        connection.pending.pop(call_id)
+                        self._release_pending_locked(connection.user_id, current.byte_weight)
+                        if len(connection.call_tombstones) >= 256:
+                            retire = True
+                            connection.ready = False
+                        else:
+                            connection.call_tombstones[call_id] = current.max_result_bytes
                     else:
                         connection.pending.pop(call_id)
                         self._release_pending_locked(connection.user_id, current.byte_weight)
         if not future.done():
             future.cancel()
+        if retire:
+            self._schedule_unregister(handle)
 
     async def _discard_registration(self, handle: ConnectionHandle) -> None:
         connection: _Connection | None = None
@@ -1337,6 +1846,11 @@ class DeviceRegistry:
                 current = self._connections.get(handle.device_id)
                 if current is not None and current.handle == handle:
                     connection = self._connections.pop(handle.device_id)
+                    self._release_publication_fence_locked(
+                        handle.device_id,
+                        user_id=current.user_id,
+                        expected_handle=handle,
+                    )
         if connection is not None:
             retirement = self._track_retirement(
                 handle.device_id,
@@ -1356,6 +1870,13 @@ class DeviceRegistry:
         removed = False
         async with self._lock:
             connection.config_update_in_flight = None
+            self._finish_config_update_locked(connection)
+            self._finish_all_mcp_registration_locked(connection)
+            self._release_publication_fence_locked(
+                handle.device_id,
+                user_id=connection.user_id,
+                expected_handle=handle,
+            )
             if self._connections.get(handle.device_id) is connection:
                 self._connections.pop(handle.device_id)
                 removed = True
@@ -1413,10 +1934,18 @@ class DeviceRegistry:
     ) -> None:
         await self.transfers.disconnect(connection.handle)
         async with self._lock:
+            connection.config_update_in_flight = None
+            self._finish_config_update_locked(connection)
+            self._finish_all_mcp_registration_locked(connection)
             validation = connection.config_validation
             connection.config_validation = None
+            config_apply = connection.config_apply
+            connection.config_apply = None
             pending = list(connection.pending.values())
             connection.pending.clear()
+            connection.call_tombstones.clear()
+            connection.validation_tombstones.clear()
+            connection.accepted_mcp_bindings.clear()
             for call in pending:
                 self._release_pending_locked(connection.user_id, call.byte_weight)
         for future in pending:
@@ -1434,6 +1963,8 @@ class DeviceRegistry:
                 else DeviceUnavailableError("Device disconnected")
             )
             validation.future.set_exception(error)
+        if config_apply is not None and not config_apply.future.done():
+            config_apply.future.set_exception(DeviceUnavailableError("Device disconnected"))
         if close_code is not None:
             try:
                 await connection.transport.close(close_code, close_reason)
@@ -1496,6 +2027,28 @@ def _config_contains_secrets(config: DeviceConfigFrame) -> bool:
     for server in config.mcp_servers:
         payload = server.storage_dict()
         values = payload.get("env", payload.get("headers", {}))
-        if isinstance(values, dict) and any(bool(value) for value in values.values()):
+        if isinstance(values, dict) and values:
             return True
     return False
+
+
+def _stale_mcp_registration_ack(frame: RegisterMcpAckFrame) -> RegisterMcpAckFrame:
+    return RegisterMcpAckFrame(
+        id=frame.id,
+        config_revision=frame.config_revision,
+        catalog_digest=frame.catalog_digest,
+        results=[
+            RejectedMcpRegistration(
+                name=result.name,
+                runtime_generation=result.runtime_generation,
+                accepted=False,
+                code="mcp_registration_stale",
+            )
+            for result in frame.results
+        ],
+    )
+
+
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()

@@ -16,16 +16,23 @@ from starlette.websockets import WebSocketDisconnect
 
 from openctopus_server.db.engine import get_engine
 from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.mcp_routes import (
+    McpRegistrationError,
+    validate_mcp_registration,
+)
 from openctopus_server.devices.protocol import (
     MAX_BINARY_CHUNK_BYTES,
     MAX_TEXT_FRAME_BYTES,
     PROTOCOL_VERSION,
+    ConfigAppliedFrame,
+    ConfigValidateResultFrame,
     DeviceConfigFrame,
     ErrorFrame,
     HelloAckFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
+    RegisterMcpFrame,
     ToolResultFrame,
     TransferBeginFrame,
     TransferEndFrame,
@@ -47,15 +54,19 @@ from openctopus_server.services import devices
 router = APIRouter()
 
 HELLO_TIMEOUT_SECONDS = 10.0
+MCP_REGISTRATION_TIMEOUT_SECONDS = 9.0
 PING_INTERVAL_SECONDS = 30.0
 LIVENESS_TIMEOUT_SECONDS = 70.0
 
-_VERSION_REASON = '{"code":"version_unsupported","protocol_version":"2"}'
+_VERSION_REASON = '{"code":"version_unsupported","protocol_version":"3"}'
 
 
 class _WebSocketLike(Protocol):
     @property
     def headers(self) -> Mapping[str, str]: ...
+
+    @property
+    def scope(self) -> Mapping[str, Any]: ...
 
     async def accept(self) -> None: ...
 
@@ -326,7 +337,18 @@ def _is_critical_text(payload: str) -> bool:
         frame_type = json.loads(payload).get("type")
     except (TypeError, json.JSONDecodeError):
         return False
-    return frame_type in {"error", "ping", "pong", "transfer_ready", "transfer_end"}
+    return frame_type in {
+        "error",
+        "hello_ack",
+        "config_update",
+        "config_validate",
+        "config_applied_ack",
+        "register_mcp_ack",
+        "ping",
+        "pong",
+        "transfer_ready",
+        "transfer_end",
+    }
 
 
 @router.websocket("/ws/device")
@@ -374,12 +396,13 @@ async def serve_device_socket(
 
     handle: ConnectionHandle | None = None
     try:
-        # Serialize the authoritative config read, registration, and hello_ack
-        # with REST config commit-and-push.  Otherwise a PATCH can commit while
-        # the device is not yet online and leave this connection on stale config.
+        # The mutation lock makes this short authoritative read/publication
+        # observe one durable revision. Network config activation happens after
+        # releasing it so heartbeat and REST validation remain independent.
         async with registry.config_update_lock(
             user_id=device.user_id,
             device_name=device.name,
+            device_id=device.id,
         ):
             try:
                 # Do not let a token rotated or revoked while waiting for hello register.
@@ -391,6 +414,20 @@ async def serve_device_socket(
                 await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
                 return
 
+            try:
+                config = _device_config(device)
+                catalog = devices.parse_stored_mcp_catalog(device.mcp_catalog)
+            except Exception:
+                await transport.close(1011, '{"code":"io_error"}')
+                return
+            secret_transport_safe = websocket.scope.get("scheme") == "wss"
+            if _config_contains_secrets(config) and not secret_transport_safe:
+                await transport.close(
+                    4403,
+                    '{"code":"mcp_secret_transport_insecure"}',
+                )
+                return
+
             handle = await registry.register(
                 device_id=device.id,
                 user_id=device.user_id,
@@ -400,6 +437,9 @@ async def serve_device_socket(
                 ready=False,
                 operating_system=hello.os,
                 shells=hello.shells,
+                secret_transport_safe=secret_transport_safe,
+                config_revision=device.config_revision,
+                catalog_digest=catalog.digest,
             )
             if handle is None:
                 await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
@@ -407,22 +447,45 @@ async def serve_device_socket(
             ack = HelloAckFrame(
                 id=hello.id,
                 device_name=device.name,
-                config=DeviceConfigFrame(
-                    workspace_path=device.workspace_path,
-                    restrict_to_workspace=device.restrict_to_workspace,
-                    ssrf_denylist=device.ssrf_denylist,
-                    shell_timeout_max=device.shell_timeout_max,
-                    env_allowlist=device.env_allowlist,
-                ),
+                config_revision=device.config_revision,
+                config=config,
+                mcp_catalog=catalog,
             )
-            if not await registry.activate(handle, ack.model_dump_json()):
-                return
         stop_event = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            _heartbeat(registry, handle, transport, stop_event=stop_event)
+        activation = asyncio.create_task(registry.activate(handle, ack))
+        route_task = asyncio.create_task(
+            _route_frames(
+                websocket,
+                registry,
+                handle,
+                transport,
+                engine=engine,
+                token=token,
+                stop_event=stop_event,
+            )
         )
         try:
-            await _route_frames(websocket, registry, handle, transport, stop_event=stop_event)
+            done, _ = await asyncio.wait(
+                {activation, route_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:
+            stop_event.set()
+            activation.cancel()
+            route_task.cancel()
+            await asyncio.gather(activation, route_task, return_exceptions=True)
+            raise
+        if activation not in done:
+            activation.cancel()
+            await asyncio.gather(activation, route_task, return_exceptions=True)
+            return
+        if not await activation:
+            stop_event.set()
+            await asyncio.gather(route_task, return_exceptions=True)
+            return
+        heartbeat = asyncio.create_task(_heartbeat(registry, handle, transport, stop_event=stop_event))
+        try:
+            await route_task
         finally:
             heartbeat.cancel()
             try:
@@ -437,6 +500,26 @@ async def serve_device_socket(
                 # A peer disconnect removes the registry entry but otherwise
                 # leaves the bounded writer waiting forever on its condition.
                 await transport.close(1000, "")
+
+
+def _device_config(device: devices.DeviceSnapshot) -> DeviceConfigFrame:
+    return DeviceConfigFrame(
+        workspace_path=device.workspace_path,
+        restrict_to_workspace=device.restrict_to_workspace,
+        ssrf_denylist=device.ssrf_denylist,
+        shell_timeout_max=device.shell_timeout_max,
+        env_allowlist=device.env_allowlist,
+        mcp_servers=list(devices.parse_stored_mcp_servers(device.mcp_servers)),
+    )
+
+
+def _config_contains_secrets(config: DeviceConfigFrame) -> bool:
+    for server in config.mcp_servers:
+        payload = server.storage_dict()
+        values = payload.get("env", payload.get("headers", {}))
+        if isinstance(values, dict) and values:
+            return True
+    return False
 
 
 async def _find_device_by_token(engine: AsyncEngine, token: str) -> devices.DeviceSnapshot | None:
@@ -466,15 +549,119 @@ async def _receive_hello(websocket: _WebSocketLike) -> HelloFrame:
     return frame
 
 
+class _McpRegistrationRunner:
+    def __init__(
+        self,
+        *,
+        registry: DeviceRegistry,
+        handle: ConnectionHandle,
+        transport: WebSocketTransport,
+        engine: AsyncEngine,
+        token: str,
+        stop_event: asyncio.Event | None,
+    ) -> None:
+        self._registry = registry
+        self._handle = handle
+        self._transport = transport
+        self._engine = engine
+        self._token = token
+        self._stop_event = stop_event
+        self._task: asyncio.Task[bool] | None = None
+        self._latest: RegisterMcpFrame | None = None
+
+    async def start(self, frame: RegisterMcpFrame) -> bool:
+        if self._task is not None:
+            if not self._task.done():
+                self._latest = frame
+                return True
+            if not await self.poll():
+                return False
+        self._task = asyncio.create_task(self._run(frame))
+        return True
+
+    async def _run(self, frame: RegisterMcpFrame) -> bool:
+        while True:
+            ok = await _register_mcp(
+                registry=self._registry,
+                handle=self._handle,
+                transport=self._transport,
+                engine=self._engine,
+                token=self._token,
+                frame=frame,
+            )
+            if not ok:
+                self._latest = None
+                if self._stop_event is not None:
+                    self._stop_event.set()
+                return False
+            next_frame = self._latest
+            self._latest = None
+            if next_frame is None:
+                return True
+            frame = next_frame
+
+    async def poll(self) -> bool:
+        if self._task is None or not self._task.done():
+            return True
+        task = self._task
+        self._task = None
+        return await task
+
+    async def close(self) -> None:
+        self._latest = None
+        if self._task is None:
+            return
+        task = self._task
+        self._task = None
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def _route_frames(
     websocket: _WebSocketLike,
     registry: DeviceRegistry,
     handle: ConnectionHandle,
     transport: WebSocketTransport,
     *,
+    engine: AsyncEngine,
+    token: str,
     stop_event: asyncio.Event | None = None,
 ) -> None:
+    registrations = _McpRegistrationRunner(
+        registry=registry,
+        handle=handle,
+        transport=transport,
+        engine=engine,
+        token=token,
+        stop_event=stop_event,
+    )
+    try:
+        await _route_frames_loop(
+            websocket,
+            registry,
+            handle,
+            transport,
+            registrations=registrations,
+            stop_event=stop_event,
+        )
+    finally:
+        await registrations.close()
+
+
+async def _route_frames_loop(
+    websocket: _WebSocketLike,
+    registry: DeviceRegistry,
+    handle: ConnectionHandle,
+    transport: WebSocketTransport,
+    *,
+    registrations: _McpRegistrationRunner,
+    stop_event: asyncio.Event | None,
+) -> None:
     while True:
+        if not await registrations.poll():
+            if stop_event is not None:
+                stop_event.set()
+            return
         try:
             message = await _receive_message_or_stop(websocket, stop_event)
             if message is None:
@@ -496,31 +683,72 @@ async def _route_frames(
                 if exc.code == "protocol_transfer_unknown_id"
                 else ErrorCode.PROTOCOL_MALFORMED_FRAME
             )
-            if await registry.send_text(handle, _error_payload(error_code, str(exc))):
-                await transport.close(1002, "protocol_error")
+            await transport.send_text(_error_payload(error_code, str(exc)))
+            await transport.close(1002, "protocol_error")
             return
         except _FrameError as exc:
-            if await registry.send_text(
-                handle,
-                _error_payload(exc.code, str(exc)),
-            ):
-                await transport.close(1002, "protocol_error")
+            await transport.send_text(_error_payload(exc.code, str(exc)))
+            await transport.close(1002, "protocol_error")
             return
         except _VersionMismatchError:
-            if await registry.send_text(
-                handle,
-                _error_payload(ErrorCode.PROTOCOL_VERSION_MISMATCH, "Protocol version is unsupported"),
-            ):
-                await transport.close(4409, _VERSION_REASON)
+            await transport.send_text(
+                _error_payload(
+                    ErrorCode.PROTOCOL_VERSION_MISMATCH,
+                    "Protocol version is unsupported",
+                )
+            )
+            await transport.close(4409, _VERSION_REASON)
             return
 
         if isinstance(frame, PongFrame):
             if not await registry.mark_pong(handle, frame.id):
-                if await registry.send_text(
-                    handle,
-                    _error_payload(ErrorCode.PROTOCOL_MALFORMED_FRAME, "Unexpected pong ID"),
-                ):
-                    await transport.close(1002, "protocol_error")
+                await transport.send_text(
+                    _error_payload(ErrorCode.PROTOCOL_MALFORMED_FRAME, "Unexpected pong ID")
+                )
+                await transport.close(1002, "protocol_error")
+                return
+        elif isinstance(frame, ConfigAppliedFrame):
+            if not await registry.resolve_config_applied(handle, frame):
+                await transport.send_text(
+                    _error_payload(
+                        ErrorCode.PROTOCOL_MALFORMED_FRAME,
+                        "Unexpected config_applied",
+                    )
+                )
+                await transport.close(1002, "protocol_error")
+                return
+        elif isinstance(frame, ConfigValidateResultFrame):
+            if not await registry.resolve_config_validate_result(handle, frame):
+                if not await registry.is_current(handle):
+                    return
+                await transport.send_text(
+                    _error_payload(
+                        ErrorCode.PROTOCOL_MALFORMED_FRAME,
+                        "Unknown config validation ID",
+                    )
+                )
+                await transport.close(1002, "protocol_error")
+                return
+        elif isinstance(frame, RegisterMcpFrame):
+            if not await registry.can_register_mcp(handle):
+                if not await registry.is_registered(handle):
+                    return
+                await transport.send_text(
+                    _error_payload(
+                        ErrorCode.PROTOCOL_MALFORMED_FRAME,
+                        "register_mcp requires an applied configuration",
+                    )
+                )
+                await transport.close(1002, "protocol_error")
+                return
+            if not await registrations.start(frame):
+                await transport.send_text(
+                    _error_payload(
+                        ErrorCode.PROTOCOL_MALFORMED_FRAME,
+                        "MCP registration exchange is already in progress",
+                    )
+                )
+                await transport.close(1002, "protocol_error")
                 return
         elif isinstance(frame, ToolResultFrame):
             try:
@@ -530,31 +758,27 @@ async def _route_frames(
                     encoded_bytes=len(payload.encode("utf-8")),
                 )
             except DeviceProtocolError:
-                if await registry.send_text(
-                    handle,
+                await transport.send_text(
                     _error_payload(
                         ErrorCode.PROTOCOL_MALFORMED_FRAME,
                         "Tool result exceeded its response credit",
                     ),
-                ):
-                    await transport.close(1002, "protocol_error")
+                )
+                await transport.close(1002, "protocol_error")
                 return
             if not resolved:
                 if not await registry.is_current(handle):
                     return
-                if not await registry.send_text(
-                    handle,
+                await transport.send_text(
                     _error_payload(ErrorCode.PROTOCOL_MALFORMED_FRAME, "Unknown tool result ID"),
-                ):
-                    return
+                )
                 await transport.close(1002, "protocol_error")
                 return
         elif isinstance(frame, HelloFrame):
-            if await registry.send_text(
-                handle,
+            await transport.send_text(
                 _error_payload(ErrorCode.PROTOCOL_MALFORMED_FRAME, "hello is only valid as first frame"),
-            ):
-                await transport.close(1002, "protocol_error")
+            )
+            await transport.close(1002, "protocol_error")
             return
         elif isinstance(
             frame,
@@ -569,10 +793,60 @@ async def _route_frames(
                     if exc.code == "protocol_transfer_unknown_id"
                     else ErrorCode.PROTOCOL_MALFORMED_FRAME
                 )
-                if await registry.send_text(handle, _error_payload(error_code, str(exc))):
-                    await transport.close(1002, "protocol_error")
+                await transport.send_text(_error_payload(error_code, str(exc)))
+                await transport.close(1002, "protocol_error")
                 return
         # A device-originated error is informational and does not affect routing.
+
+
+async def _register_mcp(
+    *,
+    registry: DeviceRegistry,
+    handle: ConnectionHandle,
+    transport: WebSocketTransport,
+    engine: AsyncEngine,
+    token: str,
+    frame: RegisterMcpFrame,
+    timeout_seconds: float = MCP_REGISTRATION_TIMEOUT_SECONDS,
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    try:
+        async with asyncio.timeout_at(deadline):
+            device = await _find_device_by_token(engine, token)
+            if device is None:
+                await transport.close(4401, UNAUTHORIZED_CLOSE_REASON)
+                return False
+            configs = devices.parse_stored_mcp_servers(device.mcp_servers)
+            catalog = devices.parse_stored_mcp_catalog(device.mcp_catalog)
+            candidate = validate_mcp_registration(
+                frame,
+                authoritative_config_revision=device.config_revision,
+                authoritative_configs=configs,
+                authoritative_catalog=catalog,
+            )
+            return await registry.publish_mcp_registration(
+                handle,
+                candidate,
+                timeout_seconds=max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
+            )
+    except TimeoutError:
+        await transport.close(1013, '{"code":"io_error"}')
+        return False
+    except McpRegistrationError as exc:
+        if exc.code == ErrorCode.PROTOCOL_MALFORMED_FRAME.value:
+            await transport.send_text(
+                _error_payload(ErrorCode.PROTOCOL_MALFORMED_FRAME, exc.message)
+            )
+            await transport.close(1002, "protocol_error")
+        else:
+            await transport.close(1011, '{"code":"config_validation_failed"}')
+        return False
+    except Exception:
+        await transport.close(1013, '{"code":"io_error"}')
+        return False
 
 
 async def _heartbeat(
@@ -675,6 +949,9 @@ def _parse_frame(
     payload: str,
 ) -> (
     HelloFrame
+    | ConfigAppliedFrame
+    | ConfigValidateResultFrame
+    | RegisterMcpFrame
     | ToolResultFrame
     | PongFrame
     | ErrorFrame
@@ -696,6 +973,9 @@ def _parse_frame(
     except ValidationError as exc:
         if raw.get("type") not in {
             "hello",
+            "config_applied",
+            "config_validate_result",
+            "register_mcp",
             "tool_result",
             "pong",
             "error",

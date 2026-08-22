@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from openctopus_server.api.device_ws import WebSocketTransport
 from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
+    ConfigAppliedFrame,
     DeviceConfigFrame,
     encode_binary_chunk,
     new_uuid7,
@@ -238,7 +239,7 @@ async def test_config_commit_and_push_are_serialized_in_commit_order() -> None:
     device_id = uuid4()
     user_id = uuid4()
     transport = BlockingConfigTransport()
-    await registry.register(
+    handle = await registry.register(
         device_id=device_id,
         user_id=user_id,
         device_name="laptop",
@@ -264,9 +265,36 @@ async def test_config_commit_and_push_are_serialized_in_commit_order() -> None:
     await asyncio.sleep(0)
     assert second.done() is False
     transport.release.set()
-    await asyncio.gather(first, second)
 
-    assert [json.loads(payload)["config"]["workspace_path"] for payload in transport.sent_text] == [
+    async def apply_update(index: int) -> None:
+        for _ in range(100):
+            updates = [
+                json.loads(payload)
+                for payload in transport.sent_text
+                if json.loads(payload).get("type") == "config_update"
+            ]
+            if len(updates) > index:
+                break
+            await asyncio.sleep(0)
+        update = updates[index]
+        assert await registry.resolve_config_applied(
+            handle,
+            ConfigAppliedFrame(
+                id=UUID(update["id"]),
+                config_revision=update["config_revision"],
+            ),
+        )
+
+    await apply_update(0)
+    await first
+    await apply_update(1)
+    await second
+
+    assert [
+        json.loads(payload)["config"]["workspace_path"]
+        for payload in transport.sent_text
+        if json.loads(payload).get("type") == "config_update"
+    ] == [
         "/committed/old",
         "/committed/new",
     ]
