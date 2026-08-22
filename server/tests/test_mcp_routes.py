@@ -461,6 +461,29 @@ def test_registration_rejects_stale_aggregate_snapshot(stale_field: str) -> None
     assert candidate.ack.results[0].code == "mcp_registration_stale"
 
 
+def test_stale_registration_rejects_the_reported_old_server_set() -> None:
+    catalog = _catalog(_entry())
+    old_runtime = ReadyMcpRuntimeSnapshot(
+        name="old",
+        runtime_generation=_GEN_ONE,
+        state="ready",
+        code=None,
+        source_catalog=_source(),
+    )
+
+    candidate = validate_mcp_registration(
+        _register(catalog, revision=6, servers=[old_runtime]),
+        authoritative_config_revision=7,
+        authoritative_configs=[_config()],
+        authoritative_catalog=catalog,
+    )
+
+    assert candidate.bindings == ()
+    assert [(result.name, result.accepted, result.code) for result in candidate.ack.results] == [
+        ("old", False, "mcp_registration_stale")
+    ]
+
+
 def test_registration_requires_exact_authoritative_server_coverage() -> None:
     catalog = _catalog(_entry())
     with pytest.raises(McpRegistrationError) as missing:

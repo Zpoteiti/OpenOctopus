@@ -229,11 +229,10 @@ async def test_handshake_rechecks_token_registers_and_acks_only_active_config(
     assert await registry.is_online(snapshot.id, user_id=snapshot.user_id) is False
 
 
-@pytest.mark.parametrize("secret", ["actual-secret", ""])
 async def test_secret_bearing_hello_requires_exact_wss_scope_and_uses_wire_secret(
     monkeypatch: Any,
-    secret: str,
 ) -> None:
+    secret = "actual-secret"
     snapshot = replace(
         _snapshot(),
         mcp_servers=[
@@ -278,6 +277,36 @@ async def test_secret_bearing_hello_requires_exact_wss_scope_and_uses_wire_secre
     hello_ack = json.loads(secure.sent[0])
     assert hello_ack["config"]["mcp_servers"][0]["env"] == {"TOKEN": secret}
     assert "<redacted>" not in secure.sent[0]
+
+
+async def test_empty_mcp_secret_value_does_not_require_wss(monkeypatch: Any) -> None:
+    snapshot = replace(
+        _snapshot(),
+        mcp_servers=[
+            {
+                "name": "demo",
+                "transport": "stdio",
+                "command": "mcp-demo",
+                "env": {"TOKEN": ""},
+            }
+        ],
+    )
+    hello = _hello()
+    websocket = _FakeWebSocket(
+        headers={"authorization": "Bearer token"},
+        scope={"scheme": "ws"},
+        incoming=[
+            {"type": "websocket.receive", "text": hello},
+            {"type": "websocket.receive", "text": _config_applied(hello)},
+        ],
+    )
+    monkeypatch.setattr(device_ws, "_find_device_by_token", AsyncMock(return_value=snapshot))
+
+    await device_ws.serve_device_socket(websocket, DeviceRegistry(), object())  # type: ignore[arg-type]
+
+    hello_ack = json.loads(websocket.sent[0])
+    assert hello_ack["config"]["mcp_servers"][0]["env"] == {"TOKEN": ""}
+    assert websocket.closes == [(1000, "")]
 
 
 async def test_register_mcp_is_validated_and_acked_after_config_activation(

@@ -77,6 +77,7 @@ class DeviceMcpUnavailableError(RuntimeError):
 
 UNAUTHORIZED_CLOSE_REASON = '{"code":"unauthorized"}'
 MCP_REGISTRATION_WAIT_SECONDS = 9.0
+VALIDATION_CANCEL_TIMEOUT_SECONDS = 5.0
 
 
 class DeviceTransport(Protocol):
@@ -226,7 +227,7 @@ class DeviceRegistry:
         self._revocation_epochs: OrderedDict[UUID, tuple[int, float]] = OrderedDict()
         self._config_locks: dict[UUID, _ConfigLockEntry] = {}
         self._publication_fences: dict[UUID, _PublicationFence] = {}
-        self._cleanup_tasks: set[asyncio.Task[bool]] = set()
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._retirement_tasks: dict[UUID, set[asyncio.Task[None]]] = {}
         self.transfers = TransferManager(
             self,
@@ -677,25 +678,27 @@ class DeviceRegistry:
         if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
             await self._expire_validation(connection, pending)
             raise DeviceProtocolError("MCP validation frame exceeds the text-frame limit")
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
         try:
-            async with connection.send_lock:
-                async with self._lock:
-                    current = self._connections.get(device_id)
-                    if (
-                        self._closed
-                        or current is not connection
-                        or current.handle != handle
-                        or current.config_validation is not pending
-                    ):
-                        raise DeviceUnavailableError("Device connection was replaced")
-                    pending.issued = True
-                await connection.transport.send_text(payload)
             try:
-                async with asyncio.timeout(timeout_seconds):
+                async with asyncio.timeout_at(deadline):
+                    async with connection.send_lock:
+                        async with self._lock:
+                            current = self._connections.get(device_id)
+                            if (
+                                self._closed
+                                or current is not connection
+                                or current.handle != handle
+                                or current.config_validation is not pending
+                            ):
+                                raise DeviceUnavailableError("Device connection was replaced")
+                            pending.issued = True
+                        await connection.transport.send_text(payload)
                     result = await asyncio.shield(future)
             except TimeoutError:
                 await self._expire_validation(connection, pending)
-                await self._send_validation_cancel(connection, handle, validation_id)
+                if pending.issued:
+                    self._schedule_validation_cancel(connection, handle, validation_id)
                 raise
         except asyncio.CancelledError:
             await self._expire_validation(connection, pending)
@@ -772,7 +775,7 @@ class DeviceRegistry:
             connection = self._connections.get(validation.handle.device_id)
             if connection is None or connection.handle != validation.handle:
                 return
-        await self._send_validation_cancel(
+        self._schedule_validation_cancel(
             connection,
             validation.handle,
             validation.id,
@@ -829,6 +832,29 @@ class DeviceRegistry:
                 await connection.transport.send_text(frame.model_dump_json())
         except Exception:
             self._schedule_unregister(handle)
+
+    def _schedule_validation_cancel(
+        self,
+        connection: _Connection,
+        handle: ConnectionHandle,
+        validation_id: UUID,
+    ) -> None:
+        async def _cancel_or_retire() -> None:
+            try:
+                async with asyncio.timeout(VALIDATION_CANCEL_TIMEOUT_SECONDS):
+                    await self._send_validation_cancel(connection, handle, validation_id)
+            except TimeoutError:
+                await self._retire_ambiguous_config(connection, handle)
+
+        task = asyncio.create_task(_cancel_or_retire())
+        self._cleanup_tasks.add(task)
+
+        def _consume_cleanup(completed: asyncio.Task[None]) -> None:
+            self._cleanup_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(_consume_cleanup)
 
     @asynccontextmanager
     async def config_update_lock(
@@ -1501,6 +1527,7 @@ class DeviceRegistry:
         frame_id: UUID | None = None,
         expected_handle: ConnectionHandle | None = None,
         timeout_seconds: float = 10.0,
+        handoff_future: asyncio.Future[bool] | None = None,
     ) -> bool:
         catalog = mcp_catalog or PersistedMcpCatalog(
             version=1,
@@ -1531,6 +1558,8 @@ class DeviceRegistry:
                     user_id=user_id,
                     expected_handle=expected_handle,
                 )
+                if handoff_future is not None and not handoff_future.done():
+                    handoff_future.set_result(False)
                 return False
             if connection.config_apply is not None:
                 raise DeviceBusyError("Device configuration apply is already in progress")
@@ -1548,6 +1577,8 @@ class DeviceRegistry:
                 user_id=user_id,
                 expected_handle=handle,
             )
+            if handoff_future is not None and not handoff_future.done():
+                handoff_future.set_result(not insecure_secret_transport)
         if insecure_secret_transport:
             await self._retire_ambiguous_config(connection, handle)
             return False
@@ -2027,7 +2058,7 @@ def _config_contains_secrets(config: DeviceConfigFrame) -> bool:
     for server in config.mcp_servers:
         payload = server.storage_dict()
         values = payload.get("env", payload.get("headers", {}))
-        if isinstance(values, dict) and values:
+        if isinstance(values, dict) and any(bool(value) for value in values.values()):
             return True
     return False
 

@@ -11,6 +11,7 @@ from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
 from openctopus_server.devices.mcp_models import (
     PersistedMcpCatalog,
     StdioMcpServerConfig,
+    StreamableHttpMcpServerConfig,
 )
 from openctopus_server.devices.mcp_routes import (
     AcceptedMcpBinding,
@@ -87,6 +88,37 @@ class BlockingFailingTransport(FakeTransport):
         self.send_started.set()
         await self.release_send.wait()
         raise OSError("socket is closed")
+
+
+@dataclass
+class FirstSendBlockingTransport(FakeTransport):
+    attempted_text: list[str] = field(default_factory=list)
+    send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    first_send_cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.attempted_text.append(payload)
+        if len(self.attempted_text) == 1:
+            self.send_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.first_send_cancelled.set()
+                raise
+        self.sent_text.append(payload)
+        self.sent.set()
+
+
+@dataclass
+class EverySendBlockingTransport(FakeTransport):
+    attempted_text: list[str] = field(default_factory=list)
+    second_send_started: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.attempted_text.append(payload)
+        if len(self.attempted_text) == 2:
+            self.second_send_started.set()
+        await asyncio.Future()
 
 
 @dataclass
@@ -931,6 +963,109 @@ async def test_validation_late_result_consumes_tombstone_once() -> None:
     assert not await registry.resolve_config_validate_result(handle, late)
 
 
+async def test_config_validation_deadline_includes_blocked_send() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FirstSendBlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            validate_servers=("demo",),
+            timeout_seconds=0.01,
+        )
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    try:
+        await asyncio.sleep(0.05)
+        assert validation.done()
+    finally:
+        if not validation.done():
+            validation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await validation
+
+    with pytest.raises(TimeoutError):
+        await validation
+    assert transport.first_send_cancelled.is_set()
+    request = json.loads(transport.attempted_text[0])
+    await asyncio.wait_for(transport.sent.wait(), timeout=1)
+    assert json.loads(transport.sent_text[0]) == {
+        "type": "config_validate_cancel",
+        "id": request["id"],
+    }
+    late = ConfigValidateResultFrame(
+        id=UUID(request["id"]),
+        ok=False,
+        failures=[
+            McpValidationFailure(
+                name="demo",
+                stage="initialize",
+                code="config_validation_failed",
+                message="late",
+            )
+        ],
+    )
+    assert await registry.resolve_config_validate_result(handle, late)
+
+
+async def test_blocked_validation_cancel_retires_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openctopus_server.devices.registry.VALIDATION_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = EverySendBlockingTransport()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            registry.validate_config(
+                device_id=device_id,
+                user_id=user_id,
+                expected_device_name="laptop",
+                base_config_revision=1,
+                candidate_config=DeviceConfigFrame(
+                    workspace_path="~/workspace",
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+                validate_servers=("demo",),
+                timeout_seconds=0.01,
+            ),
+            timeout=0.1,
+        )
+    await asyncio.wait_for(transport.second_send_started.wait(), timeout=1)
+    for _ in range(100):
+        if not await registry.is_online(device_id, user_id=user_id):
+            break
+        await asyncio.sleep(0.01)
+    assert not await registry.is_online(device_id, user_id=user_id)
+
+
 async def test_config_validation_wire_reveals_secret_only_to_the_wss_device() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
@@ -982,6 +1117,67 @@ async def test_config_validation_wire_reveals_secret_only_to_the_wss_device() ->
         ),
         failures=[],
     )
+    assert await registry.resolve_config_validate_result(handle, result)
+    assert (await validation).source_catalog == result.source_catalog
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        StdioMcpServerConfig(
+            name="demo",
+            transport="stdio",
+            command="mcp-demo",
+            env={"TOKEN": ""},
+        ),
+        StreamableHttpMcpServerConfig(
+            name="demo",
+            transport="streamable_http",
+            url="https://mcp.example.test",
+            headers={"Authorization": ""},
+        ),
+    ],
+)
+async def test_empty_mcp_secret_values_do_not_require_secure_device_transport(
+    server: StdioMcpServerConfig | StreamableHttpMcpServerConfig,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+                mcp_servers=[server],
+            ),
+            validate_servers=("demo",),
+            timeout_seconds=1,
+        )
+    )
+    request = await _wait_for_sent(transport)
+    result = ConfigValidateResultFrame(
+        id=UUID(str(request["id"])),
+        ok=True,
+        source_catalog=SourceMcpCatalog(
+            version=1,
+            servers=[SourceMcpServerCatalog(name="demo")],
+        ),
+        failures=[],
+    )
+
     assert await registry.resolve_config_validate_result(handle, result)
     assert (await validation).source_catalog == result.source_catalog
 

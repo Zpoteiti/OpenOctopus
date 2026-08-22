@@ -41,6 +41,7 @@ from openctopus_server.errors.exceptions import DeviceError
 from openctopus_server.services import devices
 
 router = APIRouter(prefix="/api/devices", tags=["Devices"])
+CONFIG_TRANSITION_TIMEOUT_SECONDS = 30.0
 
 
 @router.get("", response_model=list[DeviceResponse])
@@ -177,6 +178,9 @@ async def _build_validate_and_commit(
                 f"MCP validation failed for '{failure.name}'",
             ) from exc
 
+    transition_deadline = (
+        asyncio.get_running_loop().time() + CONFIG_TRANSITION_TIMEOUT_SECONDS
+    )
     transition = asyncio.create_task(
         _commit_and_activate_candidate(
             db,
@@ -192,6 +196,7 @@ async def _build_validate_and_commit(
                 else SourceMcpCatalog(version=1, servers=[])
             ),
             validation=validation,
+            transition_deadline=transition_deadline,
         )
     )
     return await await_future_cancellation_safe(transition)
@@ -208,6 +213,7 @@ async def _commit_and_activate_candidate(
     candidate_mcp: tuple[object, ...],
     source_catalog: SourceMcpCatalog,
     validation: ConfigValidation | None,
+    transition_deadline: float | None = None,
 ) -> devices.DeviceSnapshot:
     # The tuple is produced only by parse_mcp_server_configs; keeping the cast
     # local prevents REST DTO details from leaking into the persistence API.
@@ -215,63 +221,206 @@ async def _commit_and_activate_candidate(
 
     from openctopus_server.devices.mcp_models import McpServerConfig
 
-    parsed_candidate = cast(tuple[McpServerConfig, ...], candidate_mcp)
-    fence_installed = await registry.begin_config_update(
-        device_id=current.id,
-        user_id=user_id,
-        expected_handle=(validation.handle if validation is not None else None),
-    )
-    if validation is not None and not fence_installed:
-        await registry.discard_validated_config(validation)
-        raise DeviceError(ErrorCode.DEVICE_CONFIG_CONFLICT, "Device connection was replaced")
     try:
-        snapshot, changed = await devices.commit_config_candidate(
-            db,
-            user_id=user_id,
-            name=name,
-            base_config_revision=patch.base_config_revision,
-            fields=set(patch.model_fields_set) - {"base_config_revision", "mcp_servers"},
-            new_name=patch.name,
-            workspace_path=patch.workspace_path,
-            restrict_to_workspace=patch.restrict_to_workspace,
-            ssrf_denylist=patch.ssrf_denylist,
-            shell_timeout_max=patch.shell_timeout_max,
-            env_allowlist=patch.env_allowlist,
-            mcp_servers=(parsed_candidate if "mcp_servers" in patch.model_fields_set else None),
-            source_catalog=source_catalog,
-        )
-    except devices.DevicePatchCommitOutcomeUnknownError as exc:
+        deadline = transition_deadline
+        if deadline is None:
+            deadline = asyncio.get_running_loop().time() + CONFIG_TRANSITION_TIMEOUT_SECONDS
+        activation: asyncio.Task[bool] | None = None
+        async with asyncio.timeout_at(deadline):
+            parsed_candidate = cast(tuple[McpServerConfig, ...], candidate_mcp)
+            fence_installed = False
+            try:
+                fence_installed = await registry.begin_config_update(
+                    device_id=current.id,
+                    user_id=user_id,
+                    expected_handle=(validation.handle if validation is not None else None),
+                )
+                if validation is not None and not fence_installed:
+                    raise DeviceError(
+                        ErrorCode.DEVICE_CONFIG_CONFLICT,
+                        "Device connection was replaced",
+                    )
+                snapshot, changed = await devices.commit_config_candidate(
+                    db,
+                    user_id=user_id,
+                    name=name,
+                    base_config_revision=patch.base_config_revision,
+                    fields=set(patch.model_fields_set)
+                    - {"base_config_revision", "mcp_servers"},
+                    new_name=patch.name,
+                    workspace_path=patch.workspace_path,
+                    restrict_to_workspace=patch.restrict_to_workspace,
+                    ssrf_denylist=patch.ssrf_denylist,
+                    shell_timeout_max=patch.shell_timeout_max,
+                    env_allowlist=patch.env_allowlist,
+                    mcp_servers=(
+                        parsed_candidate if "mcp_servers" in patch.model_fields_set else None
+                    ),
+                    source_catalog=source_catalog,
+                )
+            except devices.DevicePatchCommitOutcomeUnknownError as exc:
+                cleanup = asyncio.create_task(
+                    _close_and_retire_config_update(
+                        db,
+                        registry,
+                        device_id=exc.device_id,
+                        user_id=user_id,
+                    )
+                )
+                try:
+                    await await_future_cancellation_safe(cleanup)
+                finally:
+                    raise exc.cause
+            except BaseException:
+                cleanup = asyncio.create_task(
+                    _close_and_discard_candidate(
+                        db,
+                        registry,
+                        device_id=current.id,
+                        user_id=user_id,
+                        fence_installed=fence_installed,
+                        validation=validation,
+                    )
+                )
+                try:
+                    await await_future_cancellation_safe(cleanup)
+                finally:
+                    raise
+            if not changed:
+                await _close_and_discard_candidate(
+                    db,
+                    registry,
+                    device_id=current.id,
+                    user_id=user_id,
+                    fence_installed=fence_installed,
+                    validation=validation,
+                )
+                return snapshot
+
+            handoff: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            activation = asyncio.create_task(
+                _activate_committed_candidate(
+                    db,
+                    registry,
+                    snapshot=snapshot,
+                    validation=validation,
+                    handoff=handoff,
+                )
+            )
+            try:
+                await asyncio.shield(handoff)
+            except BaseException:
+                activation.cancel()
+                cleanup = asyncio.create_task(
+                    _settle_activation_and_retire(
+                        activation,
+                        registry,
+                        device_id=snapshot.id,
+                        user_id=snapshot.user_id,
+                    )
+                )
+                try:
+                    await await_future_cancellation_safe(cleanup)
+                finally:
+                    raise
+    except TimeoutError as exc:
+        raise DeviceError(
+            ErrorCode.DEVICE_CONFIG_CONFLICT,
+            "Device configuration transition timed out",
+        ) from exc
+
+    assert activation is not None
+    await await_future_cancellation_safe(activation)
+    return snapshot
+
+
+async def _close_and_discard_candidate(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    device_id: UUID,
+    user_id: UUID,
+    fence_installed: bool,
+    validation: ConfigValidation | None,
+) -> None:
+    try:
+        if fence_installed:
+            await registry.abort_config_update(device_id=device_id, user_id=user_id)
+    finally:
         try:
-            await db.close()
+            if validation is not None:
+                await registry.discard_validated_config(validation)
         finally:
-            await registry.retire_config_update(device_id=exc.device_id, user_id=user_id)
-        raise exc.cause
-    except BaseException:
-        if fence_installed:
-            await registry.abort_config_update(device_id=current.id, user_id=user_id)
-        if validation is not None:
-            await registry.discard_validated_config(validation)
-        raise
-    if not changed:
-        if fence_installed:
-            await registry.abort_config_update(device_id=current.id, user_id=user_id)
-        if validation is not None:
-            await registry.discard_validated_config(validation)
-        return snapshot
+            await db.close()
+
+
+async def _close_and_retire_config_update(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    device_id: UUID,
+    user_id: UUID,
+) -> None:
     try:
         await db.close()
     finally:
-        await registry.push_config(
-            device_id=snapshot.id,
-            user_id=snapshot.user_id,
-            device_name=snapshot.name,
-            config=_snapshot_config_frame(snapshot),
-            config_revision=snapshot.config_revision,
-            mcp_catalog=devices.parse_stored_mcp_catalog(snapshot.mcp_catalog),
-            frame_id=(validation.id if validation is not None else None),
-            expected_handle=(validation.handle if validation is not None else None),
-        )
-    return snapshot
+        await registry.retire_config_update(device_id=device_id, user_id=user_id)
+
+
+async def _activate_committed_candidate(
+    db: AsyncSession,
+    registry: DeviceRegistry,
+    *,
+    snapshot: devices.DeviceSnapshot,
+    validation: ConfigValidation | None,
+    handoff: asyncio.Future[bool],
+) -> bool:
+    async def _push() -> bool:
+        try:
+            pushed = await registry.push_config(
+                device_id=snapshot.id,
+                user_id=snapshot.user_id,
+                device_name=snapshot.name,
+                config=_snapshot_config_frame(snapshot),
+                config_revision=snapshot.config_revision,
+                mcp_catalog=devices.parse_stored_mcp_catalog(snapshot.mcp_catalog),
+                frame_id=(validation.id if validation is not None else None),
+                expected_handle=(validation.handle if validation is not None else None),
+                handoff_future=handoff,
+            )
+        except asyncio.CancelledError:
+            if not handoff.done():
+                handoff.cancel()
+            raise
+        except BaseException as exc:
+            if not handoff.done():
+                handoff.set_exception(exc)
+            raise
+        if not handoff.done():
+            handoff.set_result(pushed)
+        return pushed
+
+    try:
+        await db.close()
+    except asyncio.CancelledError:
+        if not handoff.done():
+            handoff.cancel()
+        raise
+    except BaseException:
+        await _push()
+        raise
+    return await _push()
+
+
+async def _settle_activation_and_retire(
+    activation: asyncio.Task[bool],
+    registry: DeviceRegistry,
+    *,
+    device_id: UUID,
+    user_id: UUID,
+) -> None:
+    await asyncio.gather(activation, return_exceptions=True)
+    await registry.retire_config_update(device_id=device_id, user_id=user_id)
 
 
 def _non_mcp_noop(snapshot: devices.DeviceSnapshot, patch: DevicePatchRequest) -> bool:

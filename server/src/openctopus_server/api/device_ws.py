@@ -517,7 +517,7 @@ def _config_contains_secrets(config: DeviceConfigFrame) -> bool:
     for server in config.mcp_servers:
         payload = server.storage_dict()
         values = payload.get("env", payload.get("headers", {}))
-        if isinstance(values, dict) and values:
+        if isinstance(values, dict) and any(bool(value) for value in values.values()):
             return True
     return False
 

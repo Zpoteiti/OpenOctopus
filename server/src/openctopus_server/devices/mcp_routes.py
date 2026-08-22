@@ -381,18 +381,18 @@ def validate_mcp_registration(
         configs=authoritative_configs,
         catalog=authoritative_catalog,
     )
+    stale = (
+        frame.config_revision != authoritative_config_revision
+        or frame.catalog_digest != authoritative_catalog.digest
+    )
     requested_names = {snapshot.name for snapshot in frame.servers}
     expected_names = {config.name for config in normalized}
-    if requested_names != expected_names:
+    if not stale and requested_names != expected_names:
         raise McpRegistrationError(
             "protocol_malformed_frame",
             "register_mcp must exactly cover authoritative MCP servers",
         )
 
-    stale = (
-        frame.config_revision != authoritative_config_revision
-        or frame.catalog_digest != authoritative_catalog.digest
-    )
     results: list[AcceptedMcpRegistration | RejectedMcpRegistration] = []
     bindings: list[AcceptedMcpBinding] = []
     for snapshot in frame.servers:

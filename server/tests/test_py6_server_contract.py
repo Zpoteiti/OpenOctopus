@@ -947,6 +947,337 @@ async def test_patch_ambiguous_commit_retires_the_fenced_generation(
     assert registry.retired == 1
 
 
+async def test_candidate_transition_deadline_cleans_a_stalled_precommit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
+    from openctopus_server.devices.registry import ConfigValidation, ConnectionHandle
+    from openctopus_server.dto.device import DevicePatchRequest
+
+    device_id = uuid4()
+    user_id = uuid4()
+    validation_id = new_uuid7()
+    snapshot = devices.DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/old-workspace",
+        restrict_to_workspace=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+    commit_started = asyncio.Event()
+    commit_cancelled = asyncio.Event()
+
+    async def commit(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        commit_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            commit_cancelled.set()
+            raise
+
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
+
+    class _DB:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.aborted = 0
+            self.discarded = 0
+            self.retired = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def abort_config_update(self, **_kwargs: object) -> None:
+            self.aborted += 1
+
+        async def discard_validated_config(self, _validation: object) -> None:
+            self.discarded += 1
+
+        async def retire_config_update(self, **_kwargs: object) -> None:
+            self.retired += 1
+
+    db = _DB()
+    registry = _Registry()
+    transition = asyncio.create_task(
+        _commit_and_activate_candidate(
+            db,  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=snapshot,
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=ConfigValidation(
+                id=validation_id,
+                handle=ConnectionHandle(device_id=device_id, generation=1),
+                source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            ),
+            transition_deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+    )
+    await commit_started.wait()
+
+    with pytest.raises(DeviceError) as raised:
+        await asyncio.wait_for(transition, timeout=1)
+
+    assert raised.value.code is ErrorCode.DEVICE_CONFIG_CONFLICT
+    assert commit_cancelled.is_set()
+    assert db.closed
+    assert registry.aborted == 1
+    assert registry.discarded == 1
+    assert registry.retired == 0
+
+
+async def test_candidate_transition_deadline_retires_an_ambiguous_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
+    from openctopus_server.dto.device import DevicePatchRequest
+    from openctopus_server.services.devices import DevicePatchCommitOutcomeUnknownError
+
+    device_id = uuid4()
+    user_id = uuid4()
+    snapshot = devices.DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/old-workspace",
+        restrict_to_workspace=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+    commit_started = asyncio.Event()
+
+    async def commit(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        commit_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as exc:
+            raise DevicePatchCommitOutcomeUnknownError(exc, device_id=device_id) from exc
+
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
+
+    class _DB:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.aborted = 0
+            self.retired = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def abort_config_update(self, **_kwargs: object) -> None:
+            self.aborted += 1
+
+        async def retire_config_update(self, **_kwargs: object) -> None:
+            assert db.closed
+            self.retired += 1
+
+    db = _DB()
+    registry = _Registry()
+    transition = asyncio.create_task(
+        _commit_and_activate_candidate(
+            db,  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=snapshot,
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=None,
+            transition_deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+    )
+    await commit_started.wait()
+
+    with pytest.raises(DeviceError) as raised:
+        await asyncio.wait_for(transition, timeout=1)
+
+    assert raised.value.code is ErrorCode.DEVICE_CONFIG_CONFLICT
+    assert db.closed
+    assert registry.aborted == 0
+    assert registry.retired == 1
+
+
+async def test_candidate_transition_deadline_ends_only_after_push_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
+    from openctopus_server.dto.device import DevicePatchRequest
+
+    device_id = uuid4()
+    user_id = uuid4()
+    snapshot = devices.DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/new-workspace",
+        restrict_to_workspace=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+
+    async def commit(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        return snapshot, True
+
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
+
+    class _DB:
+        async def close(self) -> None:
+            return None
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.push_started = asyncio.Event()
+            self.push_release = asyncio.Event()
+            self.retired = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def push_config(self, **kwargs: object) -> bool:
+            handoff = kwargs["handoff_future"]
+            assert isinstance(handoff, asyncio.Future)
+            handoff.set_result(True)
+            self.push_started.set()
+            await self.push_release.wait()
+            return True
+
+        async def retire_config_update(self, **_kwargs: object) -> None:
+            self.retired += 1
+
+    registry = _Registry()
+    transition = asyncio.create_task(
+        _commit_and_activate_candidate(
+            _DB(),  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=replace(snapshot, workspace_path="~/old-workspace"),
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=None,
+            transition_deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+    )
+    await registry.push_started.wait()
+    await asyncio.sleep(0.03)
+    assert not transition.done()
+
+    registry.push_release.set()
+    assert await asyncio.wait_for(transition, timeout=1) == snapshot
+    assert registry.retired == 0
+
+
+async def test_candidate_transition_retires_when_push_never_takes_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openctopus_server.api.devices import _commit_and_activate_candidate
+    from openctopus_server.devices.mcp_models import SourceMcpCatalog
+    from openctopus_server.dto.device import DevicePatchRequest
+
+    device_id = uuid4()
+    user_id = uuid4()
+    snapshot = devices.DeviceSnapshot(
+        id=device_id,
+        user_id=user_id,
+        name="laptop",
+        token_hint="hint",
+        workspace_path="~/new-workspace",
+        restrict_to_workspace=False,
+        ssrf_denylist=[],
+        created_at=datetime.now(UTC),
+    )
+
+    async def commit(*_args: object, **_kwargs: object) -> tuple[object, bool]:
+        return snapshot, True
+
+    monkeypatch.setattr(devices, "commit_config_candidate", commit)
+
+    class _DB:
+        async def close(self) -> None:
+            return None
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.push_started = asyncio.Event()
+            self.push_cancelled = asyncio.Event()
+            self.retired = 0
+
+        async def begin_config_update(self, **_kwargs: object) -> bool:
+            return True
+
+        async def push_config(self, **_kwargs: object) -> bool:
+            self.push_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.push_cancelled.set()
+                raise
+
+        async def retire_config_update(self, **_kwargs: object) -> None:
+            self.retired += 1
+
+    registry = _Registry()
+    transition = asyncio.create_task(
+        _commit_and_activate_candidate(
+            _DB(),  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            user_id=user_id,
+            name="laptop",
+            patch=DevicePatchRequest(
+                base_config_revision=1,
+                workspace_path="~/new-workspace",
+            ),
+            current=replace(snapshot, workspace_path="~/old-workspace"),
+            candidate_mcp=(),
+            source_catalog=SourceMcpCatalog(version=1, servers=[]),
+            validation=None,
+            transition_deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+    )
+    await registry.push_started.wait()
+
+    with pytest.raises(DeviceError) as raised:
+        await asyncio.wait_for(transition, timeout=1)
+
+    assert raised.value.code is ErrorCode.DEVICE_CONFIG_CONFLICT
+    assert registry.push_cancelled.is_set()
+    assert registry.retired == 1
+
+
 def test_outcome_unknown_is_stable_tool_error() -> None:
     # The mapping is exercised through the public result code contract.
     assert ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value == "tool_execution_outcome_unknown"
