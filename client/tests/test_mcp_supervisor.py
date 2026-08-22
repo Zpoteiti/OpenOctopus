@@ -980,6 +980,116 @@ def test_dispatch_requires_exact_accepted_route_identity() -> None:
     asyncio.run(exercise())
 
 
+def test_invoke_cleanup_blocker_prevents_same_remote_sink_validation() -> None:
+    async def exercise() -> None:
+        class TimeoutCleanupBlockedRuntime(_FakeRuntime):
+            def __init__(self, config: McpServerConfig) -> None:
+                super().__init__(config)
+                self.close_calls = 0
+
+            async def invoke(
+                self,
+                entry_id: UUID,
+                arguments: Mapping[str, Any],
+                *,
+                runtime_generation: UUID,
+            ) -> ToolOutput:
+                self.invocations.append((entry_id, arguments, runtime_generation))
+                self.state = McpRuntimeState.CLEANUP_BLOCKED
+                self.code = "mcp_cleanup_incomplete"
+                return ToolOutput(
+                    "request outcome is unknown",
+                    is_error=True,
+                    code="tool_execution_outcome_unknown",
+                )
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                await super().close()
+
+        remote = StreamableHttpMcpServerConfig(
+            name="corp",
+            transport="streamable_http",
+            url="https://mcp.invalid/mcp",
+            headers={},
+        )
+        runtime = TimeoutCleanupBlockedRuntime(remote)
+        validation_calls = 0
+
+        def factory(config: McpServerConfig) -> McpServerRuntime:
+            assert config == remote
+            return cast(McpServerRuntime, runtime)
+
+        async def validator(
+            _configs: Sequence[McpServerConfig], **_kwargs: object
+        ) -> CandidateValidation:
+            nonlocal validation_calls
+            validation_calls += 1
+            return CandidateValidation(
+                source_catalog=None,
+                failures=(
+                    McpValidationFailure(
+                        server="corp",
+                        stage="candidate",
+                        code="config_validation_failed",
+                        message="candidate validation should not run",
+                    ),
+                ),
+            )
+
+        entry_id = new_uuid7()
+        supervisor = McpSupervisor(
+            runtime_factory=factory,
+            candidate_validator=cast(
+                Callable[..., Awaitable[CandidateValidation]], validator
+            ),
+        )
+        supervisor.attach_connection()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(remote),
+            catalog=_catalog(_persisted("corp", entry_id)),
+        )
+        await _ready_registration(supervisor, runtime)
+
+        result = await supervisor.invoke(
+            ToolCall(
+                id=new_uuid7(),
+                name="mcp_corp_echo",
+                args={},
+                max_result_bytes=4096,
+                mcp_route=McpRoute(
+                    entry_id=entry_id,
+                    config_revision=1,
+                    catalog_digest="a" * 64,
+                    runtime_generation=runtime.generation,
+                ),
+            )
+        )
+        assert result.code == "tool_execution_outcome_unknown"
+
+        validation = await supervisor.validate(
+            ConfigValidate(
+                id=new_uuid7(),
+                base_config_revision=1,
+                candidate_config=_device_config(
+                    remote.model_copy(update={"enabled_capabilities": []})
+                ),
+                validate_servers=["corp"],
+                deadline_ms=300000,
+            )
+        )
+        assert validation is not None and not validation.ok
+        assert validation.failures[0].code == "mcp_cleanup_incomplete"
+        assert validation_calls == 0
+
+        await supervisor.shutdown()
+        assert runtime.close_calls == 1
+        assert runtime.state is McpRuntimeState.ABSENT
+
+    asyncio.run(exercise())
+
+
 def test_insecure_server_origin_rejects_secret_activation_and_validation() -> None:
     async def exercise() -> None:
         factory = _RuntimeFactory()

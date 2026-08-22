@@ -980,13 +980,15 @@ class McpSupervisor:
                 raise
             except Exception:
                 return fail("tool_mcp_error", "The MCP request failed safely")
-            if slot.runtime.state not in {McpRuntimeState.READY, McpRuntimeState.AWAITING_ACK}:
-                self._accepted.pop(entry.server, None)
-                self._mark_dirty()
-                if slot.runtime.state is McpRuntimeState.UNAVAILABLE:
-                    self._schedule_retry(slot)
             return output
         finally:
+            if slot.runtime.state not in {McpRuntimeState.READY, McpRuntimeState.AWAITING_ACK}:
+                self._record_cleanup_state(slot.runtime)
+                if self._slots.get(entry.server) is slot:
+                    self._accepted.pop(entry.server, None)
+                    self._mark_dirty()
+                    if slot.runtime.state is McpRuntimeState.UNAVAILABLE:
+                        self._schedule_retry(slot)
             slot.calls -= 1
             if slot.calls == 0:
                 slot.drained.set()
