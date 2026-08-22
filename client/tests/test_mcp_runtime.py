@@ -225,6 +225,15 @@ def _config(name: str = "local") -> StdioMcpServerConfig:
     )
 
 
+def _remote_config(name: str = "remote") -> StreamableHttpMcpServerConfig:
+    return StreamableHttpMcpServerConfig(
+        name=name,
+        transport="streamable_http",
+        url="https://mcp.invalid/mcp",
+        headers={},
+    )
+
+
 def test_runtime_public_message_handler_emits_bounded_change_and_failure_events() -> None:
     async def exercise() -> list[McpRuntimeEvent]:
         runtime = McpServerRuntime(_config(), client_factory=_FakeBuilder())
@@ -445,6 +454,7 @@ async def test_candidate_failure_is_secret_safe_and_closes_every_runtime() -> No
 @pytest.mark.asyncio
 async def test_candidate_cleanup_failure_cannot_leak_third_party_exception() -> None:
     sentinel = "secret-from-close-exception"
+    retained: list[McpServerRuntime] = []
     builder = _FakeBuilder(
         lambda _name: _FakeClient(
             _FakeSession(),
@@ -453,23 +463,24 @@ async def test_candidate_cleanup_failure_cannot_leak_third_party_exception() -> 
         )
     )
 
-    outcome = await validate_candidate([_config()], client_factory=builder)
+    outcome = await validate_candidate(
+        [_config()],
+        client_factory=builder,
+        cleanup_sink=retained.extend,
+    )
 
     assert outcome.ok is False
     assert sentinel not in repr(outcome.failures)
     assert builder.clients["local"].closed is True
+    assert retained == []
 
 
 @pytest.mark.asyncio
 async def test_candidate_failure_reports_cleanup_blocked_runtime_to_owner() -> None:
     retained: list[McpServerRuntime] = []
-    builder = _FakeBuilder(
-        lambda _name: _FakeClient(
-            _FakeSession(),
-            enter_error=RuntimeError("connect failed"),
-            close_error=RuntimeError("cleanup failed"),
-        )
-    )
+    client = _FakeClient(_FakeSession(), enter_error=RuntimeError("connect failed"))
+    client.transport.cleanup_incomplete = True
+    builder = _FakeBuilder(lambda _name: client)
 
     outcome = await validate_candidate(
         [_config()],
@@ -485,13 +496,9 @@ async def test_candidate_failure_reports_cleanup_blocked_runtime_to_owner() -> N
 @pytest.mark.asyncio
 async def test_cancelled_candidate_reports_cleanup_blocked_runtime_to_owner() -> None:
     retained: list[McpServerRuntime] = []
-    builder = _FakeBuilder(
-        lambda _name: _FakeClient(
-            _FakeSession(),
-            enter_delay=60,
-            close_error=RuntimeError("cleanup failed"),
-        )
-    )
+    client = _FakeClient(_FakeSession(), enter_delay=60)
+    client.transport.cleanup_incomplete = True
+    builder = _FakeBuilder(lambda _name: client)
     task = asyncio.create_task(
         validate_candidate(
             [_config()],
@@ -632,6 +639,39 @@ async def test_transport_failure_closes_attempt_before_backoff() -> None:
     assert output.code == "tool_execution_outcome_unknown"
     assert "third-party transport detail" not in str(output.content)
     assert client.closed is True
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+    assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_invocation_timeout_closes_ambiguous_runtime_before_backoff() -> None:
+    class HangingSession(_FakeSession):
+        async def send_request(
+            self,
+            request: types.ClientRequest,
+            result_type: type[types.CallToolResult],
+        ) -> types.CallToolResult:
+            assert result_type is types.CallToolResult
+            self.sent_requests.append(request)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    session = HangingSession()
+    client = _FakeClient(session)
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+        invocation_timeout=0.01,
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+
+    assert output.code == "tool_execution_outcome_unknown"
+    assert client.closed
     assert runtime.state is McpRuntimeState.UNAVAILABLE
     assert runtime.enter_backoff(jitter=0.5) == 1
 
@@ -801,6 +841,54 @@ async def test_runtime_close_retries_cleanup_blocked_client() -> None:
     await runtime.close()
 
     assert client.close_calls == 2
+    assert runtime.state is McpRuntimeState.ABSENT
+
+
+@pytest.mark.asyncio
+async def test_remote_close_deadline_does_not_block_replacement() -> None:
+    release = asyncio.Event()
+
+    class HangingCloseClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__(_FakeSession())
+            self.close_calls = 0
+            self.close_cancelled = False
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    self.close_cancelled = True
+                    raise
+            self.closed = True
+
+    client = HangingCloseClient()
+    runtime = McpServerRuntime(
+        _remote_config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+        cleanup_timeout=0.01,
+    )
+    await runtime.start()
+    close_task = asyncio.create_task(runtime.close())
+    completed = False
+    first_state: McpRuntimeState | None = None
+    try:
+        done, _pending = await asyncio.wait({close_task}, timeout=0.1)
+        completed = close_task in done
+        if completed:
+            await close_task
+            first_state = runtime.state
+    finally:
+        release.set()
+        if not close_task.done():
+            await close_task
+        await runtime.close()
+
+    assert completed
+    assert first_state is McpRuntimeState.ABSENT
+    assert client.close_cancelled
     assert runtime.state is McpRuntimeState.ABSENT
 
 

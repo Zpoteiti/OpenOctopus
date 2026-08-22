@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ from openoctopus_client.tools.common import ToolOutput, fail
 CONNECT_TIMEOUT_SECONDS = 30.0
 DISCOVERY_TIMEOUT_SECONDS = 30.0
 INVOCATION_TIMEOUT_SECONDS = 60.0
+REMOTE_CLEANUP_TIMEOUT_SECONDS = 10.0
 CANDIDATE_TIMEOUT_SECONDS = 300.0
 VALIDATION_PARALLELISM = 4
 
@@ -297,8 +299,14 @@ class McpServerRuntime:
         connect_timeout: float = CONNECT_TIMEOUT_SECONDS,
         discovery_timeout: float = DISCOVERY_TIMEOUT_SECONDS,
         invocation_timeout: float = INVOCATION_TIMEOUT_SECONDS,
+        cleanup_timeout: float = REMOTE_CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
-        if connect_timeout <= 0 or discovery_timeout <= 0 or invocation_timeout <= 0:
+        if (
+            connect_timeout <= 0
+            or discovery_timeout <= 0
+            or invocation_timeout <= 0
+            or cleanup_timeout <= 0
+        ):
             raise ValueError("MCP runtime deadlines must be positive")
         self.config = config
         self.generation = new_uuid7()
@@ -310,11 +318,11 @@ class McpServerRuntime:
         self._connect_timeout = connect_timeout
         self._discovery_timeout = discovery_timeout
         self._invocation_timeout = invocation_timeout
+        self._cleanup_timeout = cleanup_timeout
         self._client: RuntimeClient | None = None
         self._source_catalog: SourceMcpServerCatalog | None = None
         self._routes: dict[UUID, McpEntryRoute] = {}
         self._close_task: asyncio.Task[None] | None = None
-        self._close_failed = False
         self._retry_attempt = 0
         self._event_kinds: set[McpRuntimeEventKind] = set()
         self._event_order: deque[McpRuntimeEventKind] = deque()
@@ -358,37 +366,52 @@ class McpServerRuntime:
         if self._close_task is None or (
             self._close_task.done() and self._cleanup_incomplete()
         ):
-            self._close_failed = False
             client = self._client
 
             async def close_client() -> None:
                 if client is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         await client.close()
-                    except Exception:
-                        self._close_failed = True
 
             self._close_task = asyncio.create_task(
                 close_client(),
                 name=f"mcp-close-{self.config.name}",
             )
         cancelled = False
+        deadline = (
+            asyncio.get_running_loop().time() + self._cleanup_timeout
+            if isinstance(self.config, RemoteMcpServerConfigBase)
+            else None
+        )
         while not self._close_task.done():
             try:
-                await asyncio.shield(self._close_task)
+                if deadline is None:
+                    await asyncio.shield(self._close_task)
+                    continue
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    self._close_task.cancel()
+                    break
+                done, _pending = await asyncio.wait(
+                    {self._close_task},
+                    timeout=remaining,
+                )
+                if self._close_task not in done:
+                    self._close_task.cancel()
+                    break
             except asyncio.CancelledError:
                 cancelled = True
-        await self._close_task
+        if self._close_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._close_task
         if cancelled:
             raise asyncio.CancelledError
 
     def _cleanup_incomplete(self) -> bool:
         return bool(
-            self._close_failed
-            or (
-                self._client is not None
-                and getattr(self._client.transport, "cleanup_incomplete", False)
-            )
+            isinstance(self.config, StdioMcpServerConfig)
+            and self._client is not None
+            and getattr(self._client.transport, "cleanup_incomplete", False)
         )
 
     def _effective_terminal_error(
@@ -546,7 +569,6 @@ class McpServerRuntime:
         self._source_catalog = None
         self._routes.clear()
         self._close_task = None
-        self._close_failed = False
         self._message_handler.clear_terminal_failure()
         self._clear_events()
 
@@ -650,6 +672,7 @@ class McpServerRuntime:
                 )
                 return map_prompt_result(prompt_result)
         except TimeoutError:
+            await self._close_unavailable("tool_execution_outcome_unknown")
             return fail(
                 "tool_execution_outcome_unknown",
                 "The MCP request timed out after it may have been sent; do not retry blindly",

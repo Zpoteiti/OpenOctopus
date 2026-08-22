@@ -269,6 +269,7 @@ def create_mcp_http_client(
 ) -> httpx.AsyncClient:
     """FastMCP-compatible HTTP client factory with fixed network semantics."""
 
+    del timeout
     kwargs.pop("follow_redirects", None)
     bounded_headers = dict(headers or {})
     for name in tuple(bounded_headers):
@@ -278,7 +279,7 @@ def create_mcp_http_client(
     return httpx.AsyncClient(
         headers=bounded_headers,
         auth=auth,
-        timeout=timeout,
+        timeout=None,
         follow_redirects=False,
         trust_env=False,
         verify=True,
@@ -290,39 +291,70 @@ def _windows_env_value(environment: Mapping[str, str], name: str) -> str | None:
     return _environment_value(environment, name, windows=True)
 
 
-def _resolve_windows_command(command: str, environment: Mapping[str, str]) -> str:
+def _resolve_windows_command(
+    command: str,
+    environment: Mapping[str, str],
+    *,
+    cwd: str | Path | None = None,
+) -> str:
     path = _windows_env_value(environment, "PATH") or ""
     pathext_value = _windows_env_value(environment, "PATHEXT") or ".COM;.EXE;.BAT;.CMD"
     extensions = tuple(
         item.casefold() for item in pathext_value.split(";") if item.startswith(".")
     )
     supplied_extension = ntpath.splitext(command)[1].casefold()
-    names = (
-        (command,)
-        if supplied_extension in extensions
-        else tuple(command + ext for ext in extensions)
-    )
-    directories = ("",) if ntpath.dirname(command) else tuple(path.split(";"))
-    for directory in directories:
-        candidate = ntpath.abspath(ntpath.join(directory.strip('"'), command))
-        candidate_base = candidate[: -len(command)] if command else candidate
-        for name in names:
-            resolved = candidate_base + name
+    working_dir = str(Path.cwd() if cwd is None else cwd)
+    candidates: tuple[str, ...]
+    if ntpath.dirname(command):
+        candidates = (
+            command if ntpath.isabs(command) else ntpath.join(working_dir, command),
+        )
+    else:
+        candidates = tuple(
+            ntpath.join(
+                directory.strip('"')
+                if ntpath.isabs(directory.strip('"'))
+                else ntpath.join(working_dir, directory.strip('"')),
+                command,
+            )
+            for directory in path.split(";")
+        )
+    for candidate in candidates:
+        names = (
+            (candidate,)
+            if supplied_extension in extensions
+            else tuple(candidate + ext for ext in extensions)
+        )
+        for resolved in names:
+            resolved = ntpath.normpath(resolved)
             if os.path.isfile(resolved):
                 return resolved
     raise FileNotFoundError(command)
 
 
 def _stdio_argv(
-    command: str, args: Sequence[str], environment: Mapping[str, str]
+    command: str,
+    args: Sequence[str],
+    environment: Mapping[str, str],
+    *,
+    cwd: str | Path | None = None,
 ) -> tuple[str, ...]:
     if os.name != "nt":
-        resolved = shutil.which(command, path=environment.get("PATH"))
+        candidate = command
+        search_path = environment.get("PATH")
+        if os.path.dirname(command) and not os.path.isabs(command):
+            candidate = str((Path.cwd() if cwd is None else Path(cwd)) / command)
+        elif cwd is not None and search_path is not None:
+            search_path = os.pathsep.join(
+                entry if os.path.isabs(entry) else str(Path(cwd) / entry)
+                for entry in search_path.split(os.pathsep)
+            )
+        resolved = shutil.which(candidate, path=search_path)
         if resolved is None:
             raise FileNotFoundError(command)
         return (resolved, *args)
 
-    resolved = _resolve_windows_command(command, environment)
+    resolved = _resolve_windows_command(command, environment, cwd=cwd)
     if ntpath.splitext(resolved)[1].casefold() not in {".cmd", ".bat"}:
         return (resolved, *args)
     system_root = _windows_env_value(os.environ, "SystemRoot") or r"C:\Windows"
@@ -403,9 +435,10 @@ class BoundedStdioTransport(ClientTransport):
         if self._provided_stderr_sink is None:
             self._owned_stderr_sink = open(os.devnull, "wb")  # noqa: SIM115
         stderr_sink = self._provided_stderr_sink or self._owned_stderr_sink
+        spawned = False
         try:
             self.process = await asyncio.create_subprocess_exec(
-                *_stdio_argv(self.command, self.args, self.environment),
+                *_stdio_argv(self.command, self.args, self.environment, cwd=self.cwd),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=stderr_sink,
@@ -413,6 +446,7 @@ class BoundedStdioTransport(ClientTransport):
                 env=self.environment,
                 **_new_session_kwargs(),
             )
+            spawned = True
             if self.process.stdin is None or self.process.stdout is None:
                 raise McpTransportError("stdio process streams were not created")
             if os.name == "nt":
@@ -431,7 +465,11 @@ class BoundedStdioTransport(ClientTransport):
             self._writer_task = asyncio.create_task(self._write_stdin(), name="mcp-stdio-writer")
         except BaseException:
             self._connecting = False
-            await self._close_owned_stderr()
+            if spawned:
+                with contextlib.suppress(BaseException):
+                    await self.close()
+            else:
+                await self._close_owned_stderr()
             raise
 
     async def _publish_error(self, error: Exception) -> None:

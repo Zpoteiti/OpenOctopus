@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ from openoctopus_client.mcp.transport import (
     McpTransportClosingError,
     McpTransportError,
     UnsupportedMcpContentEncodingError,
+    _stdio_argv,
     build_mcp_environment,
     create_fastmcp_client,
     create_mcp_http_client,
@@ -316,10 +318,17 @@ async def test_real_streamable_http_transport_initializes_explicitly() -> None:
 @pytest.mark.asyncio
 async def test_real_legacy_sse_transport_initializes_explicitly() -> None:
     fake = _SseMcpTransport()
+    effective_timeouts: list[httpx.Timeout] = []
+
+    def http_client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        client = create_mcp_http_client(_transport=fake, **kwargs)
+        effective_timeouts.append(client.timeout)
+        return client
+
     transport = SSETransport(
         "https://mcp.invalid/sse",
         headers={"X-MCP-Test": "present"},
-        httpx_client_factory=partial(create_mcp_http_client, _transport=fake),
+        httpx_client_factory=http_client_factory,
     )
     client = create_fastmcp_client(transport)
 
@@ -330,6 +339,55 @@ async def test_real_legacy_sse_transport_initializes_explicitly() -> None:
     assert any(request.method == "GET" for request in fake.requests)
     assert any(request.method == "POST" for request in fake.requests)
     assert all(request.headers["accept-encoding"] == "identity" for request in fake.requests)
+    assert effective_timeouts
+    assert all(
+        timeout.connect is None
+        and timeout.read is None
+        and timeout.write is None
+        and timeout.pool is None
+        for timeout in effective_timeouts
+    )
+
+
+def test_stdio_relative_command_resolves_from_configured_cwd(tmp_path: Path) -> None:
+    configured_cwd = tmp_path / "configured"
+    configured_cwd.mkdir()
+    if os.name == "nt":
+        executable = configured_cwd / "mcp-local.cmd"
+        executable.write_text("@exit /b 0\n", encoding="utf-8")
+        command = r".\mcp-local"
+        environment = {"PATH": "", "PATHEXT": ".CMD"}
+    else:
+        executable = configured_cwd / "mcp-local"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        command = "./mcp-local"
+        environment = {"PATH": ""}
+
+    argv = _stdio_argv(command, (), environment, cwd=configured_cwd)
+
+    assert str(executable.resolve()).casefold() in " ".join(argv).casefold()
+
+
+def test_stdio_bare_command_resolves_relative_path_from_configured_cwd(
+    tmp_path: Path,
+) -> None:
+    configured_cwd = tmp_path / "configured"
+    executable_dir = configured_cwd / "bin"
+    executable_dir.mkdir(parents=True)
+    if os.name == "nt":
+        executable = executable_dir / "mcp-local.cmd"
+        executable.write_text("@exit /b 0\n", encoding="utf-8")
+        environment = {"PATH": "bin", "PATHEXT": ".CMD"}
+    else:
+        executable = executable_dir / "mcp-local"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        environment = {"PATH": "bin"}
+
+    argv = _stdio_argv("mcp-local", (), environment, cwd=configured_cwd)
+
+    assert str(executable.resolve()).casefold() in " ".join(argv).casefold()
 
 
 @pytest.mark.asyncio
@@ -475,6 +533,44 @@ async def test_stdio_close_is_cancellation_shielded_and_force_kills(
     assert transport.cleanup_incomplete is False
     assert transport.process is not None and transport.process.returncode is not None
     await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_start_failure_after_spawn_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("openoctopus_client.mcp.transport._STDIN_EOF_SECONDS", 0.01)
+    monkeypatch.setattr("openoctopus_client.mcp.transport._TERMINATE_SECONDS", 0.01)
+    monkeypatch.setattr("openoctopus_client.mcp.transport._FORCE_KILL_SECONDS", 0.2)
+
+    class FailMemoryStream:
+        def __class_getitem__(cls, item: object) -> type[FailMemoryStream]:
+            del item
+            return cls
+
+        def __new__(cls, *args: object, **kwargs: object) -> FailMemoryStream:
+            del args, kwargs
+            raise RuntimeError("post-spawn setup failed")
+
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport.anyio.create_memory_object_stream",
+        FailMemoryStream,
+    )
+    transport = BoundedStdioTransport(
+        command=sys.executable,
+        args=("-c", "import time; time.sleep(60)"),
+    )
+
+    with pytest.raises(RuntimeError, match="post-spawn setup failed"):
+        await transport._start()
+    assert transport.process is not None
+    wait_task = asyncio.create_task(transport.process.wait())
+    try:
+        done, _pending = await asyncio.wait({wait_task}, timeout=0.5)
+        assert wait_task in done
+    finally:
+        await transport.close()
+        await wait_task
 
 
 @pytest.mark.asyncio
