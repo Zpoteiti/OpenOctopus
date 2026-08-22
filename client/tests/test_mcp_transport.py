@@ -320,8 +320,19 @@ async def test_real_legacy_sse_transport_initializes_explicitly() -> None:
     fake = _SseMcpTransport()
     effective_timeouts: list[httpx.Timeout] = []
 
-    def http_client_factory(**kwargs: Any) -> httpx.AsyncClient:
-        client = create_mcp_http_client(_transport=fake, **kwargs)
+    def http_client_factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+        **kwargs: Any,
+    ) -> httpx.AsyncClient:
+        client = create_mcp_http_client(
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+            _transport=fake,
+            **kwargs,
+        )
         effective_timeouts.append(client.timeout)
         return client
 

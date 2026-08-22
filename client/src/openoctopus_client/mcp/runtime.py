@@ -323,6 +323,8 @@ class McpServerRuntime:
         self._source_catalog: SourceMcpServerCatalog | None = None
         self._routes: dict[UUID, McpEntryRoute] = {}
         self._close_task: asyncio.Task[None] | None = None
+        self._stdio_cleanup_failed = False
+        self._remote_cleanup_pending = False
         self._retry_attempt = 0
         self._event_kinds: set[McpRuntimeEventKind] = set()
         self._event_order: deque[McpRuntimeEventKind] = deque()
@@ -366,12 +368,41 @@ class McpServerRuntime:
         if self._close_task is None or (
             self._close_task.done() and self._cleanup_incomplete()
         ):
+            self._stdio_cleanup_failed = False
+            self._remote_cleanup_pending = False
             client = self._client
 
             async def close_client() -> None:
-                if client is not None:
+                if client is None:
+                    return
+                if not isinstance(self.config, StdioMcpServerConfig):
                     with contextlib.suppress(Exception):
                         await client.close()
+                    return
+
+                client_close_failed = False
+                try:
+                    await client.close()
+                except asyncio.CancelledError:
+                    client_close_failed = True
+                except Exception:
+                    client_close_failed = True
+
+                transport = client.transport
+                if isinstance(transport, BoundedStdioTransport):
+                    try:
+                        await transport.close()
+                    except asyncio.CancelledError:
+                        self._stdio_cleanup_failed = True
+                    except Exception:
+                        self._stdio_cleanup_failed = True
+                    else:
+                        self._stdio_cleanup_failed = transport.cleanup_incomplete
+                else:
+                    self._stdio_cleanup_failed = bool(
+                        client_close_failed
+                        or getattr(transport, "cleanup_incomplete", False)
+                    )
 
             self._close_task = asyncio.create_task(
                 close_client(),
@@ -388,30 +419,39 @@ class McpServerRuntime:
                 if deadline is None:
                     await asyncio.shield(self._close_task)
                     continue
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    self._close_task.cancel()
-                    break
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
                 done, _pending = await asyncio.wait(
                     {self._close_task},
                     timeout=remaining,
                 )
                 if self._close_task not in done:
                     self._close_task.cancel()
+                    await asyncio.sleep(0)
                     break
             except asyncio.CancelledError:
                 cancelled = True
         if self._close_task.done():
             with contextlib.suppress(asyncio.CancelledError):
                 await self._close_task
+            self._remote_cleanup_pending = False
+        elif isinstance(self.config, RemoteMcpServerConfigBase):
+            self._remote_cleanup_pending = True
         if cancelled:
             raise asyncio.CancelledError
 
     def _cleanup_incomplete(self) -> bool:
+        if isinstance(self.config, RemoteMcpServerConfigBase):
+            return bool(
+                self._remote_cleanup_pending
+                and self._close_task is not None
+                and not self._close_task.done()
+            )
         return bool(
-            isinstance(self.config, StdioMcpServerConfig)
-            and self._client is not None
-            and getattr(self._client.transport, "cleanup_incomplete", False)
+            self._stdio_cleanup_failed
+            or (
+                self._client is not None
+                and getattr(self._client.transport, "cleanup_incomplete", False)
+            )
         )
 
     def _effective_terminal_error(
@@ -569,6 +609,8 @@ class McpServerRuntime:
         self._source_catalog = None
         self._routes.clear()
         self._close_task = None
+        self._stdio_cleanup_failed = False
+        self._remote_cleanup_pending = False
         self._message_handler.clear_terminal_failure()
         self._clear_events()
 

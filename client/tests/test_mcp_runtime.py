@@ -179,7 +179,9 @@ class _FakeClient:
         close_error: Exception | None = None,
     ) -> None:
         self.session = session
-        self.transport = SimpleNamespace(cleanup_incomplete=False)
+        self.transport: SimpleNamespace | BoundedStdioTransport = SimpleNamespace(
+            cleanup_incomplete=False
+        )
         self.enter_error = enter_error
         self.enter_delay = enter_delay
         self.close_delay = close_delay
@@ -472,7 +474,8 @@ async def test_candidate_cleanup_failure_cannot_leak_third_party_exception() -> 
     assert outcome.ok is False
     assert sentinel not in repr(outcome.failures)
     assert builder.clients["local"].closed is True
-    assert retained == []
+    assert len(retained) == 1
+    assert retained[0].state is McpRuntimeState.CLEANUP_BLOCKED
 
 
 @pytest.mark.asyncio
@@ -889,6 +892,107 @@ async def test_remote_close_deadline_does_not_block_replacement() -> None:
     assert completed
     assert first_state is McpRuntimeState.ABSENT
     assert client.close_cancelled
+    assert runtime.state is McpRuntimeState.ABSENT
+
+
+@pytest.mark.asyncio
+async def test_remote_close_exception_does_not_block_replacement() -> None:
+    client = _FakeClient(_FakeSession(), close_error=RuntimeError("remote close failed"))
+    runtime = McpServerRuntime(
+        _remote_config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+
+    await runtime.close()
+
+    assert runtime.state is McpRuntimeState.ABSENT
+
+
+@pytest.mark.asyncio
+async def test_remote_close_retains_delayed_cancellation_until_shutdown_retry() -> None:
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    class DelayedCancellationClient(_FakeClient):
+        async def close(self) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+
+    client = DelayedCancellationClient(_FakeSession())
+    runtime = McpServerRuntime(
+        _remote_config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+        cleanup_timeout=0.01,
+    )
+    await runtime.start()
+
+    await runtime.close()
+
+    assert cancellation_seen.is_set()
+    assert runtime.state.value == "cleanup_blocked"
+    assert runtime._close_task is not None and not runtime._close_task.done()
+
+    release.set()
+    await runtime.close()
+
+    assert runtime.state is McpRuntimeState.ABSENT
+    assert runtime._close_task is not None and runtime._close_task.done()
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_close_error_falls_through_to_transport_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = BoundedStdioTransport(command=sys.executable, args=("-c", "pass"))
+    transport_close_calls = 0
+
+    async def failing_transport_close() -> None:
+        nonlocal transport_close_calls
+        transport_close_calls += 1
+        raise RuntimeError("transport cleanup failed")
+
+    monkeypatch.setattr(transport, "close", failing_transport_close)
+    client = _FakeClient(_FakeSession(), close_error=RuntimeError("FastMCP close failed"))
+    client.transport = transport
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+
+    await runtime.close()
+
+    assert transport_close_calls == 1
+    assert runtime.state is McpRuntimeState.CLEANUP_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_close_error_is_recovered_by_transport_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = BoundedStdioTransport(command=sys.executable, args=("-c", "pass"))
+    transport_close_calls = 0
+
+    async def successful_transport_close() -> None:
+        nonlocal transport_close_calls
+        transport_close_calls += 1
+
+    monkeypatch.setattr(transport, "close", successful_transport_close)
+    client = _FakeClient(_FakeSession(), close_error=RuntimeError("FastMCP close failed"))
+    client.transport = transport
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+
+    await runtime.close()
+
+    assert transport_close_calls == 1
     assert runtime.state is McpRuntimeState.ABSENT
 
 
