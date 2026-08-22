@@ -136,7 +136,7 @@ def test_env_allowlist_rejects_reserved_prefix_case_insensitively() -> None:
         with pytest.raises(ValidationError):
             DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=False,
+                restrict_to_workspace=False,
                 ssrf_denylist=[],
                 env_allowlist=[name],
             )
@@ -400,14 +400,14 @@ async def test_ambiguous_policy_commit_retires_the_fenced_connection() -> None:
     assert await registry.unregister(handle) is False
 
 
-def test_client_only_exec_schemas_have_only_trusted_device_targets() -> None:
+def test_client_only_exec_schemas_have_all_owned_device_targets() -> None:
     registry = ToolRegistry((_ClientOnlyTool("exec", _EXEC_SCHEMA),))
     assert registry.get_tool_schemas() == []
-    schema = registry.get_tool_schemas(
-        device_names=("sandbox", "trusted"),
-        trusted_device_names=("trusted",),
-    )[0]
-    assert schema["input_schema"]["properties"]["openoctopus_device"]["enum"] == ["trusted"]
+    schema = registry.get_tool_schemas(device_names=("restricted", "unrestricted"))[0]
+    assert schema["input_schema"]["properties"]["openoctopus_device"]["enum"] == [
+        "restricted",
+        "unrestricted",
+    ]
     assert "server" not in schema["input_schema"]["properties"]["openoctopus_device"]["enum"]
 
 
@@ -420,16 +420,13 @@ def test_write_stdin_schema_explains_pipe_and_tty_control_semantics() -> None:
     assert "terminate=true" in description
 
 
-async def test_client_only_dispatch_rechecks_trust_without_blocking_sandbox_file_tools() -> None:
+async def test_client_only_dispatch_accepts_every_owned_device() -> None:
     user_id = uuid4()
     sandbox_id = uuid4()
     trusted_id = uuid4()
 
     async def resolve(_user_id: UUID, name: str) -> UUID | None:
         return {"sandbox": sandbox_id, "trusted": trusted_id}.get(name)
-
-    async def resolve_trusted(_user_id: UUID, name: str) -> UUID | None:
-        return trusted_id if name == "trusted" else None
 
     dispatcher = _DeviceDispatcher()
     registry = ToolRegistry(
@@ -439,11 +436,10 @@ async def test_client_only_dispatch_rechecks_trust_without_blocking_sandbox_file
             _ClientOnlyTool("write_stdin", _WRITE_STDIN_SCHEMA),
         ),
         device_resolver=resolve,
-        trusted_device_resolver=resolve_trusted,
     )
     ctx = ToolContext(user_id=user_id, session_id=uuid4())
 
-    rejected = await registry.execute(
+    restricted_exec = await registry.execute(
         name="exec",
         args={"command": "pwd", DEVICE_FIELD_NAME: "sandbox"},
         ctx=ctx,
@@ -465,10 +461,10 @@ async def test_client_only_dispatch_rechecks_trust_without_blocking_sandbox_file
         device_registry=dispatcher,
     )
 
-    assert rejected.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert restricted_exec.is_error is False
     assert accepted.is_error is False
     assert sandbox_file.is_error is False
-    assert len(dispatcher.calls) == 2
+    assert len(dispatcher.calls) == 3
 
 
 async def test_client_only_args_credit_deadline_and_result_limit_are_server_enforced() -> None:
@@ -486,7 +482,6 @@ async def test_client_only_args_credit_deadline_and_result_limit_are_server_enfo
             _ClientOnlyTool("list_exec_sessions", _LIST_EXEC_SESSIONS_SCHEMA),
         ),
         device_resolver=resolve,
-        trusted_device_resolver=resolve,
     )
     ctx = ToolContext(user_id=user_id, session_id=uuid4())
 
@@ -565,7 +560,7 @@ async def test_exec_normalization_preserves_bounded_output_report_metadata() -> 
     dispatcher = _DeviceDispatcher(content=report)
     registry = ToolRegistry(
         (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
-        trusted_device_resolver=resolve,
+        device_resolver=resolve,
     )
 
     result = await registry.execute(
@@ -596,7 +591,6 @@ async def test_device_specific_timeout_cap_is_left_to_the_current_client_config(
     registry = ToolRegistry(
         (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
         device_resolver=resolve,
-        trusted_device_resolver=resolve,
     )
     result = await registry.execute(
         name="exec",
@@ -655,7 +649,6 @@ async def test_client_only_transport_deadlines_follow_report_window(
     registry = ToolRegistry(
         (_ClientOnlyTool(name, schemas[name]),),
         device_resolver=resolve,
-        trusted_device_resolver=resolve,
     )
     await registry.execute(
         name=name,
@@ -690,7 +683,6 @@ async def test_client_exec_stable_errors_are_preserved(code: str) -> None:
     registry = ToolRegistry(
         (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
         device_resolver=resolve,
-        trusted_device_resolver=resolve,
     )
     result = await registry.execute(
         name="exec",
@@ -751,7 +743,7 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
         name="laptop",
         token_hint="hint",
         workspace_path="~/workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         created_at=datetime.now(UTC),
     )
@@ -759,10 +751,10 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
     async def owned_id(*_args: object, **_kwargs: object) -> UUID:
         return device_id
 
-    async def patch(*_args: object, **_kwargs: object) -> DeviceSnapshot:
+    async def patch(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
         committed.set()
         await release.wait()
-        return snapshot
+        return snapshot, True
 
     monkeypatch.setattr(devices, "owned_id", owned_id)
     monkeypatch.setattr(devices, "patch", patch)
@@ -793,7 +785,7 @@ async def test_patch_cancellation_does_not_rollback_a_committed_policy_fence(
     request = asyncio.create_task(
         patch_device(
             "laptop",
-            DevicePatchRequest(sandbox_mode=False),
+            DevicePatchRequest(restrict_to_workspace=False),
             user=SimpleNamespace(id=user_id),  # type: ignore[arg-type]
             db=_DB(),  # type: ignore[arg-type]
             registry=registry,  # type: ignore[arg-type]
@@ -823,7 +815,7 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
         name="laptop",
         token_hint="hint",
         workspace_path="~/new-workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         created_at=datetime.now(UTC),
     )
@@ -831,8 +823,8 @@ async def test_patch_db_close_failure_still_activates_committed_policy(
     async def owned_id(*_args: object, **_kwargs: object) -> UUID:
         return device_id
 
-    async def patch(*_args: object, **_kwargs: object) -> DeviceSnapshot:
-        return snapshot
+    async def patch(*_args: object, **_kwargs: object) -> tuple[DeviceSnapshot, bool]:
+        return snapshot, True
 
     monkeypatch.setattr(devices, "owned_id", owned_id)
     monkeypatch.setattr(devices, "patch", patch)
@@ -886,10 +878,11 @@ async def test_patch_ambiguous_commit_retires_the_fenced_generation(
         name="laptop",
         token_hint="hint",
         workspace_path="~/old-workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         shell_timeout_max=600,
         env_allowlist=[],
+        config_revision=1,
         created_at=datetime.now(UTC),
     )
     durable_workspace = "~/old-workspace"

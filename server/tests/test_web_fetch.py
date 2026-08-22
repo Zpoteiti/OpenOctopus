@@ -7,15 +7,20 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import openctopus_server.tools.web_fetch as web_fetch_module
 from openctopus_server.admission import KeyedAdmission
+from openctopus_server.db.models import SystemConfig
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.network_policy import compile_ssrf_policy
+from openctopus_server.services.system_config import load_web_fetch_policy
 from openctopus_server.tools.base import ToolContext, ToolResult
 from openctopus_server.tools.truncate import TRUNCATION_MARKER
 from openctopus_server.tools.web_fetch import (
     DEFAULT_MAX_CHARS,
     HtmlContentConverter,
+    PolicyLoader,
     WebFetchTool,
 )
 
@@ -94,13 +99,19 @@ def _web_fetch_tool(
     transport: httpx.AsyncBaseTransport | None = None,
     content_converter: HtmlContentConverter | None = None,
     web_admission: KeyedAdmission | None = None,
+    denylist: list[str] | None = None,
+    policy_loader: PolicyLoader | None = None,
 ) -> WebFetchTool:
+    async def load_policy():
+        return compile_ssrf_policy(denylist) if denylist is not None else compile_ssrf_policy(None)
+
     return WebFetchTool(
         web_admission=web_admission
         or KeyedAdmission(global_limit=2, per_key_limit=1, timeout_seconds=1),
         content_converter=content_converter or _StubContentConverter(),
         resolver=resolver,
         transport=transport,
+        policy_loader=policy_loader or load_policy,
     )
 
 
@@ -137,7 +148,7 @@ async def test_fetch_pins_checked_ip_and_preserves_host_and_sni() -> None:
     result = await tool.execute({"url": "https://example.com/path?q=1"}, _ctx())
 
     assert result == ToolResult(content="hello")
-    assert resolver_calls == [("example.com", 443), ("example.com", 443)]
+    assert resolver_calls == [("example.com", 443)]
     assert captured == {
         "url": f"https://{PUBLIC_IP}/path?q=1",
         "host": "example.com",
@@ -169,6 +180,7 @@ def test_fetch_schema_advertises_hard_max_chars() -> None:
         "240.0.0.1",
         "0.0.0.0",
         "::1",
+        "::ffff:127.0.0.1",
         "fc00::1",
         "fe80::1",
         "ff02::1",
@@ -201,24 +213,60 @@ async def test_fetch_rejects_mixed_public_and_private_dns_answers() -> None:
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
 
 
-async def test_fetch_rechecks_dns_immediately_before_connect() -> None:
+async def test_fetch_uses_one_dns_snapshot_per_hop_and_connects_to_that_ip() -> None:
     calls = 0
+    captured_url = ""
 
-    async def rebinding_resolver(hostname: str, port: int) -> list[str]:
+    async def resolver(hostname: str, port: int) -> list[str]:
         nonlocal calls
         calls += 1
-        return [PUBLIC_IP] if calls == 1 else ["127.0.0.1"]
+        assert (hostname, port) == ("snapshot.example", 80)
+        return [PUBLIC_IP]
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_url
+        captured_url = str(request.url)
+        return _streaming_text_response("safe", headers={"content-type": "text/plain"})
+
+    tool = _web_fetch_tool(resolver=resolver, transport=httpx.MockTransport(handler))
+
+    result = await tool.execute({"url": "http://snapshot.example/path"}, _ctx())
+
+    assert result == ToolResult(content="safe")
+    assert calls == 1
+    assert captured_url == f"http://{PUBLIC_IP}/path"
+
+
+async def test_fetch_explicit_empty_denylist_allows_private_target() -> None:
     tool = _web_fetch_tool(
-        resolver=rebinding_resolver,
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
+        denylist=[],
+        resolver=lambda hostname, port: asyncio.sleep(0, result=["10.1.2.3"]),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "internal",
+                headers={"content-type": "text/plain"},
+            )
+        ),
     )
 
-    result = await tool.execute({"url": "http://rebind.example"}, _ctx())
+    result = await tool.execute({"url": "http://internal.example"}, _ctx())
 
-    assert calls == 2
+    assert result == ToolResult(content="internal")
+
+
+async def test_fetch_applies_hostname_port_rule_before_dns() -> None:
+    resolver_calls: list[tuple[str, int]] = []
+    tool = _web_fetch_tool(
+        denylist=["blocked.example:8443"],
+        resolver=_public_resolver(resolver_calls),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unused")),
+    )
+
+    result = await tool.execute({"url": "https://blocked.example:8443/path"}, _ctx())
+
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+    assert resolver_calls == []
 
 
 async def test_fetch_admission_is_acquired_before_dns_and_is_released() -> None:
@@ -286,13 +334,19 @@ async def test_fetch_admission_is_held_through_html_conversion() -> None:
     second = await tool.execute({"url": "https://second.example"}, _ctx())
 
     assert second.code is ErrorCode.NETWORK_TIMEOUT
-    assert resolver_calls == ["first.example", "first.example"]
+    assert resolver_calls == ["first.example"]
     release_conversion.set()
     assert await first == ToolResult(content="converted")
 
 
 async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None:
     requests: list[str] = []
+    policy_loads = 0
+
+    async def load_policy():
+        nonlocal policy_loads
+        policy_loads += 1
+        return compile_ssrf_policy(None)
 
     async def resolve(hostname: str, port: int) -> list[str]:
         return ["127.0.0.1"] if hostname == "private.example" else [PUBLIC_IP]
@@ -301,13 +355,47 @@ async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None
         requests.append(str(request.url))
         return httpx.Response(302, headers={"location": "http://private.example/secret"})
 
-    tool = _web_fetch_tool(resolver=resolve, transport=httpx.MockTransport(handler))
+    tool = _web_fetch_tool(
+        resolver=resolve,
+        transport=httpx.MockTransport(handler),
+        policy_loader=load_policy,
+    )
 
     result = await tool.execute({"url": "https://public.example/start"}, _ctx())
 
     assert requests == [f"https://{PUBLIC_IP}/start"]
+    assert policy_loads == 1
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+async def test_fetch_hot_reads_the_postgres_policy(pg_engine: Any) -> None:
+    requests: list[str] = []
+
+    async def resolve(_hostname: str, _port: int) -> list[str]:
+        return ["10.1.2.3"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return _streaming_text_response("ok", headers={"content-type": "text/plain"})
+
+    tool = WebFetchTool(
+        web_admission=KeyedAdmission(global_limit=2, per_key_limit=1, timeout_seconds=1),
+        content_converter=_StubContentConverter(),
+        resolver=resolve,
+        transport=httpx.MockTransport(handler),
+        policy_loader=lambda: load_web_fetch_policy(pg_engine),
+    )
+
+    blocked = await tool.execute({"url": "http://internal.example/status"}, _ctx())
+    async with AsyncSession(pg_engine) as db:
+        db.add(SystemConfig(key="web_fetch_denylist", value=[]))
+        await db.commit()
+    allowed = await tool.execute({"url": "http://internal.example/status"}, _ctx())
+
+    assert blocked.code is ErrorCode.NETWORK_SSRF_BLOCKED
+    assert allowed == ToolResult(content="ok")
+    assert requests == ["http://10.1.2.3/status"]
 
 
 @pytest.mark.parametrize(

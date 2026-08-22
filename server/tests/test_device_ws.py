@@ -72,7 +72,7 @@ def _snapshot() -> DeviceSnapshot:
         name="laptop",
         token_hint="openoctopus_dev_...token",
         workspace_path="~/workspace",
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         ssrf_denylist=["127.0.0.0/8"],
         created_at=datetime.now(UTC),
     )
@@ -133,7 +133,7 @@ async def test_handshake_rechecks_token_registers_and_acks_only_active_config(
             "device_name": "laptop",
             "config": {
                 "workspace_path": "~/workspace",
-                "sandbox_mode": True,
+                "restrict_to_workspace": True,
                 "ssrf_denylist": ["127.0.0.0/8"],
                 "shell_timeout_max": 600,
                 "env_allowlist": list(DEFAULT_ENV_ALLOWLIST),
@@ -226,7 +226,7 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
                 shells=shells,
             )
 
-    snapshot = replace(_snapshot(), sandbox_mode=False)
+    snapshot = replace(_snapshot(), restrict_to_workspace=False)
     disconnect = asyncio.Event()
     websocket = _FakeWebSocket(
         headers={"authorization": "Bearer token"},
@@ -258,7 +258,7 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
                 device_name=snapshot.name,
                 config=DeviceConfigFrame(
                     workspace_path=snapshot.workspace_path,
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=snapshot.ssrf_denylist,
                 ),
             )
@@ -274,8 +274,8 @@ async def test_config_patch_cannot_be_missed_during_handshake_registration(
 
     frames = [json.loads(payload) for payload in websocket.sent]
     assert [frame["type"] for frame in frames] == ["hello_ack", "config_update"]
-    assert frames[0]["config"]["sandbox_mode"] is False
-    assert frames[1]["config"]["sandbox_mode"] is True
+    assert frames[0]["config"]["restrict_to_workspace"] is False
+    assert frames[1]["config"]["restrict_to_workspace"] is True
 
 
 async def test_revoked_token_between_hello_and_registration_is_rejected(

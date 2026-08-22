@@ -49,7 +49,7 @@ async def create_device(
         user_id=user.id,
         name=body.name,
         workspace_path=body.workspace_path,
-        sandbox_mode=body.sandbox_mode,
+        restrict_to_workspace=body.restrict_to_workspace,
         ssrf_denylist=body.ssrf_denylist,
         shell_timeout_max=body.shell_timeout_max,
         env_allowlist=body.env_allowlist,
@@ -90,7 +90,8 @@ async def _patch_and_activate(
 ) -> devices.DeviceSnapshot:
     policy_fields = {
         "workspace_path",
-        "sandbox_mode",
+        "restrict_to_workspace",
+        "ssrf_denylist",
         "shell_timeout_max",
         "env_allowlist",
     }
@@ -104,14 +105,14 @@ async def _patch_and_activate(
                 user_id=user_id,
             )
     try:
-        snapshot = await devices.patch(
+        snapshot, changed = await devices.patch(
             db,
             user_id=user_id,
             name=name,
             fields=set(patch.model_fields_set),
             new_name=patch.name,
             workspace_path=patch.workspace_path,
-            sandbox_mode=patch.sandbox_mode,
+            restrict_to_workspace=patch.restrict_to_workspace,
             ssrf_denylist=patch.ssrf_denylist,
             shell_timeout_max=patch.shell_timeout_max,
             env_allowlist=patch.env_allowlist,
@@ -132,6 +133,16 @@ async def _patch_and_activate(
                 user_id=user_id,
             )
         raise
+    if not changed:
+        if fence_installed and fenced_device_id is not None:
+            try:
+                await db.close()
+            finally:
+                await registry.abort_config_update(
+                    device_id=fenced_device_id,
+                    user_id=user_id,
+                )
+        return snapshot
     if patch.model_fields_set:
         # The commit above ended the DB transaction. Close the session before
         # any potentially slow device transport await. The committed policy
@@ -145,7 +156,7 @@ async def _patch_and_activate(
                 device_name=snapshot.name,
                 config=DeviceConfigFrame(
                     workspace_path=snapshot.workspace_path,
-                    sandbox_mode=snapshot.sandbox_mode,
+                    restrict_to_workspace=snapshot.restrict_to_workspace,
                     ssrf_denylist=snapshot.ssrf_denylist,
                     shell_timeout_max=snapshot.shell_timeout_max,
                     env_allowlist=snapshot.env_allowlist,
@@ -198,13 +209,34 @@ async def _response(snapshot: devices.DeviceSnapshot, registry: DeviceRegistry) 
         name=snapshot.name,
         token_hint=snapshot.token_hint,
         workspace_path=snapshot.workspace_path,
-        sandbox_mode=snapshot.sandbox_mode,
+        restrict_to_workspace=snapshot.restrict_to_workspace,
         ssrf_denylist=snapshot.ssrf_denylist,
         shell_timeout_max=snapshot.shell_timeout_max,
         env_allowlist=snapshot.env_allowlist,
+        config_revision=snapshot.config_revision,
+        mcp_config_count=len(snapshot.mcp_servers),
+        mcp_enabled_capability_count=_enabled_capability_count(snapshot.mcp_catalog),
+        mcp_catalog_digest=str(snapshot.mcp_catalog["digest"]),
         online=await registry.is_online(snapshot.id, user_id=snapshot.user_id),
         created_at=snapshot.created_at,
     )
+
+
+def _enabled_capability_count(catalog: dict[str, object]) -> int:
+    servers = catalog.get("servers")
+    if not isinstance(servers, list):
+        return 0
+    count = 0
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        entries = server.get("entries")
+        if not isinstance(entries, list):
+            continue
+        count += sum(
+            isinstance(entry, dict) and entry.get("enabled") is True for entry in entries
+        )
+    return count
 
 
 async def _after_commit[T](

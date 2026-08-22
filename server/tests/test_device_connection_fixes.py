@@ -116,13 +116,13 @@ def test_workspace_path_rejects_nul_in_protocol_frame() -> None:
     with pytest.raises(ValueError, match="NUL"):
         DeviceConfigFrame(
             workspace_path="/tmp/work\x00space",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         )
     with pytest.raises(ValueError, match="NUL"):
         DeviceConfigFrame(
             workspace_path="/tmp/workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=["127.0.0.1\x00/32"],
         )
 
@@ -253,7 +253,7 @@ async def test_config_commit_and_push_are_serialized_in_commit_order() -> None:
                 device_name="laptop",
                 config=DeviceConfigFrame(
                     workspace_path=path,
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                     ssrf_denylist=[],
                 ),
             )

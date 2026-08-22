@@ -201,7 +201,9 @@ class Device(Base):
     workspace_path: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'~/openoctopus/workspace'")
     )
-    sandbox_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    restrict_to_workspace: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("TRUE")
+    )
     ssrf_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
@@ -218,6 +220,23 @@ class Device(Base):
         server_default=text(
             "'[\"PATH\",\"HOME\",\"LANG\",\"TERM\",\"SystemRoot\",\"ComSpec\",\"PATHEXT\",\"TEMP\",\"TMP\",\"USERPROFILE\"]'::jsonb"
         ),
+    )
+    mcp_servers: Mapped[list[Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    mcp_catalog: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            "'{\"version\": 1, \"digest\": \"d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf\", \"servers\": []}'::jsonb"
+        ),
+    )
+    config_revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -238,6 +257,10 @@ class Device(Base):
         CheckConstraint(
             "shell_timeout_max >= 0 AND shell_timeout_max <= 86400",
             name="check_device_shell_timeout_max",
+        ),
+        CheckConstraint(
+            "config_revision >= 1",
+            name="check_device_config_revision",
         ),
     )
 

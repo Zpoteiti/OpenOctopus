@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import ipaddress
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import ConfigError
+
+DEFAULT_SSRF_DENYLIST = (
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "::/128",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "169.254.169.254/32",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+)
+
+_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MAX_ENTRIES = 256
+_MAX_ENTRY_BYTES = 512
+
+type IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+@dataclass(frozen=True, slots=True)
+class SsrfPolicy:
+    canonical_entries: tuple[str, ...]
+    networks: tuple[IpNetwork, ...]
+    hosts: frozenset[str]
+    host_ports: frozenset[tuple[str, int]]
+
+    def denies_host(self, hostname: str, port: int) -> bool:
+        return hostname in self.hosts or (hostname, port) in self.host_ports
+
+    def denies_address(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int) -> bool:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            return self.denies_address(address.ipv4_mapped, port)
+        normalized = str(address)
+        return (normalized, port) in self.host_ports or any(
+            address.version == network.version and address in network for network in self.networks
+        )
+
+
+def canonicalize_ssrf_denylist(entries: Iterable[str]) -> tuple[str, ...]:
+    values = tuple(entries)
+    if len(values) > _MAX_ENTRIES:
+        raise _invalid("web_fetch_denylist has too many entries")
+
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _canonical_entry(value)
+        if normalized in seen:
+            raise _invalid("web_fetch_denylist contains duplicate entries")
+        seen.add(normalized)
+        canonical.append(normalized)
+    return tuple(canonical)
+
+
+def compile_ssrf_policy(entries: Iterable[str] | None) -> SsrfPolicy:
+    canonical = canonicalize_ssrf_denylist(
+        DEFAULT_SSRF_DENYLIST if entries is None else entries
+    )
+    networks: list[IpNetwork] = []
+    hosts: set[str] = set()
+    host_ports: set[tuple[str, int]] = set()
+    for entry in canonical:
+        try:
+            network = ipaddress.ip_network(entry, strict=True)
+        except ValueError:
+            host, port = _split_host_port(entry)
+            if port is None:
+                hosts.add(host)
+            else:
+                host_ports.add((host, port))
+        else:
+            networks.append(network)
+    return SsrfPolicy(canonical, tuple(networks), frozenset(hosts), frozenset(host_ports))
+
+
+def _canonical_entry(value: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise _invalid("web_fetch_denylist entries must be non-blank without outer whitespace")
+    if "\x00" in value or len(value.encode("utf-8")) > _MAX_ENTRY_BYTES:
+        raise _invalid("web_fetch_denylist entries must be bounded and contain no NUL")
+
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        host, port = _split_host_port(value)
+        canonical_host = _canonical_host(host)
+        if port is None:
+            return canonical_host
+        rendered_host = f"[{canonical_host}]" if ":" in canonical_host else canonical_host
+        return f"{rendered_host}:{port}"
+    return network.with_prefixlen
+
+
+def _split_host_port(value: str) -> tuple[str, int | None]:
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing <= 1 or closing + 1 >= len(value) or value[closing + 1] != ":":
+            raise _invalid("web_fetch_denylist contains an invalid host and port")
+        host = value[1:closing]
+        port_text = value[closing + 2 :]
+    elif value.count(":") == 1:
+        host, separator, port_text = value.partition(":")
+        if not separator:
+            return value, None
+    elif ":" in value:
+        raise _invalid("IPv6 host and port entries must use brackets")
+    else:
+        return value, None
+
+    if not port_text.isascii() or not port_text.isdecimal():
+        raise _invalid("web_fetch_denylist port must be an integer")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise _invalid("web_fetch_denylist port must be between 1 and 65535")
+    return host, port
+
+
+def _canonical_host(value: str) -> str:
+    if not value or any(character in value for character in "/\\@?#*"):
+        raise _invalid("web_fetch_denylist contains an invalid hostname")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        try:
+            hostname = value.encode("idna").decode("ascii").rstrip(".").lower()
+        except UnicodeError as exc:
+            raise _invalid("web_fetch_denylist contains an invalid hostname") from exc
+        if (
+            not hostname
+            or len(hostname) > 253
+            or any(_HOST_LABEL.fullmatch(label) is None for label in hostname.split("."))
+        ):
+            raise _invalid("web_fetch_denylist contains an invalid hostname")
+        return hostname
+    return str(address)
+
+
+def _invalid(message: str) -> ConfigError:
+    return ConfigError(ErrorCode.CONFIG_VALIDATION_FAILED, message)

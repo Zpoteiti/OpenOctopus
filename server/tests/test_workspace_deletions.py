@@ -293,7 +293,7 @@ async def test_user_deletion_commit_and_device_invalidation_survive_cancellation
             token_hash=b"c" * 32,
             token_hint="openoctopus_dev_...cancel",
             workspace_path="~/workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         )
         setup_db.add(device)

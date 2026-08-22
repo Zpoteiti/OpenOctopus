@@ -148,7 +148,7 @@ class ChatRuntime:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
         self.limiter = ProviderLimiter()
-        self.tool_registry = tool_registry or build_py3_registry()
+        self.tool_registry = tool_registry or build_py3_registry(engine=engine)
         self.workspace_service = workspace_service
         self.device_registry = device_registry or get_device_registry()
         self.context_admission = context_admission or get_context_admission()
@@ -824,7 +824,7 @@ class ChatRuntime:
             device_rows = list(
                 (
                     await db.execute(
-                        select(Device.name, Device.id, Device.sandbox_mode)
+                        select(Device.name, Device.id)
                         .where(Device.user_id == user_id)
                         .order_by(Device.created_at, Device.id)
                     )
@@ -832,14 +832,10 @@ class ChatRuntime:
                 .tuples()
                 .all()
             )
-            device_targets = {name: device_id for name, device_id, _ in device_rows}
-            trusted_device_names = [
-                name for name, _, sandbox_mode in device_rows if not sandbox_mode
-            ]
+            device_targets = dict(device_rows)
 
         registry_schemas = self.tool_registry.get_tool_schemas(
             device_names=device_targets.keys(),
-            trusted_device_names=trusted_device_names,
         )
 
         should_compact = False

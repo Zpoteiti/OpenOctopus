@@ -409,7 +409,7 @@ async def serve_device_socket(
                 device_name=device.name,
                 config=DeviceConfigFrame(
                     workspace_path=device.workspace_path,
-                    sandbox_mode=device.sandbox_mode,
+                    restrict_to_workspace=device.restrict_to_workspace,
                     ssrf_denylist=device.ssrf_denylist,
                     shell_timeout_max=device.shell_timeout_max,
                     env_allowlist=device.env_allowlist,

@@ -427,7 +427,7 @@ async def test_config_push_updates_the_current_connection_name() -> None:
             device_name="new-name",
             config=DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -474,7 +474,7 @@ async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )
@@ -509,7 +509,7 @@ async def test_config_push_send_failure_marks_the_device_offline() -> None:
             device_name="laptop",
             config=DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -539,7 +539,7 @@ async def test_cancelled_config_push_retires_the_ambiguous_generation(
             device_name="new-name",
             config=DeviceConfigFrame(
                 workspace_path="~/new-workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -572,7 +572,7 @@ async def test_config_update_precedes_new_name_dispatch_and_blocks_stale_name() 
             device_name="new-name",
             config=DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -1004,7 +1004,7 @@ async def test_config_push_preserves_active_transfer_and_rejects_stale_new_route
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )
@@ -1095,7 +1095,7 @@ async def test_config_push_fences_an_unissued_transfer_preflight() -> None:
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )

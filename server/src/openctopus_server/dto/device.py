@@ -28,7 +28,7 @@ class DeviceCreateRequest(BaseModel):
 
     name: str
     workspace_path: WorkspacePath = "~/openoctopus/workspace"
-    sandbox_mode: bool = True
+    restrict_to_workspace: bool = True
     ssrf_denylist: SsrfDenylist | None = None
     shell_timeout_max: int = Field(default=600, ge=0, le=86400)
     env_allowlist: EnvAllowlist | None = None
@@ -39,7 +39,7 @@ class DevicePatchRequest(BaseModel):
 
     name: str | None = None
     workspace_path: WorkspacePath | None = None
-    sandbox_mode: bool | None = None
+    restrict_to_workspace: bool | None = None
     ssrf_denylist: SsrfDenylist | None = None
     shell_timeout_max: int | None = Field(default=None, ge=0, le=86400)
     env_allowlist: EnvAllowlist | None = None
@@ -52,10 +52,14 @@ class DeviceResponse(BaseModel):
     name: str
     token_hint: str
     workspace_path: str
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: list[str]
     shell_timeout_max: int
     env_allowlist: list[str]
+    config_revision: int
+    mcp_config_count: int
+    mcp_enabled_capability_count: int
+    mcp_catalog_digest: str
     online: bool
     created_at: datetime
 

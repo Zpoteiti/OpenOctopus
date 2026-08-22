@@ -409,7 +409,7 @@ async def _create_rows(engine: AsyncEngine, config: NetworkHarnessConfig) -> _Ro
                 token_hash=token_digest(token),
                 token_hint=token_hint(token),
                 workspace_path="/tmp/openoctopus-capacity-harness",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         )

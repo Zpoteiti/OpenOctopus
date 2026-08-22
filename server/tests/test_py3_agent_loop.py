@@ -614,7 +614,7 @@ async def test_provider_schema_includes_only_the_session_owners_paired_devices(
         await runtime.close()
 
 
-async def test_sandbox_device_keeps_file_tools_but_not_exec(
+async def test_all_owned_devices_get_file_and_exec_tools(
     user_client,
     test_app,
     pg_engine,
@@ -630,14 +630,14 @@ async def test_sandbox_device_keeps_file_tools_but_not_exec(
                     name="sandbox-laptop",
                     token_hash=b"s" * 32,
                     token_hint="sandbox-token",
-                    sandbox_mode=True,
+                    restrict_to_workspace=True,
                 ),
                 Device(
                     user_id=owner.id,
                     name="trusted-laptop",
                     token_hash=b"t" * 32,
                     token_hint="trusted-token",
-                    sandbox_mode=False,
+                    restrict_to_workspace=False,
                 ),
             ]
         )
@@ -662,9 +662,9 @@ async def test_sandbox_device_keeps_file_tools_but_not_exec(
             "sandbox-laptop",
             "trusted-laptop",
         }
-        assert schemas["exec"]["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
-            "trusted-laptop"
-        ]
+        assert set(
+            schemas["exec"]["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"]
+        ) == {"sandbox-laptop", "trusted-laptop"}
     finally:
         await runtime.close()
 
@@ -1920,7 +1920,7 @@ async def test_cancel_during_device_preflight_marks_current_and_remaining_cancel
             name="trusted-laptop",
             token_hash=b"p" * 32,
             token_hint="preflight-token",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
         )
         db.add(device)
         await db.commit()
@@ -1954,7 +1954,7 @@ async def test_cancel_during_device_preflight_marks_current_and_remaining_cancel
         provider_factory=lambda config: provider,
         tool_registry=ToolRegistry(
             (_ExecTool([]),),
-            trusted_device_resolver=block_preflight,
+            device_resolver=block_preflight,
         ),
     )
     test_app.state.chat_runtime = runtime
@@ -1997,7 +1997,7 @@ async def test_cancel_after_device_issue_consumes_late_result_without_overwrite(
             name="trusted-laptop",
             token_hash=b"i" * 32,
             token_hint="issued-token",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
         )
         db.add(device)
         await db.commit()

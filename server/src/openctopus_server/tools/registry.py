@@ -26,6 +26,8 @@ from openctopus_server.devices.registry import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError
+from openctopus_server.network_policy import SsrfPolicy
+from openctopus_server.services.system_config import load_web_fetch_policy
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
 from openctopus_server.tools.device_field import (
     DEVICE_FIELD_MARKER,
@@ -35,7 +37,12 @@ from openctopus_server.tools.device_field import (
 from openctopus_server.tools.file_transfer import FileTransferTool
 from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.result import normalize_tool_result
-from openctopus_server.tools.web_fetch import HtmlContentConverter, Resolver, WebFetchTool
+from openctopus_server.tools.web_fetch import (
+    HtmlContentConverter,
+    PolicyLoader,
+    Resolver,
+    WebFetchTool,
+)
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
 from openctopus_server.tools.workspace_files import build_workspace_file_tools
 from openctopus_server.workspace.file_content import DocumentParser
@@ -167,10 +174,8 @@ class ToolRegistry:
         tools: Iterable[Tool],
         *,
         device_resolver: DeviceResolver | None = None,
-        trusted_device_resolver: DeviceResolver | None = None,
     ) -> None:
         self._device_resolver = device_resolver
-        self._trusted_device_resolver = trusted_device_resolver
         self._tools: dict[str, Tool] = {}
         for tool in tools:
             name = tool.name()
@@ -185,18 +190,14 @@ class ToolRegistry:
         self,
         *,
         device_names: Iterable[str] = (),
-        trusted_device_names: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         device_sites = tuple(device_names)
-        trusted_sites = (
-            device_sites if trusted_device_names is None else tuple(trusted_device_names)
-        )
         schemas: list[dict[str, Any]] = []
         for tool in self._tools.values():
             if tool.routing_mode is ToolRoutingMode.CLIENT_ONLY:
-                if not trusted_sites:
+                if not device_sites:
                     continue
-                schema = inject_device_routing(tool.schema(), sites=trusted_sites)
+                schema = inject_device_routing(tool.schema(), sites=device_sites)
             elif tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
                 schema = inject_device_routing(tool.schema(), sites=("server", *device_sites))
             elif tool.routing_mode is ToolRoutingMode.INTRINSIC_DEVICE:
@@ -251,13 +252,8 @@ class ToolRegistry:
                         ErrorCode.TOOL_DEVICE_UNREACHABLE,
                         f"Tool install site is unavailable: {device}",
                     )
-                resolver = (
-                    self._trusted_device_resolver
-                    if tool.routing_mode is ToolRoutingMode.CLIENT_ONLY
-                    else self._device_resolver
-                )
-                if resolver is not None:
-                    live_device_id = await resolver(ctx.user_id, device)
+                if self._device_resolver is not None:
+                    live_device_id = await self._device_resolver(ctx.user_id, device)
                     if live_device_id != device_id:
                         return _normalized_error(
                             ErrorCode.TOOL_DEVICE_UNREACHABLE,
@@ -316,6 +312,7 @@ class ToolRegistry:
 
 def build_py3_registry(
     *,
+    engine: AsyncEngine | None = None,
     resolver: Resolver | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     web_admission: KeyedAdmission | None = None,
@@ -328,6 +325,7 @@ def build_py3_registry(
                 content_converter=content_converter or get_content_converter(),
                 resolver=resolver,
                 transport=transport,
+                policy_loader=_web_fetch_policy_loader(engine),
             ),
         )
     )
@@ -357,6 +355,7 @@ def build_py4_registry(
                 content_converter=converter,
                 resolver=resolver,
                 transport=transport,
+                policy_loader=_web_fetch_policy_loader(engine),
             ),
             MessageTool(engine, workspace_service),
             FileTransferTool(
@@ -379,8 +378,17 @@ def build_py4_registry(
             ),
         ),
         device_resolver=_owned_device_resolver(engine),
-        trusted_device_resolver=_owned_device_resolver(engine, trusted_only=True),
     )
+
+
+def _web_fetch_policy_loader(engine: AsyncEngine | None) -> PolicyLoader | None:
+    if engine is None:
+        return None
+
+    async def load() -> SsrfPolicy:
+        return await load_web_fetch_policy(engine)
+
+    return load
 
 
 class _ClientOnlyTool(Tool):
@@ -407,7 +415,7 @@ class _ClientOnlyTool(Tool):
 _EXEC_SCHEMA: dict[str, Any] = {
     "name": "exec",
     "description": (
-        "在可信配对设备执行命令。默认使用 pipe；需要 REPL、TTY 检测或行式交互时设置 tty=true，"
+        "在配对设备执行命令。默认使用 pipe；需要 REPL、TTY 检测或行式交互时设置 tty=true，"
         "并为长时间交互显式设置足够大的 timeout。yield_time_ms 不延长 hard timeout。"
     ),
     "input_schema": {
@@ -590,18 +598,15 @@ def _client_call_limits(name: str, args: dict[str, Any]) -> tuple[int, float]:
 
 def _owned_device_resolver(
     engine: AsyncEngine,
-    *,
-    trusted_only: bool = False,
 ) -> DeviceResolver:
     async def resolve(user_id: UUID, name: str) -> UUID | None:
         async with AsyncSession(engine, expire_on_commit=False) as db:
-            statement = select(Device.id).where(
-                Device.user_id == user_id,
-                Device.name == name,
+            device_id = await db.scalar(
+                select(Device.id).where(
+                    Device.user_id == user_id,
+                    Device.name == name,
+                )
             )
-            if trusted_only:
-                statement = statement.where(Device.sandbox_mode.is_(False))
-            device_id = await db.scalar(statement)
         return device_id if isinstance(device_id, UUID) else None
 
     return resolve

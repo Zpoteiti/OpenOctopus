@@ -13,7 +13,7 @@ EXPECTED_COLUMNS = {
     "messages": 8,
     "pending_messages": 7,
     "turn_runs": 6,
-    "devices": 11,
+    "devices": 14,
     "workspaces": 6,
     "workspace_members": 3,
     "workspace_deletions": 3,
@@ -103,3 +103,34 @@ async def test_device_schema_hashes_tokens_and_rejects_invalid_names(pg_engine):
                 ),
                 {"user_id": user_id},
             )
+
+
+async def test_device_schema_uses_py7_config_defaults(pg_engine):
+    async with pg_engine.begin() as conn:
+        user_id = (
+            await conn.execute(
+                text(
+                    "INSERT INTO users (email, password_hash, name) "
+                    "VALUES ('device-defaults@test.com', 'hash', 'Defaults') RETURNING id"
+                )
+            )
+        ).scalar_one()
+        row = (
+            await conn.execute(
+                text(
+                    "INSERT INTO devices (user_id, name, token_hash, token_hint) "
+                    "VALUES (:user_id, 'laptop', decode(repeat('02', 32), 'hex'), 'hint') "
+                    "RETURNING restrict_to_workspace, mcp_servers, mcp_catalog, config_revision"
+                ),
+                {"user_id": user_id},
+            )
+        ).one()
+
+    assert row.restrict_to_workspace is True
+    assert row.mcp_servers == []
+    assert row.mcp_catalog == {
+        "version": 1,
+        "digest": "d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
+        "servers": [],
+    }
+    assert row.config_revision == 1

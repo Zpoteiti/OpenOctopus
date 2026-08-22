@@ -90,7 +90,7 @@ async def _request_as(
     [
         ("GET", "/api/devices", None),
         ("POST", "/api/devices", {"name": "Laptop"}),
-        ("PATCH", "/api/devices/laptop/config", {"sandbox_mode": False}),
+        ("PATCH", "/api/devices/laptop/config", {"restrict_to_workspace": False}),
         ("POST", "/api/devices/laptop/regenerate-token", None),
         ("DELETE", "/api/devices/laptop", None),
     ],
@@ -131,7 +131,7 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
         "name": "alice-laptop",
         "token_hint": f"{token[:16]}...{token[-6:]}",
         "workspace_path": "~/work",
-        "sandbox_mode": True,
+        "restrict_to_workspace": True,
         "ssrf_denylist": [
             "0.0.0.0/8",
             "127.0.0.0/8",
@@ -151,6 +151,10 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
         ],
         "shell_timeout_max": 600,
         "env_allowlist": list(devices.DEFAULT_ENV_ALLOWLIST),
+        "config_revision": 1,
+        "mcp_config_count": 0,
+        "mcp_enabled_capability_count": 0,
+        "mcp_catalog_digest": devices.EMPTY_MCP_CATALOG["digest"],
         "online": False,
         "created_at": device["created_at"],
     }
@@ -183,7 +187,7 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
         "/api/devices/alice-laptop/config",
         json={
             "name": "Desk  PC",
-            "sandbox_mode": False,
+            "restrict_to_workspace": False,
             "ssrf_denylist": ["internal.example:8443"],
         },
     )
@@ -192,9 +196,24 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
     assert patched == {
         **device,
         "name": "desk-pc",
-        "sandbox_mode": False,
+        "restrict_to_workspace": False,
         "ssrf_denylist": ["internal.example:8443"],
+        "config_revision": 2,
     }
+
+    same_value_no_op = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/desk-pc/config",
+        json={
+            "name": "Desk PC",
+            "restrict_to_workspace": False,
+            "ssrf_denylist": ["internal.example:8443"],
+        },
+    )
+    assert same_value_no_op.status_code == 200
+    assert same_value_no_op.json() == patched
 
     no_op_response = await _request_as(
         async_client, owner, "PATCH", "/api/devices/desk-pc/config", json={}
@@ -304,6 +323,35 @@ async def test_device_config_is_bounded_before_it_can_reach_the_wire(
     assert response.json()["code"] == "device_invalid_request"
 
 
+async def test_device_default_ssrf_policy_is_independent_of_workspace_restriction(
+    async_client: Any,
+) -> None:
+    owner = await _register(async_client, email="policy@test.com")
+
+    response = await _request_as(
+        async_client,
+        owner,
+        "POST",
+        "/api/devices",
+        json={"name": "laptop", "restrict_to_workspace": False},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()["device"]
+    assert body["restrict_to_workspace"] is False
+    assert body["ssrf_denylist"] == list(devices.DEFAULT_SSRF_DENYLIST)
+
+    legacy = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/laptop/config",
+        json={"sandbox_mode": False},
+    )
+    assert legacy.status_code == 400
+    assert legacy.json()["code"] == "device_invalid_request"
+
+
 async def test_device_rest_projects_registry_state_after_commits(
     async_client: Any,
     test_app: Any,
@@ -348,6 +396,16 @@ async def test_device_rest_projects_registry_state_after_commits(
     assert registry.config_updates[0]["device_name"] == "laptop"
     assert registry.config_updates[0]["config"].workspace_path == "~/updated"
 
+    same_value_response = await _request_as(
+        async_client,
+        owner,
+        "PATCH",
+        "/api/devices/laptop/config",
+        json={"workspace_path": "~/updated"},
+    )
+    assert same_value_response.status_code == 200
+    assert len(registry.config_updates) == 1
+
     no_op_response = await _request_as(
         async_client,
         owner,
@@ -386,7 +444,7 @@ async def test_post_commit_device_invalidation_finishes_before_cancellation_prop
         name="laptop",
         token_hint="openoctopus_dev_...token",
         workspace_path="~/workspace",
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         ssrf_denylist=[],
         created_at=datetime.now(UTC),
     )

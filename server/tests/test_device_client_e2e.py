@@ -422,7 +422,7 @@ async def test_real_postgres_source_client_device_lifecycle(
                 json={
                     "name": "E2E Laptop",
                     "workspace_path": str(workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )
@@ -680,7 +680,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 json={
                     "name": "owner-laptop",
                     "workspace_path": str(owner_workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )
@@ -705,7 +705,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 json={
                     "name": "other-laptop",
                     "workspace_path": str(other_workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )

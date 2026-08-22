@@ -254,7 +254,7 @@ async def test_device_download_ref_rejects_a_reused_device_name(
                 token_hash=b"r" * 32,
                 token_hint="openoctopus_dev_...replacement",
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         )

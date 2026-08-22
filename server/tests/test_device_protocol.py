@@ -93,14 +93,14 @@ def test_hello_ack_contains_active_py6_config() -> None:
         device_name="alice-laptop",
         config=DeviceConfigFrame(
             workspace_path="~/openoctopus/workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=["127.0.0.0/8", "::1/128"],
         ),
     )
 
     assert set(frame.config.model_dump()) == {
         "workspace_path",
-        "sandbox_mode",
+        "restrict_to_workspace",
         "ssrf_denylist",
         "shell_timeout_max",
         "env_allowlist",

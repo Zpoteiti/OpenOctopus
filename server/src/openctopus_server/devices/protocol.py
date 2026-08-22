@@ -102,7 +102,7 @@ class ShellMetadata(ProtocolModel):
 
 class DeviceConfigFrame(ProtocolModel):
     workspace_path: str = Field(min_length=1, max_length=4096)
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: list[str] = Field(max_length=256)
     shell_timeout_max: int = Field(default=600, ge=0, le=86400)
     env_allowlist: list[str] = Field(

@@ -4,6 +4,7 @@ import hashlib
 import re
 import secrets
 import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
@@ -13,26 +14,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.db.models import Device
+from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import DeviceError
+from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
 
-DEFAULT_SSRF_DENYLIST = (
-    "0.0.0.0/8",
-    "127.0.0.0/8",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-    "::/128",
-    "::1/128",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "100.64.0.0/10",
-    "169.254.0.0/16",
-    "169.254.169.254/32",
-    "fc00::/7",
-    "fe80::/10",
-    "ff00::/8",
-)
 DEFAULT_ENV_ALLOWLIST = (
     "PATH",
     "HOME",
@@ -47,6 +33,11 @@ DEFAULT_ENV_ALLOWLIST = (
 )
 
 _DEVICE_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+EMPTY_MCP_CATALOG = {
+    "version": 1,
+    "digest": EMPTY_CATALOG_DIGEST,
+    "servers": [],
+}
 
 
 @dataclass(frozen=True)
@@ -56,11 +47,14 @@ class DeviceSnapshot:
     name: str
     token_hint: str
     workspace_path: str
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: list[str]
     created_at: datetime
     shell_timeout_max: int = 600
     env_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_ENV_ALLOWLIST))
+    mcp_servers: list[dict[str, object]] = field(default_factory=list)
+    mcp_catalog: dict[str, object] = field(default_factory=lambda: deepcopy(EMPTY_MCP_CATALOG))
+    config_revision: int = 1
 
 
 class DevicePatchCommitOutcomeUnknownError(Exception):
@@ -123,7 +117,7 @@ async def create(
     user_id: UUID,
     name: str,
     workspace_path: str,
-    sandbox_mode: bool,
+    restrict_to_workspace: bool,
     ssrf_denylist: list[str] | None,
     shell_timeout_max: int = 600,
     env_allowlist: list[str] | None = None,
@@ -140,8 +134,8 @@ async def create(
         token_hash=token_digest(token),
         token_hint=token_hint(token),
         workspace_path=workspace_path,
-        sandbox_mode=sandbox_mode,
-        ssrf_denylist=_initial_ssrf_denylist(sandbox_mode, ssrf_denylist),
+        restrict_to_workspace=restrict_to_workspace,
+        ssrf_denylist=_initial_ssrf_denylist(ssrf_denylist),
         shell_timeout_max=shell_timeout_max,
         env_allowlist=_initial_env_allowlist(env_allowlist),
     )
@@ -158,42 +152,60 @@ async def patch(
     fields: set[str],
     new_name: str | None,
     workspace_path: str | None,
-    sandbox_mode: bool | None,
+    restrict_to_workspace: bool | None,
     ssrf_denylist: list[str] | None,
     shell_timeout_max: int | None = None,
     env_allowlist: list[str] | None = None,
-) -> DeviceSnapshot:
+) -> tuple[DeviceSnapshot, bool]:
     device = await _owned_for_update(db, user_id=user_id, name=name)
+    changed = False
     if "name" in fields:
         if new_name is None:
             raise _invalid("Device name must be a string")
-        device.name = canonicalize_name(new_name)
+        canonical_name = canonicalize_name(new_name)
+        if device.name != canonical_name:
+            device.name = canonical_name
+            changed = True
     if "workspace_path" in fields:
         if workspace_path is None:
             raise _invalid("Workspace path must be a string")
         _validate_workspace_path(workspace_path)
-        device.workspace_path = workspace_path
-    if "sandbox_mode" in fields:
-        if sandbox_mode is None:
-            raise _invalid("Sandbox mode must be a boolean")
-        device.sandbox_mode = sandbox_mode
+        if device.workspace_path != workspace_path:
+            device.workspace_path = workspace_path
+            changed = True
+    if "restrict_to_workspace" in fields:
+        if restrict_to_workspace is None:
+            raise _invalid("Workspace restriction must be a boolean")
+        if device.restrict_to_workspace != restrict_to_workspace:
+            device.restrict_to_workspace = restrict_to_workspace
+            changed = True
     if "ssrf_denylist" in fields:
         if ssrf_denylist is None:
             raise _invalid("SSRF denylist must be an array")
         _validate_ssrf_denylist(ssrf_denylist)
-        device.ssrf_denylist = list(ssrf_denylist)
+        candidate_denylist = list(ssrf_denylist)
+        if device.ssrf_denylist != candidate_denylist:
+            device.ssrf_denylist = candidate_denylist
+            changed = True
     if "shell_timeout_max" in fields:
         if shell_timeout_max is None:
             raise _invalid("Shell timeout max must be an integer")
         _validate_shell_timeout_max(shell_timeout_max)
-        device.shell_timeout_max = shell_timeout_max
+        if device.shell_timeout_max != shell_timeout_max:
+            device.shell_timeout_max = shell_timeout_max
+            changed = True
     if "env_allowlist" in fields:
         if env_allowlist is None:
             raise _invalid("Environment allowlist must be an array")
         _validate_env_allowlist(env_allowlist)
-        device.env_allowlist = list(env_allowlist)
+        candidate_allowlist = list(env_allowlist)
+        if device.env_allowlist != candidate_allowlist:
+            device.env_allowlist = candidate_allowlist
+            changed = True
+    if changed:
+        device.config_revision += 1
     await _commit_patch_or_name_conflict(db, device_id=device.id)
-    return _snapshot(device)
+    return _snapshot(device), changed
 
 
 async def regenerate_token(
@@ -245,12 +257,10 @@ async def _commit_patch_or_name_conflict(db: AsyncSession, *, device_id: UUID) -
         raise DevicePatchCommitOutcomeUnknownError(exc, device_id=device_id) from exc
 
 
-def _initial_ssrf_denylist(sandbox_mode: bool, supplied: list[str] | None) -> list[str]:
+def _initial_ssrf_denylist(supplied: list[str] | None) -> list[str]:
     if supplied is not None:
         return list(supplied)
-    if sandbox_mode:
-        return list(DEFAULT_SSRF_DENYLIST)
-    return []
+    return list(DEFAULT_SSRF_DENYLIST)
 
 
 def _validate_workspace_path(path: str) -> None:
@@ -304,10 +314,13 @@ def _snapshot(device: Device) -> DeviceSnapshot:
         name=device.name,
         token_hint=device.token_hint,
         workspace_path=device.workspace_path,
-        sandbox_mode=device.sandbox_mode,
+        restrict_to_workspace=device.restrict_to_workspace,
         ssrf_denylist=list(device.ssrf_denylist),
         shell_timeout_max=device.shell_timeout_max,
         env_allowlist=list(device.env_allowlist),
+        mcp_servers=deepcopy(device.mcp_servers),
+        mcp_catalog=deepcopy(device.mcp_catalog),
+        config_revision=device.config_revision,
         created_at=device.created_at,
     )
 
