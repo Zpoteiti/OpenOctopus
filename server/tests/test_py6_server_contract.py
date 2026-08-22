@@ -1278,6 +1278,49 @@ async def test_candidate_transition_retires_when_push_never_takes_handoff(
     assert registry.retired == 1
 
 
+async def test_settled_handoff_does_not_retire_a_published_replacement() -> None:
+    from openctopus_server.api.devices import _settle_activation_and_retire
+
+    device_id = uuid4()
+    user_id = uuid4()
+    registry = DeviceRegistry()
+    old_handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=_Transport(),
+    )
+    assert old_handle is not None
+    assert await registry.begin_config_update(
+        device_id=device_id,
+        user_id=user_id,
+        expected_handle=old_handle,
+    )
+    await registry.abort_config_update(device_id=device_id, user_id=user_id)
+
+    replacement = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=_Transport(),
+    )
+    assert replacement is not None
+    handoff: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    handoff.set_result(True)
+    activation = asyncio.create_task(asyncio.sleep(0))
+    activation.cancel()
+
+    await _settle_activation_and_retire(
+        activation,
+        registry,
+        device_id=device_id,
+        user_id=user_id,
+        handoff=handoff,
+    )
+
+    assert await registry.is_current(replacement)
+
+
 def test_outcome_unknown_is_stable_tool_error() -> None:
     # The mapping is exercised through the public result code contract.
     assert ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value == "tool_execution_outcome_unknown"

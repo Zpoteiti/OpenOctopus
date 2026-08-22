@@ -112,13 +112,18 @@ class FirstSendBlockingTransport(FakeTransport):
 @dataclass
 class EverySendBlockingTransport(FakeTransport):
     attempted_text: list[str] = field(default_factory=list)
+    first_send_started: asyncio.Event = field(default_factory=asyncio.Event)
     second_send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_second_send: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def send_text(self, payload: str) -> None:
         self.attempted_text.append(payload)
-        if len(self.attempted_text) == 2:
+        if len(self.attempted_text) == 1:
+            self.first_send_started.set()
+            await asyncio.Future()
+        else:
             self.second_send_started.set()
-        await asyncio.Future()
+            await self.release_second_send.wait()
 
 
 @dataclass
@@ -1064,6 +1069,52 @@ async def test_blocked_validation_cancel_retires_in_background(
             break
         await asyncio.sleep(0.01)
     assert not await registry.is_online(device_id, user_id=user_id)
+
+
+async def test_cancelled_validation_does_not_wait_for_the_cancel_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openctopus_server.devices.registry.VALIDATION_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = EverySendBlockingTransport()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            validate_servers=("demo",),
+        )
+    )
+    await asyncio.wait_for(transport.first_send_started.wait(), timeout=1)
+
+    validation.cancel()
+    await asyncio.wait_for(transport.second_send_started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    cancellation_propagated = validation.done()
+    retired_in_background = not await registry.is_online(device_id, user_id=user_id)
+    transport.release_second_send.set()
+    with pytest.raises(asyncio.CancelledError):
+        await validation
+
+    assert cancellation_propagated
+    assert retired_in_background
 
 
 async def test_config_validation_wire_reveals_secret_only_to_the_wss_device() -> None:

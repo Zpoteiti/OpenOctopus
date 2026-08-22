@@ -317,6 +317,7 @@ async def _commit_and_activate_candidate(
                         registry,
                         device_id=snapshot.id,
                         user_id=snapshot.user_id,
+                        handoff=handoff,
                     )
                 )
                 try:
@@ -418,8 +419,16 @@ async def _settle_activation_and_retire(
     *,
     device_id: UUID,
     user_id: UUID,
+    handoff: asyncio.Future[bool],
 ) -> None:
     await asyncio.gather(activation, return_exceptions=True)
+    if handoff.done() and not handoff.cancelled():
+        try:
+            handoff.result()
+        except BaseException:
+            pass
+        else:
+            return
     await registry.retire_config_update(device_id=device_id, user_id=user_id)
 
 

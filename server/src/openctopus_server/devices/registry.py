@@ -703,13 +703,7 @@ class DeviceRegistry:
         except asyncio.CancelledError:
             await self._expire_validation(connection, pending)
             if pending.issued:
-                cleanup = asyncio.create_task(
-                    self._send_validation_cancel(connection, handle, validation_id)
-                )
-                try:
-                    await await_future_cancellation_safe(cleanup)
-                except asyncio.CancelledError:
-                    pass
+                self._schedule_validation_cancel(connection, handle, validation_id)
             raise
         except (DeviceUnavailableError, TimeoutError):
             raise
