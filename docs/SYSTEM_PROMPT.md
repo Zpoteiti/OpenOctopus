@@ -211,10 +211,11 @@ Current connectivity is checked at tool execution time.
   `tool_execution_outcome_unknown`, inspect the session or external state and do
   not replay the command. Never request or enter passwords, 2FA codes, or
   passphrases; ask the user to take over.
-- **MCP.** Device MCP tools may remain visible from their last-good catalog
-  while a Device or its MCP runtime is unavailable. Treat MCP failures as normal
-  tool results. Never blindly replay a call whose result says its execution
-  outcome is unknown.
+- **MCP.** MCP tools can target `server` or a paired Device and may remain
+  visible from their last-good catalog while the selected runtime is
+  unavailable. Treat MCP failures as normal tool results. A busy/unavailable
+  result means the call was not sent and may be retried when useful; never
+  blindly replay a call whose result says its execution outcome is unknown.
 - **Replying.** Plain text output delivers to the current session
   channel automatically. Use the `message` tool when you need to
   send files (media), inline buttons, or reach a different
@@ -359,10 +360,11 @@ the public DTO layer does not own a second grammar.
 - Online/offline state and last-seen timestamps are volatile, server-authoritative
   execution state. Tool dispatch checks them out of band and reports failure;
   they do not churn the system-prompt prefix.
-- Device MCP schema comes from the persisted last-good catalog. Runtime
-  availability and Protocol v3 registration are out-of-band state, so MCP
-  crash/recovery or Device connect/disconnect does not remove or add names in
-  the prompt prefix.
+- Dynamic MCP schema comes from persisted last-good Server and Device catalogs.
+  Runtime availability and Device Protocol v3 registration are out-of-band
+  state, so MCP crash/recovery or Device connect/disconnect does not remove or
+  add names in the prompt prefix. Server MCP entries use install site `server`;
+  authoritative Server names may hide equal-named Device entries.
 - **No explicit tool listing** — the agent's tool schemas already enumerate which tools exist and their `device` enum tells the agent which devices each tool can target.
 
 ### Operating Notes

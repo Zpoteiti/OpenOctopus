@@ -43,6 +43,8 @@ from openctopus_server.devices.registry import (
     DeviceUnavailableError,
 )
 from openctopus_server.devices.transfer import TransferUnavailableError
+from openctopus_server.mcp.authority import ServerMcpAuthorityFence
+from openctopus_server.mcp.models import empty_server_mcp_envelope, parse_server_mcp_configs
 
 
 @dataclass
@@ -769,6 +771,101 @@ async def test_mcp_epoch_change_before_send_is_reported_as_route_unavailable() -
     assert await registration
     with pytest.raises(DeviceMcpUnavailableError):
         await call
+
+
+async def test_server_authority_commit_fences_device_mcp_issue() -> None:
+    registry = DeviceRegistry()
+    authority = ServerMcpAuthorityFence(empty_server_mcp_envelope())
+    device_id = uuid4()
+    user_id = uuid4()
+    entry_id = new_uuid7()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        config_revision=7,
+        catalog_digest="1" * 64,
+    )
+    assert await registry.publish_mcp_registration(
+        handle,
+        McpRegistrationCandidate(
+            ack=RegisterMcpAckFrame(
+                id=new_uuid7(),
+                config_revision=7,
+                catalog_digest="1" * 64,
+                results=[],
+            ),
+            bindings=(
+                AcceptedMcpBinding(
+                    name="demo",
+                    runtime_generation=new_uuid7(),
+                    config_revision=7,
+                    catalog_digest="1" * 64,
+                    entry_ids=(entry_id,),
+                ),
+            ),
+        ),
+    )
+    transport.sent_text.clear()
+    route = FrozenMcpEntryRoute(
+        device_id=device_id,
+        device_name="laptop",
+        entry_id=entry_id,
+        config_revision=7,
+        catalog_digest="1" * 64,
+        server="demo",
+        surface="tool",
+        raw_name="search",
+        invocation_identity="search",
+        final_name="mcp_demo_search",
+        server_config_revision=1,
+    )
+    issued = False
+
+    def mark_issued() -> None:
+        nonlocal issued
+        issued = True
+
+    reserved = empty_server_mcp_envelope().model_copy(
+        update={
+            "config_revision": 2,
+            "mcp_servers": list(
+                parse_server_mcp_configs(
+                    [
+                        {
+                            "name": "demo",
+                            "transport": "streamable_http",
+                            "url": "https://mcp.example/mcp",
+                            "enabled_capabilities": [],
+                        }
+                    ]
+                )
+            ),
+        }
+    )
+    async with authority.transition():
+        call = asyncio.create_task(
+            registry.dispatch_mcp_tool(
+                route=route,
+                user_id=user_id,
+                name=route.final_name,
+                args={"query": "x"},
+                max_result_bytes=1024,
+                timeout_seconds=1,
+                on_issued=mark_issued,
+                issue_guard=lambda: authority.device_issue(route),
+            )
+        )
+        await asyncio.sleep(0)
+        assert not call.done()
+        authority.publish(reserved)
+
+    with pytest.raises(DeviceMcpUnavailableError):
+        await call
+    assert issued is False
+    assert transport.sent_text == []
 
 
 async def test_config_transition_waits_for_registration_then_pushes() -> None:

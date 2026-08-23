@@ -14,6 +14,7 @@ from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.mcp_models import SourceMcpCatalog
+from openctopus_server.devices.mcp_routes import OwnerMcpDevice
 from openctopus_server.devices.protocol import DeviceConfigFrame
 from openctopus_server.devices.registry import (
     ConfigValidation,
@@ -38,10 +39,13 @@ from openctopus_server.dto.device import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import DeviceError
-from openctopus_server.services import devices
+from openctopus_server.mcp.models import ServerMcpEnvelope
+from openctopus_server.mcp.routes import CompositeMcpSnapshot, build_composite_mcp_snapshot
+from openctopus_server.services import devices, server_mcp
 
 router = APIRouter(prefix="/api/devices", tags=["Devices"])
 CONFIG_TRANSITION_TIMEOUT_SECONDS = 30.0
+MCP_AUTHORITY_SNAPSHOT_ATTEMPTS = 3
 
 
 @router.get("", response_model=list[DeviceResponse])
@@ -50,9 +54,15 @@ async def list_devices(
     db: AsyncSession = Depends(get_db),
     registry: DeviceRegistry = Depends(get_device_registry),
 ) -> list[DeviceResponse]:
-    snapshots = await devices.list_owned(db, user_id=user.id)
+    snapshots, _envelope, mcp_snapshot = await _owner_mcp_projection(
+        db,
+        user_id=user.id,
+    )
     await db.commit()
-    return [await _response(snapshot, registry) for snapshot in snapshots]
+    return [
+        await _response(snapshot, registry, mcp_snapshot=mcp_snapshot)
+        for snapshot in snapshots
+    ]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=DeviceTokenResponse)
@@ -72,7 +82,10 @@ async def create_device(
         shell_timeout_max=body.shell_timeout_max,
         env_allowlist=body.env_allowlist,
     )
-    return DeviceTokenResponse(token=token, device=await _response(snapshot, registry))
+    return DeviceTokenResponse(
+        token=token,
+        device=await _response(snapshot, registry),
+    )
 
 
 @router.get("/{name}/config", response_model=DeviceConfigResponse)
@@ -82,9 +95,18 @@ async def get_device_config(
     db: AsyncSession = Depends(get_db),
     registry: DeviceRegistry = Depends(get_device_registry),
 ) -> DeviceConfigResponse:
-    snapshot = await devices.get_owned(db, user_id=user.id, name=name)
+    snapshots, envelope, mcp_snapshot = await _owner_mcp_projection(
+        db,
+        user_id=user.id,
+    )
+    snapshot = _named_snapshot(snapshots, name=name)
     await db.commit()
-    return await _config_response(snapshot, registry)
+    return await _config_response(
+        snapshot,
+        registry,
+        envelope=envelope,
+        mcp_snapshot=mcp_snapshot,
+    )
 
 
 @router.patch("/{name}/config", response_model=DeviceConfigResponse)
@@ -109,7 +131,18 @@ async def patch_device(
             device_id=device_id,
             patch=patch,
         )
-    return await _config_response(snapshot, registry)
+    snapshots, envelope, mcp_snapshot = await _owner_mcp_projection(
+        db,
+        user_id=user_id,
+    )
+    snapshot = _id_snapshot(snapshots, device_id=snapshot.id)
+    await db.commit()
+    return await _config_response(
+        snapshot,
+        registry,
+        envelope=envelope,
+        mcp_snapshot=mcp_snapshot,
+    )
 
 
 async def _build_validate_and_commit(
@@ -138,6 +171,13 @@ async def _build_validate_and_commit(
     mcp_changed = "mcp_servers" in patch.model_fields_set and (
         devices.mcp_configs_storage(current_mcp) != devices.mcp_configs_storage(candidate_mcp)
     )
+    if mcp_changed:
+        envelope = await server_mcp.load_envelope(db)
+        devices.validate_mcp_candidate_reservations(
+            current_configs=current_mcp,
+            candidate_configs=candidate_mcp,
+            server_envelope=envelope,
+        )
     if not mcp_changed and _non_mcp_noop(current, patch):
         await db.rollback()
         return current
@@ -487,6 +527,9 @@ def _snapshot_config_frame(snapshot: devices.DeviceSnapshot) -> DeviceConfigFram
 async def _config_response(
     snapshot: devices.DeviceSnapshot,
     registry: DeviceRegistry,
+    *,
+    envelope: ServerMcpEnvelope,
+    mcp_snapshot: CompositeMcpSnapshot,
 ) -> DeviceConfigResponse:
     configs = devices.parse_stored_mcp_servers(snapshot.mcp_servers)
     catalog = devices.parse_stored_mcp_catalog(snapshot.mcp_catalog)
@@ -517,16 +560,29 @@ async def _config_response(
         )
         for entry in server.entries:
             target = getattr(projection, surface_fields[entry.surface])
+            key = (snapshot.id, entry.entry_id)
+            suppression_reason = mcp_snapshot.suppression_by_entry.get(key)
+            provider_visible = any(
+                route.device_id == snapshot.id and route.entry_id == entry.entry_id
+                for route in mcp_snapshot.device_routes
+            )
+            assert not entry.enabled or provider_visible or suppression_reason is not None
             target.append(
                 McpDiscoveredCapability(
                     raw_name=entry.raw_name,
                     final_name=entry.final_name,
                     enabled=entry.enabled,
+                    provider_visible=provider_visible,
+                    suppression_reason=suppression_reason,
                 )
             )
     redacted: list[McpServerResponse] = []
+    reserved_names = {config.name for config in envelope.mcp_servers}
     for config in configs:
         payload = config.storage_dict()
+        shadowed = config.name in reserved_names
+        payload["effective_status"] = "shadowed_by_server" if shadowed else "active"
+        payload["shadowed_by"] = config.name if shadowed else None
         if config.transport == "stdio":
             payload["env"] = {key: "<redacted>" for key in config.env}
             redacted.append(StdioMcpServerResponse.model_validate(payload))
@@ -561,7 +617,20 @@ async def regenerate_device_token(
         )
     )
     snapshot, token = await await_future_cancellation_safe(mutation)
-    return DeviceTokenResponse(token=token, device=await _response(snapshot, registry))
+    snapshots, _envelope, mcp_snapshot = await _owner_mcp_projection(
+        db,
+        user_id=user.id,
+    )
+    snapshot = _id_snapshot(snapshots, device_id=snapshot.id)
+    await db.commit()
+    return DeviceTokenResponse(
+        token=token,
+        device=await _response(
+            snapshot,
+            registry,
+            mcp_snapshot=mcp_snapshot,
+        ),
+    )
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
@@ -583,7 +652,18 @@ async def delete_device(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-async def _response(snapshot: devices.DeviceSnapshot, registry: DeviceRegistry) -> DeviceResponse:
+async def _response(
+    snapshot: devices.DeviceSnapshot,
+    registry: DeviceRegistry,
+    *,
+    mcp_snapshot: CompositeMcpSnapshot | None = None,
+) -> DeviceResponse:
+    if mcp_snapshot is None:
+        enabled = _enabled_capability_count(snapshot.mcp_catalog)
+        assert enabled == 0
+        visible = suppressed = 0
+    else:
+        enabled, visible, suppressed = _mcp_capability_counts(snapshot, mcp_snapshot)
     return DeviceResponse(
         id=snapshot.id,
         name=snapshot.name,
@@ -595,7 +675,9 @@ async def _response(snapshot: devices.DeviceSnapshot, registry: DeviceRegistry) 
         env_allowlist=snapshot.env_allowlist,
         config_revision=snapshot.config_revision,
         mcp_config_count=len(snapshot.mcp_servers),
-        mcp_enabled_capability_count=_enabled_capability_count(snapshot.mcp_catalog),
+        mcp_enabled_capability_count=enabled,
+        mcp_provider_visible_capability_count=visible,
+        mcp_suppressed_capability_count=suppressed,
         mcp_catalog_digest=str(snapshot.mcp_catalog["digest"]),
         online=await registry.is_online(snapshot.id, user_id=snapshot.user_id),
         created_at=snapshot.created_at,
@@ -615,6 +697,70 @@ def _enabled_capability_count(catalog: dict[str, object]) -> int:
             continue
         count += sum(isinstance(entry, dict) and entry.get("enabled") is True for entry in entries)
     return count
+
+
+def _mcp_capability_counts(
+    snapshot: devices.DeviceSnapshot,
+    mcp_snapshot: CompositeMcpSnapshot,
+) -> tuple[int, int, int]:
+    enabled = _enabled_capability_count(snapshot.mcp_catalog)
+    visible = sum(route.device_id == snapshot.id for route in mcp_snapshot.device_routes)
+    suppressed = sum(
+        device_id == snapshot.id
+        for device_id, _entry_id in mcp_snapshot.suppression_by_entry
+    )
+    assert visible + suppressed == enabled
+    return enabled, visible, suppressed
+
+
+async def _owner_mcp_projection(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+) -> tuple[list[devices.DeviceSnapshot], ServerMcpEnvelope, CompositeMcpSnapshot]:
+    for _attempt in range(MCP_AUTHORITY_SNAPSHOT_ATTEMPTS):
+        before = await server_mcp.load_envelope(db)
+        snapshots = await devices.list_owned(db, user_id=user_id)
+        envelope = await server_mcp.load_envelope(db)
+        if (
+            before.config_revision == envelope.config_revision
+            and before.mcp_catalog.digest == envelope.mcp_catalog.digest
+        ):
+            break
+    else:
+        raise RuntimeError("Server MCP authority changed repeatedly during Device projection")
+    owners = [
+        OwnerMcpDevice(
+            device_id=snapshot.id,
+            name=snapshot.name,
+            config_revision=snapshot.config_revision,
+            catalog=devices.parse_stored_mcp_catalog(snapshot.mcp_catalog),
+        )
+        for snapshot in snapshots
+    ]
+    return snapshots, envelope, build_composite_mcp_snapshot(envelope, owners)
+
+
+def _named_snapshot(
+    snapshots: list[devices.DeviceSnapshot],
+    *,
+    name: str,
+) -> devices.DeviceSnapshot:
+    for snapshot in snapshots:
+        if snapshot.name == name:
+            return snapshot
+    raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")
+
+
+def _id_snapshot(
+    snapshots: list[devices.DeviceSnapshot],
+    *,
+    device_id: UUID,
+) -> devices.DeviceSnapshot:
+    for snapshot in snapshots:
+        if snapshot.id == device_id:
+            return snapshot
+    raise DeviceError(ErrorCode.DEVICE_NOT_FOUND, "Device not found")
 
 
 async def _after_commit[T](

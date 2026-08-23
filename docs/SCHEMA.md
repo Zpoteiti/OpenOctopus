@@ -46,11 +46,11 @@ unsupported keys return `400 Bad Request`):
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 | `web_fetch_denylist` | array of strings | ADR-133 | Effective Server `web_fetch` denylist. Missing uses the private/reserved/metadata default; explicit `[]` allows all otherwise-valid HTTP(S) targets. PATCH validates and canonicalizes the complete list before writing, and later fetches read the current value without a restart. |
 
-Reserved/future known keys (not PATCH-editable until their milestone):
+Dedicated admin-managed keys (not editable through `PATCH /api/admin/config`):
 
 | Key | Type | ADR | Purpose |
 |---|---|---|---|
-| `server_mcp` | array of `McpServerConfig` | ADR-114 | Admin-configured shared-service MCPs exposed as install site `server`; shared credentials, one runtime per MCP, bounded queue. |
+| `server_mcp` | `ServerMcpEnvelope` object | ADR-114 | Authoritative Py8a admin shared-service MCP config, monotonic revision, and complete last-good catalog. Managed only through `GET/PUT /api/admin/server-mcp`. |
 
 Bootstrap does not seed `system_config` rows. Fresh `GET /api/admin/config`
 therefore returns the effective quota defaults, `llm_max_output_tokens=16384`,
@@ -68,10 +68,42 @@ uses `GET {llm_endpoint}/v1/models` before any DB write, so failed identity
 changes do not persist paired config updates. `llm_api_key` is stored in
 `system_config` for outbound calls but redacted as `"<redacted>"` in admin
 config read and patch responses. Sending the literal redaction marker as a new
-key is rejected. `server_mcp` is documented for the Py8 MCP scope and is not
-accepted by the admin-config endpoint. Object storage is deployment
+key is rejected. `server_mcp` is not accepted by the generic admin-config
+endpoint. Object storage is deployment
 infrastructure config supplied through environment / deployment secrets, not
 `system_config`.
+
+`system_config.server_mcp` stores one strict JSONB envelope:
+
+```json
+{
+  "version": 1,
+  "config_revision": 7,
+  "mcp_servers": [],
+  "mcp_catalog": {
+    "version": 1,
+    "digest": "<lowercase sha256>",
+    "servers": []
+  }
+}
+```
+
+The config, revision, and complete last-good four-surface catalog change in one
+row and one transaction. A missing row reads as the canonical empty envelope at
+revision 1; the first effective PUT writes revision 2. Effective no-ops neither
+write nor advance `updated_at`; deleting the final config writes an empty
+envelope with the next revision rather than deleting the row. Strict parsing,
+catalog/config correspondence, bounded canonical JSON, and the catalog digest
+are authoritative invariants; corruption is a startup failure, while an MCP
+endpoint outage is only degraded runtime state.
+
+Server MCP stdio `env` and remote `headers` are intentionally reversible
+plaintext inside this PostgreSQL value. REST projections preserve their keys
+but replace every value with `"<redacted>"`; catalogs, Provider schemas,
+runtime diagnostics, errors, and logs contain no secret values. Each Server MCP
+config also stores its effective `max_concurrent_calls` (`1..32`; stdio default
+1, Streamable HTTP/SSE default 8). Runtime generations, counters, retry state,
+and sanitized errors are process-local and never stored in the envelope.
 
 `llm_max_output_tokens` is validated as an integer in `1..1_000_000`. When
 `llm_max_context_tokens` is configured, a merged config update must also keep

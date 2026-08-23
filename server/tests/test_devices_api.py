@@ -166,6 +166,8 @@ async def test_device_rest_lifecycle_stores_only_the_token_hash(
         "config_revision": 1,
         "mcp_config_count": 0,
         "mcp_enabled_capability_count": 0,
+        "mcp_provider_visible_capability_count": 0,
+        "mcp_suppressed_capability_count": 0,
         "mcp_catalog_digest": devices.EMPTY_MCP_CATALOG["digest"],
         "online": False,
         "created_at": device["created_at"],

@@ -238,9 +238,9 @@ translate to Python package boundaries.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-047 | Shared MCP client in `openoctopus_common` | `Supersede` | Py7 Device MCP runs in `openoctopus_client.mcp`; Server persists validated Device configuration and last-good catalogs but does not host the Device MCP runtime. Server/admin MCP is deferred to Py8, so no shared MCP client package is needed in Py7. |
+| ADR-047 | Shared MCP client in `openoctopus_common` | `Supersede` | MCP clients live at their execution site: Device MCP in `openoctopus_client.mcp`, Py8a shared-service MCP in `openoctopus_server.mcp`. Both pin FastMCP 3.4.7 and share contract fixtures without a common Python package. |
 | ADR-048 | MCP wrapping — tools, resources, prompts as tool-registry entries | `Supersede` | Py7 discovers four surfaces and uses one `mcp_<server>_<alias>` namespace with explicit hidden routes. Typed surface infixes and prompt stringification are replaced by deterministic safe-block mapping. |
-| ADR-049 | MCP collision rejection — server orchestrates DB cleanup + corrective config_update | `Supersede` | Py7 keeps collision rejection but replaces optimistic offline save/prune with online validate-before-save for every add/modify. Pure deletion alone may commit offline; last-good catalogs persist. |
+| ADR-049 | MCP collision rejection — server orchestrates DB cleanup + corrective config_update | `Supersede` | All add/modify flows validate before save; pure deletion may be offline. Py8a admin Server config is authoritative across tenancies: existing Device entries cannot block it and are shadowed/suppressed after commit, while later conflicting Device mutations are rejected. |
 | ADR-050 | Device config is first-class + editable | `Supersede` | Py7 Device config uses `restrict_to_workspace`, independent SSRF/env policy, `mcp_servers`, atomic `mcp_catalog`, and monotonic `config_revision`. PATCH requires `base_config_revision`; MCP is whole-field replacement. |
 | ADR-051 | Device policy is persistent; no session-level privilege escalation | `Translate` | Keep per-device policy as the only privilege boundary. Browser, channel, cron, and heartbeat sessions cannot temporarily escalate; users change the durable device config when a workflow needs broader access. |
 | ADR-052 | `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy | `Supersede` | Keep the shared tool but make policy independent of workspace restriction. Server uses admin-hot `web_fetch_denylist`; Client uses Device `ssrf_denylist`. Both pin DNS/revalidate redirects; neither governs exec/PTY/MCP. |
@@ -308,16 +308,16 @@ simple semantics. Rust-specific mechanics translate to Python boundaries.
 
 ## Accepted Theme 9: MCP As Dynamic Tool Surface
 
-This theme covers ADR-099, ADR-100, ADR-105, and ADR-114. Py7 implements
-Device MCP as a persistent last-good flat tool surface. Server/admin MCP remains
-deferred to Py8.
+This theme covers ADR-099, ADR-100, ADR-105, and ADR-114. Device and Py8a Server
+MCP are persistent last-good flat tool surfaces. Server config names reserve
+their namespace and take priority over derived Device Provider routes.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
 | ADR-099 | MCP resource templates — URI placeholders are surfaced as schema properties | `Supersede` | Py7 keeps template arguments but uses bounded RFC 6570 validation and `uritemplate`, not regex substitution. Static resources remain zero-arg. |
 | ADR-100 | MCP `enabled_tools` filter — tools only, simple string list | `Supersede` | Py7 uses `enabled_capabilities` across tools, static resources, templates, and prompts: `null` none, `[]` explicitly all, list exact final names. |
 | ADR-105 | MCP subprocess lifecycle on openoctopus_client | `Supersede` | Py7 uses generation-bound runtimes, background retry, drift detection, single-flight aggregate registration, explicit cleanup, and no invocation replay. MCP sessions survive ordinary OO WS reconnect. |
-| ADR-114 | Python-main MCP tenancy: admin shared-service + device only | `Supersede for Py7 scope` | Py7 implements Device MCP only. The admin shared-service runtime/route remains deferred to Py8. |
+| ADR-114 | Python-main MCP tenancy: admin shared-service + device only | `Supersede` | Both scopes are active. Py8a gives each admin-configured name one Server runtime/client/session, whole-list CAS config/catalog persistence, bounded fair admission, degraded recovery, and no per-user/pool tenancy. |
 
 ## Accepted Theme 10: Explicit Non-Goals (v1)
 
@@ -349,9 +349,9 @@ four-party trust model is language-agnostic.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-072 | Server is not a code execution environment for agents | `Keep` | Server tool surface remains deliberately restricted: `read_file`, `write_file`, `edit_file`, `delete_file`, `list_dir`, `find_files`, `grep`, `message`, `web_fetch`, `cron`, `file_transfer`. No `exec`/`python`/`eval` — server treats all agent-provided and user-uploaded files as inert data. The one admin-gated exception is server-side MCP subprocess, installed by admin only and schema-collision-checked. |
+| ADR-072 | Server is not a code execution environment for agents | `Keep` | Server exposes no Agent `exec`/`python`/`eval` and treats uploaded files as inert data. Py8a Server stdio MCP is the explicit admin-gated exception: trusted same-UID code installed only through the admin API, with bounded lifecycle but no OS sandbox. |
 | ADR-073 | Client device policy gates | `Supersede` | Py7 replaces the coarse profile with `restrict_to_workspace` for structured paths/initial cwd only. `ssrf_denylist` independently controls Client `web_fetch`; `env_allowlist` controls exec inheritance. There is no command denylist or OS sandbox. |
-| ADR-074 | Trust model summary | `Keep` | Four-party trust model carries forward unchanged: Admin (LLM/MCP/server config), User (own workspace/devices/channels), Agent (read/write within user boundary, execute on user devices under device policy), Partner (user's own identity on the channel — messages unwrapped and trusted), Allowed user (non-partner authorized via allow_list — messages wrapped `[untrusted]` per ADR-007). Hard boundaries: no cross-user agent access, no server-side code execution, no content interpretation by server. |
+| ADR-074 | Trust model summary | `Keep` | Four-party trust model carries forward: Admin (LLM/MCP/server config), User (own workspace/devices/channels), Agent (read/write within user boundary, execute on user devices under device policy, invoke only admin-declared Server MCP), Partner (user's own identity on the channel), Allowed user (wrapped `[untrusted]`). Hard boundaries: no cross-user access, no general Server exec/eval, and no execution of uploaded content; Server MCP is the explicit trusted-admin exception. |
 
 ## Accepted Theme 12: Persistence and Message Schema
 
@@ -572,7 +572,7 @@ normal user message into an isolated cron session.
 
 `docs/API.yaml`, `docs/SCHEMA.md`, `docs/DECISIONS.md`, and `docs/TOOLS.md`
 are updated for Python-main to keep Admin API narrow: runtime product config,
-basic user management, and a Py8-reserved server MCP surface.
+basic user management, and the Py8a shared-service Server MCP surface.
 
 - `GET /api/admin/config` returns only OpenOctopus-recognized LLM/quota and
   Server `web_fetch_denylist` keys.
@@ -596,8 +596,16 @@ basic user management, and a Py8-reserved server MCP surface.
   `workspace_fs`. There is no single-user admin GET route.
 - `DELETE /api/admin/users/{id}` protects the last admin and returns
   `409 last_admin_required` when deletion would remove it.
-- `/api/admin/server-mcp` remains a Py8 design placeholder and is not exposed
-  by Py7. Each future configured server MCP
-  gets one shared runtime/client and a bounded FIFO queue. There is no pool,
-  per-user runtime, or session-scoped runtime in the Py8 contract. MCP `env` is
-  returned as stored because admin is the trust boundary for that route.
+- `GET/PUT /api/admin/server-mcp` reads or atomically replaces the whole
+  Server MCP list with `base_config_revision` CAS. Added/modified entries
+  complete real initialize and four-surface discovery before save; pure
+  deletion can be offline. Config secrets remain plaintext in PostgreSQL but
+  every REST value is redacted.
+- Each configured Server MCP gets one shared runtime/client/session. Its
+  per-runtime queue is bounded and fair across users, all Server MCPs share
+  global/per-user active-or-draining caps, and endpoint failure is degraded
+  state that does not fail `/health` or remove last-good Provider schemas.
+- Admin Server names take priority: they shadow existing Device namespaces and
+  reserve future Device mutations. Enabled Server schemas consume Provider MCP
+  capacity first; remaining Device suppression is deterministic and visible in
+  Device API projections.

@@ -72,6 +72,7 @@ class FrozenMcpEntryRoute:
     raw_name: str
     invocation_identity: str
     final_name: str
+    server_config_revision: int | None = None
 
     @property
     def source_identity(self) -> tuple[McpSurface, str, str]:

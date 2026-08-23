@@ -122,7 +122,7 @@ tags:
   - name: Cron
     description: Scheduled agent invocations
   - name: Admin
-    description: Admin-only system config and user management; Server MCP remains deferred to Py8 and has no Py7 route
+    description: Admin-only system config, shared-service Server MCP, and user management
 
 security:
   - cookieAuth: []
@@ -139,6 +139,8 @@ paths:
         capability probe runs only at startup. Runtime probes are single-flight
         on one dedicated RustFS connection, separate from the configured
         workspace object-operation pool.
+        Shared Server MCP is optional: endpoint/process failure is reported only
+        in the admin Server MCP projection and never changes this health result.
       responses:
         '200':
           description: Both dependencies are connected.
@@ -1385,6 +1387,10 @@ paths:
         keys remain visible, but every value is `"<redacted>"`. The catalog is
         available while the Device is offline and includes disabled entries so
         callers can construct an exact `enabled_capabilities` allowlist.
+        Response-only fields show whether a Server MCP name shadows a complete
+        Device config and whether each enabled capability remains Provider
+        visible after Server namespace, exact-name, and Server-first capacity
+        selection. These fields are derived and are never PATCH input.
       responses:
         '200':
           description: Current Device MCP configuration.
@@ -1415,6 +1421,11 @@ paths:
         connection. A successful commit atomically updates config, last-good
         catalog, and revision before pushing the authoritative Protocol v3
         config to the Client.
+
+        A Device candidate may preserve or delete an existing MCP whose name is
+        now reserved by Server MCP, but it may not add or effectively modify
+        that reserved name. The final commit fence rechecks reservations and
+        exact enabled Server-name collisions; failures save nothing.
       requestBody:
         required: true
         content:
@@ -1436,8 +1447,9 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            Stale revision, rename/schema collision, owner aggregate limit,
-            Device offline/replaced/busy, or insecure secret transport.
+            Stale revision, Server-reserved MCP name, rename/schema collision,
+            owner aggregate limit, Device offline/replaced/busy, or insecure
+            secret transport.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}:
@@ -1763,7 +1775,7 @@ paths:
         Object storage is deployment infrastructure config, like Postgres: it
         is read from environment / deployment secrets at server startup and is
         not exposed through this admin API. `server_mcp` is managed through the
-        later Py8 `/api/admin/server-mcp` route, not through config patching.
+        dedicated `/api/admin/server-mcp` route, not through config patching.
 
         Python-main accepts `llm_endpoint`, `llm_api_key`, and `llm_model` on PATCH
         after validating the merged provider identity with `GET
@@ -1854,6 +1866,79 @@ paths:
           description: OK
           content: { application/json: { schema: { $ref: '#/components/schemas/AdminConfig' } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/admin/server-mcp:
+    description: Py8a admin shared-service Server MCP configuration and runtime diagnostics.
+    get:
+      tags: [Admin]
+      summary: Read shared Server MCP config, catalog, and runtime state
+      description: |
+        Returns the authoritative PostgreSQL config revision, redacted complete
+        config, last-good four-surface discovery projection, and a matching
+        process-local runtime snapshot. Stdio env and remote header keys remain
+        visible but every value is `"<redacted>"`. Runtime unavailability is
+        degraded state: schemas remain visible and `/health` continues to
+        depend only on PostgreSQL and RustFS.
+
+        Each runtime name has separate `active` and `draining` slots so a
+        replacement is not overwritten in diagnostics. A deleted name remains
+        with `configured=false` only while its old generation is draining.
+        Runtime error messages are bounded OpenOctopus-authored text and never
+        expose command args, URL query, env/header values, stderr, response
+        bodies, or third-party exception data.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      responses:
+        '200':
+          description: Current authoritative config and matching runtime snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerMcpResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Admin]
+      summary: Validate and atomically replace all shared Server MCP config
+      description: |
+        Whole-list replacement with required `base_config_revision`. Stale CAS
+        and a same-name generation still draining return
+        `409 server_mcp_config_conflict`. The revision is checked before remote
+        work and again in the final transaction.
+
+        Every added or effectively modified server completes a real FastMCP
+        initialize plus bounded discovery of tools, static resources, resource
+        templates, and prompts before anything is saved. Pure deletion does not
+        require the removed endpoint to be reachable. A precise no-op neither
+        initializes nor increments the revision. Config, next revision, and the
+        complete last-good catalog commit in one JSONB envelope before the new
+        runtime is published.
+
+        `"<redacted>"` retains an existing secret only for the same name,
+        transport, sink, and key; new or changed sinks require real values.
+        Existing Device MCP never blocks an admin candidate. A committed Server
+        name shadows the same Device namespace, while Server enabled schemas
+        consume the Provider MCP budget before deterministic Device selection.
+      security:
+        - cookieAuth: [admin]
+        - bearerAuth: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServerMcpPut' }
+      responses:
+        '200':
+          description: Transitioned authoritative config and runtime snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerMcpResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Stale CAS, draining-generation conflict, Server collision, or Server-only Provider capacity violation; nothing was saved.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: Strict config, secret marker, spawn, initialize, discovery, or catalog validation failed; nothing was saved.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/admin/users:
     description: Python-main admin user management route.
@@ -1972,6 +2057,7 @@ components:
             Stable error code from `openoctopus_server/errors/`.
             Examples: `device_not_found`, `device_invalid_request`,
             `tool_device_unreachable`, `tool_device_busy`,
+            `tool_mcp_busy`, `tool_mcp_unavailable`, `tool_mcp_error`,
             `tool_execution_outcome_unknown`,
             `workspace_not_found`, `auth_forbidden`, `workspace_soft_locked`,
             `workspace_upload_too_large`, `workspace_invalid_skill_format`,
@@ -1981,7 +2067,10 @@ components:
             `tool_no_match`, `tool_invalid_schedule`, `auth_last_admin_required`,
             `tool_content_conversion_busy`,
             `tool_content_conversion_resource_exceeded`, and
-            `tool_content_conversion_failed`.
+            `tool_content_conversion_failed`. Admin/Device MCP mutation codes
+            include `server_mcp_config_conflict`,
+            `mcp_name_reserved_by_server`, `mcp_schema_collision`, and
+            `mcp_server_schema_limit`.
         message: { type: string }
 
     User:
@@ -2527,7 +2616,7 @@ components:
     Device:
       type: object
       additionalProperties: false
-      required: [id, name, restrict_to_workspace, workspace_path, ssrf_denylist, shell_timeout_max, env_allowlist, config_revision, mcp_config_count, mcp_enabled_capability_count, mcp_catalog_digest, online, token_hint, created_at]
+      required: [id, name, restrict_to_workspace, workspace_path, ssrf_denylist, shell_timeout_max, env_allowlist, config_revision, mcp_config_count, mcp_enabled_capability_count, mcp_provider_visible_capability_count, mcp_suppressed_capability_count, mcp_catalog_digest, online, token_hint, created_at]
       properties:
         id:
           type: string
@@ -2576,6 +2665,15 @@ components:
         mcp_enabled_capability_count:
           type: integer
           minimum: 0
+          description: Enabled entries selected by this Device's own config, before Server-derived suppression.
+        mcp_provider_visible_capability_count:
+          type: integer
+          minimum: 0
+          description: Enabled Device catalog entries visible in the current owner Provider snapshot.
+        mcp_suppressed_capability_count:
+          type: integer
+          minimum: 0
+          description: Enabled Device catalog entries suppressed by Server namespace, exact final-name collision, or Provider capacity. Visible plus suppressed equals enabled.
         mcp_catalog_digest:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -2890,7 +2988,8 @@ components:
       description: |
         Py7 Device MCP tagged union. All four discovered surfaces use final
         names `mcp_<server>_<alias>`; the name does not encode the surface.
-        Admin/Server MCP is deferred to Py8.
+        Py8a Server MCP uses the separate Server-only union that adds
+        `max_concurrent_calls`; Device input never accepts that field.
 
     McpEnabledCapabilities:
       type: [array, "null"]
@@ -2974,6 +3073,223 @@ components:
           properties:
             transport: { type: string, enum: [sse] }
 
+    ServerMcpServerConfig:
+      oneOf:
+        - $ref: '#/components/schemas/ServerStdioMcpServerConfig'
+        - $ref: '#/components/schemas/ServerStreamableHttpMcpServerConfig'
+        - $ref: '#/components/schemas/ServerSseMcpServerConfig'
+      discriminator:
+        propertyName: transport
+        mapping:
+          stdio: '#/components/schemas/ServerStdioMcpServerConfig'
+          streamable_http: '#/components/schemas/ServerStreamableHttpMcpServerConfig'
+          sse: '#/components/schemas/ServerSseMcpServerConfig'
+      description: |
+        Py8a admin shared-service config. Input may omit
+        `max_concurrent_calls`; successful responses and PostgreSQL storage
+        always include its effective value (stdio 1, remote 8).
+
+    ServerStdioMcpServerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, transport, command]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [stdio] }
+        command:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Direct executable argv[0]; no shell parsing. Runs as the Server OS user with no OS sandbox.
+        args:
+          type: array
+          maxItems: 64
+          items: { type: string, maxLength: 4096 }
+        cwd: { type: [string, "null"], minLength: 1, maxLength: 4096 }
+        env:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string }
+          description: Plaintext on write; every REST response value is `"<redacted>"`. `OPENOCTOPUS_*` is never inherited.
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        max_concurrent_calls:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 1
+
+    ServerStreamableHttpMcpServerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, transport, url]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [streamable_http] }
+        url:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Exact HTTP(S) MCP endpoint without userinfo or fragment; redirects are not followed.
+        headers:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string }
+          description: Plaintext on write and redacted in REST; non-empty headers require HTTPS.
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        max_concurrent_calls:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 8
+
+    ServerSseMcpServerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, transport, url]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [sse] }
+        url:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Exact legacy SSE endpoint; there is no Streamable HTTP fallback.
+        headers:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string }
+          description: Plaintext on write and redacted in REST; non-empty headers require HTTPS.
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        max_concurrent_calls:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 8
+
+    ServerMcpServerConfigView:
+      oneOf:
+        - $ref: '#/components/schemas/ServerStdioMcpServerConfigView'
+        - $ref: '#/components/schemas/ServerRemoteMcpServerConfigView'
+      discriminator:
+        propertyName: transport
+        mapping:
+          stdio: '#/components/schemas/ServerStdioMcpServerConfigView'
+          streamable_http: '#/components/schemas/ServerRemoteMcpServerConfigView'
+          sse: '#/components/schemas/ServerRemoteMcpServerConfigView'
+      description: Canonical response-only redacted Server MCP config projection.
+
+    ServerStdioMcpServerConfigView:
+      type: object
+      additionalProperties: false
+      required: [name, transport, command, args, cwd, env, enabled_capabilities, max_concurrent_calls]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [stdio] }
+        command: { type: string, minLength: 1, maxLength: 4096 }
+        args:
+          type: array
+          maxItems: 64
+          items: { type: string, maxLength: 4096 }
+        cwd: { type: [string, "null"], minLength: 1, maxLength: 4096 }
+        env:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string, enum: ["<redacted>"] }
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        max_concurrent_calls: { type: integer, minimum: 1, maximum: 32 }
+
+    ServerRemoteMcpServerConfigView:
+      type: object
+      additionalProperties: false
+      required: [name, transport, url, headers, enabled_capabilities, max_concurrent_calls]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [streamable_http, sse] }
+        url: { type: string, minLength: 1, maxLength: 4096 }
+        headers:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string, enum: ["<redacted>"] }
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        max_concurrent_calls: { type: integer, minimum: 1, maximum: 32 }
+
+    ServerMcpPut:
+      type: object
+      additionalProperties: false
+      required: [base_config_revision, mcp_servers]
+      properties:
+        base_config_revision: { type: integer, format: int64, minimum: 1 }
+        mcp_servers:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/ServerMcpServerConfig' }
+
+    ServerMcpRuntimeError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message:
+          type: string
+          maxLength: 1024
+          description: Sanitized OpenOctopus-authored diagnostic; never third-party text.
+
+    ServerMcpRuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [state, origin, config_revision, catalog_digest, runtime_generation, max_concurrent_calls, active_calls, waiting_calls, draining_calls, restart_attempt, last_error]
+      properties:
+        state:
+          type: string
+          enum: [starting, discovering, ready, unavailable, backoff, drifted, draining, cleanup_blocked]
+        origin: { type: string, enum: [persisted, candidate] }
+        config_revision: { type: [integer, "null"], format: int64, minimum: 1 }
+        catalog_digest: { type: [string, "null"], pattern: '^[0-9a-f]{64}$' }
+        runtime_generation: { type: [string, "null"], format: uuid }
+        max_concurrent_calls: { type: integer, minimum: 1, maximum: 32 }
+        active_calls: { type: integer, minimum: 0, maximum: 32 }
+        waiting_calls: { type: integer, minimum: 0, maximum: 128 }
+        draining_calls: { type: integer, minimum: 0, maximum: 32 }
+        restart_attempt: { type: integer, minimum: 0 }
+        last_error:
+          oneOf:
+            - $ref: '#/components/schemas/ServerMcpRuntimeError'
+            - type: "null"
+
+    ServerMcpRuntimeSlot:
+      type: object
+      additionalProperties: false
+      required: [configured, active, draining]
+      properties:
+        configured: { type: boolean }
+        active:
+          oneOf:
+            - $ref: '#/components/schemas/ServerMcpRuntimeStatus'
+            - type: "null"
+        draining:
+          oneOf:
+            - $ref: '#/components/schemas/ServerMcpRuntimeStatus'
+            - type: "null"
+
+    ServerMcpResponse:
+      type: object
+      additionalProperties: false
+      required: [config_revision, mcp_servers, mcp_catalog_digest, mcp_discovered, runtimes]
+      properties:
+        config_revision: { type: integer, format: int64, minimum: 1 }
+        mcp_servers:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/ServerMcpServerConfigView' }
+        mcp_catalog_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        mcp_discovered:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/McpDiscoveredServer' }
+        runtimes:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/ServerMcpRuntimeSlot' }
+
     DeviceConfigPatch:
       type: object
       additionalProperties: false
@@ -3029,6 +3345,96 @@ components:
           type: array
           items: { $ref: '#/components/schemas/McpDiscoveredCapability' }
 
+    DeviceMcpServerConfigView:
+      oneOf:
+        - $ref: '#/components/schemas/DeviceStdioMcpServerConfigView'
+        - $ref: '#/components/schemas/DeviceRemoteMcpServerConfigView'
+      discriminator:
+        propertyName: transport
+        mapping:
+          stdio: '#/components/schemas/DeviceStdioMcpServerConfigView'
+          streamable_http: '#/components/schemas/DeviceRemoteMcpServerConfigView'
+          sse: '#/components/schemas/DeviceRemoteMcpServerConfigView'
+      description: Response-only redacted Device MCP config projection.
+
+    DeviceStdioMcpServerConfigView:
+      type: object
+      additionalProperties: false
+      required: [name, transport, command, args, cwd, env, enabled_capabilities, effective_status, shadowed_by]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [stdio] }
+        command: { type: string, minLength: 1, maxLength: 4096 }
+        args:
+          type: array
+          maxItems: 64
+          items: { type: string, maxLength: 4096 }
+        cwd: { type: [string, "null"], minLength: 1, maxLength: 4096 }
+        env:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string, enum: ["<redacted>"] }
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        effective_status: { type: string, enum: [active, shadowed_by_server] }
+        shadowed_by:
+          type: [string, "null"]
+          pattern: '^[a-z][a-z0-9_]{0,31}$'
+          description: Exact authoritative Server config name when shadowed.
+
+    DeviceRemoteMcpServerConfigView:
+      type: object
+      additionalProperties: false
+      required: [name, transport, url, headers, enabled_capabilities, effective_status, shadowed_by]
+      properties:
+        name: { type: string, pattern: '^[a-z][a-z0-9_]{0,31}$' }
+        transport: { type: string, enum: [streamable_http, sse] }
+        url: { type: string, minLength: 1, maxLength: 4096 }
+        headers:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string, enum: ["<redacted>"] }
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+        effective_status: { type: string, enum: [active, shadowed_by_server] }
+        shadowed_by:
+          type: [string, "null"]
+          pattern: '^[a-z][a-z0-9_]{0,31}$'
+          description: Exact authoritative Server config name when shadowed.
+
+    DeviceMcpDiscoveredCapability:
+      type: object
+      additionalProperties: false
+      required: [raw_name, final_name, enabled, provider_visible, suppression_reason]
+      properties:
+        raw_name: { type: string, minLength: 1, maxLength: 256 }
+        final_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]{1,64}$'
+        enabled: { type: boolean }
+        provider_visible: { type: boolean }
+        suppression_reason:
+          type: [string, "null"]
+          enum: [server_namespace_reserved, server_final_name_collision, provider_capacity, null]
+
+    DeviceMcpDiscoveredServer:
+      type: object
+      additionalProperties: false
+      required: [tools, resources, resource_templates, prompts]
+      properties:
+        tools:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceMcpDiscoveredCapability' }
+        resources:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceMcpDiscoveredCapability' }
+        resource_templates:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceMcpDiscoveredCapability' }
+        prompts:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceMcpDiscoveredCapability' }
+
     DeviceConfig:
       type: object
       additionalProperties: false
@@ -3045,10 +3451,10 @@ components:
         mcp_servers:
           type: array
           maxItems: 16
-          items: { $ref: '#/components/schemas/McpServerConfig' }
+          items: { $ref: '#/components/schemas/DeviceMcpServerConfigView' }
         mcp_catalog_digest:
           type: string
           pattern: '^[0-9a-f]{64}$'
         mcp_discovered:
           type: object
-          additionalProperties: { $ref: '#/components/schemas/McpDiscoveredServer' }
+          additionalProperties: { $ref: '#/components/schemas/DeviceMcpDiscoveredServer' }

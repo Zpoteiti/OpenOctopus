@@ -3,6 +3,8 @@ name = "openoctopus-server"
 version = "0.0.1"
 requires-python = ">=3.12"
 dependencies = [
+    "fastmcp-slim[client]==3.4.7",
+    "mcp==1.26.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "sqlalchemy[asyncio]>=2.0",
@@ -13,6 +15,7 @@ dependencies = [
     "pyjwt>=2.10",
     "email-validator>=2.2",
     "httpx>=0.28",
+    "jsonschema>=4.20,<5",
     "anthropic>=0.104.1,<1",
     "minio>=7.2",
     "urllib3>=2.2",
@@ -22,6 +25,7 @@ dependencies = [
     "markitdown[pdf,docx,xlsx,pptx]==0.1.7",
     "pypdf>=5.0",
     "tiktoken==0.13.0",
+    "uritemplate==4.2.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +35,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-PyYAML>=6.0",
+    "types-jsonschema",
     "types-regex",
     "python-docx>=1.1",
     "openpyxl>=3.1",

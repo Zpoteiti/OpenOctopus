@@ -11,6 +11,9 @@ from copy import deepcopy
 from typing import Any
 from uuid import UUID
 
+import uritemplate
+from jsonschema import SchemaError as JsonSchemaSchemaError
+from jsonschema.validators import validator_for
 from pydantic import BaseModel
 
 from openctopus_server.tools.device_field import (
@@ -26,6 +29,7 @@ from .mcp_models import (
     ProviderMcpTool,
     SourceMcpCatalog,
     SourceMcpPrompt,
+    SourceMcpResource,
     SourceMcpResourceTemplate,
     SourceMcpServerCatalog,
     parse_mcp_server_configs,
@@ -176,6 +180,12 @@ def extract_resource_template_variables(template: str) -> tuple[str, ...]:
                 seen.add(name)
                 variables.append(name)
         index = end + 1
+    try:
+        parsed = tuple(str(value) for value in uritemplate.variables(template))
+    except (TypeError, ValueError) as exc:
+        raise _validation_error("resource template is not valid RFC 6570") from exc
+    if parsed != tuple(variables):
+        raise _validation_error("resource template variable projection is ambiguous")
     return tuple(variables)
 
 
@@ -186,6 +196,10 @@ def _validate_capability_value(value: object) -> None:
 
 def _validate_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
     _validate_capability_value(schema)
+    try:
+        validator_for(schema).check_schema(schema)
+    except JsonSchemaSchemaError:
+        raise _validation_error("MCP tool input schema is invalid") from None
     if schema.get("type") != "object":
         raise _validation_error("MCP tool input schema must have top-level type object")
     properties = schema.get("properties")
@@ -548,6 +562,71 @@ def _merge_identity(entry: PersistedMcpCatalogEntry) -> bytes:
     )
 
 
+def provider_tool_for_entry(
+    entry: PersistedMcpCatalogEntry,
+    *,
+    sites: Sequence[str],
+    selector_description: str,
+) -> ProviderMcpTool:
+    """Build the canonical Provider schema for one logical MCP entry."""
+
+    input_schema = deepcopy(entry.input_schema)
+    properties = input_schema.get("properties")
+    required = input_schema.get("required", [])
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        raise _validation_error("persisted MCP provider schema is invalid")
+    if DEVICE_FIELD_NAME in properties:
+        raise _validation_error(f"persisted MCP schema reserves {DEVICE_FIELD_NAME}")
+    properties[DEVICE_FIELD_NAME] = openoctopus_device_field(
+        selector_description,
+        sites=tuple(sites),
+    )
+    input_schema["required"] = [*required, DEVICE_FIELD_NAME]
+    return ProviderMcpTool(
+        name=entry.final_name,
+        description=entry.provider_description,
+        input_schema=input_schema,
+    )
+
+
+def validate_persisted_catalog_entry(entry: PersistedMcpCatalogEntry) -> None:
+    """Validate persisted facts even when no fresh discovery source is present."""
+
+    _validate_capability_value(entry)
+    if entry.final_name != wrapped_capability_name(entry.server, entry.raw_name):
+        raise _validation_error("persisted MCP final name does not match its source identity")
+    _validate_tool_schema(entry.input_schema)
+    if entry.output_schema is not None:
+        if entry.surface != "tool":
+            raise _validation_error("only MCP tools may define an output schema")
+        _validate_capability_value(entry.output_schema)
+    expected_prefix = _provider_description(entry.server, entry.surface, None)
+    if not entry.provider_description.startswith(expected_prefix):
+        raise _validation_error("persisted MCP provider description is invalid")
+    if entry.surface in {"tool", "prompt"}:
+        if entry.invocation_identity != entry.raw_name:
+            raise _validation_error("persisted MCP invocation identity is invalid")
+        return
+    if entry.surface == "resource":
+        SourceMcpResource(
+            raw_name=entry.raw_name,
+            uri=entry.invocation_identity,
+        )
+        if canonical_json_bytes(entry.input_schema) != canonical_json_bytes(
+            _resource_schema()
+        ):
+            raise _validation_error("persisted MCP resource schema is invalid")
+        return
+    template = SourceMcpResourceTemplate(
+        raw_name=entry.raw_name,
+        uri_template=entry.invocation_identity,
+    )
+    if canonical_json_bytes(entry.input_schema) != canonical_json_bytes(
+        _template_schema(template)
+    ):
+        raise _validation_error("persisted MCP resource template schema is invalid")
+
+
 def merge_owner_catalogs(
     catalogs_by_device: Mapping[str, PersistedMcpCatalog],
     *,
@@ -602,23 +681,13 @@ def merge_owner_catalogs(
                 "mcp_schema_collision",
                 f"MCP device contains duplicate install routes: {final_name}",
             )
-        input_schema = deepcopy(reference.input_schema)
-        properties = input_schema.get("properties")
-        required = input_schema.get("required", [])
-        if not isinstance(properties, dict) or not isinstance(required, list):
-            raise _validation_error("persisted MCP provider schema is invalid")
-        if DEVICE_FIELD_NAME in properties:
-            raise _validation_error(f"persisted MCP schema reserves {DEVICE_FIELD_NAME}")
-        properties[DEVICE_FIELD_NAME] = openoctopus_device_field(
-            "Which paired device should execute this MCP capability.",
-            sites=sites,
-        )
-        input_schema["required"] = [*required, DEVICE_FIELD_NAME]
         merged.append(
-            ProviderMcpTool(
-                name=final_name,
-                description=reference.provider_description,
-                input_schema=input_schema,
+            provider_tool_for_entry(
+                reference,
+                sites=sites,
+                selector_description=(
+                    "Which paired device should execute this MCP capability."
+                ),
             )
         )
     if (

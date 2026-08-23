@@ -23,6 +23,7 @@ from openctopus_server.devices.mcp_routes import (
 )
 from openctopus_server.devices.protocol import ToolResultFrame, new_uuid7
 from openctopus_server.devices.registry import (
+    DeviceIssueGuard,
     DeviceMcpUnavailableError,
     DeviceUnavailableError,
 )
@@ -104,7 +105,9 @@ class _McpDispatcher:
         timeout_seconds: float,
         chat_session_id: UUID | None = None,
         on_issued: Callable[[], None] | None = None,
+        issue_guard: DeviceIssueGuard | None = None,
     ) -> ToolResultFrame:
+        del issue_guard
         if self.issue_before_failure and on_issued is not None:
             on_issued()
         if self.failure is not None:

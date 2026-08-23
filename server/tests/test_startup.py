@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.main import _lifespan
+from openctopus_server.mcp.models import empty_server_mcp_envelope
 
 
 def _settings() -> SimpleNamespace:
@@ -26,9 +27,24 @@ def _settings() -> SimpleNamespace:
 @pytest.fixture(autouse=True)
 def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     converter = SimpleNamespace(probe=AsyncMock())
+    supervisor = SimpleNamespace(
+        start=AsyncMock(),
+        begin_shutdown=AsyncMock(),
+        shutdown=AsyncMock(),
+        ready_generations=Mock(return_value={}),
+        dispatch_server_mcp=AsyncMock(),
+    )
     monkeypatch.setattr("openctopus_server.main.initialize_token_estimator", Mock())
     monkeypatch.setattr("openctopus_server.main.get_content_converter", lambda: converter)
-    return converter
+    monkeypatch.setattr(
+        "openctopus_server.main.ServerMcpSupervisor.create_default",
+        Mock(return_value=supervisor),
+    )
+    monkeypatch.setattr(
+        "openctopus_server.main._load_server_mcp_authority",
+        AsyncMock(return_value=empty_server_mcp_envelope()),
+    )
+    return SimpleNamespace(probe=converter.probe, supervisor=supervisor)
 
 
 def _app_with_runtime() -> tuple[FastAPI, SimpleNamespace]:
@@ -66,6 +82,20 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
     _startup_dependencies: SimpleNamespace,
 ) -> None:
     app, runtime = _app_with_runtime()
+    events: list[str] = []
+
+    async def begin_shutdown() -> None:
+        events.append("mcp-begin")
+
+    async def close_runtime() -> None:
+        events.append("chat-close")
+
+    async def shutdown() -> None:
+        events.append("mcp-close")
+
+    _startup_dependencies.supervisor.begin_shutdown.side_effect = begin_shutdown
+    runtime.close.side_effect = close_runtime
+    _startup_dependencies.supervisor.shutdown.side_effect = shutdown
     engine, connection = _engine()
     storage = Mock(
         probe_startup=AsyncMock(),
@@ -87,10 +117,16 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
             storage.recover_transfer_uploads.assert_awaited_once()
             _startup_dependencies.probe.assert_awaited_once()
             recover_deletions.assert_awaited_once()
+            _startup_dependencies.supervisor.start.assert_awaited_once()
+            assert app.state.server_mcp_supervisor is (
+                _startup_dependencies.supervisor
+            )
 
     assert connection.execute.await_count == 2
     connection.run_sync.assert_awaited_once()
     runtime.close.assert_awaited_once()
+    assert events == ["mcp-begin", "chat-close", "mcp-close"]
+    _startup_dependencies.supervisor.shutdown.assert_awaited_once()
     runtime.device_registry.close.assert_awaited_once()
     storage.close.assert_awaited_once()
     engine.dispose.assert_awaited_once()

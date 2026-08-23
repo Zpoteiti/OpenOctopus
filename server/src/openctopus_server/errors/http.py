@@ -32,6 +32,7 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_REF_CONFLICT: 409,
     ErrorCode.TOOL_DEVICE_UNREACHABLE: 409,
     ErrorCode.TOOL_DEVICE_BUSY: 429,
+    ErrorCode.TOOL_MCP_BUSY: 429,
     ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN: 409,
     ErrorCode.TOOL_PATH_OUTSIDE_WORKSPACE: 403,
     ErrorCode.TOOL_NO_MATCH: 409,
@@ -56,7 +57,10 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.MCP_WITHIN_SERVER_COLLISION: 409,
     ErrorCode.MCP_SCHEMA_COLLISION: 409,
     ErrorCode.MCP_OWNER_SCHEMA_LIMIT: 409,
+    ErrorCode.MCP_NAME_RESERVED_BY_SERVER: 409,
+    ErrorCode.MCP_SERVER_SCHEMA_LIMIT: 409,
     ErrorCode.MCP_SECRET_TRANSPORT_INSECURE: 409,
+    ErrorCode.SERVER_MCP_CONFIG_CONFLICT: 409,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.INVALID_MESSAGE_CONTENT: 400,
     ErrorCode.INVALID_CURSOR: 400,
@@ -71,8 +75,13 @@ async def openoctopus_error_handler(request: Request, exc: Exception) -> JSONRes
     status = ERROR_STATUS.get(exc.code, 500)
     if (
         exc.code is ErrorCode.CONFIG_VALIDATION_FAILED
-        and request.url.path.startswith("/api/devices/")
-        and request.url.path.endswith("/config")
+        and (
+            (
+                request.url.path.startswith("/api/devices/")
+                and request.url.path.endswith("/config")
+            )
+            or request.url.path == "/api/admin/server-mcp"
+        )
     ):
         status = 422
     return JSONResponse(
@@ -92,6 +101,14 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    if request.url.path == "/api/admin/server-mcp":
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": ErrorCode.CONFIG_VALIDATION_FAILED.value,
+                "message": "Server MCP configuration is invalid",
+            },
+        )
     if request.url.path.startswith("/api/devices"):
         return JSONResponse(
             status_code=400,

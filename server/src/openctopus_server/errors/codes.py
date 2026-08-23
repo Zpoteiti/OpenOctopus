@@ -65,6 +65,7 @@ class ErrorCode(StrEnum):
     TOOL_DB_ERROR = "tool_db_error"
     TOOL_CRON_JOB_NOT_FOUND = "tool_cron_job_not_found"
     TOOL_MCP_UNAVAILABLE = "tool_mcp_unavailable"
+    TOOL_MCP_BUSY = "tool_mcp_busy"
     TOOL_MCP_ERROR = "tool_mcp_error"
     TOOL_MCP_MESSAGE_TOO_LARGE = "tool_mcp_message_too_large"
     TOOL_MCP_INVALID_RESULT = "tool_mcp_invalid_result"
@@ -83,6 +84,8 @@ class ErrorCode(StrEnum):
     MCP_WITHIN_SERVER_COLLISION = "mcp_within_server_collision"
     MCP_SCHEMA_COLLISION = "mcp_schema_collision"
     MCP_OWNER_SCHEMA_LIMIT = "mcp_owner_schema_limit"
+    MCP_NAME_RESERVED_BY_SERVER = "mcp_name_reserved_by_server"
+    MCP_SERVER_SCHEMA_LIMIT = "mcp_server_schema_limit"
     MCP_SPAWN_FAILED = "mcp_spawn_failed"
     MCP_MESSAGE_TOO_LARGE = "mcp_message_too_large"
     MCP_SECRET_TRANSPORT_INSECURE = "mcp_secret_transport_insecure"
@@ -95,6 +98,7 @@ class ErrorCode(StrEnum):
     USER_NOT_FOUND = "user_not_found"
     # Config
     CONFIG_VALIDATION_FAILED = "config_validation_failed"
+    SERVER_MCP_CONFIG_CONFLICT = "server_mcp_config_conflict"
     # Chat/provider
     NOT_FOUND = "not_found"
     INVALID_MESSAGE_CONTENT = "invalid_message_content"

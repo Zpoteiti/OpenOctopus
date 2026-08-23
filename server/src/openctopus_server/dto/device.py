@@ -60,6 +60,8 @@ class StdioMcpServerResponse(BaseModel):
     cwd: str | None
     env: dict[str, str]
     enabled_capabilities: list[str] | None
+    effective_status: Literal["active", "shadowed_by_server"]
+    shadowed_by: str | None
 
 
 class RemoteMcpServerResponse(BaseModel):
@@ -70,6 +72,8 @@ class RemoteMcpServerResponse(BaseModel):
     url: str
     headers: dict[str, str]
     enabled_capabilities: list[str] | None
+    effective_status: Literal["active", "shadowed_by_server"]
+    shadowed_by: str | None
 
 
 type McpServerResponse = StdioMcpServerResponse | RemoteMcpServerResponse
@@ -81,6 +85,12 @@ class McpDiscoveredCapability(BaseModel):
     raw_name: str
     final_name: str
     enabled: bool
+    provider_visible: bool
+    suppression_reason: Literal[
+        "server_namespace_reserved",
+        "server_final_name_collision",
+        "provider_capacity",
+    ] | None
 
 
 class McpDiscoveredServer(BaseModel):
@@ -123,6 +133,8 @@ class DeviceResponse(BaseModel):
     config_revision: int
     mcp_config_count: int
     mcp_enabled_capability_count: int
+    mcp_provider_visible_capability_count: int
+    mcp_suppressed_capability_count: int
     mcp_catalog_digest: str
     online: bool
     created_at: datetime

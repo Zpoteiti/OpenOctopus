@@ -3,7 +3,7 @@ import inspect
 import json
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -48,6 +48,11 @@ from openctopus_server.devices.mcp_routes import (
 )
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.mcp.models import ServerMcpEnvelope
+from openctopus_server.mcp.routes import (
+    CompositeMcpSnapshot,
+    build_composite_mcp_snapshot,
+)
 from openctopus_server.provider.anthropic import (
     AnthropicProvider,
     Provider,
@@ -71,6 +76,7 @@ from openctopus_server.services.messages import (
     register_cancel_waiter,
     reserve_pending_turn,
 )
+from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
 from openctopus_server.tools.base import (
     MessageDeliveryEffect,
     ToolContext,
@@ -82,8 +88,12 @@ from openctopus_server.workspace.skills import get_skills_cache
 
 ProviderFactory = Callable[[ProviderConfig], Provider]
 RequestTokenEstimator = Callable[..., int | Awaitable[int]]
+ServerMcpGenerationResolver = Callable[
+    [ServerMcpEnvelope], Mapping[str, UUID | None]
+]
 
 _MAX_ITERATIONS = 200
+_MCP_AUTHORITY_SNAPSHOT_ATTEMPTS = 3
 _COMPACTION_SYSTEM = (
     "Summarize the conversation state for another assistant that will continue it. "
     "Preserve user intent, constraints, decisions, completed work, tool findings, "
@@ -124,7 +134,7 @@ class _PreparedTurn:
     tools: list[dict[str, Any]]
     user_id: UUID
     device_targets: dict[str, UUID]
-    mcp_snapshot: OwnerMcpSnapshot
+    mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +143,7 @@ class _CompletedProviderTurn:
     assistant: Message
     user_id: UUID
     device_targets: dict[str, UUID]
-    mcp_snapshot: OwnerMcpSnapshot
+    mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,24 +151,59 @@ class _UnhandledProviderFailure:
     pass
 
 
+async def _load_mcp_authority_snapshot(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+) -> tuple[ServerMcpEnvelope, tuple[OwnerDeviceSnapshot, ...]]:
+    """Capture Server and owner Device MCP authority from one stable interval."""
+
+    for _attempt in range(_MCP_AUTHORITY_SNAPSHOT_ATTEMPTS):
+        before = await load_server_mcp_envelope(db)
+        devices = await load_owner_device_snapshot(db, user_id=user_id)
+        after = await load_server_mcp_envelope(db)
+        if (
+            before.config_revision == after.config_revision
+            and before.mcp_catalog.digest == after.mcp_catalog.digest
+        ):
+            return after, devices
+    raise RuntimeError("Server MCP authority changed repeatedly while preparing a turn")
+
+
 def _build_owner_tool_state(
     devices: Sequence[OwnerDeviceSnapshot],
     *,
     tool_registry: ToolRegistry,
-) -> tuple[dict[str, UUID], OwnerMcpSnapshot, list[dict[str, Any]]]:
+    server_envelope: ServerMcpEnvelope | None = None,
+    runtime_generations: Mapping[str, UUID | None] | None = None,
+) -> tuple[
+    dict[str, UUID],
+    OwnerMcpSnapshot | CompositeMcpSnapshot,
+    list[dict[str, Any]],
+]:
     device_targets = {device.name: device.id for device in devices}
-    mcp_snapshot = build_owner_mcp_snapshot(
-        [
-            OwnerMcpDevice(
-                device_id=device.id,
-                name=device.name,
-                config_revision=device.config_revision,
-                catalog=device.mcp_catalog,
-            )
-            for device in devices
-        ],
-        built_in_names=tool_registry.tool_names,
-    )
+    owner_authority = [
+        OwnerMcpDevice(
+            device_id=device.id,
+            name=device.name,
+            config_revision=device.config_revision,
+            catalog=device.mcp_catalog,
+        )
+        for device in devices
+    ]
+    mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
+    if server_envelope is None:
+        mcp_snapshot = build_owner_mcp_snapshot(
+            owner_authority,
+            built_in_names=tool_registry.tool_names,
+        )
+    else:
+        mcp_snapshot = build_composite_mcp_snapshot(
+            server_envelope,
+            owner_authority,
+            built_in_names=tool_registry.tool_names,
+            runtime_generations=runtime_generations,
+        )
     registry_schemas = tool_registry.get_tool_schemas(
         device_names=device_targets.keys(),
         mcp_snapshot=mcp_snapshot,
@@ -180,6 +225,7 @@ class ChatRuntime:
         device_registry: DeviceRegistry | None = None,
         context_admission: KeyedAdmission | None = None,
         request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
+        server_mcp_generation_resolver: ServerMcpGenerationResolver | None = None,
     ) -> None:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
@@ -189,6 +235,7 @@ class ChatRuntime:
         self.device_registry = device_registry or get_device_registry()
         self.context_admission = context_admission or get_context_admission()
         self._estimate_request_tokens = request_token_estimator
+        self._server_mcp_generation_resolver = server_mcp_generation_resolver
         self.skills_cache = get_skills_cache()
         self._provider_factory = provider_factory or AnthropicProvider
         self._providers: dict[tuple[str, str], Provider] = {}
@@ -808,7 +855,10 @@ class ChatRuntime:
             if session is None:
                 raise RuntimeError("Session disappeared while preparing a turn")
             user_id = session.user_id
-            owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
+            server_envelope, owner_devices = await _load_mcp_authority_snapshot(
+                db,
+                user_id=user_id,
+            )
             active_rows = list(
                 (
                     await db.execute(
@@ -865,6 +915,12 @@ class ChatRuntime:
         device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
             owner_devices,
             tool_registry=self.tool_registry,
+            server_envelope=server_envelope,
+            runtime_generations=(
+                self._server_mcp_generation_resolver(server_envelope)
+                if self._server_mcp_generation_resolver is not None
+                else {}
+            ),
         )
 
         should_compact = False
@@ -931,7 +987,10 @@ class ChatRuntime:
         if compacted:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 config = await load_provider_config(db)
-                owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
+                server_envelope, owner_devices = await _load_mcp_authority_snapshot(
+                    db,
+                    user_id=user_id,
+                )
                 system, provider_messages = await build_provider_context(
                     db,
                     session_id=turn.session_id,
@@ -944,6 +1003,12 @@ class ChatRuntime:
             device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
                 owner_devices,
                 tool_registry=self.tool_registry,
+                server_envelope=server_envelope,
+                runtime_generations=(
+                    self._server_mcp_generation_resolver(server_envelope)
+                    if self._server_mcp_generation_resolver is not None
+                    else {}
+                ),
             )
             await self._estimate_tokens(
                 system=system,

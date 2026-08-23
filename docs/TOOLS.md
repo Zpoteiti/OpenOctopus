@@ -2,10 +2,10 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131). When the implementation drifts from this doc, fix one or the other.
 
-**Py7 milestone:** the fixed surface is the eleven shared tools plus
+**Py8a milestone:** the fixed surface is the eleven shared tools plus
 server-orchestrated single-regular-file `file_transfer` and the three
 client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). Device
-MCP adds dynamic tools from four surfaces; Server/admin MCP remains Py8.
+and admin shared-service Server MCP add dynamic tools from four surfaces.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -17,7 +17,7 @@ This is a *design* document. Use it during implementation as the source of truth
   - **Routing-only device** — for active shared tools (`read_file`, `write_file`, etc.), the source schema has **no device field at all**. `ToolRegistry.get_tool_schemas(device_names=...)` injects an `openoctopus_device` property (ADR-071) with an enum populated from the server and paired devices, and appends `openoctopus_device` to `required`. Client-only exec tools use the same injection for every paired Device. MCP entries use the same visible selector but retain immutable hidden routes from the persistent catalog.
   - **Intrinsic device** — for tools that natively operate across devices (`file_transfer`, `message`), the device field IS part of the source schema. `file_transfer` uses `openoctopus_src_device` + `openoctopus_dst_device`; `message` uses `openoctopus_device`. Each source stub has `enum: ["server"]`. At merge time, each such enum is **extended** with paired device names.
 - **Reserved `openoctopus_` prefix.** The routing field name MUST use the `openoctopus_` prefix and MUST NOT be just `device` / `src_device` / `dst_device`. Why: the merger would otherwise clobber an MCP tool's native `device` arg (e.g., a tool selecting a GPU). The reserved prefix makes collision impossible.
-- **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and is reserved for future Py8 admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
+- **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and Py8a admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
 - **Marker, not heuristic.** Every intrinsic-device field in a source schema carries `"x-openoctopus-device": true` (a JSON Schema extension). The merger detects device-routing fields by this marker, never by enum-shape guessing. The typed helper `openoctopus_device_field()` in `openctopus_server/tools/device_field.py` produces the canonical fragment — source-schema authors use it instead of hand-writing.
 - **`ToolRegistry` merge invariants:** the merge performs exactly one of two mutations per source schema:
   - **Inject:** add a brand-new `openoctopus_device` property (string, `enum` of install sites, marker `x-openoctopus-device: true`) and append `openoctopus_device` to `required`. Applies to routing-only tools.
@@ -38,6 +38,8 @@ This is a *design* document. Use it during implementation as the source of truth
   - Device MCP transport/runtime/catalog mapping lives under
     `openoctopus_client/mcp/`; Server catalog/route validation lives under
     `openctopus_server/devices/` and `openctopus_server/tools/`.
+  - Server MCP transport/runtime/catalog/admission lives under
+    `openctopus_server/mcp/`; it does not import Client implementation code.
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
@@ -75,12 +77,12 @@ This is a *design* document. Use it during implementation as the source of truth
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
 | `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
 | `list_exec_sessions` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | List sessions owned by the current chat |
-| `mcp_<server>_<alias>` | dynamic Device MCP | persisted last-good catalog | `openoctopus_client/mcp/` | Tool, static resource, resource template, or prompt; surface is hidden route metadata |
+| `mcp_<server>_<alias>` | dynamic Server or Device MCP | persisted last-good catalog | `openctopus_server/mcp/` or `openoctopus_client/mcp/` | Tool, static resource, resource template, or prompt; install site and surface are hidden route metadata |
 
-The Py7 registry contains sixteen fixed first-class tools: eleven shared
+The fixed registry contains sixteen first-class tools: eleven shared
 tools, `message`, `file_transfer`, and the three client-only exec tools. `cron`
-remains outside the active contract; enabled Device MCP catalog entries are
-added dynamically.
+remains outside the active contract; enabled Server and Device MCP catalog
+entries are added dynamically.
 
 Schemas below are the **source** schemas (what gets written in code). The agent sees these plus the merger's additions per ADR-071 (`openoctopus_device` property on routing-only tools, enum extension on intrinsic-device tools).
 
@@ -1180,14 +1182,16 @@ guards the initial cwd. Stable errors include `tool_invalid_args`,
 
 ---
 
-## Device MCP tools, resources, templates, and prompts (Py7)
+## MCP tools, resources, templates, and prompts
 
-Py7 runs user-configured MCP runtimes on paired Devices. Admin shared-service
-Server MCP remains deferred to Py8; the Server never spawns a Py7 MCP process.
-Device MCP configuration is stored on the Device row and changed through
-`GET/PATCH /api/devices/{name}/config`.
+Device MCP runs user-configured runtimes on paired Devices; its configuration is
+stored on the Device row and changed through
+`GET/PATCH /api/devices/{name}/config`. Py8a Server MCP is configured only by an
+admin through whole-list `GET/PUT /api/admin/server-mcp`, runs from the Server
+host, and exposes install site `openoctopus_device="server"`.
 
-The Client uses `fastmcp-slim[client]==3.4.7` with an explicit transport:
+Both execution sites use `fastmcp-slim[client]==3.4.7` with an explicit
+transport:
 
 - `stdio` — one executable plus bounded args/cwd/env; no user-controlled shell
   parsing. The child receives the MCP SDK safe baseline plus configured env,
@@ -1197,8 +1201,10 @@ The Client uses `fastmcp-slim[client]==3.4.7` with an explicit transport:
 
 Remote transports do not follow redirects, do not inherit ambient proxies, and
 use normal TLS verification. Non-empty headers require HTTPS. MCP transport is
-independent of `restrict_to_workspace` and `ssrf_denylist`: installing an MCP
-trusts it with the Device user's host/network access.
+independent of workspace and `web_fetch`/Device SSRF denylist policy. Device MCP
+has the Device user's host/network access; Server stdio MCP is trusted same-UID
+code and Server remote MCP has the Server's network access. Py8a provides no OS
+sandbox for Server MCP.
 
 ### Validate before save and last-good catalog
 
@@ -1219,6 +1225,15 @@ connectivity. An offline Device therefore remains in the
 `openoctopus_device` enum; dispatch returns `tool_device_unreachable`.
 A connected Device whose runtime is starting, unavailable, drifted, or not
 acknowledged returns `tool_mcp_unavailable`.
+
+Server MCP persists the same complete last-good catalog in the atomic
+`system_config.server_mcp` envelope. Every added or effectively modified Server
+config completes real initialize and four-surface discovery before the
+whole-list CAS commit; pure deletion does not require the removed endpoint to
+be reachable. GET redacts every stdio env and remote header value and adds
+sanitized runtime state/counters. Runtime startup/recovery is asynchronous:
+unavailable Server MCP remains in Provider schemas, returns
+`tool_mcp_unavailable`, and does not make `/health` unhealthy.
 
 ### Discovery, names, and filtering
 
@@ -1247,8 +1262,11 @@ There is no `_tool_`, `_resource_`, `_template_`, or `_prompt_` infix.
 The Server and Client retain explicit immutable `surface`, source identity,
 entry id, config revision, catalog digest, and runtime generation route data;
 they never infer a route by splitting the final name. Cross-surface and
-cross-install collisions are rejected rather than overwritten, truncated,
-hashed, or suffixed.
+same-tenancy cross-install collisions are rejected rather than overwritten,
+truncated, hashed, or suffixed. An admin Server install cannot be blocked by an
+existing Device collision; Server priority shadows/suppresses that Device
+projection after commit. Later Device additions or modifications still reject
+reserved names and exact Server final-name collisions.
 
 Each server applies one exact allowlist across all four surfaces:
 
@@ -1267,20 +1285,32 @@ uses `null`, reads `mcp_discovered`, then submits the desired exact names or
 
 For each Provider iteration the registry:
 
-1. reads the user's paired Devices and their persistent last-good catalogs;
-2. selects enabled entries and rejects name/schema drift;
-3. merges equal logical entries across install sites;
-4. injects required `openoctopus_device` with the exact Device enum; and
-5. freezes hidden `(device_id, entry_id, config_revision, catalog_digest)`
-   routes for that iteration.
+1. captures the Server config revision/catalog and the user's paired Device
+   catalogs in one logical snapshot;
+2. emits every enabled Server schema first, with
+   `openoctopus_device=["server"]`;
+3. shadows every Device entry whose structured MCP server name is reserved by
+   an authoritative Server config, then suppresses Device exact-final-name
+   collisions;
+4. greedily selects remaining Device logical groups in final-name order from
+   the 256-name/256-KiB budget left after Server schemas, without splitting a
+   group; and
+5. freezes the exact Server and Device routes for that Provider iteration.
 
-The Server rechecks ownership/name/revision/digest at dispatch, obtains the
-currently accepted runtime generation, removes `openoctopus_device` from the
-source args, and sends one ordinary `tool_call` with an exact `mcp_route`.
-The Client accepts it only when all hidden route fields and the final name match
-its latest acknowledged binding.
+Server MCP capacity is authoritative: an admin candidate whose enabled Server
+schemas alone exceed the Provider budget fails instead of truncating. Existing
+Device config/runtime/catalog is never deleted when shadowed. Device API
+projections report config-level `shadowed_by_server` and capability-level
+`provider_visible`/`suppression_reason`; removing the Server reservation makes
+eligible Device entries reappear without a Device write or reconnect.
 
-Runtime registration is aggregate and single-flight. Every configured server is
+The Server rechecks ownership/name/revision/digest/reservation and exact runtime
+generation at dispatch, then removes `openoctopus_device` from source args.
+Device routes send one ordinary Protocol v3 `tool_call`; Client acceptance still
+requires every hidden binding field. Server routes call the in-process shared
+runtime directly and do not add a Device protocol frame.
+
+Device runtime registration is aggregate and single-flight. Every configured server is
 reported as `ready`, `unavailable`, or `drifted`; a stale acknowledgement
 cannot reopen a changed runtime. MCP sessions survive ordinary OpenOctopus WS
 disconnects and re-register after reconnect. Runtime recovery performs a fresh
@@ -1289,8 +1319,15 @@ calls until the user validates and saves the new catalog.
 
 ### Results, timeout, and replay
 
-Each invocation has one 60-second OpenOctopus outer deadline. The Client maps
-MCP content deterministically into existing safe text/image result blocks:
+Each invocation has one 60-second OpenOctopus public deadline. Server MCP adds a
+bounded admission layer: per-runtime waiting capacity is
+`min(128, max(8, 4 * max_concurrent_calls))`, waiting expires after 5 seconds,
+all Server MCPs share 32 active/draining permits, and one user may hold 4.
+Within a runtime calls are FIFO per user and round-robin across users. Queue
+full/expiry returns `tool_mcp_busy` before send.
+
+Both execution sites map MCP content deterministically into existing safe
+text/image result blocks:
 
 - text stays text; supported JPEG/PNG/GIF/WebP images remain images;
 - resource descriptors and structured content use canonical JSON labels;
@@ -1308,11 +1345,16 @@ A call known not to have entered transport may fail as
 `tool_mcp_unavailable`. Once a call enters or may enter MCP transport,
 timeout, Stop, disconnect, or lost result returns
 `tool_execution_outcome_unknown`; OpenOctopus never automatically replays it.
-Late results are consumed by bounded WS-generation tombstones. MCP failures are
+Device late results are consumed by bounded WS-generation tombstones. For
+remote Server MCP, public timeout/Stop leaves the issued call shield-draining
+for at most 60 additional seconds while it retains runtime/global/user permits;
+a late result is consumed and discarded. Hard drain expiry retires that
+generation. Stdio timeout/Stop retires its process generation immediately, with
+permits held until the process/result boundary closes. MCP failures are
 ordinary bounded tool results, so they neither close a healthy Device WS nor
 stop the Agent loop.
 
-Stable MCP codes include `tool_mcp_unavailable`, `tool_mcp_error`,
+Stable MCP codes include `tool_mcp_busy`, `tool_mcp_unavailable`, `tool_mcp_error`,
 `tool_mcp_message_too_large`, `tool_unsupported_media`,
 `tool_mcp_invalid_result`, `tool_result_too_large`, and
 `tool_execution_outcome_unknown`.
@@ -1345,9 +1387,9 @@ stored in the context.
 
 ### Schema merging at session start
 
-Each Agent-loop Provider iteration captures one owner Device/catalog snapshot.
-The registry deep-copies fixed Server schemas, builds MCP shapes from that
-snapshot, and applies these transformations:
+Each Agent-loop Provider iteration captures one immutable global Server MCP and
+owner Device/catalog snapshot. The registry deep-copies fixed schemas, builds
+MCP shapes from that snapshot, and applies these transformations:
 
 1. Routing-only tools get a new required `openoctopus_device` field whose enum
    is `['server', *device_names]`.
@@ -1357,14 +1399,17 @@ snapshot, and applies these transformations:
    each paired name the registry appends an `anyOf` branch requiring both
    transfer endpoints to use that same name.
 4. Pure-server tools are returned as a deep copy without routing changes.
-5. Enabled last-good MCP entries merge only by equal logical identity and
-   canonical Provider schema. Their required `openoctopus_device` enum lists
-   exact install sites, while a separate immutable route table retains Device,
-   entry, revision, and digest identities.
+5. Enabled Server MCP entries enter first with site `server`. Their structured
+   server names reserve the corresponding Device namespaces; remaining Device
+   entries merge only by equal logical identity and canonical Provider schema,
+   then fit deterministically in the remaining Provider budget. A separate
+   immutable route table retains install site, entry, revision, digest, and
+   generation identities.
 
 The registry never obtains Provider shape from handshake/registration memory.
-MCP collision validation occurs before persistence and is defensively rechecked
-when building the snapshot. After the Server chooses an exact Device route,
+Same-tenancy MCP collision validation occurs before persistence and is
+defensively rechecked when building the snapshot; Server-over-Device priority
+uses the persisted reservation/suppression rules above. After the Server chooses an exact Device route,
 OpenOctopus forwards MCP tool arguments to the MCP Server without re-evaluating
 its dynamic `inputSchema`.
 
@@ -1460,7 +1505,8 @@ cache.
 - Decentralized per-tool (ADR-075). Each tool's `execute()` owns its own `asyncio.timeout()` wrapping.
 - The dispatch layer does not impose a default timeout.
 - Only `exec` exposes an Agent-controlled timeout. MCP invocation uses the fixed
-  60-second outer deadline.
+  60-second public deadline; Server remote MCP may shield-drain for one
+  additional 60-second window without extending the Agent-visible call.
 - Runaway protection comes from the iteration hard cap (200, ADR-036) + trap-in-loop detection, NOT per-tool timeouts.
 
 ### Untrusted tool result wrap
@@ -1508,8 +1554,8 @@ The agent sees errors as normal tool results and adapts on the next iteration (A
 - **`bulk_*` operations** — single-file ops only (ADR-067, superseded by ADR-087 for the rename case).
 - **Per-session `web_fetch` bypasses** — Server policy is admin-global and
   Client policy is per Device; Agent calls cannot disable either snapshot.
-- **Server/admin MCP in Py7** — Device MCP runs only on Clients. A future
-  shared-service Server MCP surface belongs to Py8.
+- **Agent-managed Server MCP** — only admins can read or replace Server MCP
+  configuration; there is no install/configure MCP Agent tool.
 - **`mkdir`** — implicit via `write_file` (ADR-088).
 - **`rmdir`** — covered by `delete_folder` (no separate empty-only variant; too niche).
 

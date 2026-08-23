@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 _PERSONAL_QUOTA_LOCK_KEY = "openoctopus:personal_quota"
 _SHARED_QUOTA_LOCK_KEY = "openoctopus:shared_workspace_quota"
+_GLOBAL_MCP_CATALOG_LOCK_KEY = "openoctopus:mcp_catalog"
+_SERVER_MCP_CONFIG_LOCK_KEY = "openoctopus:server_mcp_config"
 
 
 async def lock_personal_quota_read(db: AsyncSession) -> None:
@@ -41,3 +43,19 @@ async def lock_workspace_refs(db: AsyncSession, user_ids: Iterable[UUID]) -> Non
     statement = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
     for user_id in sorted(set(user_ids), key=str):
         await db.execute(statement, {"key": f"openoctopus:workspace_refs:{user_id}"})
+
+
+async def lock_global_mcp_catalog_write(db: AsyncSession) -> None:
+    """Fence short Server/Device MCP authority commits across processes."""
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": _GLOBAL_MCP_CATALOG_LOCK_KEY},
+    )
+
+
+async def lock_server_mcp_config_write(db: AsyncSession) -> None:
+    """Serialize Server MCP first-writer transactions before the row exists."""
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": _SERVER_MCP_CONFIG_LOCK_KEY},
+    )
