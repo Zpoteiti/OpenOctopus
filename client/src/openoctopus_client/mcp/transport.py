@@ -668,7 +668,8 @@ class BoundedStdioTransport(ClientTransport):
             return
         if os.name != "nt":
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                _send_process_group_signal(process.pid, cast(int, signal.SIGKILL))
+                sigkill = cast(int, getattr(signal, "SIGKILL"))
+                _send_process_group_signal(process.pid, sigkill)
             return
         if self._job is not None:
             with contextlib.suppress(OSError):
