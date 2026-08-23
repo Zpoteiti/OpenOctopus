@@ -457,6 +457,102 @@ def test_candidate_is_promoted_only_by_matching_update_during_lease() -> None:
     asyncio.run(exercise())
 
 
+def test_cancelled_authoritative_promotion_converges_without_orphaning_runtimes() -> None:
+    async def exercise() -> None:
+        class BlockingCloseRuntime(_FakeRuntime):
+            def __init__(self, config: McpServerConfig) -> None:
+                super().__init__(config)
+                self.close_started = asyncio.Event()
+                self.allow_close = asyncio.Event()
+
+            async def close(self) -> None:
+                self.close_started.set()
+                await self.allow_close.wait()
+                await super().close()
+
+        factory = _RuntimeFactory()
+        corp_config = _config("corp")
+        other_config = _config("other")
+        candidate_runtime = BlockingCloseRuntime(corp_config)
+        candidate_runtime.source_catalog = _source("corp")
+        candidate_runtime.state = McpRuntimeState.AWAITING_ACK
+
+        async def validator(
+            configs: Sequence[McpServerConfig], **_kwargs: object
+        ) -> CandidateValidation:
+            assert configs == [corp_config]
+            return CandidateValidation(
+                source_catalog=SourceMcpCatalog(version=1, servers=[_source("corp")]),
+                failures=(),
+                runtimes={"corp": cast(McpServerRuntime, candidate_runtime)},
+            )
+
+        supervisor = McpSupervisor(
+            runtime_factory=factory,
+            candidate_validator=cast(Callable[..., Awaitable[CandidateValidation]], validator),
+            candidate_lease_seconds=60,
+        )
+        supervisor.attach_connection()
+        other_entry = new_uuid7()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(other_config),
+            catalog=_catalog(_persisted("other", other_entry)),
+        )
+        other_runtime = factory.created[0]
+        await _ready_registration(supervisor, other_runtime)
+
+        validation_id = new_uuid7()
+        candidate_config = _device_config(other_config, corp_config)
+        result = await supervisor.validate(
+            ConfigValidate(
+                id=validation_id,
+                base_config_revision=1,
+                candidate_config=candidate_config,
+                validate_servers=["corp"],
+                deadline_ms=300000,
+            )
+        )
+        assert result is not None and result.ok
+
+        blocker = _FakeRuntime(corp_config)
+        blocker.state = McpRuntimeState.CLEANUP_BLOCKED
+        blocker.code = "mcp_cleanup_incomplete"
+        supervisor._retain_cleanup_blocked((cast(McpServerRuntime, blocker),))
+
+        activation = asyncio.create_task(
+            supervisor.activate_authoritative(
+                revision=2,
+                config=candidate_config,
+                catalog=_catalog(
+                    _persisted("other", other_entry),
+                    _persisted("corp", new_uuid7()),
+                ),
+                validation_id=validation_id,
+            )
+        )
+        await candidate_runtime.close_started.wait()
+        activation.cancel()
+        await asyncio.sleep(0)
+        assert not activation.done()
+
+        candidate_runtime.allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await activation
+
+        registration = supervisor.next_registration()
+        assert registration is not None
+        assert registration.config_revision == 2
+        assert {snapshot.name for snapshot in registration.servers} == {"corp", "other"}
+
+        await supervisor.shutdown()
+        assert candidate_runtime.closed
+        assert other_runtime.closed
+        assert blocker.closed
+
+    asyncio.run(exercise())
+
+
 def test_cancelled_validation_closes_candidate_and_creates_tombstone() -> None:
     async def exercise() -> None:
         started = asyncio.Event()

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from functools import partial
 from pathlib import Path
@@ -24,6 +25,8 @@ from openoctopus_client.mcp.transport import (
     McpTransportError,
     UnsupportedMcpContentEncodingError,
     _stdio_argv,
+    _windows_batch_arg,
+    _windows_batch_command_line,
     build_mcp_environment,
     create_fastmcp_client,
     create_mcp_http_client,
@@ -64,6 +67,113 @@ def test_stdio_environment_windows_overlay_is_case_insensitive() -> None:
     )
 
     assert result == {"PATH": r"C:\Tools", "PATHEXT": ".EXE;.CMD", "username": "bob"}
+
+
+@pytest.mark.parametrize(
+    ("argument", "encoded"),
+    [
+        ("", '""'),
+        ("plain", "plain"),
+        ("two words", '"two words"'),
+        ('say "hi"', '"say ""hi"""'),
+        ("C:\\path\\", '"C:\\path\\\\"'),
+        ('slash\\"quote', '"slash\\\\""quote"'),
+        ("a&b|c<d>e^f", '"a&b|c<d>e^f"'),
+        ("%PATH%", '"%%cd:~,%PATH%%cd:~,%"'),
+        ("wow!", '"wow!"'),
+    ],
+)
+def test_windows_batch_arguments_are_encoded_as_literal_values(
+    argument: str,
+    encoded: str,
+) -> None:
+    assert _windows_batch_arg(argument) == encoded
+
+
+def test_windows_batch_command_line_uses_fixed_literal_wrapper() -> None:
+    assert _windows_batch_command_line(
+        r"C:\Program Files\MCP\server.cmd",
+        ("", "two words", "a&b", "%PATH%", "wow!"),
+    ) == (
+        '""C:\\Program Files\\MCP\\server.cmd" "" "two words" "a&b" '
+        '"%%cd:~,%PATH%%cd:~,%" "wow!""'
+    )
+
+
+def test_windows_batch_launcher_disables_delayed_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = r"C:\Program Files\MCP\server.cmd"
+    monkeypatch.setattr("openoctopus_client.mcp.transport.os.name", "nt")
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport._resolve_windows_command",
+        lambda *_args, **_kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport.os.path.isfile", lambda _path: True
+    )
+
+    argv = _stdio_argv("server", ("wow!",), {"PATHEXT": ".CMD"})
+
+    assert argv == (
+        r"C:\Windows\System32\cmd.exe",
+        "/D",
+        "/E:ON",
+        "/V:OFF",
+        "/S",
+        "/C",
+        _windows_batch_command_line(resolved, ("wow!",)),
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native cmd.exe")
+def test_windows_batch_launcher_preserves_literal_arguments(tmp_path: Path) -> None:
+    capture = tmp_path / "capture.py"
+    capture.write_text(
+        "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "capture.cmd"
+    launcher.write_text(
+        '@echo off\n"%OO_TEST_PYTHON%" "%OO_TEST_CAPTURE%" %*\n',
+        encoding="utf-8",
+    )
+    arguments = (
+        "",
+        "two words",
+        'say "hi"',
+        "trailing\\",
+        'slash\\"quote',
+        "a&b",
+        "a|b",
+        "a<b",
+        "a>b",
+        "a^b",
+        "%PATH%",
+        "wow!",
+    )
+    environment = {
+        **os.environ,
+        "OO_TEST_PYTHON": sys.executable,
+        "OO_TEST_CAPTURE": str(capture),
+    }
+
+    completed = subprocess.run(
+        _stdio_argv(str(launcher), arguments, environment),
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == list(arguments)
+
+
+@pytest.mark.parametrize("argument", ["line\rbreak", "line\nbreak"])
+def test_windows_batch_arguments_reject_command_separating_newlines(argument: str) -> None:
+    with pytest.raises(ValueError, match="CR or LF"):
+        _windows_batch_arg(argument)
 
 
 def test_mcp_loggers_do_not_propagate_payloads(caplog: pytest.LogCaptureFixture) -> None:

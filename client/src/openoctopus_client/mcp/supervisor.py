@@ -575,6 +575,33 @@ class McpSupervisor:
         catalog: PersistedMcpCatalog,
         validation_id: UUID | None = None,
     ) -> None:
+        activation = asyncio.create_task(
+            self._activate_authoritative(
+                revision=revision,
+                config=config,
+                catalog=catalog,
+                validation_id=validation_id,
+            ),
+            name=f"mcp-activate-authoritative-{revision}",
+        )
+        cancelled = False
+        while not activation.done():
+            try:
+                await asyncio.shield(activation)
+            except asyncio.CancelledError:
+                cancelled = True
+        activation.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _activate_authoritative(
+        self,
+        *,
+        revision: int,
+        config: DeviceConfig,
+        catalog: PersistedMcpCatalog,
+        validation_id: UUID | None,
+    ) -> None:
         configs = tuple(config.mcp_servers)
         if not self._secret_transport_safe and _has_secrets(configs):
             raise ProtocolError("MCP secrets require an HTTPS Server origin")
@@ -609,7 +636,7 @@ class McpSupervisor:
         elif validation_id is not None and validation_id in self._tombstones:
             self._consume_tombstone(validation_id)
 
-        previous = self._slots
+        previous = dict(self._slots)
         next_slots: dict[str, _RuntimeSlot] = {}
         for server_config in configs:
             server_catalog = persisted[server_config.name]

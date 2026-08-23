@@ -15,7 +15,6 @@ import ntpath
 import os
 import shutil
 import signal
-import subprocess
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -332,6 +331,58 @@ def _resolve_windows_command(
     raise FileNotFoundError(command)
 
 
+_WINDOWS_BATCH_UNQUOTED = frozenset(r"#$*+-./:?@\_")
+
+
+def _windows_batch_arg(argument: str) -> str:
+    """Encode one literal argument for cmd.exe's batch-file parser."""
+
+    if "\r" in argument or "\n" in argument:
+        raise ValueError("Windows batch arguments must not contain CR or LF")
+    quoted = (
+        not argument
+        or argument.endswith("\\")
+        or any(
+            (
+                character.isascii()
+                and not (character.isalnum() or character in _WINDOWS_BATCH_UNQUOTED)
+            )
+            or not character.isprintable()
+            for character in argument
+        )
+    )
+    encoded: list[str] = ['"'] if quoted else []
+    backslashes = 0
+    for character in argument:
+        if character == "\\":
+            backslashes += 1
+        else:
+            if character == '"':
+                encoded.append("\\" * backslashes)
+                encoded.append('"')
+            elif character == "%":
+                # Expand an empty substring before the original percent so cmd
+                # cannot reinterpret a later pair as %VARIABLE%.
+                encoded.append("%%cd:~,")
+            backslashes = 0
+        encoded.append(character)
+    if quoted:
+        encoded.append("\\" * backslashes)
+        encoded.append('"')
+    return "".join(encoded)
+
+
+def _windows_batch_command_line(script: str, args: Sequence[str]) -> str:
+    if '"' in script or script.endswith("\\"):
+        raise ValueError("Windows batch script path is invalid")
+    encoded_script = _windows_batch_arg(script)
+    if not encoded_script.startswith('"'):
+        encoded_script = f'"{encoded_script}"'
+    encoded_args = " ".join(_windows_batch_arg(argument) for argument in args)
+    suffix = f" {encoded_args}" if encoded_args else ""
+    return f'"{encoded_script}{suffix}"'
+
+
 def _stdio_argv(
     command: str,
     args: Sequence[str],
@@ -361,8 +412,8 @@ def _stdio_argv(
     comspec = ntpath.join(system_root, "System32", "cmd.exe")
     if not os.path.isfile(comspec):
         raise FileNotFoundError(comspec)
-    command_line = subprocess.list2cmdline([resolved, *args])
-    return (comspec, "/D", "/S", "/C", command_line)
+    command_line = _windows_batch_command_line(resolved, args)
+    return (comspec, "/D", "/E:ON", "/V:OFF", "/S", "/C", command_line)
 
 
 async def _discard_log_notification(params: types.LoggingMessageNotificationParams) -> None:

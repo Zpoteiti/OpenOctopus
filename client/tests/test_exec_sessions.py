@@ -23,6 +23,7 @@ CHAT_ID = UUID("0190d5a7-0000-7000-8000-000000000003")
 OTHER_CHAT_ID = UUID("0190d5a7-0000-7000-8000-000000000005")
 TEST_SHELL = "cmd" if os.name == "nt" else "sh"
 TEST_COMMAND = "echo test"
+TEST_WORKSPACE = Path(__file__).resolve().parent
 
 
 class _Reader:
@@ -225,7 +226,7 @@ def _session_id(result: ToolOutput) -> UUID:
 
 def _request(*, tty: bool = False, timeout: int = 60, yield_ms: int = 1) -> ExecStart:
     policy = ExecPolicy(
-        workspace=Path("/workspace"),
+        workspace=TEST_WORKSPACE,
         restrict_to_workspace=False,
         shell_timeout_max=600,
         env_allowlist=("PATH",),
@@ -736,7 +737,7 @@ def test_policy_transition_blocks_new_start_until_old_sessions_are_terminated() 
         manager = ExecSessionManager(launcher)
         old = await manager.start(CHAT_ID, _request())
         new_policy = _request().policy.__class__(
-            workspace=Path("/workspace"),
+            workspace=TEST_WORKSPACE,
             restrict_to_workspace=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
@@ -784,7 +785,7 @@ def test_policy_transition_stays_fenced_until_old_session_cleanup_converges() ->
         await manager.start(CHAT_ID, _request())
         old_handle = cast(_TerminateFailureHandle, launcher.handles[0])
         new_policy = ExecPolicy(
-            workspace=Path("/workspace"),
+            workspace=TEST_WORKSPACE,
             restrict_to_workspace=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
@@ -826,7 +827,7 @@ def test_policy_transition_waits_for_an_inflight_spawn_to_be_reaped() -> None:
         old_start = asyncio.create_task(manager.start(CHAT_ID, _request()))
         await launcher.started.wait()
         new_policy = _request().policy.__class__(
-            workspace=Path("/workspace"),
+            workspace=TEST_WORKSPACE,
             restrict_to_workspace=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),
@@ -880,7 +881,7 @@ def test_policy_transition_fences_an_old_start_before_process_spawn(
         old_start = asyncio.create_task(manager.start(CHAT_ID, _request()))
         assert await asyncio.to_thread(resolving.wait, 5)
         new_policy = _request().policy.__class__(
-            workspace=Path("/workspace"),
+            workspace=TEST_WORKSPACE,
             restrict_to_workspace=False,
             shell_timeout_max=600,
             env_allowlist=("PATH",),

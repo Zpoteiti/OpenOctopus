@@ -61,6 +61,8 @@ from openoctopus_client.protocol import (
     ToolResult,
     TransferBegin,
     TransferEnd,
+    TransferProgress,
+    TransferReady,
     TransferRequest,
     decode_server_frame,
     encode_binary_chunk,
@@ -2286,6 +2288,143 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
                 connection.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await connection
+
+    asyncio.run(exercise())
+
+
+def test_config_ack_wait_keeps_existing_transfers_live(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000201")
+        update_id = UUID("0190d5a7-0000-7000-8000-000000000202")
+        sender_id = UUID("0190d5a7-0000-7000-8000-000000000203")
+        receiver_id = UUID("0190d5a7-0000-7000-8000-000000000204")
+        incoming: asyncio.Queue[str | None] = asyncio.Queue()
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.changed = asyncio.Condition()
+                self.closed: list[tuple[int, str]] = []
+
+            async def send(self, payload: str | bytes) -> None:
+                assert isinstance(payload, str)
+                async with self.changed:
+                    self.sent.append(payload)
+                    self.changed.notify_all()
+
+            async def recv(self) -> str | None:
+                return await incoming.get()
+
+            async def close(self, code: int, reason: str) -> None:
+                self.closed.append((code, reason))
+
+            async def wait_for(self, frame_type: str, frame_id: UUID) -> dict[str, object]:
+                def find() -> dict[str, object] | None:
+                    for payload in self.sent:
+                        frame = json.loads(payload)
+                        if frame["type"] == frame_type and frame.get("id") == str(frame_id):
+                            return cast(dict[str, object], frame)
+                    return None
+
+                async with self.changed:
+                    await asyncio.wait_for(self.changed.wait_for(lambda: find() is not None), 1)
+                    frame = find()
+                assert frame is not None
+                return frame
+
+        old_workspace = tmp_path / "old"
+        new_workspace = tmp_path / "new"
+        old_workspace.mkdir()
+        new_workspace.mkdir()
+        (old_workspace / "source.txt").write_bytes(b"")
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        socket = Socket()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+        )
+        connection = asyncio.create_task(runtime.run_connection(socket))
+
+        await incoming.put(
+            _hello_ack_json(
+                hello_id,
+                _device_config(
+                    workspace_path=str(old_workspace),
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+            )
+        )
+        await socket.wait_for("config_applied", hello_id)
+        await incoming.put(_config_applied_ack_json(hello_id))
+        await incoming.put(
+            TransferRequest(
+                id=sender_id,
+                purpose="file_transfer",
+                src_path="source.txt",
+                dst_path="copied.txt",
+            ).model_dump_json()
+        )
+        await socket.wait_for("transfer_begin", sender_id)
+        await incoming.put(
+            TransferBegin(
+                id=receiver_id,
+                direction="server_to_client",
+                purpose="file_transfer",
+                src_device="server",
+                src_path="source.txt",
+                dst_device="device",
+                dst_path="received.txt",
+                total_bytes=0,
+            ).model_dump_json()
+        )
+        await socket.wait_for("transfer_ready", receiver_id)
+        await incoming.put(
+            ConfigUpdate(
+                id=update_id,
+                device_name="device",
+                config_revision=2,
+                config=_device_config(
+                    workspace_path=str(new_workspace),
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+                mcp_catalog=_EMPTY_MCP_CATALOG,
+            ).model_dump_json()
+        )
+        await socket.wait_for("config_applied", update_id)
+
+        await incoming.put(TransferReady(id=sender_id).model_dump_json())
+        await incoming.put(TransferProgress(id=receiver_id, bytes_sent=0).model_dump_json())
+        await incoming.put(
+            TransferEnd(
+                id=receiver_id,
+                ack=False,
+                ok=True,
+                bytes_sent=0,
+                sha256=empty_digest,
+            ).model_dump_json()
+        )
+        sender_end = await socket.wait_for("transfer_end", sender_id)
+        assert sender_end["ack"] is False
+        await incoming.put(
+            TransferEnd(
+                id=sender_id,
+                ack=True,
+                ok=True,
+                bytes_sent=0,
+                sha256=empty_digest,
+            ).model_dump_json()
+        )
+        receiver_end = await socket.wait_for("transfer_end", receiver_id)
+        assert receiver_end["ack"] is True
+        await incoming.put(_config_applied_ack_json(update_id, revision=2))
+        await incoming.put(None)
+
+        assert await asyncio.wait_for(connection, timeout=1) is CloseDisposition.RETRY
+        assert socket.closed == []
+        assert (old_workspace / "received.txt").read_bytes() == b""
+        assert not (new_workspace / "received.txt").exists()
 
     asyncio.run(exercise())
 

@@ -280,13 +280,13 @@ def resolve_cwd(
     from openoctopus_client.tools.common import ToolFailure
     from openoctopus_client.tools.paths import WorkspacePaths
 
-    if value is None:
-        return workspace.resolve()
-    if "\x00" in value or not value.strip():
+    if value is not None and ("\x00" in value or not value.strip()):
         raise InvalidProcessArgumentsError("working_dir is invalid")
-    supplied = Path(value).expanduser()
     try:
         paths = WorkspacePaths(workspace, restrict_to_workspace=restrict_to_workspace)
+        if value is None:
+            return paths.root
+        supplied = Path(value).expanduser()
         return paths.resolve(str(supplied), directory=True)
     except ToolFailure as exc:
         raise InvalidProcessArgumentsError("working_dir is invalid") from exc

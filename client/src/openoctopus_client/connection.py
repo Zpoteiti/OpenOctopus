@@ -759,6 +759,11 @@ class ClientRuntime:
                     if isinstance(frame, Ping):
                         writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
                         continue
+                    if isinstance(frame, (TransferReady, TransferProgress, TransferEnd)):
+                        if transfer_manager is None:
+                            raise ProtocolError("Transfer arrived before device configuration")
+                        await transfer_manager.handle_control(frame)
+                        continue
                     if isinstance(frame, ErrorFrame):
                         continue
                     raise ProtocolError("Expected matching config applied acknowledgement")
