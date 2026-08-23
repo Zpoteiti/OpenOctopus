@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -24,9 +28,13 @@ from openoctopus_client.mcp.transport import (
     McpTransportClosingError,
     McpTransportError,
     UnsupportedMcpContentEncodingError,
+    _spawn_stdio_process,
     _stdio_argv,
+    _stdio_launch,
+    _ThreadedStdioProcess,
     _windows_batch_arg,
     _windows_batch_command_line,
+    _windows_batch_process_command_line,
     build_mcp_environment,
     create_fastmcp_client,
     create_mcp_http_client,
@@ -117,13 +125,292 @@ def test_windows_batch_launcher_disables_delayed_expansion(
 
     assert argv == (
         r"C:\Windows\System32\cmd.exe",
-        "/D",
         "/E:ON",
         "/V:OFF",
-        "/S",
+        "/D",
         "/C",
         _windows_batch_command_line(resolved, ("wow!",)),
     )
+
+
+def test_windows_batch_launcher_builds_one_raw_createprocess_command_line() -> None:
+    comspec = r"C:\Windows\System32\cmd.exe"
+    command = _windows_batch_command_line(
+        r"C:\Program Files\MCP\server.cmd",
+        ("", "two words", "a&b", "%PATH%", "wow!"),
+    )
+    assert _windows_batch_process_command_line(comspec, command) == (
+        'C:\\Windows\\System32\\cmd.exe /E:ON /V:OFF /D /C '
+        '""C:\\Program Files\\MCP\\server.cmd" "" "two words" "a&b" '
+        '"%%cd:~,%PATH%%cd:~,%" "wow!""'
+    )
+
+
+@pytest.mark.asyncio
+async def test_windows_batch_spawn_uses_raw_line_without_blocking_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    class SlowWriter(io.BytesIO):
+        def write(self, payload: Any) -> int:
+            started.set()
+            if not release.wait(1):
+                raise TimeoutError
+            return super().write(payload)
+
+    class FakePopen:
+        def __init__(self) -> None:
+            self.stdin = SlowWriter()
+            self.stdout = io.BytesIO(b"response")
+            self.pid = 123
+            self._returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self._returncode
+
+        def wait(self) -> int:
+            self._returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self._returncode = 1
+
+    def popen(command: object, **kwargs: object) -> FakePopen:
+        calls.append((command, kwargs))
+        return FakePopen()
+
+    resolved = r"C:\Program Files\MCP\server.cmd"
+    monkeypatch.setattr("openoctopus_client.mcp.transport.os.name", "nt")
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport._resolve_windows_command",
+        lambda *_args, **_kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport.os.path.isfile", lambda _path: True
+    )
+    monkeypatch.setattr("openoctopus_client.mcp.transport.subprocess.Popen", popen)
+    launch = _stdio_launch("server", ("a&b",), {"PATHEXT": ".CMD"})
+
+    process = await _spawn_stdio_process(
+        launch,
+        stderr_sink=io.BytesIO(),
+        cwd=None,
+        environment={},
+    )
+    assert isinstance(process, _ThreadedStdioProcess)
+    assert calls == [
+        (
+            launch.raw_command_line,
+            {
+                "executable": launch.executable,
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": calls[0][1]["stderr"],
+                "bufsize": 0,
+                "cwd": None,
+                "env": {},
+                "creationflags": 0x00000200,
+            },
+        )
+    ]
+    assert process.stdin is not None
+    process.stdin.write(b"payload")
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+    drain_task = asyncio.create_task(process.stdin.drain())
+    assert await asyncio.to_thread(started.wait, 1)
+    await asyncio.sleep(0)
+    assert not drain_task.done()
+    release.set()
+    await drain_task
+    timer.cancel()
+    timer.join()
+    assert await process.stdout.read() == b"response"
+    assert await process.stdout.read() == b""
+    assert process.returncode is None
+    assert await process.wait() == 0
+    assert process.returncode == 0
+    await process.close_pipes()
+    assert process.stdin._stream.closed
+    assert process.stdout._stream.closed
+
+
+@pytest.mark.asyncio
+async def test_threaded_stdio_process_does_not_depend_on_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    default_executor = ThreadPoolExecutor(max_workers=1)
+    replacement_executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(default_executor)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+
+    def occupy_default_executor() -> None:
+        blocker_started.set()
+        release_blocker.wait()
+
+    blocker = loop.run_in_executor(None, occupy_default_executor)
+    while not blocker_started.is_set():
+        await asyncio.sleep(0)
+
+    original_to_thread = asyncio.to_thread
+
+    async def forbidden_to_thread(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("raw stdio must not use the default executor")
+
+    monkeypatch.setattr(asyncio, "to_thread", forbidden_to_thread)
+    raw_process = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys;"
+                "data=sys.stdin.buffer.readline();"
+                "sys.stdout.buffer.write(b'got:'+data);"
+                "sys.stdout.buffer.flush()"
+            ),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    process = _ThreadedStdioProcess(raw_process)
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        read_task = asyncio.create_task(process.stdout.read(64 * 1024))
+        await asyncio.sleep(0)
+        process.stdin.write(b"ping\n")
+        await asyncio.wait_for(process.stdin.drain(), 1)
+        assert await asyncio.wait_for(read_task, 1) == b"got:ping\n"
+        assert await asyncio.wait_for(process.wait(), 1) == 0
+        await asyncio.wait_for(process.close_pipes(), 1)
+        await process.close_pipes()
+    finally:
+        release_blocker.set()
+        await blocker
+        monkeypatch.setattr(asyncio, "to_thread", original_to_thread)
+        if raw_process.poll() is None:
+            raw_process.kill()
+            raw_process.wait()
+        with contextlib.suppress(Exception):
+            await process.close_pipes()
+        loop.set_default_executor(replacement_executor)
+        default_executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_threaded_stdio_process_close_is_shared_and_cancellation_safe() -> None:
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    class BlockingClose(io.BytesIO):
+        def close(self) -> None:
+            close_started.set()
+            if not release_close.wait(1):
+                raise TimeoutError
+            super().close()
+
+    class ExitedPopen:
+        def __init__(self) -> None:
+            self.stdin = BlockingClose()
+            self.stdout = io.BytesIO()
+            self.pid = 123
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("exited process must not be killed")
+
+    raw_process = ExitedPopen()
+    process = _ThreadedStdioProcess(cast(Any, raw_process))
+    first_close = asyncio.create_task(process.close_pipes())
+    try:
+        while not close_started.is_set():
+            await asyncio.sleep(0)
+        second_close = asyncio.create_task(process.close_pipes())
+        first_close.cancel()
+        await asyncio.sleep(0)
+        assert not first_close.done()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        await second_close
+        await process.close_pipes()
+        assert raw_process.stdin.closed
+        assert raw_process.stdout.closed
+    finally:
+        release_close.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await first_close
+        with contextlib.suppress(Exception):
+            await process.close_pipes()
+
+
+@pytest.mark.asyncio
+async def test_stopped_raw_process_retires_io_after_job_assignment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedPopen:
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO()
+            self.pid = 123
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("exited process must not be killed")
+
+    raw_process = ExitedPopen()
+    process = _ThreadedStdioProcess(cast(Any, raw_process))
+    transport = BoundedStdioTransport(command=sys.executable)
+    transport.process = process
+    transport._job_assignment_failed = True
+
+    async def tree_stopped(_timeout: float) -> bool:
+        return True
+
+    monkeypatch.setattr(transport, "_wait_for_tree", tree_stopped)
+    existing_workers = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("oo-mcp-batch")
+    }
+    try:
+        await transport.close()
+
+        assert transport.cleanup_incomplete
+        assert transport._cleanup_blocked
+        assert raw_process.stdin.closed
+        assert raw_process.stdout.closed
+        assert {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.startswith("oo-mcp-batch")
+        } <= existing_workers
+
+        await transport.close()
+        assert transport.cleanup_incomplete
+        assert raw_process.stdin.closed
+        assert raw_process.stdout.closed
+    finally:
+        transport._job_assignment_failed = False
+        with contextlib.suppress(Exception):
+            await transport.close()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native cmd.exe")
@@ -158,8 +445,11 @@ def test_windows_batch_launcher_preserves_literal_arguments(tmp_path: Path) -> N
         "OO_TEST_CAPTURE": str(capture),
     }
 
+    launch = _stdio_launch(str(launcher), arguments, environment)
+    assert launch.raw_command_line is not None and launch.executable is not None
     completed = subprocess.run(
-        _stdio_argv(str(launcher), arguments, environment),
+        launch.raw_command_line,
+        executable=launch.executable,
         cwd=tmp_path,
         env=environment,
         check=True,

@@ -15,10 +15,14 @@ import ntpath
 import os
 import shutil
 import signal
-from collections.abc import AsyncIterator, Mapping, Sequence
+import subprocess
+import threading
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Unpack, cast
+from typing import IO, Any, TypeVar, Unpack, cast
 
 import anyio
 import httpx
@@ -61,6 +65,7 @@ _WINDOWS_SAFE_ENV = (
     "USERPROFILE",
 )
 _DISCARDED_LOGGER_ROOTS = ("fastmcp", "mcp", "httpx", "httpcore")
+_BlockingResultT = TypeVar("_BlockingResultT")
 
 
 class McpTransportError(RuntimeError):
@@ -332,6 +337,7 @@ def _resolve_windows_command(
 
 
 _WINDOWS_BATCH_UNQUOTED = frozenset(r"#$*+-./:?@\_")
+_WINDOWS_BATCH_SWITCHES = ("/E:ON", "/V:OFF", "/D", "/C")
 
 
 def _windows_batch_arg(argument: str) -> str:
@@ -383,13 +389,27 @@ def _windows_batch_command_line(script: str, args: Sequence[str]) -> str:
     return f'"{encoded_script}{suffix}"'
 
 
-def _stdio_argv(
+def _windows_batch_process_command_line(comspec: str, command: str) -> str:
+    """Build the exact command line passed to CreateProcessW for a batch file."""
+
+    executable = subprocess.list2cmdline((comspec,))
+    return f"{executable} {' '.join(_WINDOWS_BATCH_SWITCHES)} {command}"
+
+
+@dataclass(frozen=True)
+class _StdioLaunch:
+    argv: tuple[str, ...]
+    raw_command_line: str | None = None
+    executable: str | None = None
+
+
+def _stdio_launch(
     command: str,
     args: Sequence[str],
     environment: Mapping[str, str],
     *,
     cwd: str | Path | None = None,
-) -> tuple[str, ...]:
+) -> _StdioLaunch:
     if os.name != "nt":
         candidate = command
         search_path = environment.get("PATH")
@@ -403,17 +423,32 @@ def _stdio_argv(
         resolved = shutil.which(candidate, path=search_path)
         if resolved is None:
             raise FileNotFoundError(command)
-        return (resolved, *args)
+        return _StdioLaunch((resolved, *args))
 
     resolved = _resolve_windows_command(command, environment, cwd=cwd)
     if ntpath.splitext(resolved)[1].casefold() not in {".cmd", ".bat"}:
-        return (resolved, *args)
+        return _StdioLaunch((resolved, *args))
     system_root = _windows_env_value(os.environ, "SystemRoot") or r"C:\Windows"
     comspec = ntpath.join(system_root, "System32", "cmd.exe")
     if not os.path.isfile(comspec):
         raise FileNotFoundError(comspec)
     command_line = _windows_batch_command_line(resolved, args)
-    return (comspec, "/D", "/E:ON", "/V:OFF", "/S", "/C", command_line)
+    argv = (comspec, *_WINDOWS_BATCH_SWITCHES, command_line)
+    return _StdioLaunch(
+        argv,
+        raw_command_line=_windows_batch_process_command_line(comspec, command_line),
+        executable=comspec,
+    )
+
+
+def _stdio_argv(
+    command: str,
+    args: Sequence[str],
+    environment: Mapping[str, str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[str, ...]:
+    return _stdio_launch(command, args, environment, cwd=cwd).argv
 
 
 async def _discard_log_notification(params: types.LoggingMessageNotificationParams) -> None:
@@ -437,6 +472,187 @@ def create_fastmcp_client(
     )
 
 
+class _OwnedBlockingExecutor:
+    """Bounded blocking I/O workers owned by one raw stdio process."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="oo-mcp-batch")
+        self._closing = False
+
+    async def run(
+        self,
+        function: Callable[..., _BlockingResultT],
+        *args: object,
+    ) -> _BlockingResultT:
+        if self._closing:
+            raise RuntimeError("raw stdio executor is closing")
+        future = self._executor.submit(function, *args)
+        return await asyncio.wrap_future(future)
+
+    async def shutdown(self) -> None:
+        self._closing = True
+        failure: list[BaseException] = []
+
+        def retire() -> None:
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except BaseException as exc:
+                failure.append(exc)
+
+        thread = threading.Thread(target=retire, name="oo-mcp-batch-retire")
+        thread.start()
+        while thread.is_alive():
+            await asyncio.sleep(0.001)
+        thread.join()
+        if failure:
+            raise failure[0]
+
+
+class _ThreadedPipeReader:
+    def __init__(self, stream: IO[bytes], executor: _OwnedBlockingExecutor) -> None:
+        self._stream = stream
+        self._executor = executor
+
+    async def read(self, size: int = -1) -> bytes:
+        return await self._executor.run(self._stream.read, size)
+
+    async def aclose(self) -> None:
+        await self._executor.run(self._stream.close)
+
+
+class _ThreadedPipeWriter:
+    def __init__(self, stream: IO[bytes], executor: _OwnedBlockingExecutor) -> None:
+        self._stream = stream
+        self._executor = executor
+        self._pending: list[bytes] = []
+        self._lock = asyncio.Lock()
+        self._closing = False
+        self._closed = False
+
+    def write(self, payload: bytes) -> None:
+        if self._closing:
+            raise BrokenPipeError
+        self._pending.append(payload)
+
+    @staticmethod
+    def _write_all(stream: IO[bytes], payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            written = stream.write(remaining)
+            if not written:
+                raise BrokenPipeError
+            remaining = remaining[written:]
+        stream.flush()
+
+    async def drain(self) -> None:
+        async with self._lock:
+            if self._closing:
+                raise BrokenPipeError
+            payload = b"".join(self._pending)
+            self._pending.clear()
+            if payload:
+                await self._executor.run(self._write_all, self._stream, payload)
+
+    def close(self) -> None:
+        self._closing = True
+
+    async def wait_closed(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            await self._executor.run(self._stream.close)
+            self._closed = True
+
+
+class _ThreadedStdioProcess:
+    """Async facade over the raw-command-line Popen needed for cmd.exe."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stdin is None or process.stdout is None:
+            raise McpTransportError("stdio process streams were not created")
+        self._process = process
+        self._executor = _OwnedBlockingExecutor()
+        self.stdin = _ThreadedPipeWriter(process.stdin, self._executor)
+        self.stdout = _ThreadedPipeReader(process.stdout, self._executor)
+        self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.poll()
+
+    async def wait(self) -> int:
+        return await self._executor.run(self._process.wait)
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    async def _close_pipes(self) -> None:
+        self.stdin.close()
+        with contextlib.suppress(BrokenPipeError, ConnectionError, OSError):
+            await self.stdin.wait_closed()
+        with contextlib.suppress(OSError):
+            await self.stdout.aclose()
+        await self._executor.shutdown()
+
+    async def close_pipes(self) -> None:
+        if self.returncode is None:
+            raise McpTransportError("raw stdio process is still running")
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_pipes(),
+                name="mcp-batch-pipes-close",
+            )
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        await self._close_task
+        if cancelled:
+            raise asyncio.CancelledError
+
+
+async def _spawn_stdio_process(
+    launch: _StdioLaunch,
+    *,
+    stderr_sink: IO[bytes],
+    cwd: Path | None,
+    environment: Mapping[str, str],
+) -> asyncio.subprocess.Process | _ThreadedStdioProcess:
+    if launch.raw_command_line is None:
+        return await asyncio.create_subprocess_exec(
+            *launch.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=stderr_sink,
+            cwd=str(cwd) if cwd is not None else None,
+            env=environment,
+            **_new_session_kwargs(),
+        )
+
+    if os.name != "nt" or launch.executable is None:
+        raise McpTransportError("raw stdio process launch is Windows-only")
+    # The batch quoting is already complete. Passing an argv sequence here
+    # would make CPython apply its C-runtime quoting a second time.
+    process = subprocess.Popen(  # noqa: S603
+        launch.raw_command_line,
+        executable=launch.executable,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr_sink,
+        bufsize=0,
+        cwd=str(cwd) if cwd is not None else None,
+        env=environment,
+        **_new_session_kwargs(),
+    )
+    return _ThreadedStdioProcess(process)
+
+
 class BoundedStdioTransport(ClientTransport):
     """Dedicated bidirectional stdio transport with pre-decode record bounds."""
 
@@ -456,7 +672,7 @@ class BoundedStdioTransport(ClientTransport):
         self.environment = build_mcp_environment(os.environ, env)
         self._provided_stderr_sink = stderr_sink
         self._owned_stderr_sink: IO[bytes] | None = None
-        self.process: asyncio.subprocess.Process | None = None
+        self.process: asyncio.subprocess.Process | _ThreadedStdioProcess | None = None
         self.terminal_error: Exception | None = None
         self.cleanup_incomplete = False
         self._cleanup_blocked = False
@@ -486,16 +702,20 @@ class BoundedStdioTransport(ClientTransport):
         if self._provided_stderr_sink is None:
             self._owned_stderr_sink = open(os.devnull, "wb")  # noqa: SIM115
         stderr_sink = self._provided_stderr_sink or self._owned_stderr_sink
+        assert stderr_sink is not None
         spawned = False
         try:
-            self.process = await asyncio.create_subprocess_exec(
-                *_stdio_argv(self.command, self.args, self.environment, cwd=self.cwd),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=stderr_sink,
-                cwd=str(self.cwd) if self.cwd is not None else None,
-                env=self.environment,
-                **_new_session_kwargs(),
+            launch = _stdio_launch(
+                self.command,
+                self.args,
+                self.environment,
+                cwd=self.cwd,
+            )
+            self.process = await _spawn_stdio_process(
+                launch,
+                stderr_sink=stderr_sink,
+                cwd=self.cwd,
+                environment=self.environment,
             )
             spawned = True
             if self.process.stdin is None or self.process.stdout is None:
@@ -719,26 +939,29 @@ class BoundedStdioTransport(ClientTransport):
                 await asyncio.wait_for(
                     process.stdin.wait_closed(), max(0, phase_deadline - loop.time())
                 )
-        converged = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
-        if not converged:
+        tree_stopped = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
+        if not tree_stopped:
             phase_deadline = loop.time() + _TERMINATE_SECONDS
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     self._terminate_tree(), max(0, phase_deadline - loop.time())
                 )
-            converged = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
-        if not converged:
+            tree_stopped = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
+        if not tree_stopped:
             phase_deadline = loop.time() + _FORCE_KILL_SECONDS
             await self._force_kill_tree()
-            converged = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
-        if os.name == "nt" and self._job is not None and converged:
-            converged = bool(self._job.close())
+            tree_stopped = await self._wait_for_tree(max(0, phase_deadline - loop.time()))
+        cleanup_trusted = tree_stopped
+        if os.name == "nt" and self._job is not None and tree_stopped:
+            cleanup_trusted = bool(self._job.close())
             self._job = None
         if self._job_assignment_failed:
-            converged = False
-        self.cleanup_incomplete = not converged
-        self._cleanup_blocked = not converged
+            cleanup_trusted = False
+        self.cleanup_incomplete = not cleanup_trusted
+        self._cleanup_blocked = not cleanup_trusted
         await self._close_streams_and_tasks()
+        if tree_stopped and isinstance(process, _ThreadedStdioProcess):
+            await process.close_pipes()
         await self._close_owned_stderr()
         self._connecting = False
 
