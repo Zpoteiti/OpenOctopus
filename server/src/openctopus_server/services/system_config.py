@@ -2,7 +2,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.advisory import (
     lock_personal_quota_write,
@@ -11,7 +11,13 @@ from openctopus_server.db.advisory import (
 from openctopus_server.db.models import SystemConfig
 from openctopus_server.dto.config import AdminConfig, ConfigPatch
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import ConfigError
+from openctopus_server.errors.exceptions import ConfigError, ToolError
+from openctopus_server.network_policy import (
+    DEFAULT_SSRF_DENYLIST,
+    SsrfPolicy,
+    canonicalize_ssrf_denylist,
+    compile_ssrf_policy,
+)
 
 _QUOTA_DEFAULT = 524288000  # 500 MiB
 LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
@@ -32,6 +38,7 @@ _CONFIG_KEYS = {
     "llm_compaction_threshold_tokens",
     "llm_max_concurrent_requests",
     "llm_max_output_tokens",
+    "web_fetch_denylist",
 }
 
 
@@ -52,6 +59,11 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
         llm_compaction_threshold_tokens=rows.get("llm_compaction_threshold_tokens"),
         llm_max_concurrent_requests=rows.get("llm_max_concurrent_requests"),
         llm_max_output_tokens=rows.get("llm_max_output_tokens", LLM_MAX_OUTPUT_TOKENS_DEFAULT),
+        web_fetch_denylist=list(
+            canonicalize_ssrf_denylist(
+                rows.get("web_fetch_denylist", DEFAULT_SSRF_DENYLIST)
+            )
+        ),
     )
 
 
@@ -63,6 +75,11 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
         raise ConfigError(
             ErrorCode.CONFIG_VALIDATION_FAILED,
             "Cannot set llm_api_key to the redaction marker",
+        )
+
+    if "web_fetch_denylist" in data:
+        data["web_fetch_denylist"] = list(
+            canonicalize_ssrf_denylist(data["web_fetch_denylist"])
         )
 
     # Validate LLM identity before opening the write transaction.
@@ -131,6 +148,24 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
     await db.commit()
 
     return await get_config_view(db)
+
+
+async def load_web_fetch_policy(engine: AsyncEngine) -> SsrfPolicy:
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            value = await db.scalar(
+                select(SystemConfig.value).where(SystemConfig.key == "web_fetch_denylist")
+            )
+        if value is None:
+            return compile_ssrf_policy(None)
+        if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+            raise ValueError("stored web_fetch_denylist is invalid")
+        return compile_ssrf_policy(value)
+    except Exception as exc:
+        raise ToolError(
+            ErrorCode.TOOL_DB_ERROR,
+            "web_fetch network policy is unavailable",
+        ) from exc
 
 
 async def validate_llm_identity(

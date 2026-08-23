@@ -157,7 +157,7 @@ async def test_prompt_loads_workspace_identity_memory_skills_and_shared_refs(pg_
     assert next(skill for skill in cached_skills if skill.name == "research").body == ""
 
 
-async def test_prompt_describes_exec_only_for_trusted_devices(pg_engine) -> None:
+async def test_prompt_describes_exec_for_every_paired_device(pg_engine) -> None:
     user = User(
         id=uuid4(),
         email=f"{uuid4()}@test.com",
@@ -179,41 +179,41 @@ async def test_prompt_describes_exec_only_for_trusted_devices(pg_engine) -> None
         token_hash=b"s" * 32,
         token_hint="sandbox-token",
         workspace_path="/sandbox/workspace",
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         shell_timeout_max=600,
     )
-    trusted_device = Device(
+    unrestricted_device = Device(
         user_id=user.id,
         name="trusted-laptop",
         token_hash=b"t" * 32,
         token_hint="trusted-token",
         workspace_path="/trusted/workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         shell_timeout_max=900,
     )
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         db.add(user)
         await db.flush()
-        db.add_all([session, sandbox_device, trusted_device])
+        db.add_all([session, sandbox_device, unrestricted_device])
         await db.commit()
 
         prompt = await build_system_prompt(db, session=session, user=user)
 
     assert "server — OpenOctopus server tool target; exec: unavailable" in prompt
     assert (
-        "sandbox-laptop — workspace_root: /sandbox/workspace; sandbox_mode: true; exec: unavailable"
+        "sandbox-laptop — workspace_root: /sandbox/workspace; restrict_to_workspace: true; "
+        "exec: available; shell_timeout_max: 600 seconds"
     ) in prompt
     sandbox_line = next(
         line for line in prompt.splitlines() if line.startswith("- sandbox-laptop ")
     )
-    assert "exec: available" not in sandbox_line
-    assert "shell_timeout_max" not in sandbox_line
+    assert "exec: unavailable" not in sandbox_line
     assert (
-        "trusted-laptop — workspace_root: /trusted/workspace; sandbox_mode: false; "
+        "trusted-laptop — workspace_root: /trusted/workspace; restrict_to_workspace: false; "
         "exec: available; shell_timeout_max: 900 seconds"
     ) in prompt
     assert (
-        "Exec on trusted devices defaults to pipes; use tty=true for line-oriented "
+        "Exec on paired devices defaults to pipes; use tty=true for line-oriented "
         "interaction. It runs with host OS privileges and is not an OS sandbox."
     ) in prompt
     assert "Prefer file tools for ordinary file reads and writes." in prompt
@@ -229,10 +229,10 @@ async def test_prompt_describes_exec_only_for_trusted_devices(pg_engine) -> None
         "Never request or enter passwords, 2FA codes, or passphrases; ask the user to take over."
     ) in prompt
     assert "env_allowlist" not in prompt
-    assert str(trusted_device.id) not in prompt
+    assert str(unrestricted_device.id) not in prompt
 
 
-async def test_prompt_describes_only_live_trusted_device_shell_metadata(pg_engine) -> None:
+async def test_prompt_describes_live_restricted_device_shell_metadata(pg_engine) -> None:
     user = User(
         id=uuid4(),
         email=f"{uuid4()}@test.com",
@@ -248,13 +248,13 @@ async def test_prompt_describes_only_live_trusted_device_shell_metadata(pg_engin
         chat_id="chat-live-shells",
         title="New chat",
     )
-    trusted_device = Device(
+    restricted_device = Device(
         user_id=user.id,
         name="trusted-laptop",
         token_hash=b"t" * 32,
         token_hint="trusted-token",
         workspace_path="/trusted/workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=True,
         shell_timeout_max=900,
     )
     registry = DeviceRegistry()
@@ -264,13 +264,13 @@ async def test_prompt_describes_only_live_trusted_device_shell_metadata(pg_engin
         async with AsyncSession(pg_engine, expire_on_commit=False) as db:
             db.add(user)
             await db.flush()
-            db.add_all([session, trusted_device])
+            db.add_all([session, restricted_device])
             await db.commit()
 
             old_handle = await registry.register(
-                device_id=trusted_device.id,
+                device_id=restricted_device.id,
                 user_id=user.id,
-                device_name=trusted_device.name,
+                device_name=restricted_device.name,
                 transport=_PromptTransport(),
                 operating_system="linux",
                 shells=ShellMetadata(default="bash", available=["bash", "sh"]),
@@ -283,17 +283,17 @@ async def test_prompt_describes_only_live_trusted_device_shell_metadata(pg_engin
             )
 
         assert (
-            "trusted-laptop — workspace_root: /trusted/workspace; sandbox_mode: false; "
+            "trusted-laptop — workspace_root: /trusted/workspace; restrict_to_workspace: true; "
             "exec: available; shell_timeout_max: 900 seconds; os: linux; "
             "default_shell: bash; available_shells: bash, sh"
         ) in prompt
-        assert str(trusted_device.id) not in prompt
+        assert str(restricted_device.id) not in prompt
         assert "trusted-token" not in prompt
 
         new_handle = await registry.register(
-            device_id=trusted_device.id,
+            device_id=restricted_device.id,
             user_id=user.id,
-            device_name=trusted_device.name,
+            device_name=restricted_device.name,
             transport=_PromptTransport(),
             operating_system="darwin",
             shells=ShellMetadata(default="zsh", available=["zsh", "bash", "sh"]),

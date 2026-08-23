@@ -3,6 +3,8 @@ from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
+
 from openctopus_server.devices.protocol import MAX_TEXT_FRAME_BYTES, ToolResultFrame, new_uuid7
 from openctopus_server.devices.registry import DeviceBusyError, DeviceUnavailableError
 from openctopus_server.errors.codes import ErrorCode
@@ -100,6 +102,16 @@ class _PureServerTool(_EchoTool):
     routing_mode = ToolRoutingMode.PURE_SERVER
 
 
+class _ReservedMcpPrefixTool(_EchoTool):
+    def name(self) -> str:
+        return "mcp_reserved"
+
+    def schema(self) -> dict[str, Any]:
+        schema = super().schema()
+        schema["name"] = self.name()
+        return schema
+
+
 class _IntrinsicDeviceTool(_EchoTool):
     routing_mode = ToolRoutingMode.INTRINSIC_DEVICE
 
@@ -144,6 +156,11 @@ def test_py3_registry_exposes_only_server_web_fetch() -> None:
         DEVICE_FIELD_MARKER: True,
     }
     assert input_schema["required"] == ["url", DEVICE_FIELD_NAME]
+
+
+def test_registry_reserves_the_mcp_prefix_for_dynamic_capabilities() -> None:
+    with pytest.raises(ValueError, match="mcp_ prefix"):
+        ToolRegistry((_ReservedMcpPrefixTool(),))
 
 
 def test_inject_device_routing_changes_only_a_copy_of_the_inner_schema() -> None:

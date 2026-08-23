@@ -13,10 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import NetworkError, ToolError
+from openctopus_server.network_policy import SsrfPolicy, compile_ssrf_policy
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
 from openctopus_server.tools.truncate import truncate_head
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
+PolicyLoader = Callable[[], Awaitable[SsrfPolicy]]
 
 DEFAULT_MAX_CHARS = 50_000
 MAX_RESPONSE_BYTES = 5_000_000
@@ -86,11 +88,13 @@ class WebFetchTool(Tool):
         content_converter: HtmlContentConverter,
         resolver: Resolver | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        policy_loader: PolicyLoader | None = None,
     ) -> None:
         self._web_admission = web_admission
         self._content_converter = content_converter
         self._resolver = resolver or _resolve_dns
         self._transport = transport
+        self._policy_loader = policy_loader or _load_default_policy
 
     def name(self) -> str:
         return "web_fetch"
@@ -113,6 +117,7 @@ class WebFetchTool(Tool):
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
                 async with self._web_admission.slot(ctx.user_id):
+                    policy = await self._policy_loader()
                     async with httpx.AsyncClient(
                         transport=self._transport,
                         timeout=timeout,
@@ -125,6 +130,7 @@ class WebFetchTool(Tool):
                             url=parsed_args.url,
                             extract_mode=parsed_args.extract_mode,
                             max_chars=max_chars,
+                            policy=policy,
                         )
                     return ToolResult(content=truncate_head(text, max_chars))
         except AdmissionTimeoutError:
@@ -151,10 +157,11 @@ class WebFetchTool(Tool):
         url: str,
         extract_mode: Literal["markdown", "text"],
         max_chars: int,
+        policy: SsrfPolicy,
     ) -> str:
         current_url = url
         for redirect_count in range(MAX_REDIRECTS + 1):
-            response = await self._request_once(client, current_url)
+            response = await self._request_once(client, current_url, policy)
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
                 await response.aclose()
@@ -202,10 +209,19 @@ class WebFetchTool(Tool):
         self,
         client: httpx.AsyncClient,
         url: str,
+        policy: SsrfPolicy,
     ) -> httpx.Response:
         target = _parse_target(url)
-        await self._resolve_and_validate(target.hostname, target.port)
-        connect_addresses = await self._resolve_and_validate(target.hostname, target.port)
+        if policy.denies_host(target.hostname, target.port):
+            raise NetworkError(
+                ErrorCode.NETWORK_SSRF_BLOCKED,
+                f"Blocked target {target.hostname}",
+            )
+        connect_addresses = await self._resolve_and_validate(
+            target.hostname,
+            target.port,
+            policy,
+        )
         connect_address = connect_addresses[0]
         pinned_url = _pinned_url(target.parsed, connect_address, target.port)
         request = client.build_request(
@@ -221,7 +237,12 @@ class WebFetchTool(Tool):
         )
         return await client.send(request, stream=True, follow_redirects=False)
 
-    async def _resolve_and_validate(self, hostname: str, port: int) -> list[str]:
+    async def _resolve_and_validate(
+        self,
+        hostname: str,
+        port: int,
+        policy: SsrfPolicy,
+    ) -> list[str]:
         try:
             addresses = await self._resolver(hostname, port)
         except (OSError, UnicodeError) as exc:
@@ -244,10 +265,10 @@ class WebFetchTool(Tool):
                     ErrorCode.NETWORK_DNS_FAILED,
                     f"Resolver returned an invalid address for {hostname}",
                 ) from exc
-            if not _is_public_address(parsed):
+            if policy.denies_address(parsed, port):
                 raise NetworkError(
                     ErrorCode.NETWORK_SSRF_BLOCKED,
-                    f"Blocked non-public address for {hostname}",
+                    f"Blocked address for {hostname}",
                 )
             normalized = str(parsed)
             if normalized not in parsed_addresses:
@@ -298,15 +319,8 @@ async def _resolve_dns(hostname: str, port: int) -> list[str]:
     return [str(parsed)]
 
 
-def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return address.is_global and not (
-        address.is_loopback
-        or address.is_link_local
-        or address.is_private
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-    )
+async def _load_default_policy() -> SsrfPolicy:
+    return compile_ssrf_policy(None)
 
 
 def _pinned_url(parsed: SplitResult, address: str, port: int) -> str:

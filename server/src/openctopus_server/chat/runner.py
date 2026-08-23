@@ -3,7 +3,7 @@ import inspect
 import json
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -29,14 +29,23 @@ from openctopus_server.chat.context import (
     project_message_rows,
     project_provider_messages,
 )
+from openctopus_server.chat.device_snapshot import (
+    OwnerDeviceSnapshot,
+    load_owner_device_snapshot,
+)
 from openctopus_server.chat.public_projection import message_response
 from openctopus_server.chat.repair import repair_unpaired_tool_uses
 from openctopus_server.chat.stream import StreamSubscriber
 from openctopus_server.chat.token_estimator import estimate_request_tokens
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.config import get_settings
-from openctopus_server.db.models import Device, Message, PendingMessage, Session, TurnRun
+from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun
 from openctopus_server.devices.dependencies import get_device_registry
+from openctopus_server.devices.mcp_routes import (
+    OwnerMcpDevice,
+    OwnerMcpSnapshot,
+    build_owner_mcp_snapshot,
+)
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.provider.anthropic import (
@@ -115,6 +124,7 @@ class _PreparedTurn:
     tools: list[dict[str, Any]]
     user_id: UUID
     device_targets: dict[str, UUID]
+    mcp_snapshot: OwnerMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,11 +133,37 @@ class _CompletedProviderTurn:
     assistant: Message
     user_id: UUID
     device_targets: dict[str, UUID]
+    mcp_snapshot: OwnerMcpSnapshot
 
 
 @dataclass(frozen=True, slots=True)
 class _UnhandledProviderFailure:
     pass
+
+
+def _build_owner_tool_state(
+    devices: Sequence[OwnerDeviceSnapshot],
+    *,
+    tool_registry: ToolRegistry,
+) -> tuple[dict[str, UUID], OwnerMcpSnapshot, list[dict[str, Any]]]:
+    device_targets = {device.name: device.id for device in devices}
+    mcp_snapshot = build_owner_mcp_snapshot(
+        [
+            OwnerMcpDevice(
+                device_id=device.id,
+                name=device.name,
+                config_revision=device.config_revision,
+                catalog=device.mcp_catalog,
+            )
+            for device in devices
+        ],
+        built_in_names=tool_registry.tool_names,
+    )
+    registry_schemas = tool_registry.get_tool_schemas(
+        device_names=device_targets.keys(),
+        mcp_snapshot=mcp_snapshot,
+    )
+    return device_targets, mcp_snapshot, registry_schemas
 
 
 _UNHANDLED_PROVIDER_FAILURE = _UnhandledProviderFailure()
@@ -148,7 +184,7 @@ class ChatRuntime:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
         self.limiter = ProviderLimiter()
-        self.tool_registry = tool_registry or build_py3_registry()
+        self.tool_registry = tool_registry or build_py3_registry(engine=engine)
         self.workspace_service = workspace_service
         self.device_registry = device_registry or get_device_registry()
         self.context_admission = context_admission or get_context_admission()
@@ -490,6 +526,7 @@ class ChatRuntime:
                                 session_id=turn.session_id,
                             ),
                             device_targets=completed.device_targets,
+                            mcp_snapshot=completed.mcp_snapshot,
                             device_registry=self.device_registry,
                             on_issued=issued.set,
                         )
@@ -703,6 +740,7 @@ class ChatRuntime:
                     fingerprint = result.fingerprint
                     prepared_user_id = prepared.user_id
                     prepared_device_targets = prepared.device_targets
+                    prepared_mcp_snapshot = prepared.mcp_snapshot
                     del prepared, provider, result
                 except Exception as exc:
                     try:
@@ -734,6 +772,7 @@ class ChatRuntime:
             assistant=assistant,
             user_id=prepared_user_id,
             device_targets=prepared_device_targets,
+            mcp_snapshot=prepared_mcp_snapshot,
         )
 
     async def _session_owner_id(self, session_id: UUID) -> UUID:
@@ -768,6 +807,8 @@ class ChatRuntime:
             session = await db.get(Session, turn.session_id)
             if session is None:
                 raise RuntimeError("Session disappeared while preparing a turn")
+            user_id = session.user_id
+            owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
             active_rows = list(
                 (
                     await db.execute(
@@ -807,6 +848,7 @@ class ChatRuntime:
                 workspace_service=self.workspace_service,
                 skills_cache=self.skills_cache,
                 device_registry=self.device_registry,
+                device_snapshot=owner_devices,
             )
             prospective_messages.extend(
                 {
@@ -820,26 +862,9 @@ class ChatRuntime:
                 current_fingerprint=provider_fingerprint(config),
                 add_compaction_continuation=False,
             )
-            user_id = session.user_id
-            device_rows = list(
-                (
-                    await db.execute(
-                        select(Device.name, Device.id, Device.sandbox_mode)
-                        .where(Device.user_id == user_id)
-                        .order_by(Device.created_at, Device.id)
-                    )
-                )
-                .tuples()
-                .all()
-            )
-            device_targets = {name: device_id for name, device_id, _ in device_rows}
-            trusted_device_names = [
-                name for name, _, sandbox_mode in device_rows if not sandbox_mode
-            ]
-
-        registry_schemas = self.tool_registry.get_tool_schemas(
-            device_names=device_targets.keys(),
-            trusted_device_names=trusted_device_names,
+        device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
+            owner_devices,
+            tool_registry=self.tool_registry,
         )
 
         should_compact = False
@@ -906,6 +931,7 @@ class ChatRuntime:
         if compacted:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 config = await load_provider_config(db)
+                owner_devices = await load_owner_device_snapshot(db, user_id=user_id)
                 system, provider_messages = await build_provider_context(
                     db,
                     session_id=turn.session_id,
@@ -913,7 +939,12 @@ class ChatRuntime:
                     workspace_service=self.workspace_service,
                     skills_cache=self.skills_cache,
                     device_registry=self.device_registry,
+                    device_snapshot=owner_devices,
                 )
+            device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
+                owner_devices,
+                tool_registry=self.tool_registry,
+            )
             await self._estimate_tokens(
                 system=system,
                 messages=provider_messages,
@@ -927,6 +958,7 @@ class ChatRuntime:
             tools=registry_schemas,
             user_id=user_id,
             device_targets=device_targets,
+            mcp_snapshot=mcp_snapshot,
         )
 
     async def _estimate_tokens(

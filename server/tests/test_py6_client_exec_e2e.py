@@ -299,7 +299,7 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
         provider_factory=lambda config: provider,
         tool_registry=ToolRegistry(
             (_ClientOnlyTool("exec", _EXEC_SCHEMA),),
-            trusted_device_resolver=_owned_device_resolver(pg_engine, trusted_only=True),
+            device_resolver=_owned_device_resolver(pg_engine),
         ),
         device_registry=registry,
     )
@@ -346,7 +346,7 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
                 json={
                     "name": device_name,
                     "workspace_path": str(workspace),
-                    "sandbox_mode": False,
+                    "restrict_to_workspace": False,
                     "ssrf_denylist": [],
                     "shell_timeout_max": 120,
                     "env_allowlist": [

@@ -122,7 +122,7 @@ tags:
   - name: Cron
     description: Scheduled agent invocations
   - name: Admin
-    description: Admin-only system config and user management; server-side MCP route is deferred and unavailable in Py6
+    description: Admin-only system config and user management; Server MCP remains deferred to Py8 and has no Py7 route
 
 security:
   - cookieAuth: []
@@ -1307,28 +1307,24 @@ paths:
                     for every OS (Linux/macOS/Windows) per ADR-111 if omitted.
                     The client expands `~` against its own home directory at
                     startup; the server stores and returns the unexpanded form.
-                sandbox_mode:
+                restrict_to_workspace:
                   type: boolean
                   default: true
                   description: |
-                    Optional. Defaults to `true`. When true, client file tools
-                    and Workspace Files routes are confined to `workspace_path`,
-                    and client `web_fetch` applies `ssrf_denylist`. When false,
-                    the device is treated as trusted: client file tools may use
-                    paths outside `workspace_path`, and private/internal network
-                    access is allowed unless explicit deny entries remain.
+                    Optional. Defaults to `true`. Limits OpenOctopus-resolved
+                    Client file paths and exec/PTY initial working directories
+                    to `workspace_path`. It is not an OS sandbox and does not
+                    restrict shell commands, MCP, or networking.
                 ssrf_denylist:
                   type: array
                   maxItems: 256
                   items: { type: string, minLength: 1, maxLength: 512 }
                   description: |
                     Optional. CIDR, host, or `host:port` entries blocked by
-                    client-site `web_fetch`. Sandbox devices created without an
-                    explicit value are seeded with private/reserved network
-                    ranges and common metadata-service addresses. Trusted
-                    devices (`sandbox_mode=false`) created without an explicit
-                    value store an empty array. Users remove entries to permit a
-                    blocked internal target.
+                    client-site `web_fetch`, independently of
+                    `restrict_to_workspace`. Omission uses the default
+                    private/reserved/metadata list; explicit `[]` permits
+                    internal targets.
                 shell_timeout_max:
                   type: integer
                   minimum: 0
@@ -1349,8 +1345,9 @@ paths:
             `openoctopus_dev_` prefix. Lost tokens require
             `POST /api/devices/{name}/regenerate-token`.
             Client startup uses the token via the `OPENOCTOPUS_DEVICE_TOKEN` env
-            var; the active device config (`workspace_path`, `sandbox_mode`,
-            `ssrf_denylist`, `shell_timeout_max`, `env_allowlist`) is fetched
+            var; the active device config (`workspace_path`,
+            `restrict_to_workspace`, `ssrf_denylist`, `shell_timeout_max`,
+            `env_allowlist`) is fetched
             from the server's `hello_ack` frame at the WebSocket handshake.
           content:
             application/json:
@@ -1364,7 +1361,7 @@ paths:
                     description: Bearer token with `openoctopus_dev_` prefix. The device sends it at WebSocket handshake. Shown once.
                   device: { $ref: '#/components/schemas/Device' }
         '400':
-          description: Invalid name after canonicalization or invalid active Py6 config.
+          description: Invalid name after canonicalization or invalid Device config.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: |
@@ -1373,95 +1370,74 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}/config:
-    description: Python-main device management route.
+    description: Py7 Device configuration and last-good MCP discovery route.
     parameters:
       - name: name
         in: path
         required: true
         schema: { type: string }
-    patch:
+    get:
       tags: [Devices]
-      summary: Update active Py6 device config
+      summary: Read Device MCP config and last-good discovery
       description: |
-        Py6 accepts `name`, `workspace_path`, `sandbox_mode`,
-        `ssrf_denylist`, `shell_timeout_max`, and `env_allowlist`. The active
-        fields are pushed in a `config_update` frame when the device is online.
-        There is no command denylist or MCP configuration in Py6.
-
-        PATCH is a partial top-level update. Omitted fields keep their existing
-        values. `ssrf_denylist`, when provided, replaces the entire stored
-        field; Python-main does not deep-merge it.
-        An empty body or `{}` is a no-op that returns the current `Device`
-        response and does not push `config_update`.
-
-        `sandbox_mode` is a persisted per-device policy. Sessions cannot
-        temporarily override it. If `name` is provided, the server canonicalizes
-        it with the same device-name rules as `POST /api/devices`, then renames
-        the device to that stored routing slug; `server` remains reserved and is
-        rejected. The existing device token remains valid across rename.
-        Unknown fields are rejected rather than silently stored.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              properties:
-                name:
-                  type: string
-                  description: |
-                    Optional raw rename. Canonicalized to the stored per-user
-                    routing slug using the same rules as `POST /api/devices`
-                    and must not be `server`.
-                sandbox_mode:
-                  type: boolean
-                  description: |
-                    Persisted per-device policy switch. `true` confines client
-                    file tools to `workspace_path` and applies `ssrf_denylist`
-                    for client `web_fetch`; `false` treats the device as
-                    trusted for filesystem and private-network access.
-                ssrf_denylist:
-                  type: array
-                  maxItems: 256
-                  items: { type: string, minLength: 1, maxLength: 512 }
-                  description: Whole-field replacement client `web_fetch` denylist.
-                shell_timeout_max:
-                  type: integer
-                  minimum: 0
-                  maximum: 86400
-                  description: Maximum hard lifetime in seconds for client `exec`.
-                env_allowlist:
-                  type: array
-                  maxItems: 64
-                  uniqueItems: true
-                  items: { type: string, minLength: 1, maxLength: 128 }
-                  description: Exact parent environment names inherited by exec children; `OPENOCTOPUS_*` is always rejected.
-                workspace_path:
-                  type: string
-                  description: |
-                    Optional non-empty path string. Stored verbatim; the server
-                    does not expand `~` or verify the path exists on the
-                    device. The client expands/creates/reports errors when it
-                    receives `hello_ack` or `config_update`.
+        Returns the current `config_revision`, redacted MCP configuration, and
+        the persisted last-good catalog projection. Stdio env and remote header
+        keys remain visible, but every value is `"<redacted>"`. The catalog is
+        available while the Device is offline and includes disabled entries so
+        callers can construct an exact `enabled_capabilities` allowlist.
       responses:
         '200':
-          description: |
-            Updated. The response is the active Py6 device DTO directly. If
-            the committed config cannot be pushed because the socket races
-            offline, the write remains committed and `online` is false.
+          description: Current Device MCP configuration.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Device' }
+              schema: { $ref: '#/components/schemas/DeviceConfig' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Devices]
+      summary: Validate and update Device config
+      description: |
+        Every request supplies the `base_config_revision` returned by GET;
+        stale revisions fail with 409 before validation or persistence. Other
+        top-level fields are partial updates. `ssrf_denylist`, `env_allowlist`,
+        and `mcp_servers` are whole-field replacements.
+
+        Every new or modified MCP server, including filter-only changes,
+        requires the current Client to be online and to complete real MCP
+        initialize plus bounded discovery of tools, static resources, resource
+        templates, and prompts. Failure saves nothing. Pure MCP deletion may
+        commit offline; a request mixing deletion with any add/modify still
+        requires online validation. `POST /api/devices` never accepts MCP.
+
+        Config secrets are stored as plaintext in PostgreSQL but redacted in
+        REST responses. A `"<redacted>"` marker retains an existing value only
+        for the identical server/sink/key; changing a sink requires resending
+        all its secrets. Non-empty MCP env/headers require a secure WSS Device
+        connection. A successful commit atomically updates config, last-good
+        catalog, and revision before pushing the authoritative Protocol v3
+        config to the Client.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceConfigPatch' }
+      responses:
+        '200':
+          description: Updated config and last-good discovery projection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceConfig' }
         '400':
           description: |
-            Invalid name after canonicalization, invalid config shape, or
-            invalid active device policy fields. Unknown fields are rejected.
+            Invalid non-MCP config shape. Unknown fields are rejected.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: MCP syntax, spawn, initialize, discovery, or capability-limit validation failed; nothing was saved.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            Rename conflicts with an existing canonical device name.
+            Stale revision, rename/schema collision, owner aggregate limit,
+            Device offline/replaced/busy, or insecure secret transport.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/devices/{name}:
@@ -1497,8 +1473,8 @@ paths:
       summary: Regenerate the device's auth token
       description: |
         Invalidates the old token, returns a new one exactly once, and
-        preserves the existing device row, name, workspace path, sandbox mode,
-        and SSRF policy. Any active
+        preserves the existing Device identity, workspace policy, MCP config,
+        and last-good catalog. Any active
         connection for the old token is closed with 4401. Calls not yet issued
         fail as `tool_device_unreachable`; issued or ambiguous calls fail as
         `tool_execution_outcome_unknown`. The device remains paired but appears
@@ -1779,6 +1755,10 @@ paths:
             budget includes thinking and visible output, applies to the next
             provider turn, and does not expand the configured context window.
             ADR-101, ADR-125.
+          - `web_fetch_denylist` (string array) — effective canonical SSRF
+            denylist for Server-site `web_fetch`. Missing storage uses the
+            private/reserved/metadata default. Explicit `[]` permits all
+            otherwise-valid HTTP(S) targets. ADR-133.
 
         Object storage is deployment infrastructure config, like Postgres: it
         is read from environment / deployment secrets at server startup and is
@@ -1837,6 +1817,12 @@ paths:
         change is read by the next provider turn and does not mutate an
         already-running call. `llm_compaction_threshold_tokens`, when present,
         must be in `4001..(llm_max_context_tokens - 1)`.
+
+        `web_fetch_denylist`, when present, replaces the complete Server list.
+        It accepts at most 256 unique canonical CIDR/IP/hostname/host:port
+        entries. URLs, paths, userinfo, wildcard, and regex forms are invalid.
+        The whole candidate validates before any field is written; successful
+        changes apply to later fetches without restart.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1858,6 +1844,11 @@ paths:
                 llm_compaction_threshold_tokens: { type: integer, format: int64, minimum: 4001 }
                 llm_max_concurrent_requests: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
                 llm_max_output_tokens: { type: integer, format: int64, minimum: 1, maximum: 1000000 }
+                web_fetch_denylist:
+                  type: array
+                  maxItems: 256
+                  uniqueItems: true
+                  items: { type: string, minLength: 1, maxLength: 512 }
       responses:
         '200':
           description: OK
@@ -1919,102 +1910,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Deleting this user would remove the last admin.
-          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
-
-  /api/admin/server-mcp:
-    description: |
-      Deferred Py8 design only; this route is not implemented or exposed by
-      Py6. Py6 has no MCP dependency or persisted MCP configuration. The
-      following shape must not be used by a Py6 client or administrator.
-    get:
-      tags: [Admin]
-      summary: Deferred Py8 route — not available in Py6
-      description: |
-        Py8 server-side MCP route.
-
-        Lists admin shared-service MCPs only. These use admin-provided
-        shared credentials, are intended for stateless or low-state service
-        tools such as search and internal KB lookup, and appear to agents
-        as install site `openoctopus_device="server"`. Admins are the trust
-        boundary for this route, so `env` values are returned exactly as stored.
-      security:
-        - cookieAuth: [admin]
-        - bearerAuth: [admin]
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/McpServerConfig' }
-    put:
-      tags: [Admin]
-      summary: Deferred Py8 route — not available in Py6
-      description: |
-        Py8 server-side MCP route.
-
-        Replaces admin shared-service MCPs stored in
-        `system_config.server_mcp`. Py8 supports one shared runtime/client per
-        configured MCP server with a bounded per-MCP FIFO queue. There is no
-        client pool, per-user runtime, session-scoped runtime, or `pool_size`
-        config field. User-scoped server MCPs and session-scoped MCPs are out
-        of scope; users who need personal OAuth/session/browser/IDE state should
-        configure MCPs on their own devices.
-
-        Collision detection per ADR-049, two cases:
-          - **Within-server dup** — an MCP server advertises two
-            capabilities that wrap to the same name (intra-surface only;
-            cross-surface collisions impossible by ADR-048's typed-infix
-            naming). Returns `409 Conflict` and does not apply.
-          - **Cross-install schema drift** — a new MCP's wrapped name
-            matches an existing install with a different `input_schema`
-            across any surface (tool / resource / prompt). Returns
-            `409 Conflict` with a structured diff and does not apply.
-
-        Spawn or initial `list_tools/resources/prompts` failure returns
-        `400 Bad Request` and does not apply. The server validates the new
-        list before replacing `system_config.server_mcp`.
-
-        On success, the response includes `mcp_discovered`: a map from each
-        MCP server name to its discovered `tools`, `resources`, and `prompts`
-        lists. Admins use this to populate `enabled_tools` on subsequent
-        requests.
-      security:
-        - cookieAuth: [admin]
-        - bearerAuth: [admin]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: array
-              items: { $ref: '#/components/schemas/McpServerConfig' }
-      responses:
-        '200':
-          description: Applied.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  mcp_discovered:
-                    type: object
-                    additionalProperties:
-                      type: object
-                      properties:
-                        tools:
-                          type: array
-                          items: { type: string }
-                        resources:
-                          type: array
-                          items: { type: string }
-                        prompts:
-                          type: array
-                          items: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '409':
-          description: Schema collision with an existing MCP install.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
 components:
@@ -2102,7 +1997,7 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes, llm_max_output_tokens]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_max_output_tokens, web_fetch_denylist]
       description: |
         Admin-visible effective config. Quota keys are always present because
         missing rows default to 500 MiB (`524288000`).
@@ -2133,6 +2028,12 @@ components:
           minimum: 1
           maximum: 1000000
           description: Effective provider output budget, including thinking and visible output.
+        web_fetch_denylist:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 512 }
+          description: Effective canonical Server web_fetch denylist; explicit empty permits all otherwise-valid targets.
 
     AdminUser:
       type: object
@@ -2626,7 +2527,7 @@ components:
     Device:
       type: object
       additionalProperties: false
-      required: [id, name, sandbox_mode, workspace_path, ssrf_denylist, shell_timeout_max, env_allowlist, online, token_hint, created_at]
+      required: [id, name, restrict_to_workspace, workspace_path, ssrf_denylist, shell_timeout_max, env_allowlist, config_revision, mcp_config_count, mcp_enabled_capability_count, mcp_catalog_digest, online, token_hint, created_at]
       properties:
         id:
           type: string
@@ -2644,11 +2545,11 @@ components:
             May contain a leading `~`; the client expands at startup.
             Default `~/openoctopus/workspace` (ADR-111) on every OS when not
             supplied at create time. Explicit overrides are stored verbatim.
-        sandbox_mode:
+        restrict_to_workspace:
           type: boolean
           description: |
-            Persisted per-device policy switch. `true` is restricted mode;
-            `false` is trusted-device mode. Sessions cannot override it.
+            Limits OpenOctopus-resolved Client paths and initial exec/PTY cwd
+            to `workspace_path`. It is not an OS sandbox or network policy.
         ssrf_denylist:
           type: array
           maxItems: 256
@@ -2664,6 +2565,20 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 128 }
           description: Exact environment names inherited by exec children.
+        config_revision:
+          type: integer
+          format: int64
+          minimum: 1
+        mcp_config_count:
+          type: integer
+          minimum: 0
+          maximum: 16
+        mcp_enabled_capability_count:
+          type: integer
+          minimum: 0
+        mcp_catalog_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
         online:
           type: boolean
           description: |
@@ -2962,42 +2877,178 @@ components:
         truncated: { type: boolean, description: True when the 10,000-object scan ceiling stopped the search. }
 
     McpServerConfig:
-      type: object
-      required: [name, command]
+      oneOf:
+        - $ref: '#/components/schemas/StdioMcpServerConfig'
+        - $ref: '#/components/schemas/StreamableHttpMcpServerConfig'
+        - $ref: '#/components/schemas/SseMcpServerConfig'
+      discriminator:
+        propertyName: transport
+        mapping:
+          stdio: '#/components/schemas/StdioMcpServerConfig'
+          streamable_http: '#/components/schemas/StreamableHttpMcpServerConfig'
+          sse: '#/components/schemas/SseMcpServerConfig'
       description: |
-        Non-normative future MCP server configuration. Py6 has no MCP
-        dependency, route, device column, handshake frame, or persisted MCP
-        configuration. Do not add these fields to the Py6 API or device DTO;
-        a later milestone must define its own contract before implementation.
+        Py7 Device MCP tagged union. All four discovered surfaces use final
+        names `mcp_<server>_<alias>`; the name does not encode the surface.
+        Admin/Server MCP is deferred to Py8.
+
+    McpEnabledCapabilities:
+      type: [array, "null"]
+      maxItems: 512
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9_-]{1,64}$'
+      description: |
+        `null` or omission enables no discovered capability; `[]` explicitly
+        enables all; a non-empty list precisely selects final names across tools,
+        static resources, resource templates, and prompts.
+
+    StdioMcpServerConfig:
+      type: object
+      additionalProperties: false
+      required: [name, transport, command]
       properties:
         name:
           type: string
-          description: |
-            Identifier used in wrapped capability names. OpenOctopus exposes
-            tools, resources, and prompts uniformly into the agent's tool
-            registry (ADR-047/048):
-              - tools     → `mcp_<name>_<tool_name>`
-              - resources → `mcp_<name>_resource_<resource_name>`
-              - prompts   → `mcp_<name>_prompt_<prompt_name>`
-            Typed infixes (`_resource_` / `_prompt_`) prevent cross-surface
-            name collisions; intra-surface dups are rejected at install
-            time (ADR-049).
+          pattern: '^[a-z][a-z0-9_]{0,31}$'
+        transport: { type: string, enum: [stdio] }
         command:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Executable name/path; not a user-parsed shell string.
+        args:
           type: array
-          items: { type: string }
-          description: Argv to spawn the MCP subprocess (e.g. `["npx", "@foo/mcp-server"]`).
+          maxItems: 64
+          items: { type: string, maxLength: 4096 }
+        cwd:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 4096
+          description: Absolute or home-rooted directory; independent of workspace restriction.
         env:
           type: object
+          maxProperties: 64
           additionalProperties: { type: string }
-        enabled_tools:
-          type: array
-          items: { type: string }
           description: |
-            Optional allow-list of exact post-wrap tool names (ADR-100).
-            When present, only matching tools register. When absent or
-            empty, every advertised tool registers (default-allow).
-            Resources and prompts are always registered regardless of
-            this filter. Use the `mcp_discovered` field in config
-            validation responses to see available capabilities.
-            Example: `["mcp_github_create_issue", "mcp_github_list_issues"]`
-        description: { type: string }
+            Secret values, at most 16 KiB UTF-8 each. REST responses replace
+            values with `"<redacted>"`; stdio children never receive
+            `OPENOCTOPUS_*` variables.
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+
+    RemoteMcpServerConfigBase:
+      type: object
+      additionalProperties: false
+      required: [name, transport, url]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,31}$'
+        transport: { type: string }
+        url:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Final HTTP(S) endpoint without userinfo or fragment; redirects are not followed.
+        headers:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string }
+          description: Secret values are redacted in REST; non-empty headers require HTTPS and a WSS Device connection.
+        enabled_capabilities: { $ref: '#/components/schemas/McpEnabledCapabilities' }
+
+    StreamableHttpMcpServerConfig:
+      allOf:
+        - $ref: '#/components/schemas/RemoteMcpServerConfigBase'
+        - type: object
+          properties:
+            transport: { type: string, enum: [streamable_http] }
+
+    SseMcpServerConfig:
+      allOf:
+        - $ref: '#/components/schemas/RemoteMcpServerConfigBase'
+        - type: object
+          properties:
+            transport: { type: string, enum: [sse] }
+
+    DeviceConfigPatch:
+      type: object
+      additionalProperties: false
+      required: [base_config_revision]
+      properties:
+        base_config_revision: { type: integer, format: int64, minimum: 1 }
+        name: { type: string }
+        workspace_path: { type: string, minLength: 1, maxLength: 4096 }
+        restrict_to_workspace: { type: boolean }
+        ssrf_denylist:
+          type: array
+          maxItems: 256
+          items: { type: string, minLength: 1, maxLength: 512 }
+        shell_timeout_max: { type: integer, minimum: 0, maximum: 86400 }
+        env_allowlist:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 128 }
+        mcp_servers:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/McpServerConfig' }
+
+    McpDiscoveredCapability:
+      type: object
+      additionalProperties: false
+      required: [raw_name, final_name, enabled]
+      properties:
+        raw_name: { type: string, minLength: 1, maxLength: 256 }
+        final_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9_-]{1,64}$'
+        enabled: { type: boolean }
+
+    McpDiscoveredServer:
+      type: object
+      additionalProperties: false
+      required: [tools, resources, resource_templates, prompts]
+      properties:
+        tools:
+          type: array
+          items: { $ref: '#/components/schemas/McpDiscoveredCapability' }
+        resources:
+          type: array
+          items: { $ref: '#/components/schemas/McpDiscoveredCapability' }
+        resource_templates:
+          type: array
+          items: { $ref: '#/components/schemas/McpDiscoveredCapability' }
+        prompts:
+          type: array
+          items: { $ref: '#/components/schemas/McpDiscoveredCapability' }
+
+    DeviceConfig:
+      type: object
+      additionalProperties: false
+      required: [device, mcp_servers, mcp_catalog_digest, mcp_discovered]
+      properties:
+        device:
+          type: object
+          additionalProperties: false
+          required: [name, online, config_revision]
+          properties:
+            name: { type: string }
+            online: { type: boolean }
+            config_revision: { type: integer, format: int64, minimum: 1 }
+        mcp_servers:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/McpServerConfig' }
+        mcp_catalog_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        mcp_discovered:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/McpDiscoveredServer' }

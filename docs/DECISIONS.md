@@ -4,6 +4,13 @@ Architectural Decision Records for the OpenOctopus rebuild (M0 → M3).
 
 Each record captures **what** was decided and **why**, not how it was implemented. Implementation lives in per-subsystem specs and the code itself.
 
+**Current Python-main Device contract:** ADR-133 is the Py7 authority for
+workspace restriction, Protocol v3, Device MCP, and Server `web_fetch` policy.
+Earlier ADR text is retained as milestone history where explicitly marked
+superseded. Any older-body occurrence of `sandbox_mode`, `enabled_tools`, typed
+MCP name infixes, Protocol v2, or offline optimistic MCP addition describes the
+superseded milestone only and must not be implemented as current behavior.
+
 These supersede the historical ADR set in the previous Plexus codebase — most decisions are carried forward, but many are simplified, deferred, or reversed based on what we learned.
 
 ---
@@ -667,8 +674,8 @@ inventory table in `docs/TOOLS.md`.
 - **Client-only tools** (`exec`, `write_stdin`, `list_exec_sessions`) execute in
   `openoctopus_client`; their fixed schemas are server-canonical and the server
   routes calls without importing client executors.
-- **MCP-wrapped tools/resources/prompts** are dynamic and run wherever the MCP is
-  installed: admin shared-service server MCP or a user's paired device.
+- **Py7 MCP-wrapped tools/resources/templates/prompts** are dynamic and run on
+  a user's paired Device. Admin shared-service Server MCP is a Py8 extension.
 
 The original server-owned listing included `web_fetch`, but ADR-052 supersedes
 that part: `web_fetch` is a shared server/client tool.
@@ -701,16 +708,13 @@ Dispatch:
 ### ADR-071 · Tools with the same name + schema are merged; `openoctopus_device` enum lists install sites
 
 **Status:** accepted
-**Python-main clarification:** Device MCP capabilities are maintained by
-`register_mcp`, which devices send on every fresh `hello_ack` (initial
-handshake and every reconnect) and whenever the local MCP snapshot changes
-(ADR-105). The agent-loop schema build reads the current per-user tool
-registry/cache; it does not synchronously query devices. MCP capabilities are
-first wrapped into stable names (e.g. `mcp_MCP-1_analyze_image`), then
-merged by canonical schema equivalence. Stable canonicalization is required:
-Python-main must normalize JSON schema key order, whitespace, and
-OpenAI-compatibility transforms so equal schemas on different install sites
-merge correctly.
+**Py7 clarification (ADR-133):** Device MCP Provider schemas come from
+persistent last-good catalogs, including while a Device is offline.
+`register_mcp` publishes only revision- and generation-bound runtime
+availability. Each Provider iteration freezes an immutable catalog route;
+dispatch rechecks the durable revision/digest and current accepted runtime.
+Equal logical MCP entries may merge across Devices only when their canonical
+Provider shape and invocation identity match exactly.
 **Context:** Without this rule, if `read_file` exists on server + three devices, the agent would see four separate tools or four overlapping schemas. That defeats the point of the unified tool surface (ADR-041) and blows up the agent's tool-registry cognitive load.
 **Decision:** At tool-schema-build time (per session), `tools_registry::build_tool_schemas` deduplicates:
 
@@ -746,6 +750,9 @@ merge correctly.
 ### ADR-043 · Tool path policy — relative paths resolve to personal workspace; shared workspaces use `name@suffix` absolute form
 
 **Status:** accepted (revised — shared-workspace addressing pass per ADR-108)
+**Py7 clarification (ADR-133):** In the historical Client clauses below,
+`sandbox_mode` reads as `restrict_to_workspace`. The field limits structured
+paths only and does not create a trusted/untrusted process profile.
 **Context:** Original decision required absolute paths in all tool args for unambiguity. Matching nanobot's tool surface (its schemas don't distinguish relative/absolute at the schema level) and removing friction for the common case (reading `MEMORY.md`) motivated relaxing this. A second revision (ADR-108) replaces the bare-name form for shared workspaces with `name@suffix` to support same-named workspaces and rename without breaking identifiers.
 **Decision:**
 
@@ -1115,13 +1122,18 @@ shared workspace is rejected like any other write.
 
 ### ADR-047 · MCP client lives in `openoctopus_server`
 
-**Status:** accepted (revised — common removed, MCP now server-only)
+**Status:** superseded for Device MCP by ADR-133; Server/admin MCP remains deferred to Py8
+**Py7 marker:** The following text is historical. Py7 runs Device MCP clients in
+`openoctopus_client` with FastMCP 3.4.7; it does not implement Server MCP.
 **Decision:** `openoctopus_server/mcp/` contains the MCP session management and wrapping logic (name conventions per ADR-048, URI template parsing per ADR-099). Server-side shared-service MCPs use this directly. Client devices manage their own MCP subprocesses independently per ADR-105 — the server does not need to import client MCP code, and the client does not need to import server MCP code.
 **Consequences:** Single implementation. Per-site specific bits (server loads config from `system_config`; client applies from `ConfigUpdate`) stay in the owning crate. `rmcp` is already a workspace dependency. The agent sees a flat list of callable entries — it never branches on "is this a tool, resource, or prompt", just on the wrapped name.
 
 ### ADR-048 · MCP wrapping — tools, resources, prompts as tool-registry entries
 
-**Status:** accepted
+**Status:** superseded by ADR-133
+**Py7 marker:** The typed-infix and three-surface rules below are historical.
+Py7 uses four surfaces and one `mcp_<server>_<alias>` namespace; explicit route
+metadata, not the name, identifies the surface.
 **Decision:** The MCP wrap step turns each capability advertised by an MCP server into a tool-registry entry. Three name formats, mirroring nanobot's typed-infix convention exactly:
 
 | Surface | Wrapped name | Action when called |
@@ -1145,7 +1157,10 @@ Merge-time injection (ADR-071) is uniform across all three: `openoctopus_device`
 
 ### ADR-049 · MCP collision rejection — server orchestrates DB cleanup + corrective config_update
 
-**Status:** accepted
+**Status:** superseded by ADR-133
+**Py7 marker:** The offline optimistic-save/corrective-prune flow below is
+historical. Py7 requires online initialize plus complete discovery before any
+add/modify commit; only pure deletion is allowed offline.
 **Decision:** Three distinct rejection cases, all handled by the same server-orchestrated cleanup flow:
 
 1. **Within-server cross-surface or intra-surface dup.** If the same MCP server advertises two capabilities that wrap to the same name — two tools named `search`, or any internal duplicate — the install is rejected. (Cross-surface collisions like tool `search` vs resource `search` are impossible by ADR-048's typed infix, so this rule fires only on within-surface dups, which indicate a malformed MCP server.) OpenOctopus diverges from nanobot here: nanobot silently overwrites (`registry.py:19–22`); OpenOctopus rejects so the agent never sees a half-registered MCP.
@@ -1194,7 +1209,9 @@ ordinary device/config reads.
 
 ### ADR-099 · MCP resource templates — URI placeholders are surfaced as schema properties
 
-**Status:** accepted
+**Status:** superseded in detail by ADR-133
+**Py7 marker:** Py7 keeps resource templates but replaces the regex/simple
+substitution rule below with bounded RFC 6570 validation and `uritemplate`.
 **Context:** MCP resources can be either static URIs (`notion://workspace/index`) or URI templates with placeholders (`notion://page/{page_id}`). Nanobot wraps both shapes identically: the URI is stored verbatim with empty `properties` and the wrapper takes no args (`mcp.py:223, 227–231, 256`). For static URIs this works; for templates, the agent has no way to pass `{page_id}` and the resource is effectively dead weight.
 **Decision:** At wrap time, parse `{var}` placeholders out of the resource's URI template using a simple `\{(\w+)\}` regex. For each placeholder, inject one required string property into the wrapper's `input_schema`. At call time, substitute the agent-supplied values back into the URI before invoking `read_resource`. Static URIs (no placeholders) keep the zero-arg wrapper shape.
 
@@ -1215,7 +1232,10 @@ Agent calls `mcp_notion_resource_page(page_id="abc")` → wrapper computes `noti
 
 ### ADR-100 · MCP `enabled_tools` filter — tools only, simple string list
 
-**Status:** accepted
+**Status:** superseded by ADR-133
+**Py7 marker:** The `enabled_tools` rules below are historical. Py7 uses one
+`enabled_capabilities` allowlist across all four surfaces: `null` means none,
+`[]` explicitly means all, and a non-empty list precisely selects final wrapped names.
 **Python-main clarification:** Python-main simplifies the enabled filter:
 - Field name is `enabled_tools`, not `enabled`.
 - It is a simple string list of exact post-wrap tool names (e.g.
@@ -1244,6 +1264,8 @@ Example:
 ### ADR-114 · Python-main MCP tenancy: admin shared-service + device only
 
 **Status:** accepted
+**Py7 clarification:** Py7 implements only Device MCP. Admin shared-service
+Server MCP remains a Py8 contract and has no Py7 runtime or active REST route.
 **Context:** MCP sessions can carry credentials and state. A single admin-installed server-side MCP client shared by every user is acceptable for deliberately shared service-account tools (stateless search, internal KB lookup), but unsafe for personal OAuth, browser state, IDE/LSP state, shell/REPL state, or any integration whose state belongs to one user.
 **Decision:** Python-main supports exactly two MCP tenancy scopes:
 - **Admin shared-service MCP.** Configured only by admins under `system_config.server_mcp` via `/api/admin/server-mcp`. Uses admin-provided shared credentials, appears in tool schemas as install site `openoctopus_device="server"`, and is intended only for stateless or low-state service tools. Py8 runs one shared runtime/client per configured MCP server and protects each with a bounded per-MCP FIFO queue; if the queue is saturated, calls fail fast as tool errors. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract. Admins are responsible for choosing MCPs that are safe to share across all users.
@@ -1255,7 +1277,11 @@ User-scoped server MCP and session-scoped MCP are out of scope for the accepted 
 
 ### ADR-105 · MCP subprocess lifecycle on openoctopus_client
 
-**Status:** accepted
+**Status:** superseded by ADR-133
+**Py7 marker:** The worker/Alive/Dead design below is historical. Py7 uses
+generation-bound STARTING/READY/UNAVAILABLE/DRIFTED runtimes, bounded retry,
+single-flight aggregate registration, last-good schemas, and no invocation
+replay.
 **Python-main clarification:** `register_mcp` is the capability cache/update
 path. Devices send it on every fresh `hello_ack` (initial handshake and every
 reconnect) and whenever the local MCP snapshot changes. The server's
@@ -1419,7 +1445,8 @@ All three live in `openoctopus_client/src/mcp/`. The worker stitches them togeth
 
 ### ADR-050 · Device config is first-class + editable
 
-**Status:** accepted (superseded for Py6 by ADR-132)
+**Status:** superseded by ADR-133
+**Py7 marker:** The Py6 `sandbox_mode`/no-MCP contract below is historical.
 **Decision:** Each device stores the Py6 policy/config boundary on its row:
 `workspace_path`, `sandbox_mode`, `shell_timeout_max`, `ssrf_denylist`, and
 `env_allowlist`. `sandbox_mode` is the only privilege level: `true` is
@@ -1441,12 +1468,22 @@ existence.
 ### ADR-051 · Device policy is persistent; no session-level privilege escalation
 
 **Status:** accepted
+**Py7 clarification:** The persistent field is `restrict_to_workspace`; it
+limits structured Client paths and initial exec/PTY cwd only. It is not a
+privilege level or OS sandbox and does not constrain command or MCP network
+access. Client `ssrf_denylist` is independent.
 **Decision:** OpenOctopus does not implement session-scoped permission grants in Python-main. The device row is the permission boundary for every browser, channel, cron, and heartbeat session. If a session needs access that the current device policy blocks, the user changes that device's persistent config: flip `sandbox_mode`, remove an `ssrf_denylist` entry, or add an env name to `env_allowlist`. Py6 intentionally has no command denylist.
 **Consequences:** Permission behavior is predictable across channels and reconnects. There is no hidden grant state to expire, sync, audit, or replay. The tradeoff is coarser control: a policy change affects all sessions targeting that device until the user changes it back.
 
 ### ADR-052 · `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy
 
 **Status:** accepted
+**Py7 clarification (ADR-133):** Both install sites use independently
+configured denylist snapshots. Client policy never depends on
+`restrict_to_workspace`; omitted values use the default and explicit `[]`
+allows internal targets. Server policy is `system_config.web_fetch_denylist`,
+validated/canonicalized through `PATCH /api/admin/config` and hot-read for each
+fetch. Neither policy controls exec, PTY, or MCP traffic.
 **Context:** `web_fetch` originally ran only on the server with a hardcoded private-IP block. With clients in the picture (and legitimate use cases like fetching an internal company API at `10.180.20.30:8080`), making `web_fetch` shared lets the agent reach declared internal services through the same structured tool path it uses for public URLs.
 **Decision:** `web_fetch` is a shared tool. The merger's `openoctopus_device`
 enum = `["server"] + paired_clients`. Paired-but-offline clients remain
@@ -1463,12 +1500,11 @@ visible and fail at dispatch with `device_unreachable`.
 ### ADR-096 · Device WebSocket protocol — single-connection JSON control + binary file transfer
 
 **Status:** accepted
-**Python-main clarification:** The full WS protocol contract carries forward
-through Protocol v2. Python server implements JSON text frames + binary file
-transfer over one WebSocket per device via FastAPI/websockets. Py6 removes the
-old dynamic MCP frames, adds fixed shell metadata and provider-hidden exec
-ownership, and makes exec-family calls immediate-or-busy while existing
-non-shell calls retain their bounded FIFO. `docs/PROTOCOL.md` is binding.
+**Py7 clarification (ADR-133):** The full WS contract is Protocol v3, with no
+v2 fallback. In addition to fixed exec and binary transfer, it defines
+config-applied readiness, candidate MCP validation, aggregate runtime
+registration, exact hidden MCP routes, generation-scoped tombstones, and WSS
+requirements for secret-bearing config. `docs/PROTOCOL.md` is binding.
 **Context:** Devices need bidirectional, low-latency dispatch (server pushes tool calls, client pushes results, both sides push file bytes for `message`-with-files and `file_transfer`). Browser uses REST with best-effort POST streaming plus canonical GET polling (ADR-003, ADR-121); devices need WebSocket because they sit behind NAT and tool dispatch is bidirectional.
 **Decision:** A single WebSocket connection per device carries both control plane (JSON text frames) and bulk plane (binary frames). The full wire spec lives in `docs/PROTOCOL.md`; this ADR fixes the headline choices that other decisions reference:
 
@@ -1957,7 +1993,10 @@ Admin is trusted. Agent is not. The shape of "admin explicitly installs; agent c
 
 ### ADR-073 · Client device policy gates — workspace paths, SSRF denylist, env allowlist
 
-**Status:** accepted
+**Status:** superseded by ADR-133
+**Py7 marker:** The `sandbox_mode` profile table below is historical. The
+current field is `restrict_to_workspace`; Client `web_fetch` policy is
+independent, exec is visible in both states, and no OS jail is implied.
 **Context:** OpenOctopus gives the agent access to user devices. The product needs a simple, per-device policy that is predictable across browser and channel sessions. A session-scoped permission grant system was rejected for Python-main because it adds hidden runtime state, unclear replay semantics, and more UX complexity than the first rewrite needs. OS-level subprocess sandboxing (`bwrap`, `sandbox-exec`, AppContainer) is deferred to the later client sandbox milestone.
 **Decision:** Device policy is persisted on `devices` and enforced uniformly for every session targeting that device. Py6's shell policy has no command denylist or MCP fields.
 
@@ -3589,6 +3628,10 @@ Py5 implementation requirements.
 ### ADR-132 · Py6 cross-platform client exec: fixed pipe + PTY contract
 
 **Status:** accepted (2026-08-18)
+**Py7 clarification (ADR-133):** The pipe/PTY/session behavior remains active,
+but Protocol v2 and the `sandbox_mode=false` visibility gate are superseded.
+Protocol v3 exposes these fixed tools on every paired Device;
+`restrict_to_workspace` controls only their initial cwd.
 
 **Decision:** Py6 adds exactly three fixed client-only tools: `exec`,
 `write_stdin`, and `list_exec_sessions`. The server owns their canonical
@@ -3639,6 +3682,70 @@ tool-use/result pairing without claiming an ambiguous command was not run.
 
 ---
 
+### ADR-133 · Py7 workspace restriction, Protocol v3, and Device MCP
+
+**Status:** accepted (2026-08-22)
+
+**Decision:** Py7 replaces `sandbox_mode` everywhere with
+`restrict_to_workspace`. When true it limits OpenOctopus-resolved Client file
+paths and exec/PTY initial `working_dir` to the configured workspace. It does
+not inspect shell commands, isolate processes, or restrict exec/PTY/MCP
+networking. Client `ssrf_denylist` applies only to Client `web_fetch` and is
+independent of the workspace field. Server `web_fetch` reads its own validated,
+canonical `web_fetch_denylist` from `/api/admin/config`; both policies pin DNS
+results and revalidate redirects.
+
+Protocol v3 replaces v2 directly. The Client completes `hello_ack` installation
+with matching `config_applied`/`config_applied_ack` before the generation is
+routable. Failure before the process has ever reached ready exits instead of
+retrying forever; ordinary disconnects retry only after one successful ready
+transition. Any non-empty MCP env/header config may travel only on a connection
+whose authoritative ASGI scheme is WSS.
+
+Users configure at most 16 MCP servers on their own Device through
+`GET/PATCH /api/devices/{name}/config`. The Server stores stdio env and remote
+headers as reversible PostgreSQL plaintext but redacts every REST/log/error
+projection. Three explicit transports are supported: stdio, Streamable HTTP,
+and legacy SSE. FastMCP is pinned to `fastmcp-slim[client]==3.4.7`; transport
+inference, OAuth, custom CA, and disabled TLS verification are outside Py7.
+
+Discovery covers tools, static resources, resource templates, and prompts.
+All four surfaces share the final namespace `mcp_<server>_<alias>`; the
+surface and immutable source identity remain hidden route data. There is no
+typed name infix. `enabled_capabilities` has one three-state meaning across all
+surfaces: omitted/`null` enables none, `[]` explicitly enables all, and a non-empty unique
+list precisely enables those final names. Unknown names and collisions reject
+the complete candidate.
+This convention applies to finite positive selectors. Denylists, environment
+allowlists, and ordinary configuration collections retain their type-specific
+empty-list meaning; PATCH omission continues to mean unchanged.
+
+Every MCP add or modification requires the current Device Client to perform a
+real initialize and complete bounded discovery before the Server commits the
+config and matching catalog atomically. Pure deletion may commit while the
+Device is offline. The last successfully validated complete catalog is durable
+and remains Provider-visible while the Device/runtime is unavailable; dispatch
+returns an ordinary bounded tool error. Runtime `register_mcp` frames publish
+availability for an exact config revision, catalog digest, runtime generation,
+and entry identity. Calls that may have reached MCP are never replayed, and
+late validation/registration/tool results are contained by generation-scoped
+tombstones rather than poisoning a healthy replacement connection.
+
+MCP is trusted Device-host code: stdio children and remote transports can read
+or reach whatever the Device user can, subject only to their own configuration
+and host controls. `OPENOCTOPUS_*` values are removed from stdio child
+environments. Server/admin shared-service MCP remains deferred to Py8; Py7
+never runs Agent shell or MCP subprocesses on the Server.
+
+**Consequences:** Provider schemas are stable across online/offline flaps and
+come from persistent last-good catalogs; each Provider iteration freezes its
+hidden routes and dispatch revalidates them. Device MCP errors remain normal
+tool results so the Agent loop continues. `sandbox_mode`, device
+`enabled_tools`, Protocol v2, typed MCP infixes, and offline optimistic MCP
+addition are no longer Python-main contracts.
+
+---
+
 ## Appendix A · Key Design Principles
 
 Distilled from the ADRs, for fast onboarding of new contributors:
@@ -3669,7 +3776,7 @@ For contributors migrating from the old codebase, here's what changed and why:
 | WebSocket for browser chat | REST with best-effort POST streaming + canonical GET polling | ADR-003, ADR-121 |
 | `InboundEvent.sender_id`, `.identity.is_partner` | Neither field on InboundMessage | ADR-007, ADR-008 |
 | Rate limiting in bus | None in v1 | ADR-056 |
-| Per-user SSRF whitelist on `web_fetch` | Server: hardcoded block (no override). Client: per-device whitelist exceptions (capability declaration, not sandbox) | ADR-052 |
+| Per-user SSRF whitelist on `web_fetch` | Independent canonical denylist snapshots: Server admin hot config and per-Device Client config; neither is an exec/MCP firewall | ADR-052, ADR-133 |
 | `/api/files` ephemeral cache | Workspace canonical | ADR-044 |
 | `vision_stripped` on session state | Retry at provider layer only | ADR-026 |
 | Session = long-lived actor task + mpsc inbox | Session = DB row + transient lock | ADR-011 |

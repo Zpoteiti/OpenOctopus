@@ -2,7 +2,7 @@
 
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
 
 is_win = sys.platform == "win32"
 
@@ -30,6 +30,7 @@ def _assert_winpty_native_files(entries):
         )
 
 datas = collect_data_files("magika", includes=["config/**", "models/**"])
+datas += copy_metadata("fastmcp-slim")
 binaries = collect_dynamic_libs("onnxruntime")
 if is_win:
     from PyInstaller.utils.hooks import collect_all

@@ -265,7 +265,7 @@ async def test_real_file_transfer_and_device_workspace_relay(
                 json={
                     "name": "transfer-device",
                     "workspace_path": str(device_workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )

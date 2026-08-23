@@ -17,7 +17,7 @@ CALL_ID = UUID("0190d5a7-0000-7000-8000-000000000002")
 CHAT_ID = UUID("00000000-0000-4000-8000-000000000003")
 
 
-def test_protocol_v2_hello_advertises_shells_without_exec_capability() -> None:
+def test_protocol_v3_hello_advertises_shells_without_exec_capability() -> None:
     hello = Hello.new(
         client_version="0.0.1",
         operating_system="linux",
@@ -38,7 +38,7 @@ def test_protocol_v2_hello_advertises_shells_without_exec_capability() -> None:
         "os": "linux",
         "shells": {"available": ["bash", "sh"], "default": "bash"},
         "type": "hello",
-        "version": "2",
+        "version": "3",
     }
 
 
@@ -54,7 +54,7 @@ def test_shell_metadata_requires_unique_nonempty_members_and_default() -> None:
 def test_device_config_validates_exec_policy() -> None:
     config = DeviceConfig(
         workspace_path="/tmp/workspace",
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         shell_timeout_max=600,
         env_allowlist=["PATH", "HOME"],
@@ -70,7 +70,7 @@ def test_device_config_validates_exec_policy() -> None:
     with pytest.raises(ValueError):
         DeviceConfig(
             workspace_path="/tmp/workspace",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
             ssrf_denylist=[],
             shell_timeout_max=600,
             env_allowlist=["PATH", "PATH"],
@@ -78,10 +78,24 @@ def test_device_config_validates_exec_policy() -> None:
     with pytest.raises(ValueError):
         DeviceConfig(
             workspace_path="/tmp/workspace",
-            sandbox_mode=False,
+            restrict_to_workspace=False,
             ssrf_denylist=[],
             shell_timeout_max=600,
             env_allowlist=["OPENOCTOPUS_DEVICE_TOKEN"],
+        )
+
+
+def test_device_config_strictly_rejects_legacy_sandbox_mode() -> None:
+    with pytest.raises(ValueError):
+        DeviceConfig.model_validate(
+            {
+                "workspace_path": "/tmp/workspace",
+                "sandbox_mode": True,
+                "ssrf_denylist": [],
+                "shell_timeout_max": 600,
+                "env_allowlist": ["PATH"],
+            },
+            strict=True,
         )
 
 

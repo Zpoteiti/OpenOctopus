@@ -1,8 +1,8 @@
 # OpenOctopus Python client
 
-The Py6 client is a standalone Python 3.12 package for one user-owned device.
+The Py7 client is a standalone Python 3.12 package for one user-owned device.
 It connects to the server over `/ws/device` and runs shared file tools,
-`web_fetch`, and the trusted-device `exec` tools locally.
+`web_fetch`, fixed `exec` tools, and user-configured MCP runtimes locally.
 
 ## Install
 
@@ -35,29 +35,52 @@ python -m openoctopus_client version
 python -m openoctopus_client run
 ```
 
-With no subcommand, `run` is the default. Transient connection failures retry
-with bounded exponential backoff. Authentication and protocol configuration
-failures exit instead of retrying forever.
+With no subcommand, `run` is the default. Before the process has completed one
+Protocol v3 `hello`/config-applied acknowledgement, an unreachable Server is a
+startup failure and the process exits. After one successful ready transition,
+ordinary disconnects retry with bounded exponential backoff. Authentication,
+replacement, and protocol configuration failures exit.
 
 ## Local policy and conversion
 
-The server sends `workspace_path`, `sandbox_mode`, `ssrf_denylist`,
+The server sends `workspace_path`, `restrict_to_workspace`, `ssrf_denylist`,
 `shell_timeout_max`, and `env_allowlist` during the WebSocket handshake. A
 leading `~` expands against the local user's home.
-In sandbox mode, file paths must stay under the workspace root; trusted mode
-allows paths outside it, but special files and symlink/reparse escapes remain
-blocked for bounded operations. `ssrf_denylist` applies to the client
-`web_fetch` path. This is application policy, not an OS security sandbox.
-Shell tools are exposed only when `sandbox_mode=false`. Commands use closed
-stdin pipes by default; `tty=true` selects a line-oriented POSIX PTY or Windows
-ConPTY for REPLs and simple prompts. Full-screen TUI and secret input are not
-supported.
+When `restrict_to_workspace=true`, structured file paths and an exec/PTY
+process's initial working directory must stay under the workspace root. When it
+is false, absolute paths outside the workspace are allowed, but special files
+and symlink/reparse escapes remain blocked for bounded operations. Shell
+commands themselves are unrestricted in both modes. `ssrf_denylist` applies
+independently to client `web_fetch`. This is application policy, not an OS
+security sandbox. Exec and PTY are available on every paired Device; commands
+use closed stdin pipes by default and `tty=true`
+selects a line-oriented POSIX PTY or Windows ConPTY for REPLs and simple
+prompts. Full-screen TUI and secret input are not supported.
+
+## Device MCP
+
+Device MCP configuration is owned by the Server and changed through
+`GET/PATCH /api/devices/{name}/config`; the Client has no local MCP config
+file. Py7 supports explicit `stdio`, `streamable_http`, and legacy `sse`
+transports through FastMCP 3.4.7. A new or modified MCP is saved only after the
+online Client completes a real initialize and bounded discovery of tools,
+static resources, resource templates, and prompts. Pure deletion may be saved
+while the Device is offline.
+
+`env` and HTTP header values are sent only in private Device config frames and
+must use WSS when non-empty. The Client removes every `OPENOCTOPUS_*` variable
+from stdio MCP children. `restrict_to_workspace` and `ssrf_denylist` do not
+confine MCP or exec networking; installing an MCP trusts it with the Device
+user's host and network access. MCP runtimes survive an ordinary Server
+WebSocket reconnect, but calls that may have been sent are never replayed.
 
 PDF, DOCX, XLSX, PPTX, and downloaded HTML conversion runs locally in a helper
 process. Inputs are limited to 8 MiB, output to 128,000 characters, and PDF
 requests to at most 20 pages. Each conversion has a 20-second deadline;
 Linux applies a 2 GiB address-space limit and CPU limit. The helper receives no
-device token or arbitrary parent environment variables.
+device token or arbitrary parent environment variables. It reopens the
+canonical path without following links where the OS supports it and verifies
+the file identity captured before the worker started.
 
 `SIGINT` and `SIGTERM` cancel active work. Process backends use a fixed
 two-second graceful-termination window before force-kill, while the complete

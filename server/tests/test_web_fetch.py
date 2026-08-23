@@ -7,15 +7,20 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import openctopus_server.tools.web_fetch as web_fetch_module
 from openctopus_server.admission import KeyedAdmission
+from openctopus_server.db.models import SystemConfig
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.network_policy import compile_ssrf_policy
+from openctopus_server.services.system_config import load_web_fetch_policy
 from openctopus_server.tools.base import ToolContext, ToolResult
 from openctopus_server.tools.truncate import TRUNCATION_MARKER
 from openctopus_server.tools.web_fetch import (
     DEFAULT_MAX_CHARS,
     HtmlContentConverter,
+    PolicyLoader,
     WebFetchTool,
 )
 
@@ -94,13 +99,19 @@ def _web_fetch_tool(
     transport: httpx.AsyncBaseTransport | None = None,
     content_converter: HtmlContentConverter | None = None,
     web_admission: KeyedAdmission | None = None,
+    denylist: list[str] | None = None,
+    policy_loader: PolicyLoader | None = None,
 ) -> WebFetchTool:
+    async def load_policy():
+        return compile_ssrf_policy(denylist) if denylist is not None else compile_ssrf_policy(None)
+
     return WebFetchTool(
         web_admission=web_admission
         or KeyedAdmission(global_limit=2, per_key_limit=1, timeout_seconds=1),
         content_converter=content_converter or _StubContentConverter(),
         resolver=resolver,
         transport=transport,
+        policy_loader=policy_loader or load_policy,
     )
 
 
@@ -137,7 +148,7 @@ async def test_fetch_pins_checked_ip_and_preserves_host_and_sni() -> None:
     result = await tool.execute({"url": "https://example.com/path?q=1"}, _ctx())
 
     assert result == ToolResult(content="hello")
-    assert resolver_calls == [("example.com", 443), ("example.com", 443)]
+    assert resolver_calls == [("example.com", 443)]
     assert captured == {
         "url": f"https://{PUBLIC_IP}/path?q=1",
         "host": "example.com",
@@ -165,10 +176,28 @@ def test_fetch_schema_advertises_hard_max_chars() -> None:
         "192.168.1.2",
         "100.64.1.2",
         "169.254.1.2",
+        "192.0.0.8",
+        "192.0.0.11",
+        "192.0.2.1",
+        "192.88.99.2",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
         "224.0.0.1",
         "240.0.0.1",
         "0.0.0.0",
         "::1",
+        "::ffff:127.0.0.1",
+        "::ffff:93.184.216.34",
+        "64:ff9b:1::1",
+        "100::1",
+        "100:0:0:1::1",
+        "2001:1::4",
+        "2001:2::1",
+        "2001:5::1",
+        "2001:db8::1",
+        "2002::1",
+        "3fff::1",
         "fc00::1",
         "fe80::1",
         "ff02::1",
@@ -180,13 +209,48 @@ async def test_fetch_blocks_non_public_dns_targets(address: str) -> None:
 
     tool = _web_fetch_tool(
         resolver=resolve,
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "unsafe",
+                headers={"content-type": "text/plain"},
+            )
+        ),
     )
 
     result = await tool.execute({"url": "http://unsafe.example"}, _ctx())
 
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "192.0.0.9",
+        "192.0.0.10",
+        "2001:1::1",
+        "2001:1::2",
+        "2001:1::3",
+        "2001:3::1",
+        "2001:4:112::1",
+        "2001:20::1",
+        "2001:30::1",
+    ],
+)
+async def test_fetch_allows_globally_reachable_special_purpose_targets(address: str) -> None:
+    tool = _web_fetch_tool(
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[address]),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "public",
+                headers={"content-type": "text/plain"},
+            )
+        ),
+    )
+
+    result = await tool.execute({"url": "https://public-special.example"}, _ctx())
+
+    assert result == ToolResult(content="public")
 
 
 async def test_fetch_rejects_mixed_public_and_private_dns_answers() -> None:
@@ -201,24 +265,78 @@ async def test_fetch_rejects_mixed_public_and_private_dns_answers() -> None:
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
 
 
-async def test_fetch_rechecks_dns_immediately_before_connect() -> None:
+async def test_fetch_uses_one_dns_snapshot_per_hop_and_connects_to_that_ip() -> None:
     calls = 0
+    captured_url = ""
 
-    async def rebinding_resolver(hostname: str, port: int) -> list[str]:
+    async def resolver(hostname: str, port: int) -> list[str]:
         nonlocal calls
         calls += 1
-        return [PUBLIC_IP] if calls == 1 else ["127.0.0.1"]
+        assert (hostname, port) == ("snapshot.example", 80)
+        return [PUBLIC_IP]
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_url
+        captured_url = str(request.url)
+        return _streaming_text_response("safe", headers={"content-type": "text/plain"})
+
+    tool = _web_fetch_tool(resolver=resolver, transport=httpx.MockTransport(handler))
+
+    result = await tool.execute({"url": "http://snapshot.example/path"}, _ctx())
+
+    assert result == ToolResult(content="safe")
+    assert calls == 1
+    assert captured_url == f"http://{PUBLIC_IP}/path"
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["10.1.2.3", "100:0:0:1::1", "::ffff:93.184.216.34"],
+)
+async def test_fetch_explicit_empty_denylist_allows_any_target(address: str) -> None:
     tool = _web_fetch_tool(
-        resolver=rebinding_resolver,
+        denylist=[],
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[address]),
+        transport=httpx.MockTransport(
+            lambda request: _streaming_text_response(
+                "internal",
+                headers={"content-type": "text/plain"},
+            )
+        ),
+    )
+
+    result = await tool.execute({"url": "http://internal.example"}, _ctx())
+
+    assert result == ToolResult(content="internal")
+
+
+async def test_fetch_applies_explicit_mapped_ipv6_rule_before_ipv4_normalization() -> None:
+    mapped = "::ffff:93.184.216.34"
+    tool = _web_fetch_tool(
+        denylist=[f"{mapped}/128"],
+        resolver=lambda hostname, port: asyncio.sleep(0, result=[mapped]),
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unsafe")),
     )
 
-    result = await tool.execute({"url": "http://rebind.example"}, _ctx())
+    result = await tool.execute({"url": "https://mapped.example"}, _ctx())
 
-    assert calls == 2
+    assert result.is_error is True
+    assert result.code is ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+async def test_fetch_applies_hostname_port_rule_before_dns() -> None:
+    resolver_calls: list[tuple[str, int]] = []
+    tool = _web_fetch_tool(
+        denylist=["blocked.example:8443"],
+        resolver=_public_resolver(resolver_calls),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="unused")),
+    )
+
+    result = await tool.execute({"url": "https://blocked.example:8443/path"}, _ctx())
+
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+    assert resolver_calls == []
 
 
 async def test_fetch_admission_is_acquired_before_dns_and_is_released() -> None:
@@ -286,13 +404,19 @@ async def test_fetch_admission_is_held_through_html_conversion() -> None:
     second = await tool.execute({"url": "https://second.example"}, _ctx())
 
     assert second.code is ErrorCode.NETWORK_TIMEOUT
-    assert resolver_calls == ["first.example", "first.example"]
+    assert resolver_calls == ["first.example"]
     release_conversion.set()
     assert await first == ToolResult(content="converted")
 
 
 async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None:
     requests: list[str] = []
+    policy_loads = 0
+
+    async def load_policy():
+        nonlocal policy_loads
+        policy_loads += 1
+        return compile_ssrf_policy(None)
 
     async def resolve(hostname: str, port: int) -> list[str]:
         return ["127.0.0.1"] if hostname == "private.example" else [PUBLIC_IP]
@@ -301,13 +425,47 @@ async def test_fetch_checks_every_redirect_target_before_requesting_it() -> None
         requests.append(str(request.url))
         return httpx.Response(302, headers={"location": "http://private.example/secret"})
 
-    tool = _web_fetch_tool(resolver=resolve, transport=httpx.MockTransport(handler))
+    tool = _web_fetch_tool(
+        resolver=resolve,
+        transport=httpx.MockTransport(handler),
+        policy_loader=load_policy,
+    )
 
     result = await tool.execute({"url": "https://public.example/start"}, _ctx())
 
     assert requests == [f"https://{PUBLIC_IP}/start"]
+    assert policy_loads == 1
     assert result.is_error is True
     assert result.code == ErrorCode.NETWORK_SSRF_BLOCKED
+
+
+async def test_fetch_hot_reads_the_postgres_policy(pg_engine: Any) -> None:
+    requests: list[str] = []
+
+    async def resolve(_hostname: str, _port: int) -> list[str]:
+        return ["10.1.2.3"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return _streaming_text_response("ok", headers={"content-type": "text/plain"})
+
+    tool = WebFetchTool(
+        web_admission=KeyedAdmission(global_limit=2, per_key_limit=1, timeout_seconds=1),
+        content_converter=_StubContentConverter(),
+        resolver=resolve,
+        transport=httpx.MockTransport(handler),
+        policy_loader=lambda: load_web_fetch_policy(pg_engine),
+    )
+
+    blocked = await tool.execute({"url": "http://internal.example/status"}, _ctx())
+    async with AsyncSession(pg_engine) as db:
+        db.add(SystemConfig(key="web_fetch_denylist", value=[]))
+        await db.commit()
+    allowed = await tool.execute({"url": "http://internal.example/status"}, _ctx())
+
+    assert blocked.code is ErrorCode.NETWORK_SSRF_BLOCKED
+    assert allowed == ToolResult(content="ok")
+    assert requests == ["http://10.1.2.3/status"]
 
 
 @pytest.mark.parametrize(

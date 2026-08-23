@@ -31,14 +31,14 @@ class RecordingManager:
 
 
 def _dispatcher(
-    *, timeout_cap: int = 600, sandbox_mode: bool = False
+    *, timeout_cap: int = 600, restrict_to_workspace: bool = False
 ) -> tuple[ExecToolDispatcher, RecordingManager]:
     manager = RecordingManager()
     dispatcher = ExecToolDispatcher(
         manager,
         ExecPolicy(
             workspace=Path("/workspace"),
-            sandbox_mode=sandbox_mode,
+            restrict_to_workspace=restrict_to_workspace,
             shell_timeout_max=timeout_cap,
             env_allowlist=("PATH", "HOME"),
             available_shells=("bash", "sh"),
@@ -171,8 +171,8 @@ async def test_list_requires_empty_args_and_all_exec_tools_require_owner() -> No
 
 
 @pytest.mark.asyncio
-async def test_sandbox_policy_fails_closed_without_calling_manager() -> None:
-    dispatcher, manager = _dispatcher(sandbox_mode=True)
+async def test_workspace_restriction_still_exposes_exec() -> None:
+    dispatcher, manager = _dispatcher(restrict_to_workspace=True)
 
     result = await dispatcher.execute(
         "exec",
@@ -180,6 +180,7 @@ async def test_sandbox_policy_fails_closed_without_calling_manager() -> None:
         chat_session_id=CHAT_ID,
     )
 
-    assert result.is_error is True
-    assert result.code == "tool_device_unreachable"
-    assert manager.calls == []
+    assert result == ToolOutput("started")
+    request = manager.calls[0][2]
+    assert isinstance(request, ExecStart)
+    assert request.policy.restrict_to_workspace is True

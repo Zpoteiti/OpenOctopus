@@ -11,8 +11,9 @@ conda run --no-capture-output -n oo python scripts/device_network_capacity_harne
 ```
 
 The script starts a loopback Uvicorn listener and opens 500 real `/ws/device`
-WebSockets. It inserts uniquely prefixed `users` and `devices` rows, so each
-Bearer token is authenticated by the production PostgreSQL
+WebSockets. Each lightweight peer completes the Protocol v3 hello and
+config-applied acknowledgement. It inserts uniquely prefixed `users` and
+`devices` rows, so each Bearer token is authenticated by the production PostgreSQL
 `devices.token_hash` lookup. The source side is 500 lightweight protocol peer
 tasks in one process—not 500 PyInstaller processes, and not provider/Agent
 turns. The JSON report states those limits explicitly.
@@ -20,9 +21,13 @@ turns. The JSON report states those limits explicitly.
 The script also runs one bounded server-to-client transfer per connection while
 heartbeats remain active. It raises the `RLIMIT_NOFILE` soft limit only up to the
 hard limit when needed, records RSS/fd/task/queue/transfer high-water metrics,
-measures actual online connections before shutdown and after cleanup, and deletes
-only the exact rows it created in `finally`. It never truncates existing tables. The ordinary
-`device_capacity_harness.py` remains the faster in-memory registry probe; its
+measures actual online connections before shutdown and after cleanup. It also
+creates one bounded offline MCP catalog per connected Device, projects each
+owner's Provider schemas/routes, and records catalog high-water metrics. The
+lightweight peers do not start MCP runtimes, so `mcp_runtime_high_water` is zero;
+the native/frozen Client E2E is the real-runtime gate. The harness deletes
+only the exact rows it created in `finally`. It never truncates existing tables.
+The ordinary `device_capacity_harness.py` remains the faster in-memory registry probe; its
 `network_exercised` value stays `false`.
 
 The ordinary CI runs the eight-connection opt-in smoke. The 500-connection merge

@@ -66,7 +66,7 @@ def _exec_request(
     return ExecStart(
         policy=ExecPolicy(
             workspace=workspace,
-            sandbox_mode=False,
+            restrict_to_workspace=False,
             shell_timeout_max=60,
             env_allowlist=(
                 "PATH",

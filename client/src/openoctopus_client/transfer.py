@@ -68,7 +68,7 @@ class TransferConfigSnapshot:
     """The immutable local policy captured when a transfer slot starts."""
 
     workspace_path: Path
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: tuple[str, ...] = ()
     device_name: str = ""
 
@@ -77,13 +77,13 @@ class TransferConfigSnapshot:
         cls,
         workspace_path: Path,
         *,
-        sandbox_mode: bool,
+        restrict_to_workspace: bool,
         ssrf_denylist: list[str] | tuple[str, ...] = (),
         device_name: str = "",
     ) -> TransferConfigSnapshot:
         return cls(
             workspace_path=workspace_path,
-            sandbox_mode=sandbox_mode,
+            restrict_to_workspace=restrict_to_workspace,
             ssrf_denylist=tuple(ssrf_denylist),
             device_name=device_name,
         )
@@ -152,7 +152,7 @@ class TransferManager:
         workspace: Path | TransferConfigSnapshot,
         writer: SerializedWriter,
         *,
-        sandbox_mode: bool = True,
+        restrict_to_workspace: bool = True,
         ssrf_denylist: list[str] | tuple[str, ...] = (),
         device_name: str = "",
         path_locks: PathLocks | None = None,
@@ -163,7 +163,7 @@ class TransferManager:
         else:
             snapshot = TransferConfigSnapshot.from_values(
                 workspace,
-                sandbox_mode=sandbox_mode,
+                restrict_to_workspace=restrict_to_workspace,
                 ssrf_denylist=ssrf_denylist,
                 device_name=device_name,
             )
@@ -1095,7 +1095,7 @@ def _resolve_destination(
 ) -> tuple[WorkspacePaths, Path]:
     paths = WorkspacePaths(
         snapshot.workspace_path,
-        sandbox_mode=snapshot.sandbox_mode,
+        restrict_to_workspace=snapshot.restrict_to_workspace,
     )
     return paths, paths.resolve(dst_path, directory=None)
 
@@ -1135,7 +1135,7 @@ def _prepare_destination(
 def _resolve_source(snapshot: TransferConfigSnapshot, src_path: str) -> Path:
     paths = WorkspacePaths(
         snapshot.workspace_path,
-        sandbox_mode=snapshot.sandbox_mode,
+        restrict_to_workspace=snapshot.restrict_to_workspace,
     )
     return paths.resolve(src_path, directory=False)
 

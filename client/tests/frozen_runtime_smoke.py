@@ -174,6 +174,9 @@ def _runtime_smoke_payload(
     exec_seconds: float,
     exec_peak_rss: int,
     exec_peak_processes: int,
+    mcp_seconds: float,
+    mcp_peak_rss: int,
+    mcp_peak_processes: int,
     conversion_seconds: float,
     conversion_peak_rss: int,
     conversion_peak_processes: int,
@@ -194,6 +197,11 @@ def _runtime_smoke_payload(
             "seconds": round(exec_seconds, 6),
             "sampled_process_tree_peak_processes": exec_peak_processes,
             "sampled_process_tree_peak_rss_bytes": exec_peak_rss,
+        },
+        "mcp_stdio": {
+            "seconds": round(mcp_seconds, 6),
+            "sampled_process_tree_peak_processes": mcp_peak_processes,
+            "sampled_process_tree_peak_rss_bytes": mcp_peak_rss,
         },
         "conversion_child": {
             "seconds": round(conversion_seconds, 6),
@@ -257,6 +265,31 @@ def main() -> int:
         ):
             raise SmokeError("exec backend smoke failed")
 
+        mcp_environment = dict(os.environ)
+        mcp_environment["OPENOCTOPUS_DEVICE_TOKEN"] = "openoctopus_dev_mcp_smoke_secret"
+        mcp_fixture = Path(__file__).parent / "fixtures" / "fake_mcp_stdio.py"
+        mcp = _run(
+            binary,
+            "_mcp-stdio-smoke",
+            sys.executable,
+            str(mcp_fixture),
+            env=mcp_environment,
+            psutil=psutil,
+        )
+        try:
+            mcp_payload = json.loads(mcp.completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise SmokeError("MCP stdio smoke did not write JSON") from exc
+        if (
+            mcp.completed.returncode != 0
+            or mcp.completed.stderr
+            or mcp_payload != {"ok": True, "stdio_mcp": True}
+            or "mcp_smoke_secret" in mcp.completed.stdout
+        ):
+            raise SmokeError("MCP stdio smoke failed")
+        if mcp.peak_processes < 2:
+            raise SmokeError("MCP stdio smoke did not start a child process")
+
         conversion = _run(binary, "_spike-convert", str(fixture), psutil=psutil)
         try:
             conversion_payload = json.loads(conversion.completed.stdout)
@@ -293,6 +326,9 @@ def main() -> int:
                     exec_seconds=exec_backends.seconds,
                     exec_peak_rss=exec_backends.peak_rss_bytes,
                     exec_peak_processes=exec_backends.peak_processes,
+                    mcp_seconds=mcp.seconds,
+                    mcp_peak_rss=mcp.peak_rss_bytes,
+                    mcp_peak_processes=mcp.peak_processes,
                     conversion_seconds=conversion.seconds,
                     conversion_peak_rss=conversion.peak_rss_bytes,
                     conversion_peak_processes=conversion.peak_processes,

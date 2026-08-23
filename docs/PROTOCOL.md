@@ -24,14 +24,14 @@ additional handshake credentials.
 ### 1.2 Handshake
 
 After the WS upgrade succeeds, **the client sends `hello` first**. Every
-frame is validated with strict Protocol v2 DTOs: unknown fields are rejected,
+frame is validated with strict Protocol v3 DTOs: unknown fields are rejected,
 not ignored.
 
 ```jsonc
 {
   "type": "hello",
   "id": "0190d5a7-...",          // UUID v7, used to correlate hello_ack
-  "version": "2",                // protocol version
+  "version": "3",                // protocol version
   "client_version": "0.0.1",     // openoctopus_client package version
   "os": "linux",                 // "linux" | "darwin" | "windows"
   "caps": {                       // fixed non-shell capabilities
@@ -53,46 +53,75 @@ Py6 shell names: `bash`, `sh`, `zsh`, `pwsh`, `powershell`,
 the default must be one of its entries. This live metadata is used for
 prompting and diagnostics and is not persisted.
 
-Server responds with `hello_ack` containing the active Py6 device config:
+Server responds with `hello_ack` containing the authoritative Py7 Device config
+and persistent last-good MCP catalog:
 
 ```jsonc
 {
   "type": "hello_ack",
   "id": "<same as hello.id>",
   "device_name": "alice-laptop",
+  "config_revision": 7,
   "config": {
     "workspace_path": "~/openoctopus/workspace",
-    "sandbox_mode": true,
+    "restrict_to_workspace": true,
     "ssrf_denylist": ["127.0.0.0/8", "10.0.0.0/8"],
     "shell_timeout_max": 600,
-    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"]
-  }
+    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"],
+    "mcp_servers": []
+  },
+  "mcp_catalog": {"version": 1, "digest": "<sha256>", "servers": []}
 }
 ```
 
 If the token is invalid or revoked, the server closes with WS code `4401` and a JSON close-reason payload `{"code":"unauthorized"}`. No `error` frame. The server rechecks the token after receiving `hello` and before `hello_ack`, so a token revoked during an in-flight handshake cannot become an online connection.
 
-Protocol v2 is strict: a v2 server receiving `version: "1"` closes with `4409`
-and `{"code":"version_unsupported","protocol_version":"2"}`. A v2 client
+Protocol v3 is strict: a v3 server receiving any other version closes with `4409`
+and `{"code":"version_unsupported","protocol_version":"3"}`. A v3 client
 receiving an incompatible handshake exits permanently; there is no version
-negotiation or v1 fallback. A client must provide both pipe and PTY/ConPTY
+negotiation or v2 fallback. A client must provide both pipe and PTY/ConPTY
 backends; missing packaged PTY dependencies are a permanent startup failure,
 while a transient per-call PTY allocation failure returns
 `tool_pty_unavailable` without falling back to pipes.
 
+The Client installs the config, sends matching
+`config_applied(id, config_revision)`, and waits for matching
+`config_applied_ack` before the process reaches ready. The Server keeps that WS
+generation fenced and unroutable until its ACK send succeeds. MCP runtimes start
+after this acknowledgement and do not delay fixed file/web/exec readiness.
+If any MCP config contains a non-empty stdio env or remote header value, secret
+frames may be sent only when the authoritative ASGI connection scheme is
+`wss`; plaintext `ws` fails closed before disclosure.
+The application never trusts a raw `X-Forwarded-Proto` header itself. TLS
+reverse proxies must use Uvicorn proxy-header handling with an explicit
+`FORWARDED_ALLOW_IPS` trust set so only a trusted peer can produce a `wss`
+ASGI scope; wildcard proxy trust is not a production configuration.
+
+`hello_ack`, `config_update`, and `config_validate` are the only Server frames
+whose config projection may reveal stored MCP secret values. They use the
+dedicated secret-aware wire serializer and their raw JSON is never logged;
+ordinary model dumps, REST responses, errors, catalogs, and registration frames
+remain redacted or secret-free.
+
 ### 1.3 Reconnect
 
-On a retryable failure, the client retries forever with delays of 1, 2, 4, 8,
-16, then 30 seconds, each with ±20% jitter. `Retry-After` is honored up to
-the 30-second cap. Each successful connection resets the backoff, and each
-reconnect sends `hello` with a new UUID v7. This applies to the initial
-connection as well.
+Before the process has completed one `config_applied_ack`, it performs one
+bounded real connection/handshake attempt. DNS/TCP/TLS failures, HTTP 429/5xx,
+pre-ack EOF, hello timeout, and retryable WS closures are startup-unreachable
+and exit non-zero. There is no `/health` preflight or infinite first-start loop.
+
+After one successful ready transition, ordinary failures retry forever with
+delays of 1, 2, 4, 8, 16, then 30 seconds, each with ±20% jitter.
+`Retry-After` is honored up to the 30-second cap. Each successful connection
+resets the backoff, and each reconnect sends `hello` with a new UUID v7.
 
 Retryable failures are DNS/TCP/TLS failures, HTTP 429 or 5xx upgrade responses,
 and unexpected WS closure codes `1000`, `1001`, `1006`, `1013`, or `4408`.
 Code `4000` is the duplicate-connection replacement closure and is permanent:
 the old client cleans up sessions and exits without reconnecting. Ordinary
-retryable disconnects and server restart preserve runtime-owned exec sessions.
+retryable disconnects and Server restart preserve runtime-owned exec and MCP
+sessions; a fresh connection installs the authoritative revision and
+re-registers the full MCP runtime snapshot.
 HTTP 401/403 and WS `4401` are permanent authentication failures: log a
 sanitized message and exit non-zero. Other HTTP 4xx responses and WS `4409`
 are permanent URL/protocol configuration failures: log a sanitized message and
@@ -100,9 +129,9 @@ exit with status 78. In particular, the client does not retry a 4409 mismatch.
 
 In-flight calls that had not entered transport fail with
 `tool_device_unreachable`; calls that may have entered transport fail with
-`tool_execution_outcome_unknown`. The server never replays an exec or stdin
-call. Token rotation, device deletion, and 4401 permanently terminate local
-exec sessions.
+`tool_execution_outcome_unknown`. The Server never replays an exec, stdin, or
+MCP call. Token rotation, Device deletion, replacement, Client shutdown, and
+4401 terminate local exec and MCP sessions.
 
 ### 1.4 Heartbeat
 
@@ -114,7 +143,7 @@ exec sessions.
 - Server sends `ping` every **30 seconds**, starting one full interval after `hello_ack`.
 - Client must respond with `pong` echoing the `ping.id` before the next
   `ping` deadline.
-- The client does not initiate application-level `ping` in v2; server-side
+- The client does not initiate application-level `ping` in v3; server-side
   online state is authoritative.
 - After **2 missed pongs (~70s)** the server closes the connection (WS code
   `4408`) and marks the device offline. Calls rejected before issue fail with
@@ -132,6 +161,9 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 | `type` | Purpose | Carries |
 |---|---|---|
 | `hello` | Initial handshake | version, client_version, os, caps |
+| `config_applied` | Client installed an authoritative config | id, config_revision |
+| `config_validate_result` | Candidate MCP validation outcome | id, ok, source_catalog or bounded failures |
+| `register_mcp` | Aggregate runtime availability snapshot | id, config_revision, catalog_digest, servers |
 | `tool_result` | Result of a `tool_call` | id (echoes call), content string or safe blocks, is_error, code? |
 | `transfer_begin` | Byte sender opens a slot and declares source/destination metadata | id, direction, purpose, paths, total_bytes, sha256?, mime?, etag?, if_match?, if_none_match? (purpose-specific) |
 | `transfer_ready` | Receiver has reserved its destination/consumer | id |
@@ -144,9 +176,13 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 
 | `type` | Purpose | Carries |
 |---|---|---|
-| `hello_ack` | Handshake response | id (echoes hello), device_name, active Py6 config |
-| `tool_call` | Dispatch a tool to the device | id, name, args, max_result_bytes |
-| `config_update` | Push a device rename/config change (ADR-050) | id, current device_name, new config object |
+| `hello_ack` | Handshake response | id, device_name, config_revision, full config, last-good MCP catalog |
+| `config_applied_ack` | Server confirms config generation is routable | id, config_revision |
+| `config_validate` | Validate changed MCP servers without activation | id, base revision, full candidate config, changed names, deadline |
+| `config_validate_cancel` | Cancel/retire a candidate validation | id |
+| `register_mcp_ack` | Accept/reject an exact aggregate runtime snapshot | id, revision, digest, per-server results |
+| `tool_call` | Dispatch a tool to the device | id, name, args, max_result_bytes, chat_session_id?, mcp_route? |
+| `config_update` | Push authoritative config/catalog | id, device_name, config_revision, full config, last-good catalog |
 | `transfer_request` | Ask a device to send one regular file | id, purpose, src_path, dst_path? |
 | `transfer_begin` | Byte sender opens a slot and declares source/destination metadata | same fields as client frame |
 | `transfer_ready` | Receiver has reserved its destination/consumer | id |
@@ -155,10 +191,10 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 | `ping` | Liveness probe | id |
 | `error` | Out-of-band error report | id?, code, message |
 
-`register_mcp`, `config_validate`, and shell/exec frames are not separate
-frames: Py6 shell operations reuse `tool_call`/`tool_result`. The Py6 client
-does not advertise dynamic tool schemas or MCP. The `error` frame
-is for protocol-level issues (malformed JSON, unknown frame type) that are not
+Shell/exec and MCP invocation reuse `tool_call`/`tool_result`; their routing
+metadata is Provider-hidden. MCP configuration and runtime state use the
+explicit validation/registration frames above. The `error` frame is for
+protocol-level issues (malformed JSON, unknown frame type) that are not
 tied to a specific tool call. Tool failures travel as `tool_result` with
 `is_error: true` per ADR-031.
 
@@ -182,10 +218,23 @@ Server → client. Fired when the agent loop dispatches a tool whose `openoctopu
 }
 ```
 
-The client validates that `name` is one of the active shared file tools,
-`web_fetch`, or the three Py6 client-only exec tools. For the exec tools the
-frame also carries provider-hidden `chat_session_id`; ordinary tools may omit
-it. The client replies with `tool_result` when complete.
+The Client validates that `name` is one of the fixed shared/exec names or an
+exact active MCP route. Exec frames carry Provider-hidden `chat_session_id`.
+MCP frames instead include:
+
+```jsonc
+"mcp_route": {
+  "entry_id": "<uuid-v7>",
+  "config_revision": 7,
+  "catalog_digest": "<sha256>",
+  "runtime_generation": "<uuid-v7>"
+}
+```
+
+The Server removes the injected `openoctopus_device` selector before sending
+MCP source args. The Client matches route identity/revision/digest/generation
+and final name exactly; neither side parses the surface from the wrapped name.
+The Client replies with `tool_result` when complete.
 
 ### 3.2 `tool_result`
 
@@ -271,13 +320,14 @@ users can still progress concurrently when they target different resources.
 - **Heartbeat timeout** (2 missed pongs): preflight calls are unreachable;
   already-issued calls have unknown outcome.
 
-### 3.5 Py6 client-only execution
+### 3.5 Client-only execution
 
 `exec`, `write_stdin`, and `list_exec_sessions` are fixed `CLIENT_ONLY` tool
 names routed through the ordinary `tool_call`/`tool_result` frames. They are
 not extra WebSocket frame types and do not use dynamic `RegisterTools`. The
-server injects required `openoctopus_device` only for trusted paired devices
-(`sandbox_mode=false`); `server` is never an exec target. The client performs
+Server injects required `openoctopus_device` for every paired Device;
+`server` is never an exec target. `restrict_to_workspace=true` constrains only
+the initial `working_dir`, not the command or process network access. The Client performs
 strict second validation and returns raw text result content; the server applies
 the normal provider-facing result normalization.
 
@@ -305,34 +355,131 @@ PTY DSR compatibility replies are fixed: `CSI 5 n` → `ESC[0n`, `CSI 6 n` →
 only a real write/flush failure terminates the session. PTY output is a
 bounded normalized text stream with no cursor or screen-canvas state.
 
-### 3.6 `config_update` (Py6 active fields)
+### 3.6 Authoritative config application
 
 Server → client. Pushed when a `PATCH /api/devices/{name}/config` succeeds
-(ADR-050). It always carries the current canonical `device_name`, matching
-`hello_ack`, so an online rename updates the client's local display/log state
-without requiring a reconnect.
+(ADR-133). It carries the same complete config/catalog shape as `hello_ack`.
 
 ```jsonc
 {
   "type": "config_update",
-  "id": "...",
+  "id": "<uuid-v7>",
   "device_name": "alice-dev-box",
+  "config_revision": 8,
   "config": {
-    "sandbox_mode": false,
-    "ssrf_denylist": [],
     "workspace_path": "/home/alice/.openoctopus/",
+    "restrict_to_workspace": false,
+    "ssrf_denylist": [],
     "shell_timeout_max": 600,
-    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"]
-  }
+    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"],
+    "mcp_servers": []
+  },
+  "mcp_catalog": {"version": 1, "digest": "<sha256>", "servers": []}
 }
 ```
 
-Client hot-reloads. It updates its local `device_name` from the frame, then
-applies the config. Existing non-shell calls finish under their captured old
-config. A shell-policy change fences new exec calls, terminates sessions from
-the old policy, then activates the new policy; no process starts in between.
-Client does not ack — the next `tool_call` implicitly confirms the new config
-is in effect.
+The Client applies revisions serially, updates local identity/policy, promotes a
+matching validated MCP candidate where applicable, and sends
+`config_applied(id, config_revision)`. The Server validates the current WS
+generation and replies with matching `config_applied_ack` before atomically
+making it routable. Both directions have a 10-second deadline. Ambiguous ACK
+send retires that generation without rolling back the durable DB commit.
+
+### 3.7 MCP candidate validation and registration
+
+For an MCP add/modify PATCH, the Server sends `config_validate` with the full
+secret-bearing candidate, base revision, exact changed server names, and a
+300,000 ms deadline. The Client builds validation-only runtimes, performs real
+initialize and complete bounded discovery of tools, static resources, resource
+templates, and prompts, then returns either a complete `source_catalog` or
+bounded stable failures. It does not activate or register the candidate.
+
+```jsonc
+{
+  "type": "config_validate",
+  "id": "<uuid-v7>",
+  "base_config_revision": 7,
+  "candidate_config": {"...full Device config, including MCP secrets...": "..."},
+  "validate_servers": ["corp"],
+  "deadline_ms": 300000
+}
+
+{
+  "type": "config_validate_result",
+  "id": "<same uuid-v7>",
+  "ok": true,
+  "source_catalog": {"version": 1, "servers": []},
+  "failures": []
+}
+```
+
+For `ok=false`, `source_catalog` is absent and `failures` is a non-empty list
+of `{name, stage, code, message}` with bounded, secret-free values.
+
+The Server validates naming, `enabled_capabilities`, bounds, built-in and owner
+collisions before committing config plus last-good catalog atomically. A
+matching committed `config_update.id` promotes the candidate. Cancellation and
+expired IDs become WS-generation tombstones; an exact late result is ignored,
+while a truly unknown ID is a protocol error.
+
+After config acknowledgement, the Client sends one aggregate `register_mcp`
+exchange at a time. Every configured server appears as `ready`, `unavailable`,
+or `drifted` with an exact `runtime_generation`; only `ready` carries a fresh
+four-surface source catalog. The Server's `register_mcp_ack` echoes the frame
+id, config revision, catalog digest, names, and generations. A binding becomes
+routable only after ACK send succeeds. State changes while an ACK is pending
+coalesce into the next latest snapshot instead of reviving a stale one.
+
+```jsonc
+{
+  "type": "register_mcp",
+  "id": "<uuid-v7>",
+  "config_revision": 7,
+  "catalog_digest": "<sha256>",
+  "servers": [{
+    "name": "corp",
+    "runtime_generation": "<uuid-v7>",
+    "state": "ready",
+    "code": null,
+    "source_catalog": {
+      "tools": [], "resources": [], "resource_templates": [], "prompts": []
+    }
+  }]
+}
+
+{
+  "type": "register_mcp_ack",
+  "id": "<same uuid-v7>",
+  "config_revision": 7,
+  "catalog_digest": "<same sha256>",
+  "results": [{
+    "name": "corp",
+    "runtime_generation": "<same uuid-v7>",
+    "accepted": true,
+    "code": null
+  }]
+}
+```
+
+Unavailable/drifted snapshots omit `source_catalog` and require a stable code;
+their acknowledgements use `accepted=false` with a stable code.
+
+### 3.8 MCP delivery and errors
+
+Provider schemas come from persistent last-good catalogs, not transient
+registration memory. Therefore an offline Device keeps its MCP names visible;
+dispatch returns `tool_device_unreachable`. A connected Device with a starting,
+down, drifted, or unacknowledged runtime returns `tool_mcp_unavailable`.
+
+An MCP call is bound to both the OO WS writer generation and MCP runtime
+generation. After validating the OO envelope and immutable route, the Client
+forwards tool arguments without re-evaluating the dynamic MCP `inputSchema`;
+the MCP Server owns argument validation. Once the call enters or may enter MCP
+transport, timeout, Stop, or disconnect returns
+`tool_execution_outcome_unknown`; it is never replayed.
+Matching late results consume bounded generation tombstones. MCP failures are
+ordinary bounded `tool_result` frames and do not close the healthy Device WS or
+stop the Agent loop.
 
 ---
 
@@ -550,13 +697,13 @@ Standard WS close codes 1000–1015, plus OpenOctopus-specific:
 | `4000` | `connection_replaced` | A newer connection replaced this generation. Old client terminates sessions and exits permanently. |
 | `4401` | `{"code":"unauthorized"}` | Token invalid / revoked. **Exit, do NOT retry**. |
 | `4408` | — | Heartbeat timeout. Reconnect with backoff. |
-| `4409` | `{"code":"version_unsupported","protocol_version":"2"}` | Protocol version mismatch. **Exit code 78, do NOT retry**. Details are sanitized before logging. |
+| `4409` | `{"code":"version_unsupported","protocol_version":"3"}` | Protocol version mismatch. **Exit code 78, do NOT retry**. Details are sanitized before logging. |
 
 ---
 
 ## 6. Versioning
 
-Protocol version is a single string in `hello.version`; v2 is the version
+Protocol version is a single string in `hello.version`; v3 is the version
 specified here. Every frame model uses strict validation and rejects unknown
 fields. A wire-incompatible field or frame change therefore requires a
 coordinated protocol-version change; do not assume additive unknown-field
@@ -570,24 +717,25 @@ tolerance. Protocol version is independent from the package version.
 - **Streaming `tool_result`** — results are single-frame even if large (subject to the tool's own result cap). Real streaming would require a slot model like transfers; not justified yet.
 - **Multi-server failover** — single server per device. Multi-server coordination is ruled out (ADR-061).
 - **Resume / range support for transfers** — failed transfers restart from byte 0. Resumable transfers require tracking offsets persistently; not worth the complexity at current file sizes.
+- **Server/admin MCP** — Py7 runs MCP only on user Devices. Shared Server MCP
+  remains a Py8 design.
+- **MCP invocation replay** — transport recovery may resume an existing stream,
+  but OpenOctopus never issues a second MCP request for an ambiguous call.
 
 ---
 
 ## 8. Related ADRs
 
 - **ADR-031** — tool failure → `tool_result(is_error:true)`.
-- **ADR-047** — shared MCP client; three surfaces (tools/resources/prompts).
-- **ADR-048** — MCP wrapping + naming convention; prompt-output stringify rule.
-- **ADR-049** — MCP collision rejection (within-server dup + cross-install schema drift).
-- **ADR-050** — device config push.
-- **ADR-052** — `web_fetch` as shared tool with per-device whitelist.
+- **ADR-047/048/049/050/052/099/100/105** — historical MCP/device decisions
+  superseded in Py7 by ADR-133 where marked.
 - **ADR-091** — device pairing identity (revised for hashed tokens by ADR-131).
 - **ADR-095** — untrusted-tool-result wrap.
 - **ADR-096** — this protocol's headline decisions.
 - **ADR-097** — device pairing flow + token lifecycle.
-- **ADR-099** — MCP resource URI templates surfaced as schema properties.
-- **ADR-100** — MCP `enabled` filter applies uniformly across the three surfaces.
 - **ADR-131** — Py5 Python client, minimal device config, hashed tokens, and
   single-file transfer handshake.
-- **ADR-132** — Py6 fixed client exec schemas, Protocol v2, PTY boundary, and
-  chat-owned process sessions.
+- **ADR-132** — historical Py6 fixed exec/PTY and chat-owned process sessions;
+  its wire version and trusted-only gate are superseded.
+- **ADR-133** — Protocol v3, workspace restriction, Device MCP, last-good
+  catalog, validate-before-save, WSS secrets, and no replay.

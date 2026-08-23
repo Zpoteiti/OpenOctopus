@@ -446,7 +446,7 @@ def test_terminal_overflow_is_fatal_and_does_not_record_unsent_end(tmp_path: Pat
             purpose="file_transfer",
             snapshot=TransferConfigSnapshot.from_values(
                 tmp_path,
-                sandbox_mode=True,
+                restrict_to_workspace=True,
             ),
             state="READY",
         )

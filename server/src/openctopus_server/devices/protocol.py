@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
+import re
 import secrets
 import time
 from typing import Annotated, Any, Literal
@@ -17,13 +19,67 @@ from pydantic import (
     model_validator,
 )
 
-PROTOCOL_VERSION: Literal["2"] = "2"
+from .mcp_models import (
+    MCP_SERVER_MAX,
+    parse_mcp_server_configs,
+)
+from .mcp_models import (
+    McpServerConfig as McpServerConfig,
+)
+from .mcp_models import (
+    McpServerConfigBase as McpServerConfigBase,
+)
+from .mcp_models import (
+    PersistedMcpCatalog as PersistedMcpCatalog,
+)
+from .mcp_models import (
+    PersistedMcpCatalogEntry as PersistedMcpCatalogEntry,
+)
+from .mcp_models import (
+    PersistedMcpServerCatalog as PersistedMcpServerCatalog,
+)
+from .mcp_models import (
+    PromptArgument as PromptArgument,
+)
+from .mcp_models import (
+    SourceMcpCatalog as SourceMcpCatalog,
+)
+from .mcp_models import (
+    SourceMcpPrompt as SourceMcpPrompt,
+)
+from .mcp_models import (
+    SourceMcpResource as SourceMcpResource,
+)
+from .mcp_models import (
+    SourceMcpResourceTemplate as SourceMcpResourceTemplate,
+)
+from .mcp_models import (
+    SourceMcpServerCatalog as SourceMcpServerCatalog,
+)
+from .mcp_models import (
+    SourceMcpTool as SourceMcpTool,
+)
+from .mcp_models import (
+    SseMcpServerConfig as SseMcpServerConfig,
+)
+from .mcp_models import (
+    StdioMcpServerConfig as StdioMcpServerConfig,
+)
+from .mcp_models import (
+    StreamableHttpMcpServerConfig as StreamableHttpMcpServerConfig,
+)
+
+PROTOCOL_VERSION: Literal["3"] = "3"
 MAX_TEXT_FRAME_BYTES = 12 * 1024 * 1024
 # Pending-call admission reserves both the largest legal request frame and the
 # largest legal result frame.  Configuration must permit at least one such call.
 MAX_TOOL_CALL_RESERVATION_BYTES = 2 * MAX_TEXT_FRAME_BYTES
 MAX_BINARY_CHUNK_BYTES = 64 * 1024
 TRANSFER_PURPOSES = ("file_transfer", "workspace_upload", "http_relay")
+
+MCP_SERVER_CAPABILITY_MAX = 256
+
+_MCP_SERVER_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
 
 
 def new_uuid7() -> UUID:
@@ -46,7 +102,39 @@ Uuid7 = Annotated[UUID, AfterValidator(_require_uuid7)]
 
 
 class ProtocolModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        hide_input_in_errors=True,
+    )
+
+
+def _reject_nul(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("value must not contain NUL")
+    return value
+
+
+McpDigest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+McpCode = Annotated[str, Field(min_length=1, max_length=128), AfterValidator(_reject_nul)]
+
+
+class RuntimeMcpSourceCatalog(ProtocolModel):
+    tools: list[SourceMcpTool] = Field(default_factory=list, max_length=256)
+    resources: list[SourceMcpResource] = Field(default_factory=list, max_length=256)
+    resource_templates: list[SourceMcpResourceTemplate] = Field(
+        default_factory=list, max_length=256
+    )
+    prompts: list[SourceMcpPrompt] = Field(default_factory=list, max_length=256)
+
+    @model_validator(mode="after")
+    def _capability_count_is_bounded(self) -> RuntimeMcpSourceCatalog:
+        if (
+            len(self.tools) + len(self.resources) + len(self.resource_templates) + len(self.prompts)
+            > MCP_SERVER_CAPABILITY_MAX
+        ):
+            raise ValueError("MCP server source catalog exceeds its capability limit")
+        return self
 
 
 _CANONICAL_SHELL_NAMES = frozenset(
@@ -84,9 +172,7 @@ class ShellMetadata(ProtocolModel):
         if any(
             len(name) > 32
             or not all(
-                "a" <= character <= "z"
-                or "0" <= character <= "9"
-                or character == "_"
+                "a" <= character <= "z" or "0" <= character <= "9" or character == "_"
                 for character in name
             )
             or name not in _CANONICAL_SHELL_NAMES
@@ -102,7 +188,7 @@ class ShellMetadata(ProtocolModel):
 
 class DeviceConfigFrame(ProtocolModel):
     workspace_path: str = Field(min_length=1, max_length=4096)
-    sandbox_mode: bool
+    restrict_to_workspace: bool
     ssrf_denylist: list[str] = Field(max_length=256)
     shell_timeout_max: int = Field(default=600, ge=0, le=86400)
     env_allowlist: list[str] = Field(
@@ -120,6 +206,7 @@ class DeviceConfigFrame(ProtocolModel):
         ],
         max_length=64,
     )
+    mcp_servers: list[McpServerConfig] = Field(default_factory=list, max_length=MCP_SERVER_MAX)
 
     @field_validator("workspace_path")
     @classmethod
@@ -156,11 +243,16 @@ class DeviceConfigFrame(ProtocolModel):
                 raise ValueError("env_allowlist contains an invalid variable name")
         return value
 
+    @field_validator("mcp_servers")
+    @classmethod
+    def _validate_mcp_servers(cls, value: list[McpServerConfig]) -> list[McpServerConfig]:
+        return list(parse_mcp_server_configs([server.storage_dict() for server in value]))
+
 
 class HelloFrame(ProtocolModel):
     type: Literal["hello"] = "hello"
     id: Uuid7
-    version: Literal["2"]
+    version: Literal["3"]
     client_version: str = Field(min_length=1, max_length=64)
     os: Literal["linux", "darwin", "windows"]
     caps: DeviceCapabilities
@@ -171,14 +263,163 @@ class HelloAckFrame(ProtocolModel):
     type: Literal["hello_ack"] = "hello_ack"
     id: Uuid7
     device_name: str = Field(min_length=1, max_length=64)
+    config_revision: int = Field(ge=1)
     config: DeviceConfigFrame
+    mcp_catalog: PersistedMcpCatalog
 
 
 class ConfigUpdateFrame(ProtocolModel):
     type: Literal["config_update"] = "config_update"
     id: Uuid7
     device_name: str = Field(min_length=1, max_length=64)
+    config_revision: int = Field(ge=1)
     config: DeviceConfigFrame
+    mcp_catalog: PersistedMcpCatalog
+
+
+class ConfigAppliedFrame(ProtocolModel):
+    type: Literal["config_applied"] = "config_applied"
+    id: Uuid7
+    config_revision: int = Field(ge=1)
+
+
+class ConfigAppliedAckFrame(ProtocolModel):
+    type: Literal["config_applied_ack"] = "config_applied_ack"
+    id: Uuid7
+    config_revision: int = Field(ge=1)
+
+
+class ConfigValidateFrame(ProtocolModel):
+    type: Literal["config_validate"] = "config_validate"
+    id: Uuid7
+    base_config_revision: int = Field(ge=1)
+    candidate_config: DeviceConfigFrame
+    validate_servers: list[str] = Field(min_length=1, max_length=MCP_SERVER_MAX)
+    deadline_ms: Literal[300000]
+
+    @field_validator("validate_servers")
+    @classmethod
+    def _validate_server_names(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            re.fullmatch(_MCP_SERVER_NAME_PATTERN, name) is None for name in value
+        ):
+            raise ValueError("validate_servers entries must be unique MCP server names")
+        return value
+
+
+class McpValidationFailure(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    stage: str = Field(min_length=1, max_length=64)
+    code: McpCode
+    message: str = Field(min_length=1, max_length=4096)
+
+
+class ConfigValidateResultFrame(ProtocolModel):
+    type: Literal["config_validate_result"] = "config_validate_result"
+    id: Uuid7
+    ok: bool
+    source_catalog: SourceMcpCatalog | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    failures: list[McpValidationFailure] = Field(max_length=MCP_SERVER_MAX)
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> ConfigValidateResultFrame:
+        source_was_sent = "source_catalog" in self.model_fields_set
+        if self.ok:
+            if self.source_catalog is None or self.failures:
+                raise ValueError("successful MCP validation requires only a source catalog")
+        elif source_was_sent or self.source_catalog is not None or not self.failures:
+            raise ValueError("failed MCP validation requires failures and no source catalog")
+        return self
+
+
+class ConfigValidateCancelFrame(ProtocolModel):
+    type: Literal["config_validate_cancel"] = "config_validate_cancel"
+    id: Uuid7
+
+
+class ReadyMcpRuntimeSnapshot(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    runtime_generation: Uuid7
+    state: Literal["ready"]
+    code: Literal[None]
+    source_catalog: RuntimeMcpSourceCatalog
+
+
+class UnavailableMcpRuntimeSnapshot(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    runtime_generation: Uuid7
+    state: Literal["unavailable"]
+    code: McpCode
+
+
+class DriftedMcpRuntimeSnapshot(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    runtime_generation: Uuid7
+    state: Literal["drifted"]
+    code: McpCode
+
+
+McpRuntimeSnapshot = Annotated[
+    ReadyMcpRuntimeSnapshot | UnavailableMcpRuntimeSnapshot | DriftedMcpRuntimeSnapshot,
+    Field(discriminator="state"),
+]
+
+
+class RegisterMcpFrame(ProtocolModel):
+    type: Literal["register_mcp"] = "register_mcp"
+    id: Uuid7
+    config_revision: int = Field(ge=1)
+    catalog_digest: McpDigest
+    servers: list[McpRuntimeSnapshot] = Field(max_length=MCP_SERVER_MAX)
+
+    @field_validator("servers")
+    @classmethod
+    def _server_names_are_unique(cls, value: list[McpRuntimeSnapshot]) -> list[McpRuntimeSnapshot]:
+        names = [server.name for server in value]
+        if len(names) != len(set(names)):
+            raise ValueError("register_mcp server names must be unique")
+        return value
+
+
+class AcceptedMcpRegistration(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    runtime_generation: Uuid7
+    accepted: Literal[True]
+    code: Literal[None]
+
+
+class RejectedMcpRegistration(ProtocolModel):
+    name: str = Field(pattern=_MCP_SERVER_NAME_PATTERN)
+    runtime_generation: Uuid7
+    accepted: Literal[False]
+    code: McpCode
+
+
+McpRegistrationResult = Annotated[
+    AcceptedMcpRegistration | RejectedMcpRegistration,
+    Field(discriminator="accepted"),
+]
+
+
+class RegisterMcpAckFrame(ProtocolModel):
+    type: Literal["register_mcp_ack"] = "register_mcp_ack"
+    id: Uuid7
+    config_revision: int = Field(ge=1)
+    catalog_digest: McpDigest
+    results: list[McpRegistrationResult] = Field(max_length=MCP_SERVER_MAX)
+
+    @field_validator("results")
+    @classmethod
+    def _result_names_are_unique(
+        cls, value: list[McpRegistrationResult]
+    ) -> list[McpRegistrationResult]:
+        names = [result.name for result in value]
+        if len(names) != len(set(names)):
+            raise ValueError("register_mcp_ack result names must be unique")
+        return value
 
 
 class PingFrame(ProtocolModel):
@@ -219,6 +460,13 @@ class ImageResultBlock(ProtocolModel):
 SafeResultBlock = Annotated[TextResultBlock | ImageResultBlock, Field(discriminator="type")]
 
 
+class McpRoute(ProtocolModel):
+    entry_id: Uuid7
+    config_revision: int = Field(ge=1)
+    catalog_digest: McpDigest
+    runtime_generation: Uuid7
+
+
 class ToolCallFrame(ProtocolModel):
     type: Literal["tool_call"] = "tool_call"
     id: Uuid7
@@ -226,14 +474,32 @@ class ToolCallFrame(ProtocolModel):
     args: dict[str, Any]
     max_result_bytes: int = Field(ge=1, le=MAX_TEXT_FRAME_BYTES)
     chat_session_id: UUID | None = None
+    mcp_route: McpRoute | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
-    def _require_exec_owner(self) -> ToolCallFrame:
+    def _validate_hidden_route(self) -> ToolCallFrame:
         if (
             self.name in {"exec", "write_stdin", "list_exec_sessions"}
             and self.chat_session_id is None
         ):
             raise ValueError("client-only exec calls require chat_session_id")
+        is_mcp_name = self.name.startswith("mcp_")
+        if is_mcp_name != (self.mcp_route is not None):
+            raise ValueError("MCP tool names and mcp_route must appear together")
+        if self.mcp_route is not None and "openoctopus_device" in self.args:
+            raise ValueError("MCP tool calls must not forward openoctopus_device")
+        if is_mcp_name and (
+            len(self.name) > 64
+            or self.name == "mcp_"
+            or any(
+                not ("a" <= character <= "z" or "0" <= character <= "9" or character in "_-")
+                for character in self.name
+            )
+        ):
+            raise ValueError("MCP tool call name is not canonical")
         return self
 
 
@@ -446,6 +712,9 @@ TransferServerFrame = Annotated[
 
 ClientFrame = Annotated[
     HelloFrame
+    | ConfigAppliedFrame
+    | ConfigValidateResultFrame
+    | RegisterMcpFrame
     | ToolResultFrame
     | PongFrame
     | ErrorFrame
@@ -458,6 +727,10 @@ ClientFrame = Annotated[
 ServerFrame = Annotated[
     HelloAckFrame
     | ConfigUpdateFrame
+    | ConfigAppliedAckFrame
+    | ConfigValidateFrame
+    | ConfigValidateCancelFrame
+    | RegisterMcpAckFrame
     | ToolCallFrame
     | PingFrame
     | ErrorFrame
@@ -473,10 +746,59 @@ _CLIENT_FRAME_ADAPTER: TypeAdapter[ClientFrame] = TypeAdapter(ClientFrame)
 _SERVER_FRAME_ADAPTER: TypeAdapter[ServerFrame] = TypeAdapter(ServerFrame)
 
 
+def _device_config_wire_dict(
+    config: DeviceConfigFrame,
+    *,
+    exclude_none: bool,
+) -> dict[str, Any]:
+    payload = config.model_dump(mode="json", exclude_none=exclude_none)
+    payload["mcp_servers"] = [
+        {
+            key: value
+            for key, value in server.storage_dict().items()
+            if value is not None or not exclude_none
+        }
+        for server in config.mcp_servers
+    ]
+    return payload
+
+
+def frame_to_wire_dict(
+    frame: ClientFrame | ServerFrame,
+    *,
+    exclude_none: bool = False,
+) -> dict[str, Any]:
+    """Project one validated frame to its wire form, revealing only wire-bound secrets."""
+
+    payload = frame.model_dump(mode="json", exclude_none=exclude_none)
+    if isinstance(frame, (HelloAckFrame, ConfigUpdateFrame)):
+        payload["config"] = _device_config_wire_dict(
+            frame.config,
+            exclude_none=exclude_none,
+        )
+    elif isinstance(frame, ConfigValidateFrame):
+        payload["candidate_config"] = _device_config_wire_dict(
+            frame.candidate_config,
+            exclude_none=exclude_none,
+        )
+    return payload
+
+
+def encode_server_frame(frame: ServerFrame) -> str:
+    return json.dumps(
+        frame_to_wire_dict(frame),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def parse_client_frame(
     payload: str,
 ) -> (
     HelloFrame
+    | ConfigAppliedFrame
+    | ConfigValidateResultFrame
+    | RegisterMcpFrame
     | ToolResultFrame
     | PongFrame
     | ErrorFrame
@@ -485,11 +807,18 @@ def parse_client_frame(
     | TransferProgressFrame
     | TransferEndFrame
 ):
+    _validate_text_frame_size(payload)
     return _CLIENT_FRAME_ADAPTER.validate_json(payload)
 
 
 def parse_server_frame(payload: str) -> ServerFrame:
+    _validate_text_frame_size(payload)
     return _SERVER_FRAME_ADAPTER.validate_json(payload)
+
+
+def _validate_text_frame_size(payload: str) -> None:
+    if len(payload.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
+        raise ValueError("Control frame exceeds the maximum size")
 
 
 def encode_binary_chunk(slot_id: UUID, payload: bytes) -> bytes:

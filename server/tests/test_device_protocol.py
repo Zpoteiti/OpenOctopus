@@ -28,7 +28,7 @@ from openctopus_server.devices.protocol import (
 def test_uuid7_factory_and_hello_round_trip() -> None:
     frame = HelloFrame(
         id=new_uuid7(),
-        version="2",
+        version="3",
         client_version="0.0.1",
         os="linux",
         caps=DeviceCapabilities(),
@@ -46,7 +46,7 @@ def test_protocol_rejects_non_v7_ids_and_unknown_fields() -> None:
     with pytest.raises(ValidationError):
         HelloFrame(
             id=uuid.uuid4(),
-            version="2",
+            version="3",
             client_version="0.0.1",
             os="linux",
             caps=DeviceCapabilities(),
@@ -56,7 +56,7 @@ def test_protocol_rejects_non_v7_ids_and_unknown_fields() -> None:
     payload = {
         "type": "hello",
         "id": str(new_uuid7()),
-        "version": "2",
+        "version": "3",
         "client_version": "0.0.1",
         "os": "linux",
         "caps": DeviceCapabilities().model_dump(),
@@ -87,23 +87,30 @@ def test_shell_metadata_rejects_untrusted_names_and_control_characters() -> None
         ShellMetadata(default="fish", available=["fish"])
 
 
-def test_hello_ack_contains_active_py6_config() -> None:
+def test_hello_ack_contains_active_py7_config() -> None:
     frame = HelloAckFrame(
         id=new_uuid7(),
         device_name="alice-laptop",
+        config_revision=1,
         config=DeviceConfigFrame(
             workspace_path="~/openoctopus/workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=["127.0.0.0/8", "::1/128"],
         ),
+        mcp_catalog={
+            "version": 1,
+            "digest": "d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
+            "servers": [],
+        },
     )
 
     assert set(frame.config.model_dump()) == {
         "workspace_path",
-        "sandbox_mode",
+        "restrict_to_workspace",
         "ssrf_denylist",
         "shell_timeout_max",
         "env_allowlist",
+        "mcp_servers",
     }
 
 

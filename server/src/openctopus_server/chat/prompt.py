@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
 
@@ -8,8 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.chat.device_snapshot import (
+    OwnerDeviceSnapshot,
+    load_owner_device_snapshot,
+)
 from openctopus_server.db.models import (
-    Device,
     DiscordConfig,
     Session,
     TelegramConfig,
@@ -68,6 +72,7 @@ async def build_system_prompt(
     workspace_service: PromptWorkspaceService | None = None,
     skills_cache: SkillsCache | None = None,
     device_registry: DeviceRegistry | None = None,
+    device_snapshot: Sequence[OwnerDeviceSnapshot] | None = None,
 ) -> str:
     discord = (
         await db.execute(select(DiscordConfig).where(DiscordConfig.user_id == user.id))
@@ -75,11 +80,9 @@ async def build_system_prompt(
     telegram = (
         await db.execute(select(TelegramConfig).where(TelegramConfig.user_id == user.id))
     ).scalar_one_or_none()
-    devices = (
-        (await db.execute(select(Device).where(Device.user_id == user.id).order_by(Device.name)))
-        .scalars()
-        .all()
-    )
+    devices = tuple(device_snapshot) if device_snapshot is not None else None
+    if devices is None:
+        devices = await load_owner_device_snapshot(db, user_id=user.id)
     workspaces = (
         (
             await db.execute(
@@ -97,8 +100,6 @@ async def build_system_prompt(
     live_metadata: dict[UUID, DeviceLiveMetadata] = {}
     if device_registry is not None:
         for device in devices:
-            if device.sandbox_mode:
-                continue
             metadata = await device_registry.get_live_metadata(device.id, user_id=user.id)
             if metadata is not None:
                 live_metadata[device.id] = metadata
@@ -143,29 +144,26 @@ async def build_system_prompt(
         for workspace in workspaces
     )
     device_lines = ["- server — OpenOctopus server tool target; exec: unavailable"]
-    for device in devices:
+    for device in sorted(devices, key=lambda item: (item.name, str(item.id))):
         line = (
             f"- {device.name} — workspace_root: {device.workspace_path}; "
-            f"sandbox_mode: {str(device.sandbox_mode).lower()}"
+            f"restrict_to_workspace: {str(device.restrict_to_workspace).lower()}"
         )
-        if device.sandbox_mode:
-            device_lines.append(f"{line}; exec: unavailable")
-        else:
-            metadata = live_metadata.get(device.id)
-            live_shells = ""
-            if metadata is not None:
-                live_shells = (
-                    f"; os: {metadata.os}; default_shell: {metadata.default_shell}; "
-                    f"available_shells: {', '.join(metadata.available_shells)}"
-                )
-            device_lines.append(
-                f"{line}; exec: available; shell_timeout_max: {device.shell_timeout_max} seconds"
-                f"{live_shells}"
+        metadata = live_metadata.get(device.id)
+        live_shells = ""
+        if metadata is not None:
+            live_shells = (
+                f"; os: {metadata.os}; default_shell: {metadata.default_shell}; "
+                f"available_shells: {', '.join(metadata.available_shells)}"
             )
-    if any(not device.sandbox_mode for device in devices):
+        device_lines.append(
+            f"{line}; exec: available; shell_timeout_max: {device.shell_timeout_max} seconds"
+            f"{live_shells}"
+        )
+    if devices:
         device_lines.extend(
             (
-                "- Exec on trusted devices defaults to pipes; use tty=true for line-oriented "
+                "- Exec on paired devices defaults to pipes; use tty=true for line-oriented "
                 "interaction. It runs with host OS privileges and is not an OS sandbox.",
                 "- Prefer file tools for ordinary file reads and writes.",
                 "- For long-running commands, yield and then use list_exec_sessions or "

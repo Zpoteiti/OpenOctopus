@@ -60,7 +60,7 @@ def _make_directory_link(link: Path, target: Path) -> None:
 
 def test_workspace_rest_returns_machine_results_and_etag_guard(tmp_path: Path) -> None:
     (tmp_path / "notes.txt").write_text("one\ntwo\n", encoding="utf-8")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     edited = _run(
         dispatcher,
@@ -86,7 +86,7 @@ def test_workspace_rest_returns_machine_results_and_etag_guard(tmp_path: Path) -
 
 def test_workspace_rest_patch_delete_and_search_are_structured(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("print('hello')\n", encoding="utf-8")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     patched = _run(
         dispatcher,
@@ -113,7 +113,7 @@ def test_workspace_rest_patch_delete_and_search_are_structured(tmp_path: Path) -
 
 def test_workspace_rest_grep_preserves_lookahead_for_next_offset(tmp_path: Path) -> None:
     (tmp_path / "matches.txt").write_text("hit one\nhit two\nhit three\n", encoding="utf-8")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     first = _json(
         _run(
@@ -151,7 +151,7 @@ def test_workspace_rest_scan_cap_keeps_pages_within_the_retained_prefix(
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     entries = [(f"directory-{index:05d}", 0.0, True) for index in range(10_000)]
     monkeypatch.setattr(dispatcher, "_walk", lambda _root: entries)
     extra = {"recursive": True} if operation == "list_dir" else {"include_dirs": True}
@@ -195,7 +195,7 @@ def test_workspace_rest_scan_cap_keeps_pages_within_the_retained_prefix(
 
 def test_workspace_rest_rejects_deleting_the_workspace_root(tmp_path: Path) -> None:
     (tmp_path / "keep.txt").write_text("keep", encoding="utf-8")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     deleted = _run(dispatcher, operation="delete_folder", path=".")
 
@@ -204,7 +204,7 @@ def test_workspace_rest_rejects_deleting_the_workspace_root(tmp_path: Path) -> N
 
 
 def test_workspace_rest_rejects_unknown_fields_and_notebook_action(tmp_path: Path) -> None:
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     unknown = _run(dispatcher, operation="list_dir", path=".", untrusted=True)
     notebook = _run(dispatcher, operation="notebook_edit", path="book.ipynb")
     assert unknown.code == "tool_invalid_args"
@@ -218,7 +218,7 @@ def test_workspace_rest_read_only_queries_do_not_reserve_every_scanned_path(
     locks = _RecordingLocks()
     dispatcher = ClientToolDispatcher(
         tmp_path,
-        sandbox_mode=True,
+        restrict_to_workspace=True,
         ssrf_denylist=[],
         path_locks=locks,
     )
@@ -239,7 +239,7 @@ def test_workspace_rest_local_copy_and_move_return_digest_without_overwrite(
 ) -> None:
     payload = b"local transfer\n" * 10000
     (tmp_path / "source.bin").write_bytes(payload)
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     copied = _run(
         dispatcher,
@@ -283,7 +283,7 @@ def test_workspace_rest_local_transfer_rejects_same_path_links_and_special_files
     tmp_path: Path,
 ) -> None:
     (tmp_path / "source.txt").write_text("payload", encoding="utf-8")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     same = _run(
         dispatcher,
@@ -321,7 +321,7 @@ def test_workspace_rest_local_transfer_detects_external_source_change(
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"before")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     original_unchanged = dispatcher_module._source_unchanged
 
     def change_before_commit(
@@ -347,7 +347,7 @@ def test_workspace_rest_local_move_uses_native_rename_without_hard_link(
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     monkeypatch.setattr(
         dispatcher_module,
         "_link_transfer_no_replace",
@@ -373,7 +373,7 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
     source = tmp_path / "source.bin"
     destination = tmp_path / "destination.bin"
     source.write_bytes(b"before")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     native_rename = dispatcher_module._rename_transfer_no_replace
 
     def change_then_rename(
@@ -461,7 +461,7 @@ def test_workspace_rest_local_move_returns_result_after_cancel_follows_rename(
     source = tmp_path / "source.bin"
     destination = tmp_path / "destination.bin"
     source.write_bytes(b"payload")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     native_rename = dispatcher_module._rename_transfer_no_replace
     rename_completed = threading.Event()
     release_hash = threading.Event()
@@ -517,7 +517,7 @@ def test_workspace_rest_local_move_cross_volume_failure_leaves_both_paths_unchan
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     def reject_cross_volume(
         source_path: Path, destination_path: Path, source_fd: int
@@ -557,7 +557,7 @@ def test_workspace_rest_local_transfer_cancellation_cleans_temporary_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "source.bin").write_bytes(b"payload")
-    dispatcher = ClientToolDispatcher(tmp_path, sandbox_mode=True, ssrf_denylist=[])
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
 
     async def exercise() -> None:
         started = asyncio.Event()

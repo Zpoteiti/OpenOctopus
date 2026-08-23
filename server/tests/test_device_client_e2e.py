@@ -422,7 +422,7 @@ async def test_real_postgres_source_client_device_lifecycle(
                 json={
                     "name": "E2E Laptop",
                     "workspace_path": str(workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )
@@ -483,10 +483,14 @@ async def test_real_postgres_source_client_device_lifecycle(
             patch_response = await http_client.patch(
                 f"/api/devices/{name}/config",
                 headers=headers,
-                json={"name": new_name, "workspace_path": str(reconfigured_workspace)},
+                json={
+                    "base_config_revision": 1,
+                    "name": new_name,
+                    "workspace_path": str(reconfigured_workspace),
+                },
             )
             assert patch_response.status_code == 200
-            assert patch_response.json()["name"] == new_name
+            assert patch_response.json()["device"]["name"] == new_name
             await _wait_online(
                 http_client,
                 jwt,
@@ -680,7 +684,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 json={
                     "name": "owner-laptop",
                     "workspace_path": str(owner_workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )
@@ -705,7 +709,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 json={
                     "name": "other-laptop",
                     "workspace_path": str(other_workspace),
-                    "sandbox_mode": True,
+                    "restrict_to_workspace": True,
                     "ssrf_denylist": [],
                 },
             )
@@ -748,17 +752,12 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert first_response.status_code == 200, first_response.text
             first_events = [json.loads(line) for line in first_response.text.splitlines()]
             assert [
-                event["status"]
-                for event in first_events
-                if event["type"] == "turn_finished"
+                event["status"] for event in first_events if event["type"] == "turn_finished"
             ] == ["completed", "completed", "completed"]
             assert (owner_workspace / "written.txt").read_text(encoding="utf-8") == (
                 "written by agent\n"
             )
-            assert [
-                (call["name"], call["args"])
-                for call in dispatch_calls
-            ] == [
+            assert [(call["name"], call["args"]) for call in dispatch_calls] == [
                 ("read_file", {"path": "seed.txt"}),
                 ("write_file", {"path": "written.txt", "content": "written by agent\n"}),
             ]
@@ -794,9 +793,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             )
             assert first_history.status_code == 200, first_history.text
             first_history_body = first_history.json()
-            assert [
-                message["message_kind"] for message in first_history_body["messages"]
-            ] == [
+            assert [message["message_kind"] for message in first_history_body["messages"]] == [
                 "human",
                 "assistant",
                 "tool_result",
@@ -851,9 +848,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert offline_response.status_code == 200, offline_response.text
             offline_events = [json.loads(line) for line in offline_response.text.splitlines()]
             assert [
-                event["status"]
-                for event in offline_events
-                if event["type"] == "turn_finished"
+                event["status"] for event in offline_events if event["type"] == "turn_finished"
             ] == ["completed", "completed"]
             assert len(provider.calls) == 7
             assert len(dispatch_calls) == 3
@@ -872,10 +867,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                     "is_error": True,
                 }
             ]
-            assert sum(
-                block.get("tool_use_id") == "offline-1"
-                for block in offline_result
-            ) == 1
+            assert sum(block.get("tool_use_id") == "offline-1" for block in offline_result) == 1
             assert dispatch_calls[-1]["args"] == {"path": "seed.txt"}
             offline_history = await owner_client.get(
                 f"/api/sessions/{session_id}/messages",
@@ -888,7 +880,9 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 if message["message_kind"] == "tool_result"
                 and message["content"][0]["tool_use_id"] == "offline-1"
             )
-            assert offline_tool_result["content"][0]["code"] == ErrorCode.TOOL_DEVICE_UNREACHABLE.value
+            assert (
+                offline_tool_result["content"][0]["code"] == ErrorCode.TOOL_DEVICE_UNREACHABLE.value
+            )
     finally:
         for process in client_processes:
             if process.returncode is None:

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func, text
 
 from openctopus_server.db.base import Base
+from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST_JSON
 
 
 class SystemConfig(Base):
@@ -201,13 +202,13 @@ class Device(Base):
     workspace_path: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'~/openoctopus/workspace'")
     )
-    sandbox_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    restrict_to_workspace: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("TRUE")
+    )
     ssrf_denylist: Mapped[list[Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text(
-            '\'["0.0.0.0/8","127.0.0.0/8","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10","ff00::/8"]\'::jsonb'
-        ),
+        server_default=text(f"'{DEFAULT_SSRF_DENYLIST_JSON}'::jsonb"),
     )
     shell_timeout_max: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("600")
@@ -218,6 +219,23 @@ class Device(Base):
         server_default=text(
             "'[\"PATH\",\"HOME\",\"LANG\",\"TERM\",\"SystemRoot\",\"ComSpec\",\"PATHEXT\",\"TEMP\",\"TMP\",\"USERPROFILE\"]'::jsonb"
         ),
+    )
+    mcp_servers: Mapped[list[Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    mcp_catalog: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            "'{\"version\": 1, \"digest\": \"d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf\", \"servers\": []}'::jsonb"
+        ),
+    )
+    config_revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -238,6 +256,10 @@ class Device(Base):
         CheckConstraint(
             "shell_timeout_max >= 0 AND shell_timeout_max <= 86400",
             name="check_device_shell_timeout_max",
+        ),
+        CheckConstraint(
+            "config_revision >= 1",
+            name="check_device_config_revision",
         ),
     )
 

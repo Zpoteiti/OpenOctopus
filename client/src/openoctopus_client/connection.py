@@ -16,23 +16,32 @@ from email.utils import parsedate_to_datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
+from uuid import UUID
 
 from websockets.asyncio.client import connect
 
 from openoctopus_client import __version__
 from openoctopus_client.config import ClientConfiguration
 from openoctopus_client.exec_sessions import ExecPolicy, ExecSessionManager
+from openoctopus_client.mcp.supervisor import McpInvocationLease, McpSupervisor
 from openoctopus_client.process import ShellInventory, discover_shells
 from openoctopus_client.protocol import (
     EXEC_TOOL_NAMES,
+    ConfigApplied,
+    ConfigAppliedAck,
     ConfigUpdate,
+    ConfigValidate,
+    ConfigValidateCancel,
+    ConfigValidateResult,
     DeviceConfig,
     ErrorFrame,
     Hello,
     HelloAck,
+    PersistedMcpCatalog,
     Ping,
     Pong,
     ProtocolError,
+    RegisterMcpAck,
     ShellMetadata,
     ToolCall,
     ToolResult,
@@ -57,7 +66,6 @@ from openoctopus_client.writer import SerializedWriter, TextWebSocket, WriterOve
 LOGGER = logging.getLogger(__name__)
 _TOOL_QUEUE_MAX = 64
 _TOOL_QUEUE_BYTES_MAX = 32 * 1024 * 1024
-_CONFIG_UPDATE_BACKLOG_MAX = 16
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _SHUTDOWN_WATCHDOG_SECONDS = 15.0
 _HELLO_ACK_TIMEOUT_SECONDS = 10.0
@@ -114,6 +122,17 @@ class _DeviceToolDispatcher:
         await _wait_for_dispatcher_blocking(self._local)
 
 
+class _McpToolDispatcher:
+    def __init__(self, supervisor: McpSupervisor) -> None:
+        self._supervisor = supervisor
+
+    async def execute_call(self, call: ToolCall) -> ToolOutput:
+        return await self._supervisor.invoke(call)
+
+    def reserve_invocation(self, call: ToolCall) -> McpInvocationLease:
+        return self._supervisor.reserve_invocation(call)
+
+
 class _RetryableConfigError(RuntimeError):
     """A local device configuration could not be prepared safely."""
 
@@ -159,6 +178,7 @@ class _QueuedToolCall:
     call: ToolCall
     dispatcher: _QueuedToolDispatcher
     retained_bytes: int
+    mcp_invocation: McpInvocationLease | None = None
 
 
 class _ToolWorker:
@@ -186,8 +206,18 @@ class _ToolWorker:
             return False
         if not any(item is dispatcher for item in self._dispatchers):
             self._dispatchers.append(dispatcher)
+        mcp_invocation = (
+            dispatcher.reserve_invocation(call)
+            if isinstance(dispatcher, _McpToolDispatcher)
+            else None
+        )
         self._queue.put_nowait(
-            _QueuedToolCall(call=call, dispatcher=dispatcher, retained_bytes=retained_bytes)
+            _QueuedToolCall(
+                call=call,
+                dispatcher=dispatcher,
+                retained_bytes=retained_bytes,
+                mcp_invocation=mcp_invocation,
+            )
         )
         self._retained_bytes += retained_bytes
         return True
@@ -238,6 +268,8 @@ class _ToolWorker:
             )
         while not self._queue.empty():
             request = self._queue.get_nowait()
+            if request.mcp_invocation is not None:
+                request.mcp_invocation.release()
             self._retained_bytes -= request.retained_bytes
             self._queue.task_done()
         return stopped
@@ -248,7 +280,16 @@ class _ToolWorker:
                 request = await self._queue.get()
                 self._active = True
                 try:
-                    result = await self._runtime._run_tool(request.call, request.dispatcher)
+                    if request.mcp_invocation is not None:
+                        invocation = self._runtime._start_mcp_tool(
+                            request.call,
+                            request.mcp_invocation,
+                        )
+                        result = await asyncio.shield(invocation)
+                    else:
+                        result = await self._runtime._run_tool(
+                            request.call, request.dispatcher
+                        )
                     self._writer.enqueue_normal(encode_frame(result))
                     await _wait_for_dispatcher_blocking(request.dispatcher)
                 finally:
@@ -286,6 +327,7 @@ class ClientRuntime:
         | None = None,
         shell_inventory: ShellInventory | None = None,
         exec_session_manager: _RuntimeExecManager | None = None,
+        mcp_supervisor: McpSupervisor | None = None,
         hard_exit: Callable[[int], object] = os._exit,
     ) -> None:
         self._config = config
@@ -299,9 +341,18 @@ class ClientRuntime:
         self._exec_policy: ExecPolicy | None = None
         self._exec_policy_epoch = 0
         self._exec_shutdown = False
+        self._mcp_supervisor = mcp_supervisor or McpSupervisor(
+            secret_transport_safe=config.server_url.startswith("https://")
+        )
+        self._mcp_dispatcher = _McpToolDispatcher(self._mcp_supervisor)
+        self._mcp_shutdown = False
+        self._mcp_invocation_tasks: set[asyncio.Task[ToolResult]] = set()
         self._tool_dispatcher_factory = tool_dispatcher_factory or self._default_dispatcher
         self._stopping = asyncio.Event()
         self._active_config: DeviceConfig | None = None
+        self._config_revision: int | None = None
+        self._mcp_catalog: PersistedMcpCatalog | None = None
+        self._ever_ready = False
         self._device_name: str | None = None
         self._tools: ToolDispatcher | None = None
         self._transfer_manager: TransferManager | None = None
@@ -400,8 +451,14 @@ class ClientRuntime:
                             suffix,
                         )
                         return 78
+                    if not self._ever_ready:
+                        LOGGER.error("The initial device connection is unreachable")
+                        return 1
                 if disposition == CloseDisposition.SHUTDOWN or self._stopping.is_set():
                     return 0
+                if disposition == CloseDisposition.RETRY and not self._ever_ready:
+                    LOGGER.error("The initial device connection is unreachable")
+                    return 1
                 if not failed_attempt:
                     attempt = 0
                     retry_after = None if disposition is not None else retry_after
@@ -417,7 +474,11 @@ class ClientRuntime:
                     pass
             return 0
         finally:
-            await self._shutdown_exec_sessions()
+            self._arm_shutdown_watchdog()
+            await asyncio.gather(
+                self._shutdown_exec_sessions(),
+                self._shutdown_mcp(),
+            )
             if not self._shutdown_cleanup_incomplete:
                 self._cancel_shutdown_watchdog()
             for signum in installed_signals:
@@ -449,11 +510,23 @@ class ClientRuntime:
         transfer_manager: TransferManager | None = None
         transfer_failure_task: asyncio.Task[str | bytes | None] | None = None
         config_update_tasks: list[asyncio.Task[_PreparedConfig]] = []
+        config_update_frames: dict[asyncio.Task[_PreparedConfig], ConfigUpdate] = {}
+        pending_config_ack: ConfigUpdate | None = None
+        config_ack_deadline: float | None = None
         config_bound_transfer_tasks: list[asyncio.Task[None]] = []
+        validation_tasks: dict[asyncio.Task[ConfigValidateResult | None], UUID] = {}
+        suppressed_validation_tasks: set[
+            asyncio.Task[ConfigValidateResult | None]
+        ] = set()
+        mcp_control_tasks: dict[asyncio.Task[None], UUID] = {}
+        registration_signal_task: asyncio.Task[bool] | None = None
+        registration_deadline: float | None = None
+        mcp_attached = False
         receive_task: asyncio.Task[str | bytes | None] | None = None
         stopping_task = asyncio.create_task(self._stopping.wait())
         hello = self._hello_factory()
         acknowledged = False
+        pending_hello_ack: HelloAck | None = None
         shutdown_requested = False
         hello_deadline = asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
         try:
@@ -485,7 +558,8 @@ class ClientRuntime:
                 raise ProtocolError("Timed out sending hello")
             await hello_drain
             while True:
-                receive_task = asyncio.create_task(websocket.recv())
+                if receive_task is None:
+                    receive_task = asyncio.create_task(websocket.recv())
                 wait_set: set[asyncio.Task[object]] = {
                     receive_task,
                     worker_failure_task,
@@ -496,9 +570,37 @@ class ClientRuntime:
                     wait_set.add(transfer_failure_task)
                 wait_set.update(config_update_tasks)
                 wait_set.update(config_bound_transfer_tasks)
+                wait_set.update(validation_tasks)
+                wait_set.update(mcp_control_tasks)
+                if (
+                    acknowledged
+                    and not self._mcp_supervisor.has_pending_registration
+                    and registration_signal_task is None
+                ):
+                    registration_signal_task = asyncio.create_task(
+                        self._mcp_supervisor.registration_changed.wait()
+                    )
+                if registration_signal_task is not None:
+                    wait_set.add(registration_signal_task)
                 timeout = None
                 if not acknowledged:
                     timeout = max(0.0, hello_deadline - asyncio.get_running_loop().time())
+                elif pending_config_ack is not None:
+                    assert config_ack_deadline is not None
+                    timeout = max(
+                        0.0,
+                        config_ack_deadline - asyncio.get_running_loop().time(),
+                    )
+                if registration_deadline is not None:
+                    registration_timeout = max(
+                        0.0,
+                        registration_deadline - asyncio.get_running_loop().time(),
+                    )
+                    timeout = (
+                        registration_timeout
+                        if timeout is None
+                        else min(timeout, registration_timeout)
+                    )
                 done, _ = await asyncio.wait(
                     wait_set,
                     timeout=timeout,
@@ -508,6 +610,12 @@ class ClientRuntime:
                     receive_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await receive_task
+                    if pending_config_ack is not None:
+                        raise ProtocolError("Timed out waiting for config applied acknowledgement")
+                    if registration_deadline is not None:
+                        raise ProtocolError(
+                            "Timed out waiting for MCP registration acknowledgement"
+                        )
                     raise ProtocolError("Timed out waiting for hello acknowledgement")
                 if stopping_task in done:
                     shutdown_requested = True
@@ -531,21 +639,56 @@ class ClientRuntime:
                     except asyncio.CancelledError:
                         pass
                     transfer_failure_task.result()
+                completed_controls = [task for task in mcp_control_tasks if task in done]
+                for control_task in completed_controls:
+                    control_task.result()
+                    mcp_control_tasks.pop(control_task)
+                completed_validations = [task for task in validation_tasks if task in done]
+                for validation_task in completed_validations:
+                    result = validation_task.result()
+                    validation_tasks.pop(validation_task)
+                    if (
+                        result is not None
+                        and validation_task not in suppressed_validation_tasks
+                    ):
+                        writer.enqueue_normal(encode_frame(result))
+                    suppressed_validation_tasks.discard(validation_task)
+                if registration_signal_task is not None and registration_signal_task in done:
+                    registration_signal_task.result()
+                    registration_signal_task = None
+                    self._mcp_supervisor.consume_registration_signal()
+                    registration = self._mcp_supervisor.next_registration()
+                    if registration is not None:
+                        writer.enqueue_normal(encode_frame(registration))
+                        registration_deadline = (
+                            asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
+                        )
                 completed_updates = [task for task in config_update_tasks if task in done]
                 completed_transfers = [task for task in config_bound_transfer_tasks if task in done]
                 if completed_updates or completed_transfers:
                     for update_task in completed_updates:
                         update_task.result()
                         config_update_tasks.remove(update_task)
+                        update = config_update_frames.pop(update_task)
+                        if pending_config_ack is not None:
+                            raise ProtocolError("Concurrent configuration updates are not allowed")
+                        writer.enqueue_normal(
+                            encode_frame(
+                                ConfigApplied(
+                                    id=update.id,
+                                    config_revision=update.config_revision,
+                                )
+                            )
+                        )
+                        pending_config_ack = update
+                        config_ack_deadline = (
+                            asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
+                        )
                     for transfer_task in completed_transfers:
                         transfer_task.result()
                         config_bound_transfer_tasks.remove(transfer_task)
-                    if receive_task not in done:
-                        receive_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await receive_task
-                        receive_task = None
-                        continue
+                if receive_task not in done:
+                    continue
                 payload = receive_task.result()
                 receive_task = None
                 if payload is None:
@@ -557,20 +700,40 @@ class ClientRuntime:
                     continue
                 frame = decode_server_frame(payload)
                 if not acknowledged:
-                    if not isinstance(frame, HelloAck) or frame.id != hello.id:
-                        raise ProtocolError("Expected matching hello acknowledgement")
-                    await self._install_config(
-                        frame.device_name,
-                        frame.config,
-                        generation=config_generation,
-                    )
+                    if pending_hello_ack is None:
+                        if not isinstance(frame, HelloAck) or frame.id != hello.id:
+                            raise ProtocolError("Expected matching hello acknowledgement")
+                        await self._install_config(
+                            frame.device_name,
+                            frame.config,
+                            generation=config_generation,
+                        )
+                        writer.enqueue_normal(
+                            encode_frame(
+                                ConfigApplied(
+                                    id=frame.id,
+                                    config_revision=frame.config_revision,
+                                )
+                            )
+                        )
+                        pending_hello_ack = frame
+                        hello_deadline = (
+                            asyncio.get_running_loop().time() + _HELLO_ACK_TIMEOUT_SECONDS
+                        )
+                        continue
+                    if (
+                        not isinstance(frame, ConfigAppliedAck)
+                        or frame.id != pending_hello_ack.id
+                        or frame.config_revision != pending_hello_ack.config_revision
+                    ):
+                        raise ProtocolError("Expected matching config applied acknowledgement")
                     assert self._active_config is not None
                     transfer_manager = TransferManager(
                         TransferConfigSnapshot.from_values(
                             Path(self._active_config.workspace_path),
-                            sandbox_mode=frame.config.sandbox_mode,
-                            ssrf_denylist=frame.config.ssrf_denylist,
-                            device_name=frame.device_name,
+                            restrict_to_workspace=self._active_config.restrict_to_workspace,
+                            ssrf_denylist=self._active_config.ssrf_denylist,
+                            device_name=pending_hello_ack.device_name,
                         ),
                         writer,
                         path_locks=self._path_locks,
@@ -579,30 +742,95 @@ class ClientRuntime:
                     transfer_failure_task = asyncio.create_task(
                         _wait_for_transfer_failure(transfer_manager.failed)
                     )
+                    self._config_revision = pending_hello_ack.config_revision
+                    self._mcp_catalog = pending_hello_ack.mcp_catalog
+                    await self._mcp_supervisor.activate_authoritative(
+                        revision=pending_hello_ack.config_revision,
+                        config=pending_hello_ack.config,
+                        catalog=pending_hello_ack.mcp_catalog,
+                    )
+                    self._mcp_supervisor.attach_connection()
+                    mcp_attached = True
                     acknowledged = True
+                    self._ever_ready = True
                     continue
+                if pending_config_ack is not None:
+                    if isinstance(frame, RegisterMcpAck):
+                        self._mcp_supervisor.accept_registration(frame)
+                        registration_deadline = None
+                        continue
+                    if (
+                        isinstance(frame, ConfigAppliedAck)
+                        and frame.id == pending_config_ack.id
+                        and frame.config_revision == pending_config_ack.config_revision
+                    ):
+                        self._config_revision = pending_config_ack.config_revision
+                        self._mcp_catalog = pending_config_ack.mcp_catalog
+                        await self._mcp_supervisor.activate_authoritative(
+                            revision=pending_config_ack.config_revision,
+                            config=pending_config_ack.config,
+                            catalog=pending_config_ack.mcp_catalog,
+                            validation_id=pending_config_ack.id,
+                        )
+                        pending_config_ack = None
+                        config_ack_deadline = None
+                        continue
+                    if isinstance(frame, Ping):
+                        writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
+                        continue
+                    if isinstance(frame, (TransferReady, TransferProgress, TransferEnd)):
+                        if transfer_manager is None:
+                            raise ProtocolError("Transfer arrived before device configuration")
+                        await transfer_manager.handle_control(frame)
+                        continue
+                    if isinstance(frame, ErrorFrame):
+                        continue
+                    raise ProtocolError("Expected matching config applied acknowledgement")
                 if isinstance(frame, Ping):
                     writer.enqueue_critical(encode_frame(Pong(id=frame.id)))
-                elif isinstance(frame, ConfigUpdate):
-                    if len(config_update_tasks) >= _CONFIG_UPDATE_BACKLOG_MAX:
-                        raise _RetryableConfigError("Device configuration backlog is full")
-                    config_update_tasks.append(
-                        self._schedule_config_update(
-                            frame.device_name,
-                            frame.config,
-                            generation=config_generation,
-                            previous=config_update_tasks[-1] if config_update_tasks else None,
-                            transfer_manager=transfer_manager,
-                        )
+                elif isinstance(frame, ConfigValidate):
+                    validation_task = self._mcp_supervisor.begin_validation(frame)
+                    validation_tasks[validation_task] = frame.id
+                elif isinstance(frame, ConfigValidateCancel):
+                    suppressed_validation_tasks.update(
+                        task
+                        for task, validation_id in validation_tasks.items()
+                        if validation_id == frame.id
                     )
+                    control_task = asyncio.create_task(
+                        self._mcp_supervisor.cancel_validation(frame.id)
+                    )
+                    mcp_control_tasks[control_task] = frame.id
+                elif isinstance(frame, RegisterMcpAck):
+                    self._mcp_supervisor.accept_registration(frame)
+                    registration_deadline = None
+                elif isinstance(frame, ConfigUpdate):
+                    if config_update_tasks or pending_config_ack is not None:
+                        raise ProtocolError("Concurrent configuration updates are not allowed")
+                    if (
+                        self._config_revision is None
+                        or frame.config_revision <= self._config_revision
+                    ):
+                        raise ProtocolError("Configuration revision is not newer")
+                    update_task = self._schedule_config_update(
+                        frame.device_name,
+                        frame.config,
+                        generation=config_generation,
+                        previous=None,
+                        transfer_manager=transfer_manager,
+                    )
+                    config_update_tasks.append(update_task)
+                    config_update_frames[update_task] = frame
                 elif isinstance(frame, ToolCall):
                     if self._tools is None:
                         raise ProtocolError("Tool call arrived before device configuration")
                     if config_update_tasks and frame.name in EXEC_TOOL_NAMES:
                         writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
                         continue
-                    dispatcher: ToolDispatcher = self._tools
-                    if config_update_tasks:
+                    dispatcher: ToolDispatcher = (
+                        self._mcp_dispatcher if frame.mcp_route is not None else self._tools
+                    )
+                    if config_update_tasks and frame.mcp_route is None:
                         dispatcher = _ConfigBoundDispatcher(config_update_tasks[-1])
                     if not worker.enqueue(frame, dispatcher):
                         writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
@@ -654,7 +882,7 @@ class ClientRuntime:
                     pass
                 await websocket.close(1002, "protocol_error")
                 if not acknowledged:
-                    # A peer that cannot complete the strict v2 handshake will
+                    # A peer that cannot complete the strict v3 handshake will
                     # not become compatible by reconnecting with the same
                     # binary/configuration.  Let run() classify this as a
                     # permanent protocol error (exit 78).
@@ -663,6 +891,24 @@ class ClientRuntime:
             shutdown_requested = True
             return CloseDisposition.SHUTDOWN
         finally:
+            if mcp_attached:
+                self._mcp_supervisor.detach_connection()
+            if registration_signal_task is not None:
+                registration_signal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await registration_signal_task
+            for validation_task in validation_tasks:
+                if not validation_task.done():
+                    validation_task.cancel()
+            for control_task in mcp_control_tasks:
+                if not control_task.done():
+                    control_task.cancel()
+            if validation_tasks or mcp_control_tasks:
+                await asyncio.gather(
+                    *validation_tasks,
+                    *mcp_control_tasks,
+                    return_exceptions=True,
+                )
             for config_update_task in config_update_tasks:
                 if not config_update_task.done():
                     config_update_task.cancel()
@@ -730,11 +976,11 @@ class ClientRuntime:
                 self._cancel_shutdown_watchdog()
 
     def _default_dispatcher(
-        self, workspace: Path, sandbox_mode: bool, denylist: list[str]
+        self, workspace: Path, restrict_to_workspace: bool, denylist: list[str]
     ) -> LocalToolDispatcher:
         return ClientToolDispatcher(
             workspace,
-            sandbox_mode=sandbox_mode,
+            restrict_to_workspace=restrict_to_workspace,
             ssrf_denylist=denylist,
             path_locks=self._path_locks,
         )
@@ -868,7 +1114,7 @@ class ClientRuntime:
     ) -> _PreparedConfig:
         key = (
             candidate.workspace,
-            candidate.config.sandbox_mode,
+            candidate.config.restrict_to_workspace,
             candidate.config.shell_timeout_max,
             tuple(candidate.config.env_allowlist),
             self._shell_inventory.available,
@@ -881,7 +1127,7 @@ class ClientRuntime:
                 self._exec_policy_epoch += 1
                 policy = ExecPolicy(
                     workspace=candidate.workspace,
-                    sandbox_mode=candidate.config.sandbox_mode,
+                    restrict_to_workspace=candidate.config.restrict_to_workspace,
                     shell_timeout_max=candidate.config.shell_timeout_max,
                     env_allowlist=tuple(candidate.config.env_allowlist),
                     available_shells=self._shell_inventory.available,
@@ -939,6 +1185,20 @@ class ClientRuntime:
         except Exception:
             self._shutdown_cleanup_incomplete = True
 
+    async def _shutdown_mcp(self) -> None:
+        if self._mcp_shutdown:
+            return
+        self._mcp_shutdown = True
+        pending = [task for task in self._mcp_invocation_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        try:
+            await self._mcp_supervisor.shutdown()
+        except Exception:
+            self._shutdown_cleanup_incomplete = True
+
     def _track_config_task(self, task: asyncio.Task[Any]) -> None:
         self._config_tasks.add(task)
         task.add_done_callback(self._config_task_done)
@@ -974,6 +1234,37 @@ class ClientRuntime:
                 raise ProtocolError("Tool dispatcher is unavailable")
             output = await execute(call.name, call.args)
         return self._result_with_credit(call, output)
+
+    def _start_mcp_tool(
+        self,
+        call: ToolCall,
+        invocation: McpInvocationLease,
+    ) -> asyncio.Task[ToolResult]:
+        task = asyncio.create_task(
+            self._run_reserved_mcp_tool(call, invocation),
+            name=f"mcp-tool-{call.id}",
+        )
+        self._mcp_invocation_tasks.add(task)
+        task.add_done_callback(lambda completed: self._mcp_tool_done(completed, invocation))
+        return task
+
+    def _mcp_tool_done(
+        self,
+        task: asyncio.Task[ToolResult],
+        invocation: McpInvocationLease,
+    ) -> None:
+        invocation.release()
+        self._mcp_invocation_tasks.discard(task)
+        if not task.cancelled():
+            with contextlib.suppress(BaseException):
+                task.exception()
+
+    async def _run_reserved_mcp_tool(
+        self,
+        call: ToolCall,
+        invocation: McpInvocationLease,
+    ) -> ToolResult:
+        return self._result_with_credit(call, await invocation.invoke())
 
     @staticmethod
     def _result_with_credit(call: ToolCall, output: ToolOutput) -> ToolResult:
@@ -1039,7 +1330,7 @@ def _prepare_config_candidate(
     workspace = _prepare_workspace(config.workspace_path)
     dispatcher = factory(
         workspace,
-        config.sandbox_mode,
+        config.restrict_to_workspace,
         config.ssrf_denylist,
     )
     return _PreparedConfigCandidate(
@@ -1053,7 +1344,7 @@ def _prepare_config_candidate(
 def _transfer_snapshot(prepared: _PreparedConfig) -> TransferConfigSnapshot:
     return TransferConfigSnapshot.from_values(
         prepared.workspace,
-        sandbox_mode=prepared.config.sandbox_mode,
+        restrict_to_workspace=prepared.config.restrict_to_workspace,
         ssrf_denylist=prepared.config.ssrf_denylist,
         device_name=prepared.device_name,
     )

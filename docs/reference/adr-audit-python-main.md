@@ -2,7 +2,7 @@
 
 **Status:** complete
 **Branch:** `python-main`
-**Last updated:** 2026-06-16
+**Last updated:** 2026-08-22
 
 This file tracks which Rust-era ADRs remain binding for the hand-written Python
 rewrite. Old ADRs are inputs, not automatic requirements. Each ADR should be
@@ -81,10 +81,10 @@ classified before implementation depends on it.
   `enabled` flag; config existence means enabled. Platform fields keep their
   native names, and secret reads return `bot_token_hint` only.
 - Python-main removes `GET /api/me/events`. Account-level UI changes are
-  observed through ordinary authoritative reads. Online client MCP config
-  failures return from `PATCH /api/devices/{name}/config`; offline MCP config
-  failures are pruned on reconnect and become visible through device config
-  reads.
+  observed through ordinary authoritative reads. Py7 MCP add/modify fails
+  synchronously from `PATCH /api/devices/{name}/config` unless the online
+  Client completes real initialize and discovery; only pure MCP deletion is
+  accepted offline.
 - Python-main Sessions API is message-driven: there is no `POST /api/sessions`,
   no `GET /api/sessions/{id}`, and no `GET /api/sessions/{id}/stream`.
   Frontends generate a UUID and `POST /api/sessions/{id}/messages` creates the
@@ -105,18 +105,14 @@ classified before implementation depends on it.
   `cancel_requested`, waits for the current external action to finish, writes
   synthetic `user_cancelled` results for unstarted tools, writes the stop
   marker, emits a cancelled turn finish event, clears the flag, and exits.
-- Python-main device permissions are per-device only. `devices.sandbox_mode` is
-  the coarse persisted switch; sessions cannot temporarily escalate. Client
-  filesystem policy, client `web_fetch` SSRF policy, exec cwd policy, env
-  inheritance, and command denial all read the target device row.
-- Device policy uses denylist/allowlist asymmetrically: SSRF and commands are
-  denylist fields (`ssrf_denylist`, `command_denylist`) so users can remove a
-  blocking default rule; env stays an allowlist (`env_allowlist`) because secret
-  env names are not enumerable.
-- Device identity keeps the existing token-as-PK design: `devices.token` is the
-  plaintext credential and primary key, REST/tool routing uses `(user_id, name)`,
-  and token regeneration updates the PK in place while preserving the row/config.
-  This remains valid only while `devices` has no inbound foreign keys.
+- Python-main Device path policy is per Device. `restrict_to_workspace` limits
+  OpenOctopus-resolved Client paths and exec/PTY initial cwd; it is not an OS
+  sandbox and does not constrain commands, stdio MCP, remote MCP, or network.
+  Client `ssrf_denylist` independently controls only Client `web_fetch`.
+- Device identity uses immutable `devices.id UUID`; only the SHA-256
+  `token_hash` plus a non-secret hint are stored. REST/tool routing uses
+  `(user_id, name)`, and token regeneration replaces the credential while
+  preserving the row/config.
 - Device online state is in memory only. `GET /api/devices` computes `online`
   from the WebSocket registry; offline-but-paired devices remain in
   `openoctopus_device` enums and fail at dispatch with `device_unreachable`.
@@ -130,7 +126,7 @@ from the page-lifetime SSE/no-token-streaming design.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-001 | Three-crate workspace | `Supersede` | Replaced with monorepo: `openoctopus/server/` (Python server) + `openoctopus/client/` (Go/Rust). No common Python package. Shared contract is `PROTOCOL.md` + `TOOLS.md`. |
+| ADR-001 | Three-crate workspace | `Supersede` | Replaced with one monorepo containing independent Python 3.12 `server/` and `client/` packages. No common package; the wire/docs remain the shared contract. |
 | ADR-002 | Frontend embedded in server binary; Vite + proxy | `Rewrite-needed` | Rust binary embedding does not carry forward. Frontend/dev-server/packaging policy needs a Python/Docker-era decision later. |
 | ADR-003 | Browser REST; devices use WebSocket | `Supersede` | Device WebSocket carries forward. ADR-121 supersedes the old browser per-session SSE stream with streaming `POST messages` for the current turn and `GET messages` polling for canonical history/status. Browser web sessions are created implicitly by `POST messages` when the client-generated UUID is missing. |
 | ADR-004 | Auth: cookie for browser, bearer for programmatic | `Translate` | Keep the browser cookie/programmatic bearer split, implemented with the Python web stack. |
@@ -242,12 +238,12 @@ translate to Python package boundaries.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-047 | Shared MCP client in `openoctopus_common` | `Supersede` | MCP client now lives in `openoctopus_server/mcp/`. Server manages shared-service MCPs; client devices manage their own MCP subprocesses independently (ADR-105). No shared MCP code needed. |
-| ADR-048 | MCP wrapping — tools, resources, prompts as tool-registry entries | `Translate` | Keep the wrapped naming convention (`mcp_<server>_<tool>`, `_resource_`, `_prompt_`), prompt output stringification, resource URI-template argument expansion, and merge-time `openoctopus_device` injection. Python implementations replace Rust structs/rmcp mechanics but preserve the agent-visible schema contract. |
-| ADR-049 | MCP collision rejection — server orchestrates DB cleanup + corrective config_update | `Translate` | Keep rejection for within-server duplicate wrapped names, cross-install schema drift, and spawn/introspection failures. Online device edits validate before DB commit; offline desired config is pruned on reconnect and surfaced through ordinary device reads. Admin server-MCP validation is synchronous on the admin HTTP request. |
-| ADR-050 | Device config is first-class + editable | `Translate` | Keep the device row as the config source for `workspace_path`, `sandbox_mode`, `shell_timeout_max`, SSRF/env/command policy, and `mcp_servers`. PATCH is partial top-level, policy arrays/maps are whole-field replacements, MCP edits use validation-first `config_validate` when online, and accepted changes push authoritative `config_update`. |
+| ADR-047 | Shared MCP client in `openoctopus_common` | `Supersede` | Py7 Device MCP runs in `openoctopus_client.mcp`; Server persists validated Device configuration and last-good catalogs but does not host the Device MCP runtime. Server/admin MCP is deferred to Py8, so no shared MCP client package is needed in Py7. |
+| ADR-048 | MCP wrapping — tools, resources, prompts as tool-registry entries | `Supersede` | Py7 discovers four surfaces and uses one `mcp_<server>_<alias>` namespace with explicit hidden routes. Typed surface infixes and prompt stringification are replaced by deterministic safe-block mapping. |
+| ADR-049 | MCP collision rejection — server orchestrates DB cleanup + corrective config_update | `Supersede` | Py7 keeps collision rejection but replaces optimistic offline save/prune with online validate-before-save for every add/modify. Pure deletion alone may commit offline; last-good catalogs persist. |
+| ADR-050 | Device config is first-class + editable | `Supersede` | Py7 Device config uses `restrict_to_workspace`, independent SSRF/env policy, `mcp_servers`, atomic `mcp_catalog`, and monotonic `config_revision`. PATCH requires `base_config_revision`; MCP is whole-field replacement. |
 | ADR-051 | Device policy is persistent; no session-level privilege escalation | `Translate` | Keep per-device policy as the only privilege boundary. Browser, channel, cron, and heartbeat sessions cannot temporarily escalate; users change the durable device config when a workflow needs broader access. |
-| ADR-052 | `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy | `Translate` | Keep `web_fetch` as a shared server/client tool. Server install site always applies the hard private/reserved-address block; client install sites apply the target device's `ssrf_denylist` according to `sandbox_mode`. This remains structured tool policy, not an OS-level network sandbox. |
+| ADR-052 | `web_fetch` is shared; server hard-blocks private addresses, clients use per-device denylist policy | `Supersede` | Keep the shared tool but make policy independent of workspace restriction. Server uses admin-hot `web_fetch_denylist`; Client uses Device `ssrf_denylist`. Both pin DNS/revalidate redirects; neither governs exec/PTY/MCP. |
 
 ## Accepted Theme 5: Cron, Heartbeat, and Dream Deferral
 
@@ -272,7 +268,7 @@ forward, but the Rust-specific database bootstrap mechanism does not.
 | ADR-057 | Canonical `schema.sql` loaded via `include_str!` | `Translate` | Rust `sqlx::include_str!` bootstrap does not carry forward. `docs/SCHEMA.md` remains the canonical schema-shape contract. Python-main uses SQLAlchemy metadata/declarative models as the authoritative schema definition and `create_all()` for dev bootstrap. Alembic or equivalent migration framework is deferred until production launch after frontend completion; dev-machine-only before that. |
 | ADR-058 | Every user-referencing FK has `ON DELETE CASCADE` inline | `Translate` | Keep account deletion as one database-level cascade for user-owned rows, with the documented Python-main exception that shared workspaces survive creator deletion through `workspaces.created_by ON DELETE SET NULL`. |
 | ADR-059 | Messages store provider-shape content blocks as JSONB; images inline as base64 | `Translate` | Keep `messages.content` as Anthropic Messages-shaped JSONB: text, image, tool_use/tool_result, thinking, and redacted_thinking blocks. Images remain inline base64 for durable replay; workspace copies are separate agent-accessible files. |
-| ADR-060 | No `users.soul`, `users.memory_text`, or user-level SSRF policy | `Translate` | Keep SOUL.md and MEMORY.md as personal workspace files, not user columns. Keep server-side SSRF policy hardcoded for server `web_fetch`; only per-device client policy is editable. |
+| ADR-060 | No `users.soul`, `users.memory_text`, or user-level SSRF policy | `Translate` | Keep SOUL.md and MEMORY.md as personal workspace files, not user columns. Server `web_fetch` policy is admin-global; Client policy remains per Device. |
 
 ## Accepted Theme 7: Core Tool Runtime, Schema Merge, Timeouts, and Result Caps
 
@@ -284,7 +280,7 @@ Python package boundaries and Python protocol/ABC concepts.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-071 | Tools with the same name + schema are merged; `openoctopus_device` enum lists install sites | `Translate` | Keep schema merge, inject/extend `openoctopus_device`, paired-but-offline visibility. Device MCP capabilities are maintained by `register_mcp` (not synchronous device query per loop). Python-main requires stable canonicalization: normalize JSON key order, whitespace, and OpenAI-compatibility transforms. |
+| ADR-071 | Tools with the same name + schema are merged; `openoctopus_device` enum lists install sites | `Translate` | Keep schema merge and paired-but-offline visibility. Py7 MCP Provider shapes come from durable last-good catalogs; `register_mcp` supplies only exact revision/generation availability and each Provider iteration freezes hidden routes. |
 | ADR-075 | Tool timeouts are decentralized; agent may override where the schema advertises | `Translate` | Keep per-tool timeout ownership. Python-main adds event-loop safety: blocking tool work (file IO, hashing, recursive find_files/grep, transfer staging) must cross an explicit background/thread boundary. |
 | ADR-076 | Tool result cap: 16k chars global default + per-tool override; head-only truncation | `Translate` | Truncation helper lives in `openoctopus_server/tools/truncate.py`. Client implements same truncation independently. |
 | ADR-077 | `Tool` trait pattern with default methods | `Translate` | Rust `Tool` trait translates to Python protocol/ABC concept with `name()`, `schema()`, `max_output_chars()`, `execute()`. Exact Python shape (ABC, Protocol, duck typing) chosen at Py0. Cross-cutting concerns added via default methods/mixins. |
@@ -312,16 +308,16 @@ simple semantics. Rust-specific mechanics translate to Python boundaries.
 
 ## Accepted Theme 9: MCP As Dynamic Tool Surface
 
-This theme covers ADR-099, ADR-100, ADR-105, and ADR-114. Python-main
-preserves MCP as a flat tool-registry surface with wrapped names, resource
-URI templates, tools-only enabled filter, and two tenancy scopes.
+This theme covers ADR-099, ADR-100, ADR-105, and ADR-114. Py7 implements
+Device MCP as a persistent last-good flat tool surface. Server/admin MCP remains
+deferred to Py8.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-099 | MCP resource templates — URI placeholders are surfaced as schema properties | `Translate` | Keep URI template `{var}` -> schema property conversion. Static URIs remain zero-arg. |
-| ADR-100 | MCP `enabled_tools` filter — tools only, simple string list | `Supersede` | Python-main renames `enabled` to `enabled_tools`, uses exact tool name list (not glob), applies to tools only (resources/prompts always registered). Config validation responses include `mcp_discovered` so users can see available capabilities before filtering. |
-| ADR-105 | MCP subprocess lifecycle on openoctopus_client | `Translate` | Keep lifecycle model, worker queue, register_mcp as capability cache/update path. MCP subprocesses survive WS reconnect. |
-| ADR-114 | Python-main MCP tenancy: admin shared-service + device only | `Translate` | Keep two tenancy scopes. Py8 one shared runtime/client per server MCP, bounded FIFO queue, no pool/per-user/session runtime. |
+| ADR-099 | MCP resource templates — URI placeholders are surfaced as schema properties | `Supersede` | Py7 keeps template arguments but uses bounded RFC 6570 validation and `uritemplate`, not regex substitution. Static resources remain zero-arg. |
+| ADR-100 | MCP `enabled_tools` filter — tools only, simple string list | `Supersede` | Py7 uses `enabled_capabilities` across tools, static resources, templates, and prompts: `null` none, `[]` explicitly all, list exact final names. |
+| ADR-105 | MCP subprocess lifecycle on openoctopus_client | `Supersede` | Py7 uses generation-bound runtimes, background retry, drift detection, single-flight aggregate registration, explicit cleanup, and no invocation replay. MCP sessions survive ordinary OO WS reconnect. |
+| ADR-114 | Python-main MCP tenancy: admin shared-service + device only | `Supersede for Py7 scope` | Py7 implements Device MCP only. The admin shared-service runtime/route remains deferred to Py8. |
 
 ## Accepted Theme 10: Explicit Non-Goals (v1)
 
@@ -354,7 +350,7 @@ four-party trust model is language-agnostic.
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
 | ADR-072 | Server is not a code execution environment for agents | `Keep` | Server tool surface remains deliberately restricted: `read_file`, `write_file`, `edit_file`, `delete_file`, `list_dir`, `find_files`, `grep`, `message`, `web_fetch`, `cron`, `file_transfer`. No `exec`/`python`/`eval` — server treats all agent-provided and user-uploaded files as inert data. The one admin-gated exception is server-side MCP subprocess, installed by admin only and schema-collision-checked. |
-| ADR-073 | Client device policy gates | `Translate` | Four-policy contract carries forward: `sandbox_mode` (coarse device profile, `true`=restricted, `false`=trusted), `ssrf_denylist` (denylist, users remove entries to permit), `env_allowlist` (allowlist, default `PATH HOME LANG TERM`, `OPENOCTOPUS_DEVICE_TOKEN` never forwarded), `command_denylist` (command-name match denylist). Policies are per-device, persisted on the device row, and sessions cannot escalate. Policy vocabulary is platform-independent — OS sandbox primitives (bwrap/sandbox-exec) are deferred to the later client sandbox milestone and sit underneath this contract. Implemented as SQLAlchemy device model in Python. |
+| ADR-073 | Client device policy gates | `Supersede` | Py7 replaces the coarse profile with `restrict_to_workspace` for structured paths/initial cwd only. `ssrf_denylist` independently controls Client `web_fetch`; `env_allowlist` controls exec inheritance. There is no command denylist or OS sandbox. |
 | ADR-074 | Trust model summary | `Keep` | Four-party trust model carries forward unchanged: Admin (LLM/MCP/server config), User (own workspace/devices/channels), Agent (read/write within user boundary, execute on user devices under device policy), Partner (user's own identity on the channel — messages unwrapped and trusted), Allowed user (non-partner authorized via allow_list — messages wrapped `[untrusted]` per ADR-007). Hard boundaries: no cross-user agent access, no server-side code execution, no content interpretation by server. |
 
 ## Accepted Theme 12: Persistence and Message Schema
@@ -369,7 +365,7 @@ SSE are superseded and archived.
 |---|---|---|---|
 | ADR-089 | Message wire role is `user\|assistant`; logical meaning uses `message_kind` | `Translate` | Keep dual-column design: `role` = Anthropic wire role, `message_kind` = internal discriminator (`human`, `assistant`, `tool_result`, `synthetic_tool_result`, `synthetic_assistant_error`, `compaction_summary`). Tool results are `role='user'` with `message_kind='tool_result'`. Implemented as Python Enum + SQLAlchemy CHECK constraint. |
 | ADR-090 | Per-channel bot configs live in their own tables | `Translate` | Keep `discord_configs`, `telegram_configs`, and future per-channel tables. Generic REST surface (`GET/PATCH/DELETE /api/channels`) carries forward in FastAPI. Platform field names preserved; secrets write-only; `allow_list` is whole-array replacement. Implemented as SQLAlchemy channel models. |
-| ADR-091 | Device identity: `token` is PK, `(user_id, name)` is UNIQUE, user-initiated regenerate only | `Translate` | Keep token-as-PK with the guardrail: if future milestones add persistent tables with FKs to `devices`, introduce immutable `devices.id UUID PK` and demote `token` to a unique credential before adding those FKs. REST routes use canonical device name (not token). Token regeneration is user-triggered, no automatic rotation. Implemented as SQLAlchemy device model. |
+| ADR-091 | Device identity: `token` is PK, `(user_id, name)` is UNIQUE, user-initiated regenerate only | `Supersede` | Devices now use immutable UUID PK plus unique SHA-256 `token_hash`; REST routes still use canonical name and regeneration remains user-triggered. |
 | ADR-092 | No heartbeat state is persisted | `Keep` | Single-worker server alpha makes heartbeat coordination trivial. Phase 1 re-reads `HEARTBEAT.md` each tick and decides fresh; no `last_heartbeat_phase1_at` or `heartbeat_state` table. Per-process ticker, no cross-worker conflict. |
 | ADR-093 | Per-session chat SSE stream is historical | `Archive-only` | Superseded by ADR-121: browser chat uses streaming `POST messages` for live preview + `GET messages` polling for canonical history. The old `GET /api/sessions/{id}/stream` route does not exist in Python-main. |
 | ADR-094 | Runtime block is persisted per user message as historical metadata | `Translate` | Keep one-time construction at message ingress, prepended into `messages.content` JSONB, immutable after insert. Python implementation in `publish_inbound` / channel adapter paths. |
@@ -479,53 +475,42 @@ Files as server-alpha surface rather than Rust milestone notes.
 are updated for Python-main to treat Devices as a durable per-user install-site
 registry plus a WebSocket reachability layer.
 
-- Device rows are keyed by `devices.token`, which is also the plaintext bearer
-  credential used by `WS /ws/device`. The token is returned only from
-  `POST /api/devices` and `POST /api/devices/{name}/regenerate-token`.
-  Ordinary device reads return `token_hint`, never the full token.
+- Device rows use immutable UUID `devices.id`; only a unique SHA-256
+  `token_hash` and non-secret `token_hint` are stored. The plaintext bearer is
+  returned only from create/regenerate responses.
 - REST and tool routing use canonical device names, not tokens. Device names are
   canonical slugs, unique per user, normalized on create/rename and path lookup,
   and `server` is reserved for the built-in server install site.
-- Token-as-PK is retained because no persistent table has an inbound FK to
-  `devices`. If a future milestone adds durable device references, ADR-091 must
-  be revisited before adding the FK; likely outcome is introducing immutable
-  `devices.id UUID` and demoting `token` to a unique credential.
+- No persistent table has an inbound FK to `devices`; Device deletion remains a
+  single-row hard delete even though the row now has an immutable UUID identity.
 - `GET /api/devices` lists every paired device for the user and computes
   `online` from the in-memory WebSocket registry. There are no `online` or
   `last_seen_at` columns in Postgres.
 - Paired-but-offline devices remain visible in tool schemas. Calls to them fail
   at dispatch with `device_unreachable`; the enum is based on paired topology,
   not momentary connectivity.
-- `POST /api/devices` creates a device row, canonicalizes the name, fills default
-  config, returns the token exactly once, and stores desired MCP config even if
-  the device is not online yet.
+- `POST /api/devices` creates the non-MCP Device config and returns the token
+  once. It does not accept MCP config because new/modified MCP must validate
+  against an online Client.
 - `PATCH /api/devices/{name}/config` is a partial top-level update. Omitted
-  fields remain unchanged; `ssrf_denylist`, `env_allowlist`,
-  `command_denylist`, and `mcp_servers` are whole-field replacements when
-  present. Empty PATCH is a no-op.
-- Online MCP config edits are validation-first: server sends `config_validate`,
-  the client spawn/introspects without activating the candidate, and only after
-  successful validation does the server commit the DB row and send
-  `config_update`. Offline MCP config edits store desired config and are
-  validated on next reconnect.
-- `sandbox_mode` is the only coarse privilege switch. `true` means client file
-  tools and Workspace Files routes stay under `workspace_path`, client
-  `web_fetch` applies `ssrf_denylist`, and `exec.workdir` must stay inside the
-  workspace. `false` means a trusted device may use paths outside
-  `workspace_path` and internal/private network access is allowed unless the
-  user keeps explicit deny entries.
-- `env_allowlist` remains an allowlist for `exec` and client MCP subprocess
-  inheritance. `OPENOCTOPUS_DEVICE_TOKEN` must never be forwarded to agent-run
-  subprocesses.
-- `command_denylist` applies before client `exec` spawn in both sandbox and
-  trusted modes. It is a product guardrail, not a hard subprocess sandbox.
+  fields remain unchanged; `ssrf_denylist`, `env_allowlist`, and `mcp_servers`
+  are whole-field replacements. Every request carries `base_config_revision`.
+- MCP add/modify is validation-first: the online Client initializes and fully
+  discovers only the candidate servers, then Server validation atomically
+  commits config plus last-good catalog. Failure saves nothing. Pure deletion
+  may complete offline; mixed delete+modify still requires online validation.
+- `restrict_to_workspace=true` limits Client structured paths and initial
+  exec/PTY cwd. It is not an OS sandbox. Client `web_fetch` applies
+  `ssrf_denylist` in either state; explicit `[]` permits internal targets.
+- `env_allowlist` applies only to exec inheritance. Stdio MCP receives a safe
+  baseline plus its explicit config env; every `OPENOCTOPUS_*` variable is
+  removed from both child classes.
 - `DELETE /api/devices/{name}` is the state-3 complete wipe: delete the row,
   invalidate the token, close any live WS with 4401, fail in-flight tool calls as
   `device_unreachable`, remove the device from future tool enums, and rely on the
   absence of inbound FKs for single-row cleanup.
-- `POST /api/devices/{name}/regenerate-token` preserves the device row, name,
-  workspace path, policy fields, shell timeout cap, and MCP config. It replaces
-  `devices.token`, returns the new token once, closes the old live connection
+- `POST /api/devices/{name}/regenerate-token` preserves the Device identity and
+  config. It replaces `token_hash`, returns the new token once, closes the old live connection
   with 4401, and leaves the device offline-but-paired until the client reconnects
   with the new token.
 
@@ -589,7 +574,8 @@ normal user message into an isolated cron session.
 are updated for Python-main to keep Admin API narrow: runtime product config,
 basic user management, and a Py8-reserved server MCP surface.
 
-- `GET /api/admin/config` returns only OpenOctopus-recognized LLM/quota keys.
+- `GET /api/admin/config` returns only OpenOctopus-recognized LLM/quota and
+  Server `web_fetch_denylist` keys.
   Unknown `system_config` keys are ignored in this API view, and
   `PATCH /api/admin/config` rejects unknown keys with `400 Bad Request`.
 - Admin config keeps LLM and quota policy in the database. Object storage is
@@ -602,12 +588,16 @@ basic user management, and a Py8-reserved server MCP surface.
   First setup requires all three; later patches may omit unchanged values.
   Identity changes validate `/models` before any DB write. Configured
   `llm_api_key` is returned as `"<redacted>"`.
+- `web_fetch_denylist` is a whole-list hot setting. Invalid entries reject the
+  entire PATCH without saving; later Server fetches read the new canonical
+  value without restart. Explicit `[]` allows all otherwise-valid targets.
 - `GET /api/admin/users` returns flat user identity fields plus personal server
   workspace `quota_bytes`, `bytes_used`, and `locked` derived through
   `workspace_fs`. There is no single-user admin GET route.
 - `DELETE /api/admin/users/{id}` protects the last admin and returns
   `409 last_admin_required` when deletion would remove it.
-- `/api/admin/server-mcp` remains a Py8 later route. Each configured server MCP
+- `/api/admin/server-mcp` remains a Py8 design placeholder and is not exposed
+  by Py7. Each future configured server MCP
   gets one shared runtime/client and a bounded FIFO queue. There is no pool,
   per-user runtime, or session-scoped runtime in the Py8 contract. MCP `env` is
   returned as stored because admin is the trust boundary for that route.

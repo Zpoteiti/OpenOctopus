@@ -10,6 +10,8 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.DEVICE_NOT_FOUND: 404,
     ErrorCode.DEVICE_INVALID_REQUEST: 400,
     ErrorCode.DEVICE_NAME_TAKEN: 409,
+    ErrorCode.DEVICE_CONFIG_CONFLICT: 409,
+    ErrorCode.DEVICE_OFFLINE: 409,
     ErrorCode.WORKSPACE_NOT_FOUND: 404,
     ErrorCode.WORKSPACE_PERMISSION_DENIED: 403,
     ErrorCode.WORKSPACE_BLOCKED_PATH: 400,
@@ -49,6 +51,12 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.AUTH_LAST_ADMIN_REQUIRED: 409,
     ErrorCode.USER_NOT_FOUND: 404,
     ErrorCode.CONFIG_VALIDATION_FAILED: 400,
+    ErrorCode.MCP_SPAWN_FAILED: 422,
+    ErrorCode.MCP_MESSAGE_TOO_LARGE: 422,
+    ErrorCode.MCP_WITHIN_SERVER_COLLISION: 409,
+    ErrorCode.MCP_SCHEMA_COLLISION: 409,
+    ErrorCode.MCP_OWNER_SCHEMA_LIMIT: 409,
+    ErrorCode.MCP_SECRET_TRANSPORT_INSECURE: 409,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.INVALID_MESSAGE_CONTENT: 400,
     ErrorCode.INVALID_CURSOR: 400,
@@ -61,6 +69,12 @@ ERROR_STATUS: dict[ErrorCode, int] = {
 async def openoctopus_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, OpenOctopusError)
     status = ERROR_STATUS.get(exc.code, 500)
+    if (
+        exc.code is ErrorCode.CONFIG_VALIDATION_FAILED
+        and request.url.path.startswith("/api/devices/")
+        and request.url.path.endswith("/config")
+    ):
+        status = 422
     return JSONResponse(
         status_code=status,
         content={"code": exc.code.value, "message": exc.message},

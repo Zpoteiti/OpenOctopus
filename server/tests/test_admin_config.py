@@ -1,7 +1,9 @@
 import asyncio
 
 import httpx
+import pytest
 
+from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
 from openctopus_server.services import system_config
 from openctopus_server.services.system_config import validate_llm_identity
 
@@ -42,6 +44,102 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_api_key"] is None
     assert body["llm_model"] is None
     assert body["llm_max_output_tokens"] == 16384
+    assert body["web_fetch_denylist"] == list(DEFAULT_SSRF_DENYLIST)
+
+
+async def test_patch_web_fetch_denylist_canonicalizes_and_allows_empty(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "web_fetch_denylist": [
+                "10.1.2.3",
+                "192.168.9.7/24",
+                "EXAMPLE.COM.",
+                "Example.NET:8443",
+                "2001:db8::1",
+                "[2001:db8::2]:8443",
+                "BÜCHER.Example.",
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["web_fetch_denylist"] == [
+        "10.1.2.3/32",
+        "192.168.9.0/24",
+        "example.com",
+        "example.net:8443",
+        "2001:db8::1/128",
+        "[2001:db8::2]:8443",
+        "xn--bcher-kva.example",
+    ]
+
+    cleared = await admin_client.patch(
+        "/api/admin/config",
+        json={"web_fetch_denylist": []},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["web_fetch_denylist"] == []
+
+
+async def test_invalid_web_fetch_denylist_does_not_save_any_config_field(admin_client):
+    initial = await admin_client.patch(
+        "/api/admin/config",
+        json={"quota_bytes": 1234, "web_fetch_denylist": ["example.com"]},
+    )
+    assert initial.status_code == 200
+
+    invalid = await admin_client.patch(
+        "/api/admin/config",
+        json={
+            "quota_bytes": 5678,
+            "web_fetch_denylist": ["EXAMPLE.COM.", "example.com"],
+        },
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["code"] == "config_validation_failed"
+
+    stored = (await admin_client.get("/api/admin/config")).json()
+    assert stored["quota_bytes"] == 1234
+    assert stored["web_fetch_denylist"] == ["example.com"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://example.com/path",
+        "*.example.com",
+        "example.com/path",
+        "user@example.com",
+        "example.com:0",
+        "example.com:65536",
+    ],
+)
+async def test_invalid_web_fetch_denylist_entry_is_rejected(admin_client, entry):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"web_fetch_denylist": [entry]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
+
+
+async def test_null_web_fetch_denylist_is_rejected_without_changing_policy(admin_client):
+    initial = await admin_client.patch(
+        "/api/admin/config",
+        json={"web_fetch_denylist": ["example.com"]},
+    )
+    assert initial.status_code == 200
+
+    rejected = await admin_client.patch(
+        "/api/admin/config",
+        json={"web_fetch_denylist": None},
+    )
+
+    assert rejected.status_code == 422
+    stored = await admin_client.get("/api/admin/config")
+    assert stored.json()["web_fetch_denylist"] == ["example.com"]
 
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):

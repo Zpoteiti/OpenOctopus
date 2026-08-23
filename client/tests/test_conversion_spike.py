@@ -7,9 +7,11 @@ import subprocess
 import sys
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from mcp import types
 
 from openoctopus_client import cli, document_convert
 from openoctopus_client.document_convert import ConversionError
@@ -19,13 +21,19 @@ FIXTURES = CLIENT_ROOT.parent / "server" / "tests" / "fixtures" / "documents"
 MKFIFO = getattr(os, "mkfifo", None)
 
 
-def _client(*arguments: str) -> subprocess.CompletedProcess[str]:
+def _client(
+    *arguments: str,
+    extra_environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = {**os.environ, "PYTHONPATH": str(CLIENT_ROOT / "src")}
+    if extra_environment is not None:
+        environment.update(extra_environment)
     return subprocess.run(
         [sys.executable, "-m", "openoctopus_client", *arguments],
         check=False,
         capture_output=True,
         encoding="utf-8",
-        env={**os.environ, "PYTHONPATH": str(CLIENT_ROOT / "src")},
+        env=environment,
         timeout=30,
     )
 
@@ -35,6 +43,76 @@ def test_version_is_stable() -> None:
     assert result.returncode == 0
     assert result.stdout == "0.0.1\n"
     assert result.stderr == ""
+
+
+def test_mcp_stdio_smoke_runs_real_child_without_forwarding_device_token() -> None:
+    fixture = CLIENT_ROOT / "tests" / "fixtures" / "fake_mcp_stdio.py"
+
+    result = _client(
+        "_mcp-stdio-smoke",
+        sys.executable,
+        str(fixture),
+        extra_environment={"OPENOCTOPUS_DEVICE_TOKEN": "must-not-reach-mcp"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"ok": True, "stdio_mcp": True}
+    assert result.stderr == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_incomplete", "returncode"),
+    [(True, 0), (False, None)],
+)
+async def test_mcp_stdio_smoke_rejects_incomplete_child_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    cleanup_incomplete: bool,
+    returncode: int | None,
+) -> None:
+    class FakeSession:
+        async def send_request(self, *args: object, **kwargs: object) -> types.CallToolResult:
+            del args, kwargs
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "MCP_FROZEN_SMOKE_SENTINEL": "openoctopus-mcp-stdio-smoke",
+                                "OPENOCTOPUS_DEVICE_TOKEN": None,
+                            }
+                        ),
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.session = FakeSession()
+            self.transport = SimpleNamespace(
+                cleanup_incomplete=cleanup_incomplete,
+                process=SimpleNamespace(returncode=returncode),
+            )
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_discover(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return SimpleNamespace(tools=[SimpleNamespace(raw_name="environment")])
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(cli, "build_runtime_client", lambda config: fake_client)
+    monkeypatch.setattr(cli, "discover_server_catalog", fake_discover)
+
+    with pytest.raises(RuntimeError, match="cleanup"):
+        await cli._mcp_stdio_smoke(sys.executable, tmp_path / "fake-mcp.py")
 
 
 @pytest.mark.parametrize(
@@ -107,6 +185,18 @@ def test_spike_convert_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
         "message": "Document is not a regular file",
         "ok": False,
     }
+
+
+def test_conversion_worker_rejects_a_replaced_document(tmp_path: Path) -> None:
+    document = tmp_path / "document.html"
+    document.write_text("original", encoding="utf-8")
+    identity = document_convert._document_identity(document)
+    replacement = tmp_path / "replacement.html"
+    replacement.write_text("replacement", encoding="utf-8")
+    os.replace(replacement, document)
+
+    with pytest.raises(ConversionError, match="changed"):
+        document_convert._read_limited(document, expected_identity=identity)
 
 
 def test_spike_convert_rejects_windows_drive_ooxml_member() -> None:

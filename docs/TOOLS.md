@@ -2,11 +2,10 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131). When the implementation drifts from this doc, fix one or the other.
 
-**Py6 milestone:** the active client surface is the eleven shared tools plus
-server-orchestrated single-regular-file `file_transfer` and the three trusted
-client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). MCP,
-recursive folder transfer, and client-to-client transfer remain later
-milestones and are not part of the Py6 contract.
+**Py7 milestone:** the fixed surface is the eleven shared tools plus
+server-orchestrated single-regular-file `file_transfer` and the three
+client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). Device
+MCP adds dynamic tools from four surfaces; Server/admin MCP remains Py8.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -15,16 +14,16 @@ This is a *design* document. Use it during implementation as the source of truth
 ## Conventions
 
 - **Source schemas are nanobot-shape.** Two patterns for how device-awareness shows up in source:
-  - **Routing-only device** — for active shared tools (`read_file`, `write_file`, etc.), the source schema has **no device field at all**. `ToolRegistry.get_tool_schemas(device_names=...)` injects an `openoctopus_device` property (ADR-071) with an enum populated from the server and paired devices, and appends `openoctopus_device` to `required`. Client-only exec tools use the same injection but are restricted to trusted paired devices; MCP remains later.
+  - **Routing-only device** — for active shared tools (`read_file`, `write_file`, etc.), the source schema has **no device field at all**. `ToolRegistry.get_tool_schemas(device_names=...)` injects an `openoctopus_device` property (ADR-071) with an enum populated from the server and paired devices, and appends `openoctopus_device` to `required`. Client-only exec tools use the same injection for every paired Device. MCP entries use the same visible selector but retain immutable hidden routes from the persistent catalog.
   - **Intrinsic device** — for tools that natively operate across devices (`file_transfer`, `message`), the device field IS part of the source schema. `file_transfer` uses `openoctopus_src_device` + `openoctopus_dst_device`; `message` uses `openoctopus_device`. Each source stub has `enum: ["server"]`. At merge time, each such enum is **extended** with paired device names.
 - **Reserved `openoctopus_` prefix.** The routing field name MUST use the `openoctopus_` prefix and MUST NOT be just `device` / `src_device` / `dst_device`. Why: the merger would otherwise clobber an MCP tool's native `device` arg (e.g., a tool selecting a GPU). The reserved prefix makes collision impossible.
-- **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
+- **Reserved install-site name.** `server` is the built-in install site for the OpenOctopus server workspace and is reserved for future Py8 admin shared-service MCPs. User-created devices may not be named `server` (case-insensitive after ADR-109 normalization).
 - **Marker, not heuristic.** Every intrinsic-device field in a source schema carries `"x-openoctopus-device": true` (a JSON Schema extension). The merger detects device-routing fields by this marker, never by enum-shape guessing. The typed helper `openoctopus_device_field()` in `openctopus_server/tools/device_field.py` produces the canonical fragment — source-schema authors use it instead of hand-writing.
 - **`ToolRegistry` merge invariants:** the merge performs exactly one of two mutations per source schema:
   - **Inject:** add a brand-new `openoctopus_device` property (string, `enum` of install sites, marker `x-openoctopus-device: true`) and append `openoctopus_device` to `required`. Applies to routing-only tools.
   - **Extend:** for every property carrying `x-openoctopus-device: true`, replace its enum with the extended list of install sites. Applies to intrinsic-device tools.
   - Nothing else mutates. All other property names, types, descriptions, non-device enums, and the rest of `required` are strictly pass-through. See pseudocode in the Cross-cutting concerns section below.
-- **Package locations for active Py6 tools:**
+- **Package locations for active Py7 tools:**
   - **Tool source schemas and server implementations** → `openctopus_server/tools/`
     (`workspace_files.py` contains the eleven shared file-tool schemas and
     wrappers; `web_fetch.py`, `message.py`, and `file_transfer.py` contain the
@@ -36,13 +35,16 @@ This is a *design* document. Use it during implementation as the source of truth
   - `exec`, `write_stdin`, and `list_exec_sessions` are implemented by the
     client runtime; the server owns their canonical source schemas and routes
     them as `CLIENT_ONLY` calls.
+  - Device MCP transport/runtime/catalog mapping lives under
+    `openoctopus_client/mcp/`; Server catalog/route validation lives under
+    `openctopus_server/devices/` and `openctopus_server/tools/`.
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
 - **Path policy** (ADR-043, ADR-108, ADR-123): relative paths are accepted and resolve to the **personal workspace on the target device**. On the server, `WorkspaceService` resolves the authenticated virtual path and `WorkspaceFS` maps it to the user's RustFS object prefix; on a client, it is the device's local `workspace_path`. Absolute paths are also accepted. **Shared workspaces always require absolute paths in the `name@suffix` form** (e.g. `/production-department@a4f7e2d1/sprint.md`) — they have no implicit relative base, and strict-mode resolution requires both name and suffix to match the workspace row exactly. Names are validated per ADR-109.
 - **Workspace writes funnel through `WorkspaceService`** server-side (ADR-045, ADR-123). Its internal `WorkspaceFS` owns object-key mapping, quota checks, mutation coordination, and RustFS/MinIO-SDK error normalization.
 - **Server workspace IO is bounded inside the workspace service** (ADR-122, ADR-123). Tool schemas do not expose object-storage concepts; the implementation owns a bounded RustFS client pool, paged metadata scans, workspace mutation locks, and bounded in-memory transforms. REST upload/download admission is separate and never consumes Agent file-tool permits. Document reads additionally use per-user/global conversion admission before downloading bytes and keep parsing inside a resource-limited child process.
-- **File policy is per target install site.** On Python-main server workspaces, `WorkspaceService` is the authorization boundary: paths are normalized and checked against the selected personal/shared workspace before internal mapping to RustFS keys. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target device config. With `sandbox_mode=true` (default), resolved paths must stay under `workspace_path`; with `sandbox_mode=false`, the trusted device may address paths outside `workspace_path`.
+- **File policy is per target install site.** On Python-main server workspaces, `WorkspaceService` is the authorization boundary: paths are normalized and checked against the selected personal/shared workspace before internal mapping to RustFS keys. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target Device config. With `restrict_to_workspace=true` (default), resolved paths must stay under `workspace_path`; with false, absolute paths outside it are allowed. This is not an OS sandbox.
 - **Every active tool result is wrapped** (ADR-095): provider-facing
   `tool_result.content` is normalized to a safe block array. The first block is
   a server-generated `[untrusted tool result]: ...` warning text block; raw
@@ -66,18 +68,19 @@ This is a *design* document. Use it during implementation as the source of truth
 | `find_files` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Find files by path fragment, glob, or type |
 | `grep` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Search file contents |
 | `notebook_edit` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Edit Jupyter notebook cells |
-| `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — server has hardcoded private-IP block, clients enforce per-device denylist policy (ADR-052) |
+| `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — Server admin denylist and independent per-Device Client denylist |
 | `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
 | `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between server and a paired device |
-| `cron` | future placeholder | — | — | Not registered in the Py6 tool registry |
+| `cron` | future placeholder | — | — | Not registered in the current tool registry |
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
 | `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
 | `list_exec_sessions` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | List sessions owned by the current chat |
-| `mcp_<server>_<tool>`, `mcp_<server>_resource_<name>`, `mcp_<server>_prompt_<name>` | dynamic (deferred) | MCP (Python `mcp` SDK) | wherever the MCP is installed | Wrapped MCP capabilities (Py7/Py8) |
+| `mcp_<server>_<alias>` | dynamic Device MCP | persisted last-good catalog | `openoctopus_client/mcp/` | Tool, static resource, resource template, or prompt; surface is hidden route metadata |
 
-The active Py6 registry contains sixteen first-class tools: eleven shared
+The Py7 registry contains sixteen fixed first-class tools: eleven shared
 tools, `message`, `file_transfer`, and the three client-only exec tools. `cron`
-and MCP-wrapped tools remain outside the active client shell contract.
+remains outside the active contract; enabled Device MCP catalog entries are
+added dynamically.
 
 Schemas below are the **source** schemas (what gets written in code). The agent sees these plus the merger's additions per ADR-071 (`openoctopus_device` property on routing-only tools, enum extension on intrinsic-device tools).
 
@@ -230,7 +233,7 @@ or explain the failure.
 - **Server side:** routes through `WorkspaceService.write`, which authorizes the virtual path before internal `WorkspaceFS` lock, quota, and RustFS write handling.
 - **SKILL.md validation:** if `path` matches `skills/*/SKILL.md` (exactly one level deep, exact filename), run the YAML-frontmatter validator before the write commits. Reject malformed input with `workspace_invalid_skill_format`. Folder name must match frontmatter `name` (ADR-082).
 - **Skills cache invalidation:** any successful write under `skills/` invalidates the user's skills cache entry (ADR-085).
-- **Client side:** subject to the target device's `sandbox_mode`; sandbox mode confines writes to the device's `workspace_path`.
+- **Client side:** subject to the target Device's `restrict_to_workspace`; true confines writes to its `workspace_path`.
 
 **Timeout:** 30s internal.
 **Result cap:** 16,000 characters (default — usually a brief success message).
@@ -369,7 +372,7 @@ or explain the failure.
 - Applies edits in the selected install site. `action=replace` requires `old_text` and `new_text`; `action=add` requires `new_text`.
 - `dry_run=true` validates paths and replacement matches, then returns a summary without writing.
 - Server side writes through `WorkspaceService`, so authorization, quota, SKILL.md validation, skills-cache invalidation, object IO bounds, and path safety still apply.
-- Client side uses the device's normal workspace resolver and `sandbox_mode`.
+- Client side uses the Device's normal workspace resolver and `restrict_to_workspace`.
 - OpenOctopus path policy still applies after routing. Relative paths resolve to the selected personal workspace. Shared server workspace edits use the same `/name@suffix/...` absolute path form as other file tools.
 
 **Timeout:** 30s internal.
@@ -449,7 +452,7 @@ or explain the failure.
 **Mechanism:**
 - **Always recursive, no flag** (ADR-086). The tool's only purpose is recursive deletion; a non-recursive variant is `rmdir` and too niche for v1.
 - **Server side:** `WorkspaceService` authorizes the folder, then internal `WorkspaceFS` deletes its paged RustFS prefix under the workspace mutation lock. Lock auto-lifts if this brings usage under quota.
-- **Client side:** subject to `sandbox_mode` like other writes. In sandbox mode, can only remove inside `workspace_path`.
+- **Client side:** subject to `restrict_to_workspace` like other writes. When true, removal stays inside `workspace_path`.
 - **Rejects** if `path` is a file (suggests `delete_file`) or doesn't exist.
 - **Symlinks inside** the tree are unlinked, never followed outside.
 - **Skills cache invalidation:** if the deleted path was `skills/` or under it, invalidate.
@@ -740,7 +743,7 @@ REST equivalent; frontend callers can still download or replace the raw
 ### `web_fetch`
 
 **Lives in:**
-- Source schema and server implementation: `openctopus_server/tools/web_fetch.py` — applies the unconditional server block-list.
+- Source schema and server implementation: `openctopus_server/tools/web_fetch.py` — reads the current admin-configured Server denylist.
 - Client shared-tool dispatcher: `openoctopus_client/tools/dispatcher.py` — applies the target device's `ssrf_denylist` policy.
 
 **Purpose:** Fetch a URL and extract readable content (HTML → markdown/text). Available on server and any connected client; the agent picks the dispatch site via `openoctopus_device` (ADR-052). Use the server site for public URLs; use a client site to reach declared internal services in the user's network (e.g. an internal company API at `10.180.20.30:8080`).
@@ -776,15 +779,17 @@ REST equivalent; frontend callers can still download or replace the raw
 **Merge-time injection:** standard shared-tool injection — `openoctopus_device` is added with enum = `["server"] + paired_clients`. The agent picks where the fetch dispatches. Paired-but-offline client targets remain visible and return `tool_device_unreachable` at dispatch.
 
 **Mechanism:**
-- Both sites parse the URL, resolve DNS, then check the resolved IP against the policy. Re-resolve before connecting (mitigates DNS rebinding) and verify the actual connect-target IP against the policy.
-- **Server site — block-list (no exception):**
-  - RFC-1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-  - 100.64.0.0/10 carrier-grade NAT (covers Tailscale's 100.x range)
-  - Link-local (169.254.0.0/16)
-  - Loopback (127.0.0.0/8, ::1)
-  - IPv6 ULA `fc00::/7` and link-local `fe80::/10`
-- **Client site:** if `sandbox_mode=true`, rejects targets matching `device.ssrf_denylist` (CIDR, host, or `host:port`). The default sandbox-device denylist contains private/reserved ranges and common metadata-service addresses. Users remove entries from the denylist to allow known internal services. If `sandbox_mode=false`, private/internal access is allowed by default; trusted devices created without an explicit list store `[]`, while any explicit deny entries the user keeps still reject matching targets.
-- **Structured network path, not process isolation** (ADR-052, ADR-073): this policy applies to the `web_fetch` tool. Without an OS-level network sandbox, an `exec` command retains the host user's network access; the environment allowlist is not an egress policy. The UI and docs must not sell `ssrf_denylist` as a hard egress firewall.
+- Both sites parse the URL, resolve each redirect hop once, reject the entire
+  target when any result matches the immutable per-call denylist snapshot, and
+  connect to the validated pinned IP while preserving the original Host/SNI.
+- **Server site:** reads `system_config.web_fetch_denylist` once per invocation
+  before network IO. Missing config uses the existing private/reserved/metadata
+  default; admin `PATCH /api/admin/config` hot-updates the canonical whole list,
+  and explicit `[]` permits all otherwise-valid targets.
+- **Client site:** always applies `device.ssrf_denylist`, independently of
+  `restrict_to_workspace`. Omitted create input uses the default
+  private/reserved/metadata list; explicit `[]` allows a user's internal target.
+- **Structured network path, not process isolation** (ADR-052, ADR-133): this policy applies to the `web_fetch` tool. Exec, PTY, stdio MCP, and remote MCP retain host/network access and can bypass it. The environment allowlist and workspace restriction are not egress policy.
 - Fetches via `httpx`, 10s connect + 30s total timeout. Server requests identity
   encoding, rejects compressed responses, and raw-streams at most 5 MB before
   extraction. The server site has separate per-user/global admission for the
@@ -810,7 +815,7 @@ REST equivalent; frontend callers can still download or replace the raw
 `tool_content_conversion_resource_exceeded`, and
 `tool_content_conversion_failed` for HTML conversion. If the encompassing
 30-second deadline wins, the result remains `network_timeout`.
-**Related ADRs:** 050 (per-device config), 052 (server block-list + per-device client denylist), 073 (device policy gates), 074 (untrusted content treatment), 095 (result wrap), 130 (fair admission + isolated HTML conversion).
+**Related ADRs:** 050/052 (historical config/network decisions), 074 (untrusted content treatment), 095 (result wrap), 130 (fair admission + isolated HTML conversion), 133 (Py7 independent hot denylist policy).
 
 ---
 
@@ -818,14 +823,14 @@ REST equivalent; frontend callers can still download or replace the raw
 
 `message` executes on the server. `file_transfer` is also server-orchestrated,
 but its client legs execute on the paired device. Their schemas and routing
-live in `openctopus_server/tools/`; Py6 additionally advertises the three
-fixed client-only shell tools, but no MCP tools.
+live in `openctopus_server/tools/`; Py7 additionally advertises three fixed
+client-only shell tools and persistent-catalog Device MCP entries.
 
 ### `message`
 
 **Lives in:** `openctopus_server/tools/message.py`
 
-**Availability:** Registered for the current web session in Py6. The current
+**Availability:** Registered for the current web session. The current
 provider-visible schema exposes `content`, optional `media`, and the intrinsic
 `openoctopus_device` field. `content` must contain non-whitespace text and is
 capped at 16,000 characters; `media` accepts at most ten unique paths. Py6
@@ -988,12 +993,12 @@ stream failures.
 
 ---
 
-### `cron` (future placeholder; not a Py6 contract)
+### `cron` (future placeholder; not a Py7 contract)
 
 This section is historical only; no `cron` module or registry entry exists in
-Py6.
+Py7.
 
-**Implementation:** none in Py6; the future module location is intentionally TBD.
+**Implementation:** none in Py7; the future module location is intentionally TBD.
 
 **Purpose:** Schedule reminders and recurring tasks. A single tool with an `action` enum — add, list, or remove jobs. Each firing injects a synthesized user message into a dedicated cron session per ADR-053.
 
@@ -1061,12 +1066,12 @@ Py6.
 
 ---
 
-## Client-only tools (Py6)
+## Client-only tools
 
 The three tools below are fixed `CLIENT_ONLY` schemas. Their source schemas do
-not contain `openoctopus_device`; the server injects that required routing
-field and lists only paired devices with `sandbox_mode=false`. `server` is
-never an exec target. Offline trusted devices remain in the enum and return
+not contain `openoctopus_device`; the Server injects that required routing
+field and lists every paired Device. `server` is never an exec target. Offline
+paired Devices remain in the enum and return
 `tool_device_unreachable` at dispatch. Server-side REST has no exec equivalent.
 
 ### `exec`
@@ -1080,7 +1085,7 @@ input. A PowerShell/REPL session is started by the command itself (for example
 ```json
 {
   "name": "exec",
-  "description": "Execute a command on a trusted device. Pipe is the default; use tty=true for a REPL, TTY detection, SSH shell, or line-oriented prompt. Set an explicit large timeout for long interaction; yield_time_ms never extends the hard timeout.",
+  "description": "Execute a command on a paired device. Pipe is the default; use tty=true for a REPL, TTY detection, SSH shell, or line-oriented prompt. Set an explicit large timeout for long interaction; yield_time_ms never extends the hard timeout.",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -1101,7 +1106,9 @@ input. A PowerShell/REPL session is started by the command itself (for example
 
 `cmd`, `workdir`, `max_output_tokens`, `interactive`, `mode`, and arbitrary
 shell executable paths are not accepted. `working_dir` defaults to the device
-workspace; trusted devices may use an existing OS-accessible absolute path.
+workspace. With `restrict_to_workspace=true`, an explicit initial directory
+must stay under that root; false permits an OS-accessible absolute path. The
+spawned shell can change directory afterward in either mode.
 `timeout` is a hard process lifetime, default `min(60, shell_timeout_max)`,
 and `yield_time_ms` is only the initial report window. `timeout=0` is allowed
 only when the device cap is zero and a bounded yield is supplied. A normal
@@ -1153,7 +1160,7 @@ does not refresh idle time and never reveals another chat's sessions.
 ```json
 {
   "name": "list_exec_sessions",
-  "description": "List current-chat exec sessions on a trusted device.",
+  "description": "List current-chat exec sessions on a paired device.",
   "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
 }
 ```
@@ -1164,8 +1171,8 @@ stdout/stderr and PTY reports one normalized output stream; each stream is a
 50,000 maximum. Sessions survive ordinary WS reconnect and server restart but
 not token rotation, device deletion, replacement, normal client shutdown, or
 policy change. Client restart/crash/power loss has no recovery guarantee.
-There is no `command_denylist`; `sandbox_mode=false` is a trusted-device gate,
-not an OS sandbox. Stable errors include `tool_invalid_args`,
+There is no `command_denylist` or OS sandbox. `restrict_to_workspace` only
+guards the initial cwd. Stable errors include `tool_invalid_args`,
 `tool_device_busy`, `tool_exec_timeout`, `tool_exec_session_not_found`,
 `tool_exec_stdin_closed`, `tool_exec_interrupt_failed`,
 `tool_pty_unavailable`, `tool_shell_unavailable`, and
@@ -1173,173 +1180,142 @@ not an OS sandbox. Stable errors include `tool_invalid_args`,
 
 ---
 
-## MCP tools, resources, prompts (deferred to Py7/Py8; not a Py6 contract)
+## Device MCP tools, resources, templates, and prompts (Py7)
 
-Py6 has no MCP dependency, handshake frame, persisted MCP configuration, or
-MCP tool registry. The remainder of this section is later-milestone planning
-only. It must not be used to construct Py6 schemas, REST requests, device
-config, or client subprocesses.
+Py7 runs user-configured MCP runtimes on paired Devices. Admin shared-service
+Server MCP remains deferred to Py8; the Server never spawns a Py7 MCP process.
+Device MCP configuration is stored on the Device row and changed through
+`GET/PATCH /api/devices/{name}/config`.
 
-MCP servers advertise three capability surfaces — **tools**, **resources**, **prompts**. OpenOctopus wraps all three uniformly into the per-user tool registry (ADR-047), so the agent sees one flat list of callable entries. Naming by surface (ADR-048):
+The Client uses `fastmcp-slim[client]==3.4.7` with an explicit transport:
 
-| Surface | Wrapped name | Action when called |
+- `stdio` — one executable plus bounded args/cwd/env; no user-controlled shell
+  parsing. The child receives the MCP SDK safe baseline plus configured env,
+  with every `OPENOCTOPUS_*` variable removed.
+- `streamable_http` — recommended remote transport.
+- `sse` — legacy compatibility only; there is no automatic fallback.
+
+Remote transports do not follow redirects, do not inherit ambient proxies, and
+use normal TLS verification. Non-empty headers require HTTPS. MCP transport is
+independent of `restrict_to_workspace` and `ssrf_denylist`: installing an MCP
+trusts it with the Device user's host/network access.
+
+### Validate before save and last-good catalog
+
+Every MCP add or modification, including a filter-only change, requires the
+Device to be online. The Client performs a real initialize and complete bounded
+discovery without replacing the active runtime. The Server validates the
+candidate and atomically commits config, last-good catalog, and
+`config_revision`; any failure saves nothing. Pure removal may commit while the
+Device is offline.
+
+MCP env/header values are intentionally stored as reversible PostgreSQL
+plaintext. REST retains keys but returns every value as `"<redacted>"`; logs,
+errors, catalogs, Provider schemas, and prompts never include the values.
+Secret-bearing config frames require an authoritative WSS connection.
+
+Provider schemas are built from the durable last-good catalog, not current
+connectivity. An offline Device therefore remains in the
+`openoctopus_device` enum; dispatch returns `tool_device_unreachable`.
+A connected Device whose runtime is starting, unavailable, drifted, or not
+acknowledged returns `tool_mcp_unavailable`.
+
+### Discovery, names, and filtering
+
+Discovery covers four independent MCP surfaces, including cursor pagination:
+
+| Surface | Client operation | Provider tool shape |
 |---|---|---|
-| Tool | `mcp_<server>_<tool_name>` | `call_tool(name, args)` |
-| Resource | `mcp_<server>_resource_<resource_name>` | `read_resource(uri)` (URI built from agent args per ADR-099) |
-| Prompt | `mcp_<server>_prompt_<prompt_name>` | `get_prompt(name, args)` → text-joined messages per ADR-048 |
+| Tool | raw `CallToolRequest` through `ClientSession.send_request` | MCP object input schema |
+| Static resource | `read_resource(normalized_uri)` | no business args |
+| Resource template | bounded RFC 6570 expand, then `read_resource` | required string properties for template variables |
+| Prompt | `get_prompt(name, arguments)` | string properties from prompt arguments |
 
-The typed infixes (`_resource_` / `_prompt_`) make cross-surface name collisions impossible by construction. Tools stay unprefixed for back-compat with the original ADR-048 convention.
+For MCP tools, OpenOctopus validates its own envelope, immutable route, and
+resource bounds, then forwards the arguments without re-evaluating the dynamic
+MCP `inputSchema`. The MCP Server owns argument validation; its `isError` or
+JSON-RPC error is returned to the model as a bounded tool failure. OpenOctopus
+does not retry the call automatically.
 
-Py8 supports two MCP tenancy scopes (ADR-114):
-- **Admin shared-service MCPs** live in `system_config.server_mcp`, are configured only by admins, use shared credentials, and appear as install site `openoctopus_device="server"`. They are intended for stateless or low-state shared services such as search and internal KB lookup. OpenOctopus runs one shared runtime/client per configured MCP server with a bounded per-MCP FIFO queue. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract.
-- Future device MCPs are outside the Py6 device row and handshake; their
-  storage and runtime contract is intentionally unspecified here.
+All surfaces share one flat final namespace:
 
-User-scoped server MCP and session-scoped MCP are out of scope for Py8. Personal OAuth, browser/IDE state, and resource-heavy MCPs should be installed on a user device.
-
-### Wrapping — tools
-
-- **Source schema:** the MCP-provided `input_schema` is taken **as-is** — wrap is purely a name rewrite.
-- **Merge-time injection:** at session tool-schema-build time, `openoctopus_device` is added as a brand-new top-level property (with `x-openoctopus-device: true`), enum listing every install site of this MCP, appended to `required` (same mechanism as the routing-only-device pattern for shared tools, ADR-071). The reserved `openoctopus_` prefix ensures no collision with any MCP tool's native args — even if an MCP advertises a field named `device`, the merger's injected field never overwrites it.
-- **Implementation:** none in Py6; future MCP wrapper and install locations are intentionally TBD.
-
-**Worked example.** A tool `web_search` from MCP server `minimax` whose source schema is:
-
-```json
-{
-  "name": "web_search",
-  "input_schema": {
-    "type": "object",
-    "properties": { "query": { "type": "string" } },
-    "required": ["query"]
-  }
-}
+```text
+mcp_<server>_<normalized_alias>
 ```
 
-Post-wrap becomes `mcp_minimax_web_search`, source schema unchanged. Post-merge, the agent sees:
+There is no `_tool_`, `_resource_`, `_template_`, or `_prompt_` infix.
+The Server and Client retain explicit immutable `surface`, source identity,
+entry id, config revision, catalog digest, and runtime generation route data;
+they never infer a route by splitting the final name. Cross-surface and
+cross-install collisions are rejected rather than overwritten, truncated,
+hashed, or suffixed.
 
-```json
-{
-  "name": "mcp_minimax_web_search",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "query": { "type": "string" },
-      "openoctopus_device": {
-        "type": "string",
-        "enum": ["server", "alice-laptop"],
-        "x-openoctopus-device": true,
-        "description": "Which install site to execute on."
-      }
-    },
-    "required": ["query", "openoctopus_device"]
-  }
-}
+Each server applies one exact allowlist across all four surfaces:
+
+```text
+enabled_capabilities: null / omitted  -> no discovered capabilities
+enabled_capabilities: []              -> explicitly all discovered capabilities
+enabled_capabilities: ["..."]         -> exactly those final wrapped names
 ```
 
-`openoctopus_device` enum lists every site where `minimax` is mounted. The reserved `openoctopus_` prefix is the collision-proof guarantee: even if an MCP tool had its own `device` field (say, selecting a GPU), the merge step would not touch it.
+Discovery always persists the complete bounded catalog, including disabled
+entries. Unknown allowlist names reject the candidate. A useful first install
+uses `null`, reads `mcp_discovered`, then submits the desired exact names or
+`[]` to explicitly enable everything.
 
-### Wrapping — resources
+### Schema merge and routing
 
-- **Source schema:** auto-generated from the resource's URI (ADR-099). Static URIs produce a zero-arg schema; URI templates are parsed for `{var}` placeholders, each becoming a required `string` property.
-- **At call time:** the wrapper substitutes agent-supplied values back into the URI before invoking `read_resource`. Static resources call `read_resource` with the literal URI.
-- **Merge-time injection:** identical to tools — `openoctopus_device` injected at the top level.
+For each Provider iteration the registry:
 
-**Worked example — static URI.** Resource `index` at `notion://workspace/index` from MCP server `notion`:
+1. reads the user's paired Devices and their persistent last-good catalogs;
+2. selects enabled entries and rejects name/schema drift;
+3. merges equal logical entries across install sites;
+4. injects required `openoctopus_device` with the exact Device enum; and
+5. freezes hidden `(device_id, entry_id, config_revision, catalog_digest)`
+   routes for that iteration.
 
-```json
-{
-  "name": "mcp_notion_resource_index",
-  "input_schema": { "type": "object", "properties": {}, "required": [] }
-}
-```
+The Server rechecks ownership/name/revision/digest at dispatch, obtains the
+currently accepted runtime generation, removes `openoctopus_device` from the
+source args, and sends one ordinary `tool_call` with an exact `mcp_route`.
+The Client accepts it only when all hidden route fields and the final name match
+its latest acknowledged binding.
 
-Post-merge adds `openoctopus_device` (the only required arg). Calling it returns the resource's content as `tool_result`.
+Runtime registration is aggregate and single-flight. Every configured server is
+reported as `ready`, `unavailable`, or `drifted`; a stale acknowledgement
+cannot reopen a changed runtime. MCP sessions survive ordinary OpenOctopus WS
+disconnects and re-register after reconnect. Runtime recovery performs a fresh
+initialize/discovery; catalog drift keeps last-good schemas visible but blocks
+calls until the user validates and saves the new catalog.
 
-**Worked example — URI template.** Resource `page` at `notion://page/{page_id}`:
+### Results, timeout, and replay
 
-```json
-{
-  "name": "mcp_notion_resource_page",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "page_id": { "type": "string", "description": "URI template variable: page_id" }
-    },
-    "required": ["page_id"]
-  }
-}
-```
+Each invocation has one 60-second OpenOctopus outer deadline. The Client maps
+MCP content deterministically into existing safe text/image result blocks:
 
-Post-merge adds `openoctopus_device`. Agent calls `mcp_notion_resource_page(page_id="abc", openoctopus_device="server")` → wrapper computes `notion://page/abc` → `read_resource("notion://page/abc")`.
+- text stays text; supported JPEG/PNG/GIF/WebP images remain images;
+- resource descriptors and structured content use canonical JSON labels;
+- prompt message role/order is preserved;
+- unsupported media, invalid base64/JSON, and unknown blocks fail
+  all-or-nothing;
+- `isError=true` and JSON-RPC errors become `tool_mcp_error`;
+- empty success becomes `(no output)`.
 
-If a template variable name collides with the reserved `openoctopus_device`, wrapping fails at install time with a clear error (the MCP author renames the placeholder).
+The final encoded frame remains subject to the existing result credit. MCP
+results receive the normal Server-authored untrusted-result warning before
+Provider use.
 
-### Wrapping — prompts
+A call known not to have entered transport may fail as
+`tool_mcp_unavailable`. Once a call enters or may enter MCP transport,
+timeout, Stop, disconnect, or lost result returns
+`tool_execution_outcome_unknown`; OpenOctopus never automatically replays it.
+Late results are consumed by bounded WS-generation tombstones. MCP failures are
+ordinary bounded tool results, so they neither close a healthy Device WS nor
+stop the Agent loop.
 
-- **Source schema:** auto-generated from the prompt's `arguments` array. Each `{name, description, required}` becomes a string property; `required` flag is honored.
-- **At call time:** invokes `get_prompt(name, args)`. The result is a list of `PromptMessage` objects; the wrapper extracts text content from every message and joins with `"\n"` (matches nanobot `mcp.py:408–421`). Non-text content blocks are stringified via `Display`. Empty result → `"(no output)"`.
-- **Merge-time injection:** identical to tools.
-
-**Worked example.** Prompt `code_review` from MCP server `helper` with arguments `[{name:"language", required:true}, {name:"style", required:false}]`:
-
-```json
-{
-  "name": "mcp_helper_prompt_code_review",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "language": { "type": "string" },
-      "style": { "type": "string" }
-    },
-    "required": ["language"]
-  }
-}
-```
-
-Calling returns the rendered prompt messages as a single concatenated string that becomes a text block after the ADR-095 warning block in normalized `tool_result.content`.
-
-### Collision handling
-
-Two cases, both rejected at install time (ADR-049):
-
-1. **Within-server dup** — same MCP server advertises two capabilities that wrap to the same name (only intra-surface dups can fire, since `_resource_` / `_prompt_` infixes prevent cross-surface collisions). OpenOctopus diverges from nanobot's silent overwrite — install is rejected with a structured error.
-2. **Cross-install schema drift** — same wrapped name (e.g. `mcp_minimax_web_search`) is reported with a different schema across install sites. Returns `409 Conflict` with a structured diff body covering all three surfaces. User renames one of the installs to keep both side-by-side.
-
-### Dispatch
-
-When the agent calls any MCP-wrapped entry, the server looks up which install site matches the `openoctopus_device` enum value and forwards the call to that site's `McpSession` (server-side or via a `tool_call` frame to the client). Resources and prompts dispatch identically to tools.
-
-### `enabled_tools` filter (ADR-100)
-
-Each MCP server config carries an optional `enabled_tools: [<tool_name>...]`
-allow-list of exact post-wrap tool names. When present, only matching tools
-register; when absent, every advertised tool registers (default-allow).
-Resources and prompts are always registered regardless of `enabled_tools`.
-
-The config validation response (`PUT /api/admin/server-mcp` success, or
-`PATCH /api/devices/{name}/config` success with online device) includes
-`mcp_discovered` listing all discovered tools, resources, and prompts so
-users can see what is available before deciding the filter.
-
-Example:
-```json
-{
-  "name": "github",
-  "command": ["npx", "@modelcontextprotocol/server-github"],
-  "enabled_tools": ["mcp_github_create_issue", "mcp_github_list_issues"]
-}
-```
-
-### Timeout
-
-Per-MCP. The MCP's own session timeout governs; the MCP SDK's protocol defaults apply unless overridden in the MCP server's config. Same for tools, resources, prompts.
-
-### Related ADRs
-
-047 (shared MCP client + three surfaces), 048 (naming + prompt-output convention), 049 (collision rejection), 071 (merge), 099 (URI template expansion), 100 (`enabled_tools` filter).
-
----
+Stable MCP codes include `tool_mcp_unavailable`, `tool_mcp_error`,
+`tool_mcp_message_too_large`, `tool_unsupported_media`,
+`tool_mcp_invalid_result`, `tool_result_too_large`, and
+`tool_execution_outcome_unknown`.
 
 ## Cross-cutting concerns
 
@@ -1369,9 +1345,9 @@ stored in the context.
 
 ### Schema merging at session start
 
-Each agent-loop iteration calls `ToolRegistry.get_tool_schemas(device_names=...)`.
-The registry deep-copies the source schemas registered in the server
-`ToolRegistry` and applies one of these mutations:
+Each Agent-loop Provider iteration captures one owner Device/catalog snapshot.
+The registry deep-copies fixed Server schemas, builds MCP shapes from that
+snapshot, and applies these transformations:
 
 1. Routing-only tools get a new required `openoctopus_device` field whose enum
    is `['server', *device_names]`.
@@ -1381,10 +1357,16 @@ The registry deep-copies the source schemas registered in the server
    each paired name the registry appends an `anyOf` branch requiring both
    transfer endpoints to use that same name.
 4. Pure-server tools are returned as a deep copy without routing changes.
+5. Enabled last-good MCP entries merge only by equal logical identity and
+   canonical Provider schema. Their required `openoctopus_device` enum lists
+   exact install sites, while a separate immutable route table retains Device,
+   entry, revision, and digest identities.
 
-The registry does not collect client schemas from the handshake, group schemas
-across install sites, or perform MCP collision handling. Client tool arguments
-are validated by the client dispatcher after the server selects a device.
+The registry never obtains Provider shape from handshake/registration memory.
+MCP collision validation occurs before persistence and is defensively rechecked
+when building the snapshot. After the Server chooses an exact Device route,
+OpenOctopus forwards MCP tool arguments to the MCP Server without re-evaluating
+its dynamic `inputSchema`.
 
 ### Device-field helper + reserved name
 
@@ -1462,8 +1444,10 @@ def extend_openoctopus_device_enums(schema, extra):
 
 The merger never inspects enum contents to decide what to mutate — only the explicit marker.
 
-The caller supplies the current paired-device snapshot; this method has no
-per-user schema cache or MCP lifecycle handling.
+The fixed-tool pseudocode above shows only injection/extension. MCP entries are
+added from the persistent owner snapshot and paired with a Provider-hidden route
+table; runtime availability stays in the Device registry rather than the shape
+cache.
 
 ### Result cap + truncation
 
@@ -1475,7 +1459,8 @@ per-user schema cache or MCP lifecycle handling.
 
 - Decentralized per-tool (ADR-075). Each tool's `execute()` owns its own `asyncio.timeout()` wrapping.
 - The dispatch layer does not impose a default timeout.
-- Only `exec` (and some MCP tools) expose `timeout` in the schema for agent override; everything else has fixed internal timeouts as listed above.
+- Only `exec` exposes an Agent-controlled timeout. MCP invocation uses the fixed
+  60-second outer deadline.
 - Runaway protection comes from the iteration hard cap (200, ADR-036) + trap-in-loop detection, NOT per-tool timeouts.
 
 ### Untrusted tool result wrap
@@ -1521,7 +1506,10 @@ The agent sees errors as normal tool results and adapts on the next iteration (A
 - **`install_skill`** — dropped per ADR-084. Skills are installed via `file_transfer` from a client (where the user runs the installer) or via the web UI.
 - **`read_skill`** — same. Skills are read via `read_file`.
 - **`bulk_*` operations** — single-file ops only (ADR-067, superseded by ADR-087 for the rename case).
-- **Server `web_fetch` with private-IP exceptions** — server site of `web_fetch` has an unconditional block-list (ADR-052). Per-device SSRF policy only applies to the client site.
+- **Per-session `web_fetch` bypasses** — Server policy is admin-global and
+  Client policy is per Device; Agent calls cannot disable either snapshot.
+- **Server/admin MCP in Py7** — Device MCP runs only on Clients. A future
+  shared-service Server MCP surface belongs to Py8.
 - **`mkdir`** — implicit via `write_file` (ADR-088).
 - **`rmdir`** — covered by `delete_folder` (no separate empty-only variant; too niche).
 

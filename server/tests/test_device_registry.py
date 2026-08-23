@@ -7,9 +7,27 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from openctopus_server.devices.mcp_catalog import EMPTY_CATALOG_DIGEST
+from openctopus_server.devices.mcp_models import (
+    PersistedMcpCatalog,
+    StdioMcpServerConfig,
+    StreamableHttpMcpServerConfig,
+)
+from openctopus_server.devices.mcp_routes import (
+    AcceptedMcpBinding,
+    FrozenMcpEntryRoute,
+    McpRegistrationCandidate,
+)
 from openctopus_server.devices.protocol import (
+    ConfigAppliedFrame,
+    ConfigValidateResultFrame,
     DeviceConfigFrame,
+    HelloAckFrame,
+    McpValidationFailure,
+    RegisterMcpAckFrame,
     ShellMetadata,
+    SourceMcpCatalog,
+    SourceMcpServerCatalog,
     ToolResultFrame,
     TransferBeginFrame,
     TransferEndFrame,
@@ -18,6 +36,7 @@ from openctopus_server.devices.protocol import (
 from openctopus_server.devices.registry import (
     ConnectionHandle,
     DeviceBusyError,
+    DeviceMcpUnavailableError,
     DeviceOutcomeUnknownError,
     DeviceProtocolError,
     DeviceRegistry,
@@ -60,6 +79,75 @@ class BlockingTransport(FakeTransport):
 
 
 @dataclass
+class BlockingFailingTransport(FakeTransport):
+    send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_send: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        del payload
+        self.send_started.set()
+        await self.release_send.wait()
+        raise OSError("socket is closed")
+
+
+@dataclass
+class FirstSendBlockingTransport(FakeTransport):
+    attempted_text: list[str] = field(default_factory=list)
+    send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    first_send_cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.attempted_text.append(payload)
+        if len(self.attempted_text) == 1:
+            self.send_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.first_send_cancelled.set()
+                raise
+        self.sent_text.append(payload)
+        self.sent.set()
+
+
+@dataclass
+class EverySendBlockingTransport(FakeTransport):
+    attempted_text: list[str] = field(default_factory=list)
+    first_send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    second_send_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_second_send: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_text(self, payload: str) -> None:
+        self.attempted_text.append(payload)
+        if len(self.attempted_text) == 1:
+            self.first_send_started.set()
+            await asyncio.Future()
+        else:
+            self.second_send_started.set()
+            await self.release_second_send.wait()
+
+
+@dataclass
+class ImmediateConfigAppliedTransport(FakeTransport):
+    registry: DeviceRegistry | None = None
+    handle: ConnectionHandle | None = None
+
+    async def send_text(self, payload: str) -> None:
+        self.sent_text.append(payload)
+        frame = cast(dict[str, object], json.loads(payload))
+        if frame["type"] in {"hello_ack", "config_update"}:
+            assert self.registry is not None
+            assert self.handle is not None
+            assert await self.registry.resolve_config_applied(
+                self.handle,
+                ConfigAppliedFrame(
+                    id=UUID(str(frame["id"])),
+                    config_revision=int(frame["config_revision"]),
+                ),
+            )
+        self.sent.set()
+
+
+@dataclass
 class AmbiguousConfigTransport(FakeTransport):
     deliver_before_block: bool = False
     send_started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -90,6 +178,69 @@ class RecordingSink:
 async def _wait_for_sent(transport: FakeTransport) -> dict[str, object]:
     await asyncio.wait_for(transport.sent.wait(), timeout=1)
     return cast(dict[str, object], json.loads(transport.sent_text[-1]))
+
+
+async def _push_and_apply(
+    registry: DeviceRegistry,
+    handle: ConnectionHandle,
+    transport: FakeTransport,
+    *,
+    device_id: UUID,
+    user_id: UUID,
+    device_name: str,
+    config: DeviceConfigFrame,
+) -> dict[str, object]:
+    before = len(transport.sent_text)
+    push = asyncio.create_task(
+        registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name=device_name,
+            config=config,
+        )
+    )
+    for _ in range(100):
+        updates = [
+            cast(dict[str, object], json.loads(payload))
+            for payload in transport.sent_text[before:]
+            if json.loads(payload)["type"] == "config_update"
+        ]
+        if updates:
+            break
+        await asyncio.sleep(0)
+    assert updates
+    update = updates[0]
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(
+            id=UUID(str(update["id"])),
+            config_revision=int(update["config_revision"]),
+        ),
+    )
+    assert await push
+    return update
+
+
+def _empty_catalog() -> PersistedMcpCatalog:
+    return PersistedMcpCatalog(
+        version=1,
+        digest=EMPTY_CATALOG_DIGEST,
+        servers=[],
+    )
+
+
+def _hello_ack(frame_id: UUID) -> HelloAckFrame:
+    return HelloAckFrame(
+        id=frame_id,
+        device_name="laptop",
+        config_revision=1,
+        config=DeviceConfigFrame(
+            workspace_path="~/workspace",
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+        ),
+        mcp_catalog=_empty_catalog(),
+    )
 
 
 async def test_dispatch_correlates_result_and_enforces_owner() -> None:
@@ -306,9 +457,935 @@ async def test_unready_registration_is_not_online_or_routable_until_activation()
             timeout_seconds=1,
         )
 
-    assert await registry.activate(handle, "hello_ack") is True
-    assert transport.sent_text == ["hello_ack"]
+    ack = _hello_ack(new_uuid7())
+    activation = asyncio.create_task(registry.activate(handle, ack, timeout_seconds=1))
+    sent = await _wait_for_sent(transport)
+    assert sent["type"] == "hello_ack"
+    assert await registry.is_online(device_id, user_id=user_id) is False
+
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=ack.id, config_revision=1),
+    )
+    assert await activation is True
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "hello_ack",
+        "config_applied_ack",
+    ]
     assert await registry.is_online(device_id, user_id=user_id) is True
+
+
+async def test_activation_accepts_config_applied_before_send_returns() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = ImmediateConfigAppliedTransport(registry=registry)
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        ready=False,
+    )
+    transport.handle = handle
+
+    assert await registry.activate(handle, _hello_ack(new_uuid7()), timeout_seconds=1)
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "hello_ack",
+        "config_applied_ack",
+    ]
+
+
+async def test_config_apply_requires_matching_id_and_revision() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        ready=False,
+    )
+    ack = _hello_ack(new_uuid7())
+    activation = asyncio.create_task(registry.activate(handle, ack, timeout_seconds=1))
+    await _wait_for_sent(transport)
+
+    assert not await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=new_uuid7(), config_revision=1),
+    )
+    assert not await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=ack.id, config_revision=2),
+    )
+    assert await registry.is_online(device_id, user_id=user_id) is False
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=ack.id, config_revision=1),
+    )
+    assert await activation
+
+
+async def test_config_update_is_fenced_until_applied_ack_is_sent() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="old-name",
+        transport=transport,
+    )
+    assert await registry.begin_config_update(device_id=device_id, user_id=user_id)
+    update_id = new_uuid7()
+    update = asyncio.create_task(
+        registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="new-name",
+            config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            config_revision=2,
+            mcp_catalog=_empty_catalog(),
+            frame_id=update_id,
+            expected_handle=handle,
+            timeout_seconds=1,
+        )
+    )
+    await _wait_for_sent(transport)
+    with pytest.raises(DeviceUnavailableError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="old-name",
+            name="list_dir",
+            args={},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=update_id, config_revision=2),
+    )
+    assert await update
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "config_update",
+        "config_applied_ack",
+    ]
+
+
+async def test_config_update_accepts_config_applied_before_send_returns() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = ImmediateConfigAppliedTransport(registry=registry)
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    transport.handle = handle
+    assert await registry.begin_config_update(device_id=device_id, user_id=user_id)
+
+    assert await registry.push_config(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        config=DeviceConfigFrame(
+            workspace_path="~/workspace",
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+        ),
+        config_revision=2,
+        expected_handle=handle,
+        timeout_seconds=1,
+    )
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "config_update",
+        "config_applied_ack",
+    ]
+
+
+async def test_mcp_binding_is_published_only_after_ack_and_dispatch_uses_runtime() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    entry_id = new_uuid7()
+    runtime_generation = new_uuid7()
+    transport = BlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        config_revision=7,
+        catalog_digest="1" * 64,
+    )
+    candidate = McpRegistrationCandidate(
+        ack=RegisterMcpAckFrame(
+            id=new_uuid7(),
+            config_revision=7,
+            catalog_digest="1" * 64,
+            results=[],
+        ),
+        bindings=(
+            AcceptedMcpBinding(
+                name="demo",
+                runtime_generation=runtime_generation,
+                config_revision=7,
+                catalog_digest="1" * 64,
+                entry_ids=(entry_id,),
+            ),
+        ),
+    )
+    route = FrozenMcpEntryRoute(
+        device_id=device_id,
+        device_name="laptop",
+        entry_id=entry_id,
+        config_revision=7,
+        catalog_digest="1" * 64,
+        server="demo",
+        surface="tool",
+        raw_name="search",
+        invocation_identity="search",
+        final_name="mcp_demo_search",
+    )
+
+    registration = asyncio.create_task(registry.publish_mcp_registration(handle, candidate))
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    with pytest.raises(DeviceMcpUnavailableError):
+        await registry.dispatch_mcp_tool(
+            route=route,
+            user_id=user_id,
+            name=route.final_name,
+            args={"query": "x"},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+
+    transport.release_send.set()
+    assert await registration
+    transport.sent.clear()
+    call = asyncio.create_task(
+        registry.dispatch_mcp_tool(
+            route=route,
+            user_id=user_id,
+            name=route.final_name,
+            args={"query": "x"},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+    )
+    payload = await _wait_for_sent(transport)
+    assert payload["mcp_route"] == {
+        "entry_id": str(entry_id),
+        "config_revision": 7,
+        "catalog_digest": "1" * 64,
+        "runtime_generation": str(runtime_generation),
+    }
+    result = ToolResultFrame(id=UUID(str(payload["id"])), content="ok", is_error=False)
+    assert await registry.resolve_tool_result(handle, result)
+    assert await call == result
+
+
+async def test_mcp_epoch_change_before_send_is_reported_as_route_unavailable() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    entry_id = new_uuid7()
+    transport = BlockingTransport()
+    transport.release_send.set()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        config_revision=7,
+        catalog_digest="1" * 64,
+    )
+
+    def candidate(runtime_generation: UUID) -> McpRegistrationCandidate:
+        return McpRegistrationCandidate(
+            ack=RegisterMcpAckFrame(
+                id=new_uuid7(),
+                config_revision=7,
+                catalog_digest="1" * 64,
+                results=[],
+            ),
+            bindings=(
+                AcceptedMcpBinding(
+                    name="demo",
+                    runtime_generation=runtime_generation,
+                    config_revision=7,
+                    catalog_digest="1" * 64,
+                    entry_ids=(entry_id,),
+                ),
+            ),
+        )
+
+    assert await registry.publish_mcp_registration(handle, candidate(new_uuid7()))
+    route = FrozenMcpEntryRoute(
+        device_id=device_id,
+        device_name="laptop",
+        entry_id=entry_id,
+        config_revision=7,
+        catalog_digest="1" * 64,
+        server="demo",
+        surface="tool",
+        raw_name="search",
+        invocation_identity="search",
+        final_name="mcp_demo_search",
+    )
+    transport.release_send.clear()
+    transport.send_started.clear()
+    blocker = asyncio.create_task(registry.send_text(handle, "block"))
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    registration = asyncio.create_task(
+        registry.publish_mcp_registration(handle, candidate(new_uuid7()))
+    )
+    await asyncio.sleep(0)
+    call = asyncio.create_task(
+        registry.dispatch_mcp_tool(
+            route=route,
+            user_id=user_id,
+            name=route.final_name,
+            args={"query": "x"},
+            max_result_bytes=1024,
+            timeout_seconds=1,
+        )
+    )
+    await asyncio.sleep(0)
+
+    transport.release_send.set()
+    assert await blocker
+    assert await registration
+    with pytest.raises(DeviceMcpUnavailableError):
+        await call
+
+
+async def test_config_transition_waits_for_registration_then_pushes() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = BlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        config_revision=7,
+        catalog_digest="1" * 64,
+    )
+    candidate = McpRegistrationCandidate(
+        ack=RegisterMcpAckFrame(
+            id=new_uuid7(),
+            config_revision=7,
+            catalog_digest="1" * 64,
+            results=[],
+        ),
+        bindings=(),
+    )
+    registration = asyncio.create_task(
+        registry.publish_mcp_registration(handle, candidate, timeout_seconds=1)
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    transition = asyncio.create_task(
+        registry.begin_config_update(
+            device_id=device_id,
+            user_id=user_id,
+            expected_handle=handle,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not transition.done()
+
+    transport.release_send.set()
+    assert await registration
+    assert await asyncio.wait_for(transition, timeout=1)
+    update_id = new_uuid7()
+    update = asyncio.create_task(
+        registry.push_config(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            config_revision=8,
+            mcp_catalog=_empty_catalog(),
+            frame_id=update_id,
+            expected_handle=handle,
+            timeout_seconds=1,
+        )
+    )
+    for _ in range(100):
+        if any(json.loads(payload)["type"] == "config_update" for payload in transport.sent_text):
+            break
+        await asyncio.sleep(0)
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(id=update_id, config_revision=8),
+    )
+    assert await update
+
+
+async def test_cancelled_config_transition_wait_does_not_leak_a_fence() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = BlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    candidate = McpRegistrationCandidate(
+        ack=RegisterMcpAckFrame(
+            id=new_uuid7(),
+            config_revision=1,
+            catalog_digest=EMPTY_CATALOG_DIGEST,
+            results=[],
+        ),
+        bindings=(),
+    )
+    registration = asyncio.create_task(
+        registry.publish_mcp_registration(handle, candidate, timeout_seconds=1)
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    transition = asyncio.create_task(
+        registry.begin_config_update(
+            device_id=device_id,
+            user_id=user_id,
+            expected_handle=handle,
+        )
+    )
+    await asyncio.sleep(0)
+    transition.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await transition
+
+    transport.release_send.set()
+    assert await registration
+    assert await registry.begin_config_update(
+        device_id=device_id,
+        user_id=user_id,
+        expected_handle=handle,
+    )
+    await registry.abort_config_update(device_id=device_id, user_id=user_id)
+
+
+async def test_failed_registration_releases_a_waiting_config_transition() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = BlockingFailingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    candidate = McpRegistrationCandidate(
+        ack=RegisterMcpAckFrame(
+            id=new_uuid7(),
+            config_revision=1,
+            catalog_digest=EMPTY_CATALOG_DIGEST,
+            results=[],
+        ),
+        bindings=(),
+    )
+    registration = asyncio.create_task(
+        registry.publish_mcp_registration(handle, candidate, timeout_seconds=1)
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    transition = asyncio.create_task(
+        registry.begin_config_update(
+            device_id=device_id,
+            user_id=user_id,
+            expected_handle=handle,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not transition.done()
+
+    transport.release_send.set()
+    assert not await registration
+    assert not await asyncio.wait_for(transition, timeout=1)
+    assert not await registry.is_online(device_id, user_id=user_id)
+
+
+async def test_validation_late_result_consumes_tombstone_once() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    with pytest.raises(TimeoutError):
+        await registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            validate_servers=("demo",),
+            timeout_seconds=0,
+        )
+    validation = json.loads(transport.sent_text[0])
+    late = ConfigValidateResultFrame(
+        id=UUID(validation["id"]),
+        ok=False,
+        failures=[
+            McpValidationFailure(
+                name="demo",
+                stage="initialize",
+                code="config_validation_failed",
+                message="failed",
+            )
+        ],
+    )
+
+    assert await registry.resolve_config_validate_result(handle, late)
+    assert not await registry.resolve_config_validate_result(handle, late)
+
+
+async def test_config_validation_deadline_includes_blocked_send() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FirstSendBlockingTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            validate_servers=("demo",),
+            timeout_seconds=0.01,
+        )
+    )
+    await asyncio.wait_for(transport.send_started.wait(), timeout=1)
+    try:
+        await asyncio.sleep(0.05)
+        assert validation.done()
+    finally:
+        if not validation.done():
+            validation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await validation
+
+    with pytest.raises(TimeoutError):
+        await validation
+    assert transport.first_send_cancelled.is_set()
+    request = json.loads(transport.attempted_text[0])
+    await asyncio.wait_for(transport.sent.wait(), timeout=1)
+    assert json.loads(transport.sent_text[0]) == {
+        "type": "config_validate_cancel",
+        "id": request["id"],
+    }
+    late = ConfigValidateResultFrame(
+        id=UUID(request["id"]),
+        ok=False,
+        failures=[
+            McpValidationFailure(
+                name="demo",
+                stage="initialize",
+                code="config_validation_failed",
+                message="late",
+            )
+        ],
+    )
+    assert await registry.resolve_config_validate_result(handle, late)
+
+
+async def test_blocked_validation_cancel_retires_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openctopus_server.devices.registry.VALIDATION_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = EverySendBlockingTransport()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            registry.validate_config(
+                device_id=device_id,
+                user_id=user_id,
+                expected_device_name="laptop",
+                base_config_revision=1,
+                candidate_config=DeviceConfigFrame(
+                    workspace_path="~/workspace",
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+                validate_servers=("demo",),
+                timeout_seconds=0.01,
+            ),
+            timeout=0.1,
+        )
+    await asyncio.wait_for(transport.second_send_started.wait(), timeout=1)
+    for _ in range(100):
+        if not await registry.is_online(device_id, user_id=user_id):
+            break
+        await asyncio.sleep(0.01)
+    assert not await registry.is_online(device_id, user_id=user_id)
+
+
+async def test_cancelled_validation_does_not_wait_for_the_cancel_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openctopus_server.devices.registry.VALIDATION_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = EverySendBlockingTransport()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+            ),
+            validate_servers=("demo",),
+        )
+    )
+    await asyncio.wait_for(transport.first_send_started.wait(), timeout=1)
+
+    validation.cancel()
+    await asyncio.wait_for(transport.second_send_started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    cancellation_propagated = validation.done()
+    retired_in_background = not await registry.is_online(device_id, user_id=user_id)
+    transport.release_second_send.set()
+    with pytest.raises(asyncio.CancelledError):
+        await validation
+
+    assert cancellation_propagated
+    assert retired_in_background
+
+
+async def test_config_validation_wire_reveals_secret_only_to_the_wss_device() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+        secret_transport_safe=True,
+    )
+    candidate = DeviceConfigFrame(
+        workspace_path="~/workspace",
+        restrict_to_workspace=True,
+        ssrf_denylist=[],
+        mcp_servers=[
+            StdioMcpServerConfig(
+                name="demo",
+                transport="stdio",
+                command="mcp-demo",
+                env={"TOKEN": "actual-secret"},
+            )
+        ],
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=candidate,
+            validate_servers=("demo",),
+            timeout_seconds=1,
+        )
+    )
+    request = await _wait_for_sent(transport)
+
+    candidate_payload = cast(dict[str, object], request["candidate_config"])
+    servers = cast(list[dict[str, object]], candidate_payload["mcp_servers"])
+    assert servers[0]["env"] == {"TOKEN": "actual-secret"}
+    assert "actual-secret" not in candidate.model_dump_json()
+    result = ConfigValidateResultFrame(
+        id=UUID(str(request["id"])),
+        ok=True,
+        source_catalog=SourceMcpCatalog(
+            version=1,
+            servers=[SourceMcpServerCatalog(name="demo")],
+        ),
+        failures=[],
+    )
+    assert await registry.resolve_config_validate_result(handle, result)
+    assert (await validation).source_catalog == result.source_catalog
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        StdioMcpServerConfig(
+            name="demo",
+            transport="stdio",
+            command="mcp-demo",
+            env={"TOKEN": ""},
+        ),
+        StreamableHttpMcpServerConfig(
+            name="demo",
+            transport="streamable_http",
+            url="https://mcp.example.test",
+            headers={"Authorization": ""},
+        ),
+    ],
+)
+async def test_empty_mcp_secret_values_do_not_require_secure_device_transport(
+    server: StdioMcpServerConfig | StreamableHttpMcpServerConfig,
+) -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    validation = asyncio.create_task(
+        registry.validate_config(
+            device_id=device_id,
+            user_id=user_id,
+            expected_device_name="laptop",
+            base_config_revision=1,
+            candidate_config=DeviceConfigFrame(
+                workspace_path="~/workspace",
+                restrict_to_workspace=True,
+                ssrf_denylist=[],
+                mcp_servers=[server],
+            ),
+            validate_servers=("demo",),
+            timeout_seconds=1,
+        )
+    )
+    request = await _wait_for_sent(transport)
+    result = ConfigValidateResultFrame(
+        id=UUID(str(request["id"])),
+        ok=True,
+        source_catalog=SourceMcpCatalog(
+            version=1,
+            servers=[SourceMcpServerCatalog(name="demo")],
+        ),
+        failures=[],
+    )
+
+    assert await registry.resolve_config_validate_result(handle, result)
+    assert (await validation).source_catalog == result.source_catalog
+
+
+async def test_tombstone_capacity_retires_instead_of_evicting_unknown_ids() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    assert handle is not None
+    for _ in range(65):
+        with pytest.raises(TimeoutError):
+            await registry.validate_config(
+                device_id=device_id,
+                user_id=user_id,
+                expected_device_name="laptop",
+                base_config_revision=1,
+                candidate_config=DeviceConfigFrame(
+                    workspace_path="~/workspace",
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+                validate_servers=("demo",),
+                timeout_seconds=0,
+            )
+    for _ in range(100):
+        if not await registry.is_online(device_id, user_id=user_id):
+            break
+        await asyncio.sleep(0)
+    assert not await registry.is_online(device_id, user_id=user_id)
+
+
+async def test_tool_late_result_consumes_tombstone_and_releases_admission() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    transport = FakeTransport()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=transport,
+    )
+    with pytest.raises(DeviceOutcomeUnknownError):
+        await registry.dispatch_tool(
+            device_id=device_id,
+            user_id=user_id,
+            name="list_dir",
+            args={},
+            max_result_bytes=1024,
+            timeout_seconds=0,
+        )
+    assert registry.pending_count == 0
+    call = json.loads(transport.sent_text[0])
+    late = ToolResultFrame(id=UUID(call["id"]), content="late", is_error=False)
+    assert await registry.resolve_tool_result(handle, late)
+    assert not await registry.resolve_tool_result(handle, late)
+
+
+async def test_tool_tombstone_capacity_retires_the_generation() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    for _ in range(257):
+        with pytest.raises(DeviceOutcomeUnknownError):
+            await registry.dispatch_tool(
+                device_id=device_id,
+                user_id=user_id,
+                name="list_dir",
+                args={},
+                max_result_bytes=1024,
+                timeout_seconds=0,
+            )
+    for _ in range(100):
+        if not await registry.is_online(device_id, user_id=user_id):
+            break
+        await asyncio.sleep(0)
+    assert not await registry.is_online(device_id, user_id=user_id)
+
+
+async def test_close_releases_a_registration_waiting_on_publication_fence() -> None:
+    registry = DeviceRegistry()
+    device_id = uuid4()
+    user_id = uuid4()
+    handle = await registry.register(
+        device_id=device_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    assert await registry.begin_config_update(
+        device_id=device_id,
+        user_id=user_id,
+        expected_handle=handle,
+    )
+    replacement = asyncio.create_task(
+        registry.register(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+    )
+    await asyncio.sleep(0)
+    assert not replacement.done()
+
+    await asyncio.wait_for(registry.close(), timeout=1)
+    assert await asyncio.wait_for(replacement, timeout=1) is None
+
+
+async def test_cancelled_publication_lookup_releases_the_global_lock() -> None:
+    registry = DeviceRegistry()
+    await registry._lock.acquire()
+    registration = asyncio.create_task(
+        registry.register(
+            device_id=uuid4(),
+            user_id=uuid4(),
+            device_name="laptop",
+            transport=FakeTransport(),
+        )
+    )
+    for _ in range(100):
+        if registry._register_lock.locked():
+            break
+        await asyncio.sleep(0)
+    assert registry._register_lock.locked()
+
+    registration.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await registration
+    leaked = registry._register_lock.locked()
+    registry._lock.release()
+    if leaked:
+        registry._register_lock.release()
+
+    assert leaked is False
+    assert await asyncio.wait_for(
+        registry.register(
+            device_id=uuid4(),
+            user_id=uuid4(),
+            device_name="desktop",
+            transport=FakeTransport(),
+        ),
+        timeout=1,
+    ) is not None
 
 
 async def test_live_hello_metadata_follows_the_current_connection_generation() -> None:
@@ -413,27 +1490,27 @@ async def test_config_push_updates_the_current_connection_name() -> None:
     device_id = uuid4()
     user_id = uuid4()
     transport = FakeTransport()
-    await registry.register(
+    handle = await registry.register(
         device_id=device_id,
         user_id=user_id,
         device_name="old-name",
         transport=transport,
     )
+    assert handle is not None
 
-    assert (
-        await registry.push_config(
-            device_id=device_id,
-            user_id=user_id,
-            device_name="new-name",
-            config=DeviceConfigFrame(
-                workspace_path="~/workspace",
-                sandbox_mode=True,
-                ssrf_denylist=[],
-            ),
-        )
-        is True
+    payload = await _push_and_apply(
+        registry,
+        handle,
+        transport,
+        device_id=device_id,
+        user_id=user_id,
+        device_name="new-name",
+        config=DeviceConfigFrame(
+            workspace_path="~/workspace",
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+        ),
     )
-    payload = json.loads(transport.sent_text[-1])
     assert payload["type"] == "config_update"
     assert payload["device_name"] == "new-name"
     with pytest.raises(DeviceUnavailableError):
@@ -446,7 +1523,7 @@ async def test_config_push_updates_the_current_connection_name() -> None:
             max_result_bytes=16_000,
             timeout_seconds=10,
         )
-    assert len(transport.sent_text) == 1
+    assert len(transport.sent_text) == 2
 
 
 async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
@@ -468,13 +1545,16 @@ async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
     )
     assert route is not None
 
-    assert await registry.push_config(
+    await _push_and_apply(
+        registry,
+        handle,
+        transport,
         device_id=device_id,
         user_id=user_id,
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )
@@ -488,7 +1568,10 @@ async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
             max_result_bytes=1024,
             timeout_seconds=1,
         )
-    assert [json.loads(payload)["type"] for payload in transport.sent_text] == ["config_update"]
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "config_update",
+        "config_applied_ack",
+    ]
 
 
 async def test_config_push_send_failure_marks_the_device_offline() -> None:
@@ -509,7 +1592,7 @@ async def test_config_push_send_failure_marks_the_device_offline() -> None:
             device_name="laptop",
             config=DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -539,7 +1622,7 @@ async def test_cancelled_config_push_retires_the_ambiguous_generation(
             device_name="new-name",
             config=DeviceConfigFrame(
                 workspace_path="~/new-workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -559,12 +1642,13 @@ async def test_config_update_precedes_new_name_dispatch_and_blocks_stale_name() 
     device_id = uuid4()
     user_id = uuid4()
     transport = BlockingTransport()
-    await registry.register(
+    handle = await registry.register(
         device_id=device_id,
         user_id=user_id,
         device_name="old-name",
         transport=transport,
     )
+    assert handle is not None
     config_task = asyncio.create_task(
         registry.push_config(
             device_id=device_id,
@@ -572,7 +1656,7 @@ async def test_config_update_precedes_new_name_dispatch_and_blocks_stale_name() 
             device_name="new-name",
             config=DeviceConfigFrame(
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             ),
         )
@@ -604,10 +1688,25 @@ async def test_config_update_precedes_new_name_dispatch_and_blocks_stale_name() 
         )
     )
     transport.release_send.set()
+    for _ in range(100):
+        if transport.sent_text:
+            break
+        await asyncio.sleep(0)
+    update = json.loads(transport.sent_text[0])
+    assert await registry.resolve_config_applied(
+        handle,
+        ConfigAppliedFrame(
+            id=UUID(update["id"]),
+            config_revision=update["config_revision"],
+        ),
+    )
     assert await config_task is True
     with pytest.raises(DeviceUnavailableError):
         await stale
-    assert [json.loads(payload)["type"] for payload in transport.sent_text] == ["config_update"]
+    assert [json.loads(payload)["type"] for payload in transport.sent_text] == [
+        "config_update",
+        "config_applied_ack",
+    ]
 
 
 async def test_revoke_serializes_with_replacement_and_revokes_the_current_generation() -> None:
@@ -998,13 +2097,16 @@ async def test_config_push_preserves_active_transfer_and_rejects_stale_new_route
     ):
         await asyncio.sleep(0)
 
-    assert await registry.push_config(
+    await _push_and_apply(
+        registry,
+        handle,
+        transport,
         device_id=device_id,
         user_id=user_id,
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )
@@ -1089,13 +2191,16 @@ async def test_config_push_fences_an_unissued_transfer_preflight() -> None:
     )
     await source_factory_started.wait()
 
-    assert await registry.push_config(
+    await _push_and_apply(
+        registry,
+        handle,
+        transport,
         device_id=device_id,
         user_id=user_id,
         device_name="laptop",
         config=DeviceConfigFrame(
             workspace_path="~/different-workspace",
-            sandbox_mode=True,
+            restrict_to_workspace=True,
             ssrf_denylist=[],
         ),
     )
@@ -1265,7 +2370,7 @@ async def test_close_does_not_wait_for_inbound_transfer_backpressure(
     assert await inbound is False
 
 
-async def test_disconnect_and_timeout_keep_issued_calls_until_late_result() -> None:
+async def test_timeout_releases_issued_call_admission_and_accepts_one_late_result() -> None:
     registry = DeviceRegistry()
     device_id = uuid4()
     user_id = uuid4()
@@ -1290,7 +2395,7 @@ async def test_disconnect_and_timeout_keep_issued_calls_until_late_result() -> N
 
     with pytest.raises(DeviceOutcomeUnknownError):
         await timed_out
-    assert registry.pending_count == 1
+    assert registry.pending_count == 0
     late = ToolResultFrame(
         id=UUID(str(payload["id"])),
         content="late",

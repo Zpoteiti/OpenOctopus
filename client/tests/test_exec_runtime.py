@@ -19,9 +19,12 @@ from openoctopus_client.connection import (
 from openoctopus_client.exec_sessions import ExecPolicy, ExecStart, ExecWrite
 from openoctopus_client.process import ShellInventory
 from openoctopus_client.protocol import (
+    ConfigAppliedAck,
     ConfigUpdate,
     DeviceConfig,
     Hello,
+    HelloAck,
+    PersistedMcpCatalog,
     ShellMetadata,
     ToolCall,
     ToolResult,
@@ -34,6 +37,12 @@ _CALL_ID = UUID("0190d5a7-0000-7000-8000-000000000002")
 _UPDATE_ID = UUID("0190d5a7-0000-7000-8000-000000000003")
 _CHAT_ID = UUID("00000000-0000-4000-8000-000000000004")
 _SHELLS = ShellInventory(default="bash", available=("bash", "sh"))
+_EMPTY_MCP_CATALOG = PersistedMcpCatalog(
+    version=1,
+    digest="d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf",
+    servers=[],
+)
+_EMPTY_MCP_CATALOG_JSON = _EMPTY_MCP_CATALOG.model_dump(mode="json")
 
 
 def _environment() -> dict[str, str]:
@@ -55,7 +64,7 @@ def _hello() -> Hello:
 def _config(workspace: Path, *, timeout: int = 600) -> DeviceConfig:
     return DeviceConfig(
         workspace_path=str(workspace),
-        sandbox_mode=False,
+        restrict_to_workspace=False,
         ssrf_denylist=[],
         shell_timeout_max=timeout,
         env_allowlist=["PATH", "HOME"],
@@ -101,14 +110,25 @@ class _Socket:
         self.frames = frames
         self.sent: list[str] = []
         self._result_sent = asyncio.Event()
+        self._config_acks: list[str] = []
 
     async def send(self, payload: str | bytes) -> None:
         assert isinstance(payload, str)
         self.sent.append(payload)
-        if json.loads(payload).get("type") == "tool_result":
+        frame = json.loads(payload)
+        if frame.get("type") == "config_applied":
+            self._config_acks.append(
+                ConfigAppliedAck(
+                    id=UUID(frame["id"]),
+                    config_revision=frame["config_revision"],
+                ).model_dump_json()
+            )
+        if frame.get("type") == "tool_result":
             self._result_sent.set()
 
     async def recv(self) -> str | None:
+        if self._config_acks:
+            return self._config_acks.pop(0)
         if self.frames:
             return self.frames.pop(0)
         await asyncio.wait_for(self._result_sent.wait(), 1)
@@ -119,14 +139,13 @@ class _Socket:
 
 
 def _ack(workspace: Path, *, timeout: int = 600) -> str:
-    return json.dumps(
-        {
-            "type": "hello_ack",
-            "id": str(_HELLO_ID),
-            "device_name": "devbox",
-            "config": _config(workspace, timeout=timeout).model_dump(mode="json"),
-        }
-    )
+    return HelloAck(
+        id=_HELLO_ID,
+        device_name="devbox",
+        config_revision=1,
+        config=_config(workspace, timeout=timeout),
+        mcp_catalog=_EMPTY_MCP_CATALOG,
+    ).model_dump_json()
 
 
 def _exec_call() -> str:
@@ -184,7 +203,9 @@ async def test_runtime_binds_file_calls_after_config_update_to_the_new_config(
             "type": "config_update",
             "id": str(_UPDATE_ID),
             "device_name": "devbox",
+            "config_revision": 2,
             "config": _config(tmp_path, timeout=120).model_dump(mode="json"),
+            "mcp_catalog": _EMPTY_MCP_CATALOG_JSON,
         }
     )
     file_call = ToolCall(
@@ -239,7 +260,9 @@ async def test_exec_family_is_busy_immediately_during_config_activation(
     update = ConfigUpdate(
         id=_UPDATE_ID,
         device_name="devbox",
+        config_revision=2,
         config=_config(tmp_path, timeout=120),
+        mcp_catalog=_EMPTY_MCP_CATALOG,
     ).model_dump_json()
     call = ToolCall(
         id=_CALL_ID,
@@ -250,6 +273,8 @@ async def test_exec_family_is_busy_immediately_during_config_activation(
     ).model_dump_json()
     class _BlockingSocket(_Socket):
         async def recv(self) -> str | None:
+            if self._config_acks:
+                return self._config_acks.pop(0)
             if self.frames:
                 return self.frames.pop(0)
             await release_policy.wait()

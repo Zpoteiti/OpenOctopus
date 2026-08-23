@@ -370,7 +370,7 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
                 token_hash=b"d" * 32,
                 token_hint="openoctopus_dev_...device",
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         db.add(device)

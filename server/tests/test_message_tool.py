@@ -196,7 +196,7 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
                 token_hash=b"x" * 32,
                 token_hint="openoctopus_dev_...token",
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         db.add(device)
@@ -244,7 +244,7 @@ async def test_message_rejects_a_reused_device_name_from_provider_turn_snapshot(
                 token_hash=b"z" * 32,
                 token_hint="openoctopus_dev_...replacement",
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         )
@@ -278,7 +278,7 @@ async def test_message_does_not_accept_another_users_device(pg_engine) -> None:
                 token_hash=b"y" * 32,
                 token_hint="openoctopus_dev_...other",
                 workspace_path="~/workspace",
-                sandbox_mode=True,
+                restrict_to_workspace=True,
                 ssrf_denylist=[],
             )
         )

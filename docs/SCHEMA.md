@@ -44,6 +44,7 @@ unsupported keys return `400 Bad Request`):
 | `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
 | `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, `llm_max_context_tokens` is required and the value must be `4001 <= threshold < max_context_tokens`. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
+| `web_fetch_denylist` | array of strings | ADR-133 | Effective Server `web_fetch` denylist. Missing uses the private/reserved/metadata default; explicit `[]` allows all otherwise-valid HTTP(S) targets. PATCH validates and canonicalizes the complete list before writing, and later fetches read the current value without a restart. |
 
 Reserved/future known keys (not PATCH-editable until their milestone):
 
@@ -52,9 +53,9 @@ Reserved/future known keys (not PATCH-editable until their milestone):
 | `server_mcp` | array of `McpServerConfig` | ADR-114 | Admin-configured shared-service MCPs exposed as install site `server`; shared credentials, one runtime per MCP, bounded queue. |
 
 Bootstrap does not seed `system_config` rows. Fresh `GET /api/admin/config`
-therefore returns the effective quota defaults and
-`llm_max_output_tokens=16384`, while omitting the unconfigured LLM identity and
-context/compaction/concurrency keys until an admin writes values. Deployments
+therefore returns the effective quota defaults, `llm_max_output_tokens=16384`,
+and the effective canonical `web_fetch_denylist`, while omitting the unconfigured
+LLM identity and context/compaction/concurrency keys until an admin writes values. Deployments
 may carry additional opaque keys inserted outside the admin API; OpenOctopus
 ignores them in the admin config view. `PATCH /api/admin/config` rejects keys
 outside the admin-editable table above, including `server_mcp` and
@@ -339,12 +340,16 @@ CREATE TABLE IF NOT EXISTS devices (
     user_id            UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name               TEXT         NOT NULL CHECK (char_length(name) <= 64 AND name ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND name <> 'server'),
     workspace_path     TEXT         NOT NULL,
-    sandbox_mode       BOOLEAN      NOT NULL DEFAULT TRUE,
+    restrict_to_workspace BOOLEAN   NOT NULL DEFAULT TRUE,
     shell_timeout_max  INTEGER      NOT NULL DEFAULT 600 CHECK (shell_timeout_max BETWEEN 0 AND 86400),
     ssrf_denylist      JSONB        NOT NULL DEFAULT
-        '["0.0.0.0/8","127.0.0.0/8","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","169.254.169.254/32","fc00::/7","fe80::/10","ff00::/8"]'::jsonb,
+        '["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/29","192.0.0.8/32","192.0.0.11/32","192.0.0.12/30","192.0.0.16/28","192.0.0.32/27","192.0.0.64/26","192.0.0.128/25","192.0.2.0/24","192.88.99.2/32","192.168.0.0/16","198.18.0.0/15","198.51.100.0/24","203.0.113.0/24","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","::ffff:0.0.0.0/96","64:ff9b:1::/48","100::/64","100:0:0:1::/64","2001::/32","2001:1::/128","2001:1::4/126","2001:1::8/125","2001:1::10/124","2001:1::20/123","2001:1::40/122","2001:1::80/121","2001:1::100/120","2001:1::200/119","2001:1::400/118","2001:1::800/117","2001:1::1000/116","2001:1::2000/115","2001:1::4000/114","2001:1::8000/113","2001:1::1:0/112","2001:1::2:0/111","2001:1::4:0/110","2001:1::8:0/109","2001:1::10:0/108","2001:1::20:0/107","2001:1::40:0/106","2001:1::80:0/105","2001:1::100:0/104","2001:1::200:0/103","2001:1::400:0/102","2001:1::800:0/101","2001:1::1000:0/100","2001:1::2000:0/99","2001:1::4000:0/98","2001:1::8000:0/97","2001:1::1:0:0/96","2001:1::2:0:0/95","2001:1::4:0:0/94","2001:1::8:0:0/93","2001:1::10:0:0/92","2001:1::20:0:0/91","2001:1::40:0:0/90","2001:1::80:0:0/89","2001:1::100:0:0/88","2001:1::200:0:0/87","2001:1::400:0:0/86","2001:1::800:0:0/85","2001:1::1000:0:0/84","2001:1::2000:0:0/83","2001:1::4000:0:0/82","2001:1::8000:0:0/81","2001:1:0:0:1::/80","2001:1:0:0:2::/79","2001:1:0:0:4::/78","2001:1:0:0:8::/77","2001:1:0:0:10::/76","2001:1:0:0:20::/75","2001:1:0:0:40::/74","2001:1:0:0:80::/73","2001:1:0:0:100::/72","2001:1:0:0:200::/71","2001:1:0:0:400::/70","2001:1:0:0:800::/69","2001:1:0:0:1000::/68","2001:1:0:0:2000::/67","2001:1:0:0:4000::/66","2001:1:0:0:8000::/65","2001:1:0:1::/64","2001:1:0:2::/63","2001:1:0:4::/62","2001:1:0:8::/61","2001:1:0:10::/60","2001:1:0:20::/59","2001:1:0:40::/58","2001:1:0:80::/57","2001:1:0:100::/56","2001:1:0:200::/55","2001:1:0:400::/54","2001:1:0:800::/53","2001:1:0:1000::/52","2001:1:0:2000::/51","2001:1:0:4000::/50","2001:1:0:8000::/49","2001:1:1::/48","2001:1:2::/47","2001:1:4::/46","2001:1:8::/45","2001:1:10::/44","2001:1:20::/43","2001:1:40::/42","2001:1:80::/41","2001:1:100::/40","2001:1:200::/39","2001:1:400::/38","2001:1:800::/37","2001:1:1000::/36","2001:1:2000::/35","2001:1:4000::/34","2001:1:8000::/33","2001:2::/32","2001:4::/40","2001:4:100::/44","2001:4:110::/47","2001:4:113::/48","2001:4:114::/46","2001:4:118::/45","2001:4:120::/43","2001:4:140::/42","2001:4:180::/41","2001:4:200::/39","2001:4:400::/38","2001:4:800::/37","2001:4:1000::/36","2001:4:2000::/35","2001:4:4000::/34","2001:4:8000::/33","2001:5::/32","2001:6::/31","2001:8::/29","2001:10::/28","2001:40::/26","2001:80::/25","2001:100::/24","2001:db8::/32","2002::/16","3fff::/20","5f00::/16","fc00::/7","fe80::/10","ff00::/8"]'::jsonb,
     env_allowlist      JSONB        NOT NULL DEFAULT
         '["PATH","HOME","LANG","TERM","SystemRoot","ComSpec","PATHEXT","TEMP","TMP","USERPROFILE"]'::jsonb,
+    mcp_servers        JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    mcp_catalog        JSONB        NOT NULL DEFAULT
+        '{"version":1,"digest":"d5f4bb30627f342c5625dfe6a6d7a282874bd8121b32dbdd2004756e4b1ad8cf","servers":[]}'::jsonb,
+    config_revision    BIGINT       NOT NULL DEFAULT 1 CHECK (config_revision >= 1),
     token_hash         BYTEA        NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
     token_hint         TEXT         NOT NULL,
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -356,13 +361,26 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 
 - `id` is the immutable internal device identity. `token_hash` is the unique credential lookup key (ADR-131), stored as the 32-byte SHA-256 digest of the bearer token; the server never stores plaintext. `token_hint` is the non-secret prefix/suffix hint generated at issuance; REST returns the plaintext token only from create/regenerate responses.
 - `name` is the REST/tool-routing canonical slug. It is UNIQUE per user, so the URL `PATCH /api/devices/laptop/config` resolves to `(user_id, "laptop")` without ever touching the token. Raw create/rename input is canonicalized server-side: NFC normalize, trim, ASCII-lowercase, convert whitespace runs to a single hyphen, then require `^[a-z0-9]+(-[a-z0-9]+)*$`. Stored names are at most 64 characters and use only lowercase ASCII letters, digits, and hyphens. The literal name `server` is reserved for OpenOctopus's built-in server install site and is rejected for user devices after canonicalization.
-- `sandbox_mode` — the per-device privilege switch. `true` is the default restricted profile: client file tools and Workspace Files REST routes must stay inside `workspace_path`, and client `web_fetch` applies `ssrf_denylist`. `false` is the trusted-device profile: client file tools may address paths outside `workspace_path`, and internal/private network access is allowed unless the user keeps explicit deny entries. This is a persisted device property; sessions cannot temporarily override it.
-- `ssrf_denylist` — JSONB array of CIDRs, hosts, or `host:port` entries rejected by client-site `web_fetch`. Default sandbox devices are seeded with private/reserved ranges plus common metadata-service addresses; trusted devices (`sandbox_mode=false`) created without an explicit value store `[]`. Users remove entries to permit an internal target rather than guessing a whitelist entry. Server-site `web_fetch` keeps its hardcoded block-list and ignores this column (ADR-052).
-- Py6 persists `shell_timeout_max` and `env_allowlist` for client-only exec.
+- `restrict_to_workspace` — when true, OpenOctopus-resolved Client file paths and exec/PTY initial `working_dir` must stay inside `workspace_path`; when false, absolute paths outside it are allowed. Relative paths still resolve from the workspace in both modes. This is application path policy, not an OS sandbox: shell commands and stdio MCP retain the Device user's filesystem and network access.
+- `ssrf_denylist` — JSONB array of CIDRs, hosts, or `host:port` entries rejected by client-site `web_fetch`, independent of `restrict_to_workspace`. Omitted create input uses the private/reserved/metadata default; explicit `[]` permits internal targets. Server-site `web_fetch` reads its separate admin `system_config.web_fetch_denylist`.
+- `shell_timeout_max` and `env_allowlist` configure client-only exec.
   `shell_timeout_max` is the per-device hard process lifetime cap; zero permits
   only explicitly bounded `timeout=0` calls. `env_allowlist` is an exact-name
   parent-environment allowlist and every `OPENOCTOPUS_*` name is rejected.
-  Py6 has no `command_denylist` or MCP device columns.
+  There is no command denylist or exec network filter.
+- `mcp_servers` — authoritative Py7 Device MCP configuration for at most 16
+  uniquely named stdio, Streamable HTTP, or SSE servers. Stdio `env` and remote
+  `headers` are deliberately stored as reversible plaintext in PostgreSQL;
+  REST responses preserve the keys but replace every value with
+  `"<redacted>"`.
+- `mcp_catalog` — the complete bounded last-good discovery snapshot for tools,
+  static resources, resource templates, and prompts. It contains disabled
+  entries and immutable UUIDv7 route identities, but no MCP secret values.
+  Provider schemas are built from this durable catalog even while a Device is
+  offline; dispatch then returns `tool_device_unreachable`.
+- `config_revision` — monotonically increases for every effective Device
+  config or name change. MCP config and its matching last-good catalog commit
+  atomically at the same revision.
 - **Online state is in-memory only** — no `online` / `last_seen_at` columns; the connected-WS registry keyed by immutable device ID is the source of truth. The `Device` API response computes `online` on demand. Three device states per ADR-110: state-1 (online, in-registry), state-2 (offline-but-paired, row exists, not in registry — listed in `openoctopus_device` enum so the agent can still attempt and fail loudly), state-3 (deleted — row gone, in-memory entry gone, live WS force-closed, tool registry invalidated; complete wipe with no soft-delete tombstone).
 - **No inbound FKs reference `devices`** from other tables. This keeps token regeneration and device deletion local to one row. State-3 transition is a single-row DELETE; cascades from `users.id` are the only path that takes multiple device rows out at once (account deletion). If a future milestone adds durable tables that reference devices, revisit ADR-091 before adding those FKs.
 - `workspace_path` default is the literal string `~/openoctopus/workspace` on every OS (ADR-111) when omitted from `POST /api/devices`. Explicit overrides and PATCH updates must be non-empty strings and are stored verbatim. The server does not expand `~` or check client disk existence; the client expands `~` against its own home dir and creates/reports the path at startup or config-update time.

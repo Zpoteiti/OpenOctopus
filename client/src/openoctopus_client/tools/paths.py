@@ -9,15 +9,15 @@ from openoctopus_client.tools.common import ToolFailure
 
 
 class WorkspacePaths:
-    def __init__(self, workspace: Path, *, sandbox_mode: bool) -> None:
+    def __init__(self, workspace: Path, *, restrict_to_workspace: bool) -> None:
         # Resolve only after checking the configured root itself and every
         # existing parent.  Resolving first would silently accept a symlinked
-        # workspace root and make the sandbox boundary point somewhere else.
+        # workspace root and make the restriction boundary point somewhere else.
         self._check_existing_components(workspace)
         if _is_reparse_or_symlink(workspace):
             raise ToolFailure("workspace_symlink_escape", "Workspace root must not be a link")
         self._root = workspace.resolve(strict=True)
-        self._sandbox_mode = sandbox_mode
+        self._restrict_to_workspace = restrict_to_workspace
 
     @property
     def root(self) -> Path:
@@ -32,7 +32,7 @@ class WorkspacePaths:
         self._check_existing_components(candidate)
         resolved_parent, tail = self._closest_existing_parent(candidate)
         resolved = resolved_parent.joinpath(*tail)
-        if self._sandbox_mode and not _is_within(resolved, self._root):
+        if self._restrict_to_workspace and not _is_within(resolved, self._root):
             raise ToolFailure("tool_path_outside_workspace", "Path is outside the workspace")
         if candidate.exists() or candidate.is_symlink():
             self._require_kind(candidate, directory)
@@ -48,7 +48,9 @@ class WorkspacePaths:
         for item in reversed(missing):
             item.mkdir()
             self._check_existing_components(item)
-        if self._sandbox_mode and not _is_within(path.parent.resolve(strict=True), self._root):
+        if self._restrict_to_workspace and not _is_within(
+            path.parent.resolve(strict=True), self._root
+        ):
             raise ToolFailure("tool_path_outside_workspace", "Path is outside the workspace")
 
     def _closest_existing_parent(self, candidate: Path) -> tuple[Path, tuple[str, ...]]:
