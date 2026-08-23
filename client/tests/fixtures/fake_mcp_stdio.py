@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from typing import Any
+
+if os.environ.get("MCP_FROZEN_SMOKE_SENTINEL") == "openoctopus-mcp-stdio-smoke":
+    # Keep the test child observable across process-tree polling and scheduler jitter.
+    time.sleep(0.5)
 
 
 def _result(request_id: object, result: dict[str, Any]) -> None:
