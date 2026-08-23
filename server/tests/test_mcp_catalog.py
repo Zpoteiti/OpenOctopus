@@ -239,6 +239,16 @@ def test_filter_precedes_collision_and_built_in_reservation() -> None:
     assert built_in.value.code == "mcp_within_server_collision"
 
 
+def test_disabled_duplicate_logical_source_identity_is_rejected_on_every_build() -> None:
+    source = _source()
+    source.servers[0].tools.append(deepcopy(source.servers[0].tools[0]))
+
+    for _ in range(2):
+        with pytest.raises(McpCatalogError) as captured:
+            _build([_config(enabled=[])], source)
+        assert captured.value.code == "config_validation_failed"
+
+
 def test_partial_source_catalog_reuses_unchanged_persisted_servers() -> None:
     original_source = SourceMcpCatalog(
         version=1,

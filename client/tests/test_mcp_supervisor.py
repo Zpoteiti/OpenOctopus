@@ -119,6 +119,7 @@ class _FakeRuntime:
         self.allow_start = asyncio.Event()
         self.closed = False
         self.invocations: list[tuple[UUID, Mapping[str, Any], UUID]] = []
+        self.result_credits: list[tuple[UUID, int]] = []
         self.invoked = asyncio.Event()
         self.allow_invoke = asyncio.Event()
         self.allow_invoke.set()
@@ -151,8 +152,11 @@ class _FakeRuntime:
         arguments: Mapping[str, Any],
         *,
         runtime_generation: UUID,
+        request_id: UUID,
+        max_result_bytes: int,
     ) -> ToolOutput:
         self.invocations.append((entry_id, arguments, runtime_generation))
+        self.result_credits.append((request_id, max_result_bytes))
         self.invoked.set()
         await self.allow_invoke.wait()
         return ToolOutput("ok")
@@ -1059,6 +1063,7 @@ def test_dispatch_requires_exact_accepted_route_identity() -> None:
             ),
         )
         assert (await supervisor.invoke(call)).content == "ok"
+        assert runtime.result_credits == [(call.id, call.max_result_bytes)]
 
         stale = call.model_copy(
             update={
@@ -1071,6 +1076,59 @@ def test_dispatch_requires_exact_accepted_route_identity() -> None:
         assert rejected.is_error
         assert rejected.code == "tool_mcp_unavailable"
         assert len(runtime.invocations) == 1
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_reserved_call_uses_issued_generation_after_replacement() -> None:
+    async def exercise() -> None:
+        factory = _RuntimeFactory()
+        entry_id = new_uuid7()
+        catalog = _catalog(_persisted("corp", entry_id))
+        supervisor = McpSupervisor(runtime_factory=factory, drain_seconds=60)
+        supervisor.attach_connection()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(_config("corp", command="one")),
+            catalog=catalog,
+        )
+        first = factory.created[0]
+        await _ready_registration(supervisor, first)
+        first.allow_invoke.clear()
+
+        lease = supervisor.reserve_invocation(
+            ToolCall(
+                id=new_uuid7(),
+                name="mcp_corp_echo",
+                args={"value": "issued"},
+                max_result_bytes=4096,
+                mcp_route=McpRoute(
+                    entry_id=entry_id,
+                    config_revision=1,
+                    catalog_digest=catalog.digest,
+                    runtime_generation=first.generation,
+                ),
+            )
+        )
+        await supervisor.activate_authoritative(
+            revision=2,
+            config=_device_config(_config("corp", command="two")),
+            catalog=catalog,
+        )
+        await asyncio.sleep(0)
+        assert not first.closed
+
+        invocation = asyncio.create_task(lease.invoke())
+        await first.invoked.wait()
+        first.allow_invoke.set()
+        assert (await invocation).content == "ok"
+        for _attempt in range(20):
+            if first.closed:
+                break
+            await asyncio.sleep(0)
+        assert first.closed
+        assert first.invocations == [(entry_id, {"value": "issued"}, first.generation)]
         await supervisor.shutdown()
 
     asyncio.run(exercise())
@@ -1089,8 +1147,11 @@ def test_invoke_cleanup_blocker_prevents_same_remote_sink_validation() -> None:
                 arguments: Mapping[str, Any],
                 *,
                 runtime_generation: UUID,
+                request_id: UUID,
+                max_result_bytes: int,
             ) -> ToolOutput:
                 self.invocations.append((entry_id, arguments, runtime_generation))
+                self.result_credits.append((request_id, max_result_bytes))
                 self.state = McpRuntimeState.CLEANUP_BLOCKED
                 self.code = "mcp_cleanup_incomplete"
                 return ToolOutput(

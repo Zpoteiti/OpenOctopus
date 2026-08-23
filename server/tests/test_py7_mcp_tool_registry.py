@@ -249,9 +249,14 @@ async def test_registry_maps_mcp_route_and_availability_failures(
 
 
 @pytest.mark.asyncio
-async def test_registry_rejects_unknown_or_malformed_mcp_calls_before_dispatch() -> None:
+async def test_registry_rejects_unknown_mcp_but_forwards_schema_invalid_arguments() -> None:
     dispatcher = _McpDispatcher()
-    registry = ToolRegistry(())
+
+    async def route_is_current(user_id: UUID, route: FrozenMcpEntryRoute) -> bool:
+        del user_id, route
+        return True
+
+    registry = ToolRegistry((), mcp_route_resolver=route_is_current)
 
     unknown = await registry.execute(
         name="mcp_demo_missing",
@@ -269,14 +274,19 @@ async def test_registry_rejects_unknown_or_malformed_mcp_calls_before_dispatch()
     )
 
     assert unknown.code is ErrorCode.TOOL_INVALID_ARGS
-    assert malformed.code is ErrorCode.TOOL_MISSING_REQUIRED_FIELD
-    assert dispatcher.calls == []
+    assert malformed.is_error is False
+    assert dispatcher.calls[0]["args"] == {}
 
 
 @pytest.mark.asyncio
-async def test_registry_does_not_echo_provider_controlled_mcp_field_names() -> None:
+async def test_registry_forwards_unknown_mcp_fields_to_mcp_server() -> None:
     dispatcher = _McpDispatcher()
-    registry = ToolRegistry(())
+
+    async def route_is_current(user_id: UUID, route: FrozenMcpEntryRoute) -> bool:
+        del user_id, route
+        return True
+
+    registry = ToolRegistry((), mcp_route_resolver=route_is_current)
     untrusted_field = "secret-" + "x" * 20_000
 
     result = await registry.execute(
@@ -291,10 +301,8 @@ async def test_registry_does_not_echo_provider_controlled_mcp_field_names() -> N
         device_registry=dispatcher,
     )
 
-    assert result.code is ErrorCode.TOOL_INVALID_ARGS
-    assert untrusted_field not in str(result.content)
-    assert len(str(result.content)) < 1_000
-    assert dispatcher.calls == []
+    assert result.is_error is False
+    assert dispatcher.calls[0]["args"] == {"query": "octopus", untrusted_field: "value"}
 
 
 @pytest.mark.asyncio

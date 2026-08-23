@@ -23,7 +23,7 @@ from websockets.asyncio.client import connect
 from openoctopus_client import __version__
 from openoctopus_client.config import ClientConfiguration
 from openoctopus_client.exec_sessions import ExecPolicy, ExecSessionManager
-from openoctopus_client.mcp.supervisor import McpSupervisor
+from openoctopus_client.mcp.supervisor import McpInvocationLease, McpSupervisor
 from openoctopus_client.process import ShellInventory, discover_shells
 from openoctopus_client.protocol import (
     EXEC_TOOL_NAMES,
@@ -129,6 +129,9 @@ class _McpToolDispatcher:
     async def execute_call(self, call: ToolCall) -> ToolOutput:
         return await self._supervisor.invoke(call)
 
+    def reserve_invocation(self, call: ToolCall) -> McpInvocationLease:
+        return self._supervisor.reserve_invocation(call)
+
 
 class _RetryableConfigError(RuntimeError):
     """A local device configuration could not be prepared safely."""
@@ -175,6 +178,7 @@ class _QueuedToolCall:
     call: ToolCall
     dispatcher: _QueuedToolDispatcher
     retained_bytes: int
+    mcp_invocation: McpInvocationLease | None = None
 
 
 class _ToolWorker:
@@ -202,8 +206,18 @@ class _ToolWorker:
             return False
         if not any(item is dispatcher for item in self._dispatchers):
             self._dispatchers.append(dispatcher)
+        mcp_invocation = (
+            dispatcher.reserve_invocation(call)
+            if isinstance(dispatcher, _McpToolDispatcher)
+            else None
+        )
         self._queue.put_nowait(
-            _QueuedToolCall(call=call, dispatcher=dispatcher, retained_bytes=retained_bytes)
+            _QueuedToolCall(
+                call=call,
+                dispatcher=dispatcher,
+                retained_bytes=retained_bytes,
+                mcp_invocation=mcp_invocation,
+            )
         )
         self._retained_bytes += retained_bytes
         return True
@@ -254,6 +268,8 @@ class _ToolWorker:
             )
         while not self._queue.empty():
             request = self._queue.get_nowait()
+            if request.mcp_invocation is not None:
+                request.mcp_invocation.release()
             self._retained_bytes -= request.retained_bytes
             self._queue.task_done()
         return stopped
@@ -264,10 +280,10 @@ class _ToolWorker:
                 request = await self._queue.get()
                 self._active = True
                 try:
-                    if isinstance(request.dispatcher, _McpToolDispatcher):
+                    if request.mcp_invocation is not None:
                         invocation = self._runtime._start_mcp_tool(
                             request.call,
-                            request.dispatcher,
+                            request.mcp_invocation,
                         )
                         result = await asyncio.shield(invocation)
                     else:
@@ -458,8 +474,11 @@ class ClientRuntime:
                     pass
             return 0
         finally:
-            await self._shutdown_exec_sessions()
-            await self._shutdown_mcp()
+            self._arm_shutdown_watchdog()
+            await asyncio.gather(
+                self._shutdown_exec_sessions(),
+                self._shutdown_mcp(),
+            )
             if not self._shutdown_cleanup_incomplete:
                 self._cancel_shutdown_watchdog()
             for signum in installed_signals:
@@ -1219,21 +1238,33 @@ class ClientRuntime:
     def _start_mcp_tool(
         self,
         call: ToolCall,
-        dispatcher: _McpToolDispatcher,
+        invocation: McpInvocationLease,
     ) -> asyncio.Task[ToolResult]:
         task = asyncio.create_task(
-            self._run_tool(call, dispatcher),
+            self._run_reserved_mcp_tool(call, invocation),
             name=f"mcp-tool-{call.id}",
         )
         self._mcp_invocation_tasks.add(task)
-        task.add_done_callback(self._mcp_tool_done)
+        task.add_done_callback(lambda completed: self._mcp_tool_done(completed, invocation))
         return task
 
-    def _mcp_tool_done(self, task: asyncio.Task[ToolResult]) -> None:
+    def _mcp_tool_done(
+        self,
+        task: asyncio.Task[ToolResult],
+        invocation: McpInvocationLease,
+    ) -> None:
+        invocation.release()
         self._mcp_invocation_tasks.discard(task)
         if not task.cancelled():
             with contextlib.suppress(BaseException):
                 task.exception()
+
+    async def _run_reserved_mcp_tool(
+        self,
+        call: ToolCall,
+        invocation: McpInvocationLease,
+    ) -> ToolResult:
+        return self._result_with_credit(call, await invocation.invoke())
 
     @staticmethod
     def _result_with_credit(call: ToolCall, output: ToolOutput) -> ToolResult:

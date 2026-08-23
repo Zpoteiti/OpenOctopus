@@ -529,6 +529,29 @@ def test_web_fetch_hostname_denylist_is_case_insensitive(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    ("url", "entry"),
+    [
+        ("http://internal.example:8080/", "internal.example:8080"),
+        ("http://[2001:db8::1]:8080/", "[2001:db8::1]:8080"),
+    ],
+)
+def test_web_fetch_host_port_denylist_supports_dns_and_ipv6(
+    tmp_path: Path,
+    url: str,
+    entry: str,
+) -> None:
+    tools = ClientToolDispatcher(
+        tmp_path,
+        restrict_to_workspace=True,
+        ssrf_denylist=[entry],
+    )
+
+    output = _run(tools, "web_fetch", url=url, maxChars=100)
+
+    assert output.code == "network_ssrf_blocked"
+
+
+@pytest.mark.parametrize(
     ("url", "resolved"),
     [
         ("http://[::ffff:127.0.0.1]:9/", "::ffff:127.0.0.1"),

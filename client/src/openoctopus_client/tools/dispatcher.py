@@ -1419,7 +1419,7 @@ async def _validated_addresses(host: str, port: int, denylist: tuple[str, ...]) 
 
 
 def _denied_host(host: str, port: int, denylist: tuple[str, ...]) -> bool:
-    endpoint = f"{host}:{port}"
+    endpoint = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     return any(entry.lower() in {host, endpoint} for entry in denylist)
 
 

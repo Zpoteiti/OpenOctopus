@@ -94,6 +94,43 @@ class _RegistrationRequest:
     desired: bytes
 
 
+@dataclass(slots=True)
+class McpInvocationLease:
+    """Keep one issued MCP call bound to its accepted runtime generation."""
+
+    _supervisor: McpSupervisor
+    _call: ToolCall
+    _slot: _RuntimeSlot | None = None
+    _entry_id: UUID | None = None
+    _failure: ToolOutput | None = None
+    _claimed: bool = False
+    _released: bool = False
+
+    async def invoke(self) -> ToolOutput:
+        if self._claimed or self._released:
+            raise RuntimeError("MCP invocation lease was already consumed")
+        self._claimed = True
+        try:
+            if self._failure is not None:
+                return self._failure
+            assert self._slot is not None
+            assert self._entry_id is not None
+            return await self._supervisor._invoke_reserved(
+                self._call,
+                self._slot,
+                self._entry_id,
+            )
+        finally:
+            self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._slot is not None:
+            self._supervisor._release_invocation(self._slot)
+
+
 def _config_projection(configs: Sequence[McpServerConfig]) -> bytes:
     return canonical_json_bytes([config.storage_dict() for config in configs])
 
@@ -966,13 +1003,20 @@ class McpSupervisor:
         if self._dirty:
             self._changed.set()
 
-    async def invoke(self, call: ToolCall) -> ToolOutput:
+    def reserve_invocation(self, call: ToolCall) -> McpInvocationLease:
+        def unavailable(message: str) -> McpInvocationLease:
+            return McpInvocationLease(
+                self,
+                call,
+                _failure=fail("tool_mcp_unavailable", message),
+            )
+
         route = call.mcp_route
         catalog = self._catalog
         if route is None or self._revision is None or catalog is None:
-            return fail("tool_mcp_unavailable", "The MCP route is not currently available")
+            return unavailable("The MCP route is not currently available")
         if route.config_revision != self._revision or route.catalog_digest != catalog.digest:
-            return fail("tool_mcp_unavailable", "The MCP route is no longer current")
+            return unavailable("The MCP route is no longer current")
         entry = next(
             (
                 entry
@@ -983,25 +1027,40 @@ class McpSupervisor:
             None,
         )
         if entry is None or entry.final_name != call.name or not entry.enabled:
-            return fail("tool_mcp_unavailable", "The MCP entry is no longer current")
+            return unavailable("The MCP entry is no longer current")
         slot = self._slots.get(entry.server)
         if slot is None or slot.runtime.generation != route.runtime_generation:
-            return fail("tool_mcp_unavailable", "The MCP runtime is no longer current")
+            return unavailable("The MCP runtime is no longer current")
         snapshot = next(
             (value for value in self._desired_snapshots() if value.name == entry.server), None
         )
         if snapshot is None or self._accepted.get(entry.server) != canonical_json_bytes(
             snapshot.model_dump(mode="json")
         ):
-            return fail("tool_mcp_unavailable", "The MCP runtime is awaiting registration")
+            return unavailable("The MCP runtime is awaiting registration")
         slot.calls += 1
         slot.drained.clear()
+        return McpInvocationLease(self, call, slot, entry.entry_id)
+
+    async def invoke(self, call: ToolCall) -> ToolOutput:
+        return await self.reserve_invocation(call).invoke()
+
+    async def _invoke_reserved(
+        self,
+        call: ToolCall,
+        slot: _RuntimeSlot,
+        entry_id: UUID,
+    ) -> ToolOutput:
+        route = call.mcp_route
+        assert route is not None
         try:
             try:
                 output = await slot.runtime.invoke(
-                    entry.entry_id,
+                    entry_id,
                     call.args,
                     runtime_generation=route.runtime_generation,
+                    request_id=call.id,
+                    max_result_bytes=call.max_result_bytes,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1011,14 +1070,17 @@ class McpSupervisor:
         finally:
             if slot.runtime.state not in {McpRuntimeState.READY, McpRuntimeState.AWAITING_ACK}:
                 self._record_cleanup_state(slot.runtime)
-                if self._slots.get(entry.server) is slot:
-                    self._accepted.pop(entry.server, None)
+                if self._slots.get(slot.config.name) is slot:
+                    self._accepted.pop(slot.config.name, None)
                     self._mark_dirty()
                     if slot.runtime.state is McpRuntimeState.UNAVAILABLE:
                         self._schedule_retry(slot)
-            slot.calls -= 1
-            if slot.calls == 0:
-                slot.drained.set()
+
+    @staticmethod
+    def _release_invocation(slot: _RuntimeSlot) -> None:
+        slot.calls -= 1
+        if slot.calls == 0:
+            slot.drained.set()
 
     def notify_list_changed(self, server: str) -> None:
         if server not in self._slots:

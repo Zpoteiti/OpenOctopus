@@ -186,28 +186,6 @@ def _schema_for_name(snapshot: OwnerMcpSnapshot, final_name: str) -> ProviderMcp
     return matches[0]
 
 
-def _validate_top_level_args(schema: ProviderMcpTool, args: Mapping[str, Any]) -> None:
-    properties = schema.input_schema.get("properties")
-    required = schema.input_schema.get("required", [])
-    if not isinstance(properties, dict) or not isinstance(required, list):
-        raise _selection_error("tool_invalid_args", "MCP capability schema is invalid")
-    source_required = set(required) - {DEVICE_FIELD_NAME}
-    missing = source_required - set(args)
-    if missing:
-        raise _selection_error(
-            "tool_missing_required_field",
-            "A required MCP field is missing",
-        )
-    source_properties = set(properties) - {DEVICE_FIELD_NAME}
-    if schema.input_schema.get("additionalProperties") is False:
-        extra = set(args) - source_properties
-        if extra:
-            raise _selection_error(
-                "tool_invalid_args",
-                "The MCP call contains an unknown field",
-            )
-
-
 def select_mcp_call(
     snapshot: OwnerMcpSnapshot,
     *,
@@ -216,7 +194,7 @@ def select_mcp_call(
 ) -> SelectedMcpCall:
     """Resolve an exact frozen install site without interpreting the final name."""
 
-    schema = _schema_for_name(snapshot, final_name)
+    _schema_for_name(snapshot, final_name)
     if DEVICE_FIELD_NAME not in provider_args:
         raise _selection_error(
             "tool_missing_required_field",
@@ -234,7 +212,6 @@ def select_mcp_call(
         raise _selection_error("tool_invalid_args", "Unknown MCP install site")
     source_args = dict(provider_args)
     del source_args[DEVICE_FIELD_NAME]
-    _validate_top_level_args(schema, source_args)
     return SelectedMcpCall(route=routes[0], source_args=source_args)
 
 

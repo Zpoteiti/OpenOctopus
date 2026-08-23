@@ -342,7 +342,12 @@ def _build_server_entries(
     facts = _entry_facts(source)
     prepared: list[tuple[str, str, str, str, str, dict[str, Any], dict[str, Any] | None]] = []
     known_names: set[str] = set()
+    source_identities: set[tuple[str, str, str]] = set()
     for surface, raw_name, identity, description, input_schema, output_schema in facts:
+        source_identity = (surface, raw_name, identity)
+        if source_identity in source_identities:
+            raise _validation_error("MCP server contains a duplicate logical capability")
+        source_identities.add(source_identity)
         final_name = wrapped_capability_name(config.name, raw_name)
         known_names.add(final_name)
         prepared.append(

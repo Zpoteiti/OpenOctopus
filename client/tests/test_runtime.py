@@ -67,6 +67,7 @@ from openoctopus_client.protocol import (
     decode_server_frame,
     encode_binary_chunk,
     encode_frame,
+    new_uuid7,
 )
 from openoctopus_client.protocol import (
     DeviceConfig as ProtocolDeviceConfig,
@@ -752,10 +753,14 @@ def test_runtime_validates_promotes_registers_and_dispatches_mcp(tmp_path: Path)
             arguments: Mapping[str, Any],
             *,
             runtime_generation: UUID,
+            request_id: UUID,
+            max_result_bytes: int,
         ) -> ToolOutput:
             assert entry_id == expected_entry_id
             assert arguments == {"value": "hello"}
             assert runtime_generation == self.generation
+            assert request_id == UUID("0190d5a7-0000-7000-8000-000000000004")
+            assert max_result_bytes == 4096
             return ToolOutput("mcp-ok")
 
         async def close(self) -> None:
@@ -950,6 +955,20 @@ def test_mcp_call_may_converge_after_its_connection_worker_stops() -> None:
                 self.started = asyncio.Event()
                 self.release = asyncio.Event()
 
+            class Lease:
+                def __init__(self, supervisor: Supervisor, call: ToolCall) -> None:
+                    self.supervisor = supervisor
+                    self.call = call
+
+                async def invoke(self) -> ToolOutput:
+                    return await self.supervisor.invoke(self.call)
+
+                def release(self) -> None:
+                    return None
+
+            def reserve_invocation(self, call: ToolCall) -> Lease:
+                return self.Lease(self, call)
+
             async def invoke(self, call: ToolCall) -> ToolOutput:
                 del call
                 self.started.set()
@@ -987,6 +1006,77 @@ def test_mcp_call_may_converge_after_its_connection_worker_stops() -> None:
         assert not pending[0].done()
         supervisor.release.set()
         await pending[0]
+        await runtime._shutdown_mcp()
+
+    asyncio.run(exercise())
+
+
+def test_tool_worker_releases_a_queued_mcp_generation_lease_on_stop() -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+
+        class BlockingDispatcher:
+            async def execute(self, name: str, args: dict[str, Any]) -> ToolOutput:
+                del name, args
+                started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        class Lease:
+            def __init__(self) -> None:
+                self.release_calls = 0
+
+            async def invoke(self) -> ToolOutput:
+                raise AssertionError("queued MCP call must not run")
+
+            def release(self) -> None:
+                self.release_calls += 1
+
+        class Supervisor:
+            def __init__(self) -> None:
+                self.leases: list[Lease] = []
+
+            def reserve_invocation(self, call: ToolCall) -> Lease:
+                del call
+                lease = Lease()
+                self.leases.append(lease)
+                return lease
+
+            async def shutdown(self) -> None:
+                return None
+
+        supervisor = Supervisor()
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            mcp_supervisor=cast(McpSupervisor, supervisor),
+        )
+        worker = _ToolWorker(runtime, SerializedWriter())
+        regular = ToolCall(
+            id=new_uuid7(),
+            name="read_file",
+            args={"path": "notes.txt"},
+            max_result_bytes=4096,
+        )
+        mcp = ToolCall(
+            id=new_uuid7(),
+            name="mcp_corp_echo",
+            args={},
+            max_result_bytes=4096,
+            mcp_route=McpRoute(
+                entry_id=new_uuid7(),
+                config_revision=1,
+                catalog_digest="a" * 64,
+                runtime_generation=new_uuid7(),
+            ),
+        )
+        assert worker.enqueue(regular, BlockingDispatcher())
+        await started.wait()
+        assert worker.enqueue(mcp, runtime._mcp_dispatcher)
+        assert len(supervisor.leases) == 1
+        assert supervisor.leases[0].release_calls == 0
+
+        assert await worker.stop()
+        assert supervisor.leases[0].release_calls == 1
         await runtime._shutdown_mcp()
 
     asyncio.run(exercise())
@@ -3029,6 +3119,33 @@ def test_incomplete_shutdown_keeps_the_hard_exit_watchdog_armed(
         return armed
 
     assert asyncio.run(exercise()) is True
+
+
+def test_runtime_starts_exec_and_mcp_shutdown_concurrently() -> None:
+    async def exercise() -> None:
+        exec_started = asyncio.Event()
+        mcp_started = asyncio.Event()
+
+        class Runtime(ClientRuntime):
+            async def _shutdown_exec_sessions(self) -> None:
+                exec_started.set()
+                await mcp_started.wait()
+
+            async def _shutdown_mcp(self) -> None:
+                mcp_started.set()
+                await exec_started.wait()
+
+        runtime = Runtime(
+            load_config(_environment()),
+            hard_exit=lambda _code: None,
+        )
+        runtime.request_shutdown()
+        try:
+            assert await asyncio.wait_for(runtime.run(), timeout=0.2) == 0
+        finally:
+            runtime._cancel_shutdown_watchdog()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_does_not_leave_device_token_in_environment(

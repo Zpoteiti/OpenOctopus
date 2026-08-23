@@ -665,8 +665,13 @@ class McpServerRuntime:
         arguments: Mapping[str, Any],
         *,
         runtime_generation: UUID,
+        request_id: UUID,
+        max_result_bytes: int,
     ) -> ToolOutput:
-        if runtime_generation != self.generation or self.state is not McpRuntimeState.READY:
+        if runtime_generation != self.generation or self.state not in {
+            McpRuntimeState.READY,
+            McpRuntimeState.AWAITING_ACK,
+        }:
             return self._pre_send_failure()
         route = self._routes.get(entry_id)
         client = self._client
@@ -686,14 +691,22 @@ class McpServerRuntime:
                     tool_result = await client.session.send_request(
                         request, types.CallToolResult
                     )
-                    return map_tool_result(tool_result)
+                    return map_tool_result(
+                        tool_result,
+                        request_id=request_id,
+                        max_result_bytes=max_result_bytes,
+                    )
                 if route.surface == "resource":
                     if arguments:
                         return fail("tool_mcp_error", "Static MCP resources take no arguments")
                     resource_result = await client.session.read_resource(
                         normalized_resource_uri(route.invocation_identity)
                     )
-                    return map_resource_result(resource_result)
+                    return map_resource_result(
+                        resource_result,
+                        request_id=request_id,
+                        max_result_bytes=max_result_bytes,
+                    )
                 if route.surface == "resource_template":
                     if any(not isinstance(value, str) for value in arguments.values()):
                         return fail(
@@ -705,14 +718,22 @@ class McpServerRuntime:
                         cast(Mapping[str, str], arguments),
                     )
                     template_result = await client.session.read_resource(uri)
-                    return map_resource_result(template_result)
+                    return map_resource_result(
+                        template_result,
+                        request_id=request_id,
+                        max_result_bytes=max_result_bytes,
+                    )
                 if any(not isinstance(value, str) for value in arguments.values()):
                     return fail("tool_mcp_error", "MCP prompt arguments must be strings")
                 prompt_result = await client.session.get_prompt(
                     route.invocation_identity,
                     dict(cast(Mapping[str, str], arguments)),
                 )
-                return map_prompt_result(prompt_result)
+                return map_prompt_result(
+                    prompt_result,
+                    request_id=request_id,
+                    max_result_bytes=max_result_bytes,
+                )
         except TimeoutError:
             await self._close_unavailable("tool_execution_outcome_unknown")
             return fail(

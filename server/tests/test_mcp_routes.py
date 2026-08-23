@@ -41,12 +41,12 @@ _GEN_TWO = UUID("01890f7c-bb80-7000-8000-000000000022")
 _REQUEST_ID = UUID("01890f7c-bb80-7000-8000-000000000031")
 
 
-def _schema(*, extra: bool = False) -> dict[str, object]:
+def _schema() -> dict[str, object]:
     return {
         "type": "object",
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
-        "additionalProperties": extra,
+        "additionalProperties": False,
     }
 
 
@@ -259,35 +259,17 @@ def test_select_call_requires_exact_install_site_and_removes_selector() -> None:
     assert unknown_name.value.code == "tool_invalid_args"
 
 
-def test_select_call_validates_top_level_required_and_forbidden_extra_args() -> None:
+def test_select_call_forwards_schema_invalid_arguments_to_mcp_server() -> None:
     snapshot = build_owner_mcp_snapshot([_owner()])
 
-    with pytest.raises(McpRouteSelectionError) as missing:
-        select_mcp_call(
-            snapshot,
-            final_name="mcp_demo_search",
-            provider_args={"openoctopus_device": "laptop"},
-        )
-    assert missing.value.code == "tool_missing_required_field"
-
-    with pytest.raises(McpRouteSelectionError) as extra:
-        select_mcp_call(
-            snapshot,
-            final_name="mcp_demo_search",
-            provider_args={
-                "query": "octopus",
-                "unexpected": True,
-                "openoctopus_device": "laptop",
-            },
-        )
-    assert extra.value.code == "tool_invalid_args"
-
-    open_schema = _schema(extra=True)
-    open_snapshot = build_owner_mcp_snapshot(
-        [_owner(catalog=_catalog(_entry(schema=open_schema)))]
+    missing = select_mcp_call(
+        snapshot,
+        final_name="mcp_demo_search",
+        provider_args={"openoctopus_device": "laptop"},
     )
-    selected = select_mcp_call(
-        open_snapshot,
+
+    extra = select_mcp_call(
+        snapshot,
         final_name="mcp_demo_search",
         provider_args={
             "query": "octopus",
@@ -295,7 +277,9 @@ def test_select_call_validates_top_level_required_and_forbidden_extra_args() -> 
             "openoctopus_device": "laptop",
         },
     )
-    assert selected.source_args["unexpected"] is True
+
+    assert missing.source_args == {}
+    assert extra.source_args == {"query": "octopus", "unexpected": True}
 
 
 def test_route_selection_never_parses_a_final_name() -> None:

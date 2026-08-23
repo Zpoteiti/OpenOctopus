@@ -1363,8 +1363,9 @@ snapshot, and applies these transformations:
 
 The registry never obtains Provider shape from handshake/registration memory.
 MCP collision validation occurs before persistence and is defensively rechecked
-when building the snapshot. Client arguments receive strict second validation
-after the Server chooses an exact Device route.
+when building the snapshot. After the Server chooses an exact Device route,
+OpenOctopus forwards MCP tool arguments to the MCP Server without re-evaluating
+its dynamic `inputSchema`.
 
 ### Device-field helper + reserved name
 

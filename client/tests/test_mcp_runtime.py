@@ -37,6 +37,9 @@ from openoctopus_client.mcp.transport import (
 )
 from openoctopus_client.protocol import new_uuid7
 
+_RESULT_REQUEST_ID = new_uuid7()
+_RESULT_CREDIT = 4096
+
 _TOOL_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -584,21 +587,29 @@ async def test_runtime_binds_exact_entries_and_invokes_all_four_surfaces() -> No
         by_surface["tool"],
         {"value": 3},
         runtime_generation=generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
     )
     resource = await runtime.invoke(
         by_surface["resource"],
         {},
         runtime_generation=generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
     )
     template = await runtime.invoke(
         by_surface["resource_template"],
         {"id": "42"},
         runtime_generation=generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
     )
     prompt = await runtime.invoke(
         by_surface["prompt"],
         {"topic": "MCP"},
         runtime_generation=generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
     )
 
     assert tool.is_error is False
@@ -618,6 +629,42 @@ async def test_runtime_binds_exact_entries_and_invokes_all_four_surfaces() -> No
 
 
 @pytest.mark.asyncio
+async def test_runtime_applies_call_result_credit_inside_the_mapper() -> None:
+    class LargeToolSession(_FakeSession):
+        async def send_request(
+            self,
+            request: types.ClientRequest,
+            result_type: type[types.CallToolResult],
+        ) -> types.CallToolResult:
+            assert result_type is types.CallToolResult
+            self.sent_requests.append(request)
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="x" * 1024)]
+            )
+
+    session = LargeToolSession()
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: _FakeClient(session)),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=256,
+    )
+
+    assert output.code == "tool_result_too_large"
+    assert runtime.state is McpRuntimeState.READY
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_stale_unknown_and_disabled_routes_before_send() -> None:
     session = _FakeSession()
     runtime = McpServerRuntime(
@@ -630,8 +677,20 @@ async def test_runtime_rejects_stale_unknown_and_disabled_routes_before_send() -
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    stale = await runtime.invoke(tool_id, {}, runtime_generation=new_uuid7())
-    unknown = await runtime.invoke(new_uuid7(), {}, runtime_generation=runtime.generation)
+    stale = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=new_uuid7(),
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
+    unknown = await runtime.invoke(
+        new_uuid7(),
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert stale.code == "tool_mcp_unavailable"
     assert unknown.code == "tool_mcp_unavailable"
@@ -657,6 +716,8 @@ async def test_runtime_forwards_tool_arguments_without_revalidating_input_schema
         tool_id,
         {"value": "3", "options": {"mode": "unsafe", "unexpected": True}},
         runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
     )
 
     assert output.is_error is False
@@ -683,7 +744,13 @@ async def test_transport_failure_closes_attempt_before_backoff() -> None:
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_execution_outcome_unknown"
     assert "third-party transport detail" not in str(output.content)
@@ -717,7 +784,13 @@ async def test_invocation_timeout_closes_ambiguous_runtime_before_backoff() -> N
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_execution_outcome_unknown"
     assert client.closed
@@ -741,7 +814,13 @@ async def test_sdk_connection_closed_is_outcome_unknown_and_unavailable() -> Non
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_execution_outcome_unknown"
     assert runtime.state is McpRuntimeState.UNAVAILABLE
@@ -768,7 +847,13 @@ async def test_third_party_minus_32000_is_not_misclassified_as_disconnect() -> N
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_mcp_error"
     assert runtime.state is McpRuntimeState.READY
@@ -792,7 +877,13 @@ async def test_stdio_message_limit_survives_sdk_connection_closed_translation() 
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_mcp_message_too_large"
     assert "secret raw detail" not in str(output.content)
@@ -820,7 +911,13 @@ async def test_invocation_auth_failure_suspends_without_backoff(status_code: int
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
 
-    output = await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert output.code == "tool_execution_outcome_unknown"
     assert "secret upstream response" not in str(output.content)
@@ -850,7 +947,13 @@ async def test_ready_registration_resets_retry_backoff_history() -> None:
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
     sessions[0].send_error = ConnectionError("first drop")
-    await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
     assert runtime.enter_backoff(jitter=0.5) == 1
 
     runtime.begin_retry()
@@ -859,7 +962,13 @@ async def test_ready_registration_resets_retry_backoff_history() -> None:
     runtime.mark_ready(runtime.generation)
     tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
     sessions[1].send_error = ConnectionError("later drop")
-    await runtime.invoke(tool_id, {}, runtime_generation=runtime.generation)
+    await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
 
     assert runtime.enter_backoff(jitter=0.5) == 1
 
