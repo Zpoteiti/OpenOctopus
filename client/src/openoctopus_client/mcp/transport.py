@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, TypeVar, Unpack, cast
+from typing import IO, Any, Literal, TypeVar, Unpack, cast
 
 import anyio
 import httpx
@@ -82,6 +82,53 @@ class UnsupportedMcpContentEncodingError(McpTransportError):
 
 class McpTransportClosingError(McpTransportError):
     """A stdio transport cannot accept another connection."""
+
+
+type McpTransportFailureKind = Literal[
+    "message_too_large",
+    "unsupported_content_encoding",
+]
+
+
+class McpTransportFailureSignal:
+    """Publish the first payload-free terminal transport failure."""
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._kind: McpTransportFailureKind | None = None
+
+    @property
+    def kind(self) -> McpTransportFailureKind | None:
+        return self._kind
+
+    def report(self, kind: McpTransportFailureKind) -> None:
+        if self._kind is None:
+            self._kind = kind
+            self._event.set()
+
+    async def wait(self) -> McpTransportFailureKind:
+        await self._event.wait()
+        assert self._kind is not None
+        return self._kind
+
+
+def _message_limit_error(
+    message: str,
+    failure_signal: McpTransportFailureSignal | None,
+) -> McpMessageTooLargeError:
+    if failure_signal is not None:
+        failure_signal.report("message_too_large")
+    return McpMessageTooLargeError(message)
+
+
+def _unsupported_content_encoding_error(
+    failure_signal: McpTransportFailureSignal | None,
+) -> UnsupportedMcpContentEncodingError:
+    if failure_signal is not None:
+        failure_signal.report("unsupported_content_encoding")
+    return UnsupportedMcpContentEncodingError(
+        "MCP responses must use identity content encoding"
+    )
 
 
 def _is_client_secret(name: str) -> bool:
@@ -151,26 +198,50 @@ def install_mcp_log_discard_boundary() -> None:
 
 
 class _BoundedEntityStream(httpx.AsyncByteStream):
-    def __init__(self, inner: httpx.AsyncByteStream) -> None:
+    def __init__(
+        self,
+        inner: httpx.AsyncByteStream,
+        transport_failure_signal: McpTransportFailureSignal | None,
+    ) -> None:
         self._inner = inner
+        self._transport_failure_signal = transport_failure_signal
+        self._message_limit_exceeded = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         size = 0
         async for chunk in self._inner:
             size += len(chunk)
             if size > MCP_MESSAGE_BYTES_MAX:
-                await self._inner.aclose()
-                raise McpMessageTooLargeError("MCP HTTP response exceeds the raw byte limit")
+                self._message_limit_exceeded = True
+                error = _message_limit_error(
+                    "MCP HTTP response exceeds the raw byte limit",
+                    self._transport_failure_signal,
+                )
+                with contextlib.suppress(BaseException):
+                    await self._inner.aclose()
+                raise error
             yield chunk
 
     async def aclose(self) -> None:
+        if self._message_limit_exceeded:
+            with contextlib.suppress(BaseException):
+                await self._inner.aclose()
+            return
         await self._inner.aclose()
 
 
 class _BoundedSseStream(httpx.AsyncByteStream):
-    def __init__(self, inner: httpx.AsyncByteStream, *, report_eof: bool) -> None:
+    def __init__(
+        self,
+        inner: httpx.AsyncByteStream,
+        *,
+        report_eof: bool,
+        transport_failure_signal: McpTransportFailureSignal | None,
+    ) -> None:
         self._inner = inner
         self._report_eof = report_eof
+        self._transport_failure_signal = transport_failure_signal
+        self._message_limit_exceeded = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         event_size = 0
@@ -183,10 +254,14 @@ class _BoundedSseStream(httpx.AsyncByteStream):
                     if byte == 0x0A:
                         event_size += 1
                         if event_size > MCP_MESSAGE_BYTES_MAX:
-                            await self._inner.aclose()
-                            raise McpMessageTooLargeError(
-                                "MCP SSE event exceeds the raw byte limit"
+                            self._message_limit_exceeded = True
+                            error = _message_limit_error(
+                                "MCP SSE event exceeds the raw byte limit",
+                                self._transport_failure_signal,
                             )
+                            with contextlib.suppress(BaseException):
+                                await self._inner.aclose()
+                            raise error
                         if reset_after_cr:
                             event_size = 0
                         pending_cr = False
@@ -199,8 +274,14 @@ class _BoundedSseStream(httpx.AsyncByteStream):
 
                 event_size += 1
                 if event_size > MCP_MESSAGE_BYTES_MAX:
-                    await self._inner.aclose()
-                    raise McpMessageTooLargeError("MCP SSE event exceeds the raw byte limit")
+                    self._message_limit_exceeded = True
+                    error = _message_limit_error(
+                        "MCP SSE event exceeds the raw byte limit",
+                        self._transport_failure_signal,
+                    )
+                    with contextlib.suppress(BaseException):
+                        await self._inner.aclose()
+                    raise error
                 if byte == 0x0D:
                     pending_cr = True
                     reset_after_cr = not line_has_content
@@ -216,6 +297,10 @@ class _BoundedSseStream(httpx.AsyncByteStream):
             raise McpTransportError("MCP SSE stream ended unexpectedly")
 
     async def aclose(self) -> None:
+        if self._message_limit_exceeded:
+            with contextlib.suppress(BaseException):
+                await self._inner.aclose()
+            return
         await self._inner.aclose()
 
 
@@ -227,35 +312,46 @@ class BoundedHttpTransport(httpx.AsyncBaseTransport):
         inner: httpx.AsyncBaseTransport | None = None,
         *,
         report_sse_eof: bool = False,
+        transport_failure_signal: McpTransportFailureSignal | None = None,
     ) -> None:
         self._inner = inner or httpx.AsyncHTTPTransport(verify=True)
         self._report_sse_eof = report_sse_eof
+        self._transport_failure_signal = transport_failure_signal
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         response = await self._inner.handle_async_request(request)
         content_encoding = response.headers.get("content-encoding")
         if content_encoding is not None and content_encoding.strip().casefold() != "identity":
-            await response.aclose()
-            raise UnsupportedMcpContentEncodingError(
-                "MCP responses must use identity content encoding"
+            encoding_error = _unsupported_content_encoding_error(
+                self._transport_failure_signal
             )
+            with contextlib.suppress(BaseException):
+                await response.aclose()
+            raise encoding_error
         content_type = response.headers.get("content-type", "").partition(";")[0].strip()
         content_length = response.headers.get("content-length")
         if content_type.casefold() != "text/event-stream" and content_length is not None:
             with contextlib.suppress(ValueError):
                 if int(content_length) > MCP_MESSAGE_BYTES_MAX:
-                    await response.aclose()
-                    raise McpMessageTooLargeError(
-                        "MCP HTTP response exceeds the raw byte limit"
+                    error = _message_limit_error(
+                        "MCP HTTP response exceeds the raw byte limit",
+                        self._transport_failure_signal,
                     )
+                    with contextlib.suppress(BaseException):
+                        await response.aclose()
+                    raise error
         stream: httpx.AsyncByteStream
         if content_type.casefold() == "text/event-stream":
             stream = _BoundedSseStream(
                 cast(httpx.AsyncByteStream, response.stream),
                 report_eof=self._report_sse_eof and request.method == "GET",
+                transport_failure_signal=self._transport_failure_signal,
             )
         else:
-            stream = _BoundedEntityStream(cast(httpx.AsyncByteStream, response.stream))
+            stream = _BoundedEntityStream(
+                cast(httpx.AsyncByteStream, response.stream),
+                self._transport_failure_signal,
+            )
         response.stream = stream
         return response
 
@@ -269,6 +365,7 @@ def create_mcp_http_client(
     auth: httpx.Auth | None = None,
     timeout: httpx.Timeout | float | None = None,
     _transport: httpx.AsyncBaseTransport | None = None,
+    transport_failure_signal: McpTransportFailureSignal | None = None,
     **kwargs: Any,
 ) -> httpx.AsyncClient:
     """FastMCP-compatible HTTP client factory with fixed network semantics."""
@@ -287,7 +384,11 @@ def create_mcp_http_client(
         follow_redirects=False,
         trust_env=False,
         verify=True,
-        transport=BoundedHttpTransport(_transport, report_sse_eof=True),
+        transport=BoundedHttpTransport(
+            _transport,
+            report_sse_eof=True,
+            transport_failure_signal=transport_failure_signal,
+        ),
     )
 
 
@@ -664,6 +765,7 @@ class BoundedStdioTransport(ClientTransport):
         cwd: str | Path | None = None,
         env: Mapping[str, str] | None = None,
         stderr_sink: IO[bytes] | None = None,
+        transport_failure_signal: McpTransportFailureSignal | None = None,
     ) -> None:
         install_mcp_log_discard_boundary()
         self.command = command
@@ -671,6 +773,7 @@ class BoundedStdioTransport(ClientTransport):
         self.cwd = Path(cwd) if cwd is not None else None
         self.environment = build_mcp_environment(os.environ, env)
         self._provided_stderr_sink = stderr_sink
+        self._transport_failure_signal = transport_failure_signal
         self._owned_stderr_sink: IO[bytes] | None = None
         self.process: asyncio.subprocess.Process | _ThreadedStdioProcess | None = None
         self.terminal_error: Exception | None = None
@@ -757,8 +860,9 @@ class BoundedStdioTransport(ClientTransport):
                 while (newline := buffer.find(b"\n")) >= 0:
                     record_size = newline + 1
                     if record_size > MCP_MESSAGE_BYTES_MAX:
-                        raise McpMessageTooLargeError(
-                            "MCP stdio record exceeds the raw byte limit"
+                        raise _message_limit_error(
+                            "MCP stdio record exceeds the raw byte limit",
+                            self._transport_failure_signal,
                         )
                     record = bytes(buffer[:newline])
                     del buffer[:record_size]
@@ -766,7 +870,10 @@ class BoundedStdioTransport(ClientTransport):
                     assert self._read_sender is not None
                     await self._read_sender.send(SessionMessage(message))
                 if len(buffer) > MCP_MESSAGE_BYTES_MAX:
-                    raise McpMessageTooLargeError("MCP stdio record exceeds the raw byte limit")
+                    raise _message_limit_error(
+                        "MCP stdio record exceeds the raw byte limit",
+                        self._transport_failure_signal,
+                    )
             if buffer:
                 raise McpTransportError("MCP stdio stream ended with an incomplete record")
             if not self._closing:

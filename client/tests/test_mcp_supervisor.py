@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from mcp import types
 from pydantic import SecretStr
 
 from openoctopus_client.mcp.models import (
@@ -27,6 +29,7 @@ from openoctopus_client.mcp.runtime import (
     McpValidationFailure,
 )
 from openoctopus_client.mcp.supervisor import McpSupervisor
+from openoctopus_client.mcp.transport import McpTransportFailureSignal
 from openoctopus_client.protocol import (
     AcceptedMcpRegistration,
     ConfigValidate,
@@ -1830,6 +1833,344 @@ def test_idle_transport_failure_enters_one_background_backoff() -> None:
         assert registration is not None
         assert registration.servers[0].state == "unavailable"
         assert registration.servers[0].code == "tool_mcp_unavailable"
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_output", "should_retry"),
+    [
+        ("message_too_large", "tool_mcp_message_too_large", True),
+        ("unsupported_content_encoding", "tool_execution_outcome_unknown", False),
+    ],
+)
+def test_transport_signal_during_invocation_has_one_generation_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    expected_output: str,
+    should_retry: bool,
+) -> None:
+    class SignalSession:
+        def __init__(self) -> None:
+            self.invoked = asyncio.Event()
+
+        def get_server_capabilities(self) -> types.ServerCapabilities:
+            return types.ServerCapabilities(tools=types.ToolsCapability())
+
+        async def list_tools(self, cursor: str | None = None) -> types.ListToolsResult:
+            assert cursor is None
+            return types.ListToolsResult(
+                tools=[
+                    types.Tool(
+                        name="echo",
+                        description="Echo",
+                        inputSchema={"type": "object", "properties": {}},
+                    )
+                ]
+            )
+
+        async def send_request(
+            self,
+            request: types.ClientRequest,
+            result_type: type[types.CallToolResult],
+        ) -> types.CallToolResult:
+            del request
+            assert result_type is types.CallToolResult
+            self.invoked.set()
+            await asyncio.Event().wait()
+            raise AssertionError("transport signal must cancel the issued request")
+
+    class SignalClient:
+        def __init__(self, session: SignalSession) -> None:
+            self.session = session
+            self.transport = SimpleNamespace(cleanup_incomplete=False)
+            self.closed = False
+
+        async def __aenter__(self) -> SignalClient:
+            return self
+
+        async def close(self) -> None:
+            await asyncio.sleep(0)
+            self.closed = True
+
+    class CountingRuntime(McpServerRuntime):
+        def __init__(self, config: McpServerConfig) -> None:
+            super().__init__(config, client_factory=cast(Any, client_factory))
+            self.retry_count = 0
+
+        def begin_retry(self) -> None:
+            self.retry_count += 1
+            super().begin_retry()
+
+    signals: list[McpTransportFailureSignal] = []
+    sessions: list[SignalSession] = []
+    clients: list[SignalClient] = []
+
+    def client_factory(
+        _config: McpServerConfig,
+        *,
+        message_handler: object | None = None,
+        transport_failure_signal: McpTransportFailureSignal | None = None,
+    ) -> Any:
+        del message_handler
+        assert transport_failure_signal is not None
+        session = SignalSession()
+        client = SignalClient(session)
+        signals.append(transport_failure_signal)
+        sessions.append(session)
+        clients.append(client)
+        return client
+
+    def immediate_backoff(attempt: int, *, jitter: float) -> float:
+        del attempt, jitter
+        return 0
+
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.runtime.retry_backoff_seconds",
+        immediate_backoff,
+    )
+
+    async def exercise() -> None:
+        runtime: CountingRuntime | None = None
+
+        def runtime_factory(config: McpServerConfig) -> McpServerRuntime:
+            nonlocal runtime
+            runtime = CountingRuntime(config)
+            return runtime
+
+        entry_id = new_uuid7()
+        config = StreamableHttpMcpServerConfig(
+            name="corp",
+            transport="streamable_http",
+            url="https://mcp.invalid/mcp",
+            headers={},
+        )
+        supervisor = McpSupervisor(runtime_factory=runtime_factory)
+        supervisor.attach_connection()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(config),
+            catalog=_catalog(_persisted("corp", entry_id)),
+        )
+        assert runtime is not None
+        for _attempt in range(64):
+            if runtime.state is McpRuntimeState.AWAITING_ACK:
+                break
+            await asyncio.sleep(0)
+        assert runtime.state is McpRuntimeState.AWAITING_ACK
+        registration = supervisor.next_registration()
+        assert registration is not None
+        supervisor.accept_registration(
+            RegisterMcpAck(
+                id=registration.id,
+                config_revision=1,
+                catalog_digest="a" * 64,
+                results=[
+                    AcceptedMcpRegistration(
+                        name="corp",
+                        runtime_generation=runtime.generation,
+                        accepted=True,
+                        code=None,
+                    )
+                ],
+            )
+        )
+        first_generation = runtime.generation
+        invocation = asyncio.create_task(
+            supervisor.invoke(
+                ToolCall(
+                    id=new_uuid7(),
+                    name="mcp_corp_echo",
+                    args={},
+                    max_result_bytes=4096,
+                    mcp_route=McpRoute(
+                        entry_id=entry_id,
+                        config_revision=1,
+                        catalog_digest="a" * 64,
+                        runtime_generation=first_generation,
+                    ),
+                )
+            )
+        )
+        await sessions[0].invoked.wait()
+        signals[0].report(cast(Any, failure_kind))
+
+        output = await asyncio.wait_for(invocation, timeout=2)
+        assert output.code == expected_output
+        assert clients[0].closed
+
+        if should_retry:
+            for _attempt in range(128):
+                if len(signals) == 2 and runtime.state is McpRuntimeState.AWAITING_ACK:
+                    break
+                await asyncio.sleep(0)
+            assert runtime.retry_count == 1
+            assert len(signals) == 2
+            assert signals[1] is not signals[0]
+            assert runtime.generation != first_generation
+            assert runtime.state is McpRuntimeState.AWAITING_ACK
+            recovered = supervisor.next_registration()
+            assert recovered is not None
+            supervisor.accept_registration(
+                RegisterMcpAck(
+                    id=recovered.id,
+                    config_revision=1,
+                    catalog_digest="a" * 64,
+                    results=[
+                        AcceptedMcpRegistration(
+                            name="corp",
+                            runtime_generation=runtime.generation,
+                            accepted=True,
+                            code=None,
+                        )
+                    ],
+                )
+            )
+            assert runtime.state.value == McpRuntimeState.READY.value
+        else:
+            for _attempt in range(64):
+                await asyncio.sleep(0)
+            assert runtime.retry_count == 0
+            assert len(signals) == 1
+            assert runtime.state.value == McpRuntimeState.UNAVAILABLE.value
+            assert runtime.code == "config_validation_failed"
+            assert runtime.permanent_failure
+
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_retry_replaces_generation_scoped_runtime_watcher() -> None:
+    class GenerationRuntime(_FakeRuntime):
+        def __init__(self, config: McpServerConfig) -> None:
+            super().__init__(config)
+            self.signals = [McpTransportFailureSignal()]
+            self.watched_generations: list[UUID] = []
+            self.marked_kinds: list[str] = []
+            self.retry_count = 0
+            self.retry_delay = 0
+
+        async def next_event(self) -> McpRuntimeEvent:
+            generation = self.generation
+            signal = self.signals[-1]
+            self.watched_generations.append(generation)
+            await signal.wait()
+            return McpRuntimeEvent(kind="transport_failed")
+
+        async def invoke(
+            self,
+            entry_id: UUID,
+            arguments: Mapping[str, Any],
+            *,
+            runtime_generation: UUID,
+            request_id: UUID,
+            max_result_bytes: int,
+        ) -> ToolOutput:
+            del entry_id, arguments, request_id, max_result_bytes
+            assert runtime_generation == self.generation
+            self.state = McpRuntimeState.UNAVAILABLE
+            self.code = "tool_execution_outcome_unknown"
+            return ToolOutput(
+                "request timed out after issue",
+                is_error=True,
+                code="tool_execution_outcome_unknown",
+            )
+
+        async def mark_transport_unavailable(self) -> None:
+            kind = self.signals[-1].kind
+            assert kind is not None
+            self.marked_kinds.append(kind)
+            self.state = McpRuntimeState.UNAVAILABLE
+            self.code = "tool_mcp_message_too_large"
+
+        def begin_retry(self) -> None:
+            assert self.state is McpRuntimeState.BACKOFF
+            self.retry_count += 1
+            self.generation = new_uuid7()
+            self.state = McpRuntimeState.STARTING
+            self.code = "mcp_starting"
+            self.source_catalog = None
+            self.routes = {}
+            self.signals.append(McpTransportFailureSignal())
+
+    async def exercise() -> None:
+        runtime: GenerationRuntime | None = None
+
+        def runtime_factory(config: McpServerConfig) -> McpServerRuntime:
+            nonlocal runtime
+            runtime = GenerationRuntime(config)
+            return cast(McpServerRuntime, runtime)
+
+        entry_id = new_uuid7()
+        supervisor = McpSupervisor(runtime_factory=runtime_factory)
+        supervisor.attach_connection()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(_config("corp")),
+            catalog=_catalog(_persisted("corp", entry_id)),
+        )
+        assert runtime is not None
+        await _ready_registration(supervisor, runtime)
+        first_generation = runtime.generation
+        for _attempt in range(32):
+            if runtime.watched_generations == [first_generation]:
+                break
+            await asyncio.sleep(0)
+        assert runtime.watched_generations == [first_generation]
+
+        output = await supervisor.invoke(
+            ToolCall(
+                id=new_uuid7(),
+                name="mcp_corp_echo",
+                args={},
+                max_result_bytes=4096,
+                mcp_route=McpRoute(
+                    entry_id=entry_id,
+                    config_revision=1,
+                    catalog_digest="a" * 64,
+                    runtime_generation=first_generation,
+                ),
+            )
+        )
+        assert output.code == "tool_execution_outcome_unknown"
+        for _attempt in range(64):
+            if runtime.retry_count == 1 and runtime.state is McpRuntimeState.AWAITING_ACK:
+                break
+            await asyncio.sleep(0)
+        assert runtime.retry_count == 1
+        assert len(runtime.signals) == 2
+        second_generation = runtime.generation
+        assert second_generation != first_generation
+        recovered = supervisor.next_registration()
+        assert recovered is not None
+        supervisor.accept_registration(
+            RegisterMcpAck(
+                id=recovered.id,
+                config_revision=1,
+                catalog_digest="a" * 64,
+                results=[
+                    AcceptedMcpRegistration(
+                        name="corp",
+                        runtime_generation=second_generation,
+                        accepted=True,
+                        code=None,
+                    )
+                ],
+            )
+        )
+        assert runtime.state is McpRuntimeState.READY
+
+        runtime.signals[1].report("message_too_large")
+        for _attempt in range(64):
+            if runtime.retry_count == 2:
+                break
+            await asyncio.sleep(0)
+
+        assert runtime.marked_kinds == ["message_too_large"]
+        assert runtime.backoff_calls == 2
+        assert runtime.retry_count == 2
         await supervisor.shutdown()
 
     asyncio.run(exercise())

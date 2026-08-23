@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
@@ -48,6 +49,9 @@ from openoctopus_client.mcp.result import (
 from openoctopus_client.mcp.transport import (
     BoundedStdioTransport,
     McpMessageTooLargeError,
+    McpTransportError,
+    McpTransportFailureSignal,
+    UnsupportedMcpContentEncodingError,
     create_fastmcp_client,
     create_mcp_http_client,
 )
@@ -70,6 +74,37 @@ type McpRuntimeEventKind = Literal[
 ]
 
 
+def _find_nested_exception[T: BaseException](
+    error: BaseException,
+    expected: type[T],
+) -> T | None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, expected):
+            return current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
+
+
+def _contains_message_too_large(error: BaseException) -> bool:
+    return _find_nested_exception(error, McpMessageTooLargeError) is not None
+
+
+def _contains_unsupported_content_encoding(error: BaseException) -> bool:
+    return _find_nested_exception(error, UnsupportedMcpContentEncodingError) is not None
+
+
 @dataclass(frozen=True, slots=True)
 class McpRuntimeEvent:
     kind: McpRuntimeEventKind
@@ -81,6 +116,7 @@ class McpRuntimeMessageHandler(MessageHandler):
     def __init__(self, emit: Callable[[McpRuntimeEventKind], None]) -> None:
         self._emit = emit
         self._message_too_large = False
+        self._unsupported_content_encoding = False
 
     @property
     def message_too_large(self) -> bool:
@@ -88,6 +124,11 @@ class McpRuntimeMessageHandler(MessageHandler):
 
     def clear_terminal_failure(self) -> None:
         self._message_too_large = False
+        self._unsupported_content_encoding = False
+
+    @property
+    def unsupported_content_encoding(self) -> bool:
+        return self._unsupported_content_encoding
 
     async def on_tool_list_changed(
         self, message: types.ToolListChangedNotification
@@ -108,8 +149,10 @@ class McpRuntimeMessageHandler(MessageHandler):
         self._emit("prompts_changed")
 
     async def on_exception(self, message: Exception) -> None:
-        if isinstance(message, McpMessageTooLargeError):
+        if _contains_message_too_large(message):
             self._message_too_large = True
+        elif _contains_unsupported_content_encoding(message):
+            self._unsupported_content_encoding = True
         self._emit("transport_failed")
 
 
@@ -141,7 +184,14 @@ class RuntimeClient(Protocol):
     async def close(self) -> None: ...
 
 
-type RuntimeClientFactory = Callable[[McpServerConfig], RuntimeClient]
+class RuntimeClientFactory(Protocol):
+    def __call__(
+        self,
+        config: McpServerConfig,
+        *,
+        message_handler: McpRuntimeMessageHandler | None = None,
+        transport_failure_signal: McpTransportFailureSignal | None = None,
+    ) -> RuntimeClient: ...
 
 
 class McpRuntimeState(StrEnum):
@@ -183,12 +233,14 @@ def _runtime_http_client(
     headers: dict[str, str] | None = None,
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
+    transport_failure_signal: McpTransportFailureSignal | None = None,
     **kwargs: Any,
 ) -> httpx.AsyncClient:
     return create_mcp_http_client(
         headers=headers,
         timeout=timeout,
         auth=auth,
+        transport_failure_signal=transport_failure_signal,
         **kwargs,
     )
 
@@ -197,6 +249,7 @@ def build_runtime_client(
     config: McpServerConfig,
     *,
     message_handler: McpRuntimeMessageHandler | None = None,
+    transport_failure_signal: McpTransportFailureSignal | None = None,
 ) -> RuntimeClient:
     """Build exactly the transport selected by the validated tagged union."""
 
@@ -210,18 +263,25 @@ def build_runtime_client(
             config.args,
             cwd=cwd,
             env={name: value.get_secret_value() for name, value in config.env.items()},
+            transport_failure_signal=transport_failure_signal,
         )
     elif isinstance(config, StreamableHttpMcpServerConfig):
         transport = StreamableHttpTransport(
             config.url,
             headers=_plain_secrets(config),
-            httpx_client_factory=_runtime_http_client,
+            httpx_client_factory=partial(
+                _runtime_http_client,
+                transport_failure_signal=transport_failure_signal,
+            ),
         )
     elif isinstance(config, SseMcpServerConfig):
         transport = SSETransport(
             config.url,
             headers=_plain_secrets(config),
-            httpx_client_factory=_runtime_http_client,
+            httpx_client_factory=partial(
+                _runtime_http_client,
+                transport_failure_signal=transport_failure_signal,
+            ),
         )
     else:  # pragma: no cover - the strict tagged union is exhaustive
         raise TypeError("unsupported MCP transport")
@@ -261,6 +321,8 @@ def _safe_failure(
 
 
 def _is_permanent_failure(error: BaseException) -> bool:
+    if _contains_unsupported_content_encoding(error):
+        return True
     if isinstance(error, FileNotFoundError | PermissionError | McpCatalogError | ValidationError):
         return True
     return isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {401, 403}
@@ -314,7 +376,7 @@ class McpServerRuntime:
         self.code: str | None = "mcp_starting"
         self.last_failure: McpValidationFailure | None = None
         self.permanent_failure = False
-        self._client_factory = client_factory
+        self._client_factory = client_factory or build_runtime_client
         self._connect_timeout = connect_timeout
         self._discovery_timeout = discovery_timeout
         self._invocation_timeout = invocation_timeout
@@ -330,6 +392,7 @@ class McpServerRuntime:
         self._event_order: deque[McpRuntimeEventKind] = deque()
         self._event_ready = asyncio.Event()
         self._message_handler = McpRuntimeMessageHandler(self._emit_event)
+        self._transport_failure_signal = McpTransportFailureSignal()
 
     @property
     def message_handler(self) -> McpRuntimeMessageHandler:
@@ -341,7 +404,7 @@ class McpServerRuntime:
             self._event_order.append(kind)
             self._event_ready.set()
 
-    async def next_event(self) -> McpRuntimeEvent:
+    async def _next_handler_event(self) -> McpRuntimeEvent:
         while not self._event_order:
             await self._event_ready.wait()
             self._event_ready.clear()
@@ -350,6 +413,23 @@ class McpServerRuntime:
         if self._event_order:
             self._event_ready.set()
         return McpRuntimeEvent(kind=kind)
+
+    async def next_event(self) -> McpRuntimeEvent:
+        handler_event = asyncio.create_task(self._next_handler_event())
+        transport_failure = asyncio.create_task(self._transport_failure_signal.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {handler_event, transport_failure},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if transport_failure in done:
+                return McpRuntimeEvent(kind="transport_failed")
+            return handler_event.result()
+        finally:
+            for task in (handler_event, transport_failure):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(handler_event, transport_failure, return_exceptions=True)
 
     def _clear_events(self) -> None:
         self._event_kinds.clear()
@@ -454,21 +534,64 @@ class McpServerRuntime:
             )
         )
 
+    async def _await_transport_operation[T](self, operation: Awaitable[T]) -> T:
+        operation_task = asyncio.ensure_future(operation)
+        transport_failure = asyncio.create_task(self._transport_failure_signal.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {operation_task, transport_failure},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if transport_failure in done:
+                raise self._transport_signal_error() from None
+            return operation_task.result()
+        finally:
+            for task in (operation_task, transport_failure):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(operation_task, transport_failure, return_exceptions=True)
+
+    def _transport_signal_error(self) -> McpTransportError:
+        kind = self._transport_failure_signal.kind
+        if kind == "message_too_large":
+            return McpMessageTooLargeError(
+                "MCP inbound message exceeded its raw byte limit"
+            )
+        if kind == "unsupported_content_encoding":
+            return UnsupportedMcpContentEncodingError(
+                "MCP responses must use identity content encoding"
+            )
+        raise RuntimeError("MCP transport failure signal has no failure kind")
+
     def _effective_terminal_error(
         self,
         error: BaseException | None,
     ) -> BaseException | None:
+        if self._transport_failure_signal.kind is not None:
+            return self._transport_signal_error()
+        if error is not None and _contains_message_too_large(error):
+            return McpMessageTooLargeError(
+                "MCP inbound message exceeded its raw byte limit"
+            )
+        if error is not None and _contains_unsupported_content_encoding(error):
+            return UnsupportedMcpContentEncodingError(
+                "MCP responses must use identity content encoding"
+            )
         if error is not None and not _is_sdk_connection_closed(error):
             return error
         if self._message_handler.message_too_large:
             return McpMessageTooLargeError("MCP inbound message exceeded its raw byte limit")
+        if self._message_handler.unsupported_content_encoding:
+            return UnsupportedMcpContentEncodingError(
+                "MCP responses must use identity content encoding"
+            )
         client = self._client
         terminal_error = (
             getattr(client.transport, "terminal_error", None)
             if client is not None
             else None
         )
-        if isinstance(terminal_error, McpMessageTooLargeError):
+        if isinstance(terminal_error, BaseException):
             return terminal_error
         return error
 
@@ -496,13 +619,13 @@ class McpServerRuntime:
         if self.state is not McpRuntimeState.STARTING:
             raise RuntimeError("MCP runtime attempt has already started")
         try:
-            self._client = (
-                build_runtime_client(self.config, message_handler=self._message_handler)
-                if self._client_factory is None
-                else self._client_factory(self.config)
+            self._client = self._client_factory(
+                self.config,
+                message_handler=self._message_handler,
+                transport_failure_signal=self._transport_failure_signal,
             )
             async with asyncio.timeout(self._connect_timeout):
-                await self._client.__aenter__()
+                await self._await_transport_operation(self._client.__aenter__())
         except asyncio.CancelledError:
             await self._run_close_task()
             raise
@@ -513,9 +636,11 @@ class McpServerRuntime:
         self.code = None
         try:
             async with asyncio.timeout(self._discovery_timeout):
-                source = await discover_server_catalog(
-                    self.config.name,
-                    self._client.session,
+                source = await self._await_transport_operation(
+                    discover_server_catalog(
+                        self.config.name,
+                        self._client.session,
+                    )
                 )
         except asyncio.CancelledError:
             await self._run_close_task()
@@ -565,7 +690,9 @@ class McpServerRuntime:
         previous_state = self.state
         try:
             async with asyncio.timeout(self._discovery_timeout):
-                fresh = await discover_server_catalog(self.config.name, client.session)
+                fresh = await self._await_transport_operation(
+                    discover_server_catalog(self.config.name, client.session)
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -612,6 +739,7 @@ class McpServerRuntime:
         self._stdio_cleanup_failed = False
         self._remote_cleanup_pending = False
         self._message_handler.clear_terminal_failure()
+        self._transport_failure_signal = McpTransportFailureSignal()
         self._clear_events()
 
     async def mark_transport_unavailable(self) -> None:
@@ -622,16 +750,15 @@ class McpServerRuntime:
         }:
             return
         terminal_error = self._effective_terminal_error(None)
-        code = (
-            "tool_mcp_message_too_large"
-            if isinstance(terminal_error, McpMessageTooLargeError)
-            else "tool_mcp_unavailable"
-        )
-        message = (
-            f"MCP server '{self.config.name}' exceeded the inbound message limit"
-            if code == "tool_mcp_message_too_large"
-            else f"MCP server '{self.config.name}' transport became unavailable"
-        )
+        if isinstance(terminal_error, McpMessageTooLargeError):
+            code = "tool_mcp_message_too_large"
+            message = f"MCP server '{self.config.name}' exceeded the inbound message limit"
+        elif isinstance(terminal_error, UnsupportedMcpContentEncodingError):
+            code = "config_validation_failed"
+            message = f"MCP server '{self.config.name}' failed protocol validation"
+        else:
+            code = "tool_mcp_unavailable"
+            message = f"MCP server '{self.config.name}' transport became unavailable"
         failure = McpValidationFailure(
             server=self.config.name,
             stage="connect",
@@ -639,7 +766,9 @@ class McpServerRuntime:
             message=message,
         )
         self.last_failure = failure
-        self.permanent_failure = False
+        self.permanent_failure = bool(
+            terminal_error is not None and _is_permanent_failure(terminal_error)
+        )
         await self._close_unavailable(code)
 
     def _pre_send_failure(self) -> ToolOutput:
@@ -655,9 +784,45 @@ class McpServerRuntime:
             if self._cleanup_incomplete():
                 self.state = McpRuntimeState.CLEANUP_BLOCKED
                 self.code = "mcp_cleanup_incomplete"
-            else:
+            elif self.state not in {
+                McpRuntimeState.ABSENT,
+                McpRuntimeState.BACKOFF,
+                McpRuntimeState.CLOSING,
+            }:
                 self.state = McpRuntimeState.UNAVAILABLE
                 self.code = code
+
+    async def _message_too_large_output(self, *, request_was_sent: bool = True) -> ToolOutput:
+        await self._close_unavailable("tool_mcp_message_too_large")
+        message = (
+            "The MCP response exceeded the raw message limit after the request may have "
+            "been sent; do not retry blindly"
+            if request_was_sent
+            else "The MCP connection exceeded the raw message limit; the request was not sent"
+        )
+        return fail(
+            "tool_mcp_message_too_large",
+            message,
+        )
+
+    async def _outcome_unknown_output(
+        self,
+        message: str,
+        *,
+        terminal_error: BaseException | None = None,
+    ) -> ToolOutput:
+        runtime_code = "tool_execution_outcome_unknown"
+        if terminal_error is not None and _is_permanent_failure(terminal_error):
+            self.permanent_failure = True
+            if _contains_unsupported_content_encoding(terminal_error):
+                self.last_failure = _safe_failure(
+                    self.config.name,
+                    "connect",
+                    terminal_error,
+                )
+                runtime_code = self.last_failure.code
+        await self._close_unavailable(runtime_code)
+        return fail("tool_execution_outcome_unknown", message)
 
     async def invoke(
         self,
@@ -677,6 +842,21 @@ class McpServerRuntime:
         client = self._client
         if route is None or not route.enabled or client is None:
             return self._pre_send_failure()
+        terminal_error = self._effective_terminal_error(None)
+        if isinstance(terminal_error, McpMessageTooLargeError):
+            return await self._message_too_large_output(request_was_sent=False)
+        if terminal_error is not None:
+            runtime_code = "tool_mcp_unavailable"
+            if _is_permanent_failure(terminal_error):
+                self.permanent_failure = True
+                self.last_failure = _safe_failure(
+                    self.config.name,
+                    "connect",
+                    terminal_error,
+                )
+                runtime_code = self.last_failure.code
+            await self._close_unavailable(runtime_code)
+            return self._pre_send_failure()
         try:
             async with asyncio.timeout(self._invocation_timeout):
                 if route.surface == "tool":
@@ -688,8 +868,8 @@ class McpServerRuntime:
                             )
                         )
                     )
-                    tool_result = await client.session.send_request(
-                        request, types.CallToolResult
+                    tool_result = await self._await_transport_operation(
+                        client.session.send_request(request, types.CallToolResult)
                     )
                     return map_tool_result(
                         tool_result,
@@ -699,8 +879,10 @@ class McpServerRuntime:
                 if route.surface == "resource":
                     if arguments:
                         return fail("tool_mcp_error", "Static MCP resources take no arguments")
-                    resource_result = await client.session.read_resource(
-                        normalized_resource_uri(route.invocation_identity)
+                    resource_result = await self._await_transport_operation(
+                        client.session.read_resource(
+                            normalized_resource_uri(route.invocation_identity)
+                        )
                     )
                     return map_resource_result(
                         resource_result,
@@ -717,7 +899,9 @@ class McpServerRuntime:
                         route.invocation_identity,
                         cast(Mapping[str, str], arguments),
                     )
-                    template_result = await client.session.read_resource(uri)
+                    template_result = await self._await_transport_operation(
+                        client.session.read_resource(uri)
+                    )
                     return map_resource_result(
                         template_result,
                         request_id=request_id,
@@ -725,9 +909,11 @@ class McpServerRuntime:
                     )
                 if any(not isinstance(value, str) for value in arguments.values()):
                     return fail("tool_mcp_error", "MCP prompt arguments must be strings")
-                prompt_result = await client.session.get_prompt(
-                    route.invocation_identity,
-                    dict(cast(Mapping[str, str], arguments)),
+                prompt_result = await self._await_transport_operation(
+                    client.session.get_prompt(
+                        route.invocation_identity,
+                        dict(cast(Mapping[str, str], arguments)),
+                    )
                 )
                 return map_prompt_result(
                     prompt_result,
@@ -735,33 +921,26 @@ class McpServerRuntime:
                     max_result_bytes=max_result_bytes,
                 )
         except TimeoutError:
-            await self._close_unavailable("tool_execution_outcome_unknown")
-            return fail(
-                "tool_execution_outcome_unknown",
+            return await self._outcome_unknown_output(
                 "The MCP request timed out after it may have been sent; do not retry blindly",
             )
         except McpMessageTooLargeError:
-            await self._close_unavailable("tool_mcp_message_too_large")
-            return fail(
-                "tool_mcp_message_too_large",
-                "The MCP response exceeded the raw message limit after the request may have "
-                "been sent; do not retry blindly",
+            return await self._message_too_large_output()
+        except UnsupportedMcpContentEncodingError as exc:
+            return await self._outcome_unknown_output(
+                "The MCP connection failed after the request may have been sent; do not retry "
+                "blindly",
+                terminal_error=exc,
             )
         except McpError as exc:
             if _is_sdk_connection_closed(exc):
-                terminal_error = self._effective_terminal_error(exc)
+                terminal_error = self._effective_terminal_error(exc) or exc
                 if isinstance(terminal_error, McpMessageTooLargeError):
-                    await self._close_unavailable("tool_mcp_message_too_large")
-                    return fail(
-                        "tool_mcp_message_too_large",
-                        "The MCP response exceeded the raw message limit after the request may "
-                        "have been sent; do not retry blindly",
-                    )
-                await self._close_unavailable("tool_execution_outcome_unknown")
-                return fail(
-                    "tool_execution_outcome_unknown",
+                    return await self._message_too_large_output()
+                return await self._outcome_unknown_output(
                     "The MCP connection closed after the request may have been sent; do not "
                     "retry blindly",
+                    terminal_error=terminal_error,
                 )
             return fail("tool_mcp_error", "The MCP server returned a protocol error")
         except ValidationError:
@@ -771,20 +950,19 @@ class McpServerRuntime:
         except asyncio.CancelledError:
             raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {401, 403}:
-                self.permanent_failure = True
-            await self._close_unavailable("tool_execution_outcome_unknown")
-            return fail(
-                "tool_execution_outcome_unknown",
+            return await self._outcome_unknown_output(
                 "The MCP connection failed after the request may have been sent; do not retry "
                 "blindly",
+                terminal_error=exc,
             )
-        except Exception:
-            await self._close_unavailable("tool_execution_outcome_unknown")
-            return fail(
-                "tool_execution_outcome_unknown",
+        except Exception as exc:
+            terminal_error = self._effective_terminal_error(exc) or exc
+            if isinstance(terminal_error, McpMessageTooLargeError):
+                return await self._message_too_large_output()
+            return await self._outcome_unknown_output(
                 "The MCP connection failed after the request may have been sent; do not retry "
                 "blindly",
+                terminal_error=terminal_error,
             )
         raise AssertionError("unknown MCP surface")  # pragma: no cover
 
