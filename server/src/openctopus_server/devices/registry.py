@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID
@@ -73,6 +73,9 @@ class DeviceSecretTransportError(RuntimeError):
 
 class DeviceMcpUnavailableError(RuntimeError):
     pass
+
+
+type DeviceIssueGuard = Callable[[], AbstractAsyncContextManager[bool]]
 
 
 UNAUTHORIZED_CLOSE_REASON = '{"code":"unauthorized"}'
@@ -1101,6 +1104,7 @@ class DeviceRegistry:
         timeout_seconds: float,
         chat_session_id: UUID | None = None,
         on_issued: Callable[[], None] | None = None,
+        issue_guard: DeviceIssueGuard | None = None,
     ) -> ToolResultFrame:
         return await self._dispatch_tool(
             device_id=route.device_id,
@@ -1114,6 +1118,7 @@ class DeviceRegistry:
             frozen_mcp_route=route,
             chat_session_id=chat_session_id,
             on_issued=on_issued,
+            issue_guard=issue_guard,
         )
 
     async def dispatch_tool(
@@ -1141,6 +1146,7 @@ class DeviceRegistry:
             frozen_mcp_route=None,
             chat_session_id=chat_session_id,
             on_issued=on_issued,
+            issue_guard=None,
         )
 
     async def dispatch_tool_on_snapshot(
@@ -1169,6 +1175,7 @@ class DeviceRegistry:
             frozen_mcp_route=None,
             chat_session_id=chat_session_id,
             on_issued=on_issued,
+            issue_guard=None,
         )
 
     async def _dispatch_tool(
@@ -1185,6 +1192,7 @@ class DeviceRegistry:
         frozen_mcp_route: FrozenMcpEntryRoute | None,
         chat_session_id: UUID | None,
         on_issued: Callable[[], None] | None,
+        issue_guard: DeviceIssueGuard | None,
     ) -> ToolResultFrame:
         call_id = new_uuid7()
         future = asyncio.get_running_loop().create_future()
@@ -1263,6 +1271,7 @@ class DeviceRegistry:
                 expected_mcp_epoch=expected_mcp_epoch,
                 issued_call_id=call_id,
                 on_issued=on_issued,
+                issue_guard=issue_guard,
             )
         except asyncio.CancelledError:
             await self._remove_pending(handle, call_id, future, remember_expired=True)
@@ -1342,6 +1351,7 @@ class DeviceRegistry:
         expected_mcp_epoch: int | None = None,
         issued_call_id: UUID | None = None,
         on_issued: Callable[[], None] | None = None,
+        issue_guard: DeviceIssueGuard | None = None,
     ) -> bool:
         """Send only while ``handle`` remains the current device generation."""
         async with self._lock:
@@ -1351,16 +1361,29 @@ class DeviceRegistry:
         try:
             async with connection.send_lock:
                 if issued_call_id is not None:
-                    if not await self._mark_call_issued(
-                        connection,
-                        handle,
-                        issued_call_id,
-                        expected_device_name=expected_device_name,
-                        expected_config_epoch=expected_config_epoch,
-                        expected_mcp_epoch=expected_mcp_epoch,
-                        on_issued=on_issued,
-                    ):
-                        return False
+                    if issue_guard is None:
+                        if not await self._mark_call_issued(
+                            connection,
+                            handle,
+                            issued_call_id,
+                            expected_device_name=expected_device_name,
+                            expected_config_epoch=expected_config_epoch,
+                            expected_mcp_epoch=expected_mcp_epoch,
+                            on_issued=on_issued,
+                        ):
+                            return False
+                    else:
+                        async with issue_guard() as issue_allowed:
+                            if not issue_allowed or not await self._mark_call_issued(
+                                connection,
+                                handle,
+                                issued_call_id,
+                                expected_device_name=expected_device_name,
+                                expected_config_epoch=expected_config_epoch,
+                                expected_mcp_epoch=expected_mcp_epoch,
+                                on_issued=on_issued,
+                            ):
+                                return False
                 else:
                     if not await self._can_send(
                         connection,

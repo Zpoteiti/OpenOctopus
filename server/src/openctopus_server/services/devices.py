@@ -14,6 +14,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.db.advisory import lock_global_mcp_catalog_write
 from openctopus_server.db.models import Device
 from openctopus_server.devices.mcp_catalog import (
     EMPTY_CATALOG_DIGEST,
@@ -32,6 +33,8 @@ from openctopus_server.devices.mcp_models import (
 from openctopus_server.devices.protocol import new_uuid7
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import DeviceError
+from openctopus_server.mcp.models import ServerMcpEnvelope
+from openctopus_server.mcp.reservation import validate_device_mcp_candidate
 from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
 
 DEFAULT_ENV_ALLOWLIST = (
@@ -264,6 +267,55 @@ def mcp_configs_storage(configs: tuple[McpServerConfig, ...]) -> list[dict[str, 
     return [server.storage_dict() for server in configs]
 
 
+def validate_mcp_candidate_against_server(
+    *,
+    current_configs: tuple[McpServerConfig, ...],
+    candidate_configs: tuple[McpServerConfig, ...],
+    candidate_catalog: PersistedMcpCatalog,
+    server_envelope: ServerMcpEnvelope,
+) -> None:
+    reserved_names = {config.name for config in server_envelope.mcp_servers}
+    enabled_final_names = {
+        entry.final_name
+        for server in server_envelope.mcp_catalog.servers
+        for entry in server.entries
+        if entry.enabled
+    }
+    try:
+        validate_device_mcp_candidate(
+            current_configs=current_configs,
+            candidate_configs=candidate_configs,
+            candidate_catalog=candidate_catalog,
+            reserved_names=reserved_names,
+            server_enabled_final_names=enabled_final_names,
+        )
+    except McpCatalogError as exc:
+        raise _mcp_catalog_device_error(exc) from exc
+
+
+def validate_mcp_candidate_reservations(
+    *,
+    current_configs: tuple[McpServerConfig, ...],
+    candidate_configs: tuple[McpServerConfig, ...],
+    server_envelope: ServerMcpEnvelope,
+) -> None:
+    """Reject reserved config mutations before remote Device discovery."""
+    try:
+        validate_device_mcp_candidate(
+            current_configs=current_configs,
+            candidate_configs=candidate_configs,
+            candidate_catalog=PersistedMcpCatalog(
+                version=1,
+                digest=EMPTY_CATALOG_DIGEST,
+                servers=[],
+            ),
+            reserved_names={config.name for config in server_envelope.mcp_servers},
+            server_enabled_final_names=(),
+        )
+    except McpCatalogError as exc:
+        raise _mcp_catalog_device_error(exc) from exc
+
+
 async def commit_config_candidate(
     db: AsyncSession,
     *,
@@ -282,10 +334,18 @@ async def commit_config_candidate(
     built_in_names: tuple[str, ...] = (),
 ) -> tuple[DeviceSnapshot, bool]:
     """Commit a prevalidated full Device candidate in one short transaction."""
+    if mcp_servers is not None or "name" in fields:
+        await lock_global_mcp_catalog_write(db)
+    await _lock_owner_mcp_catalogs(db, user_id)
     device = await _owned_by_id_for_update(db, user_id=user_id, device_id=device_id)
     if device.config_revision != base_config_revision:
         raise DeviceError(ErrorCode.DEVICE_CONFIG_CONFLICT, "Device config revision is stale")
-    await _lock_owner_mcp_catalogs(db, user_id)
+    current_mcp_servers = parse_stored_mcp_servers(device.mcp_servers)
+    server_envelope: ServerMcpEnvelope | None = None
+    if mcp_servers is not None:
+        from openctopus_server.services.server_mcp import load_envelope
+
+        server_envelope = await load_envelope(db)
 
     changed = _apply_non_mcp_fields(
         device,
@@ -317,6 +377,13 @@ async def commit_config_candidate(
             device.mcp_catalog = catalog_payload
             changed = True
         catalog_for_device = candidate_catalog
+        assert server_envelope is not None
+        validate_mcp_candidate_against_server(
+            current_configs=current_mcp_servers,
+            candidate_configs=mcp_servers,
+            candidate_catalog=candidate_catalog,
+            server_envelope=server_envelope,
+        )
 
     if mcp_servers is not None or "name" in fields:
         if catalog_for_device is None:
@@ -472,8 +539,9 @@ async def regenerate_token(
 
 
 async def delete(db: AsyncSession, *, user_id: UUID, name: str) -> DeviceSnapshot:
-    device = await _owned_for_update(db, user_id=user_id, name=name)
+    await lock_global_mcp_catalog_write(db)
     await _lock_owner_mcp_catalogs(db, user_id)
+    device = await _owned_for_update(db, user_id=user_id, name=name)
     snapshot = _snapshot(device)
     await db.delete(device)
     await db.commit()

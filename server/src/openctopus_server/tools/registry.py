@@ -21,11 +21,13 @@ from openctopus_server.devices.mcp_routes import (
     FrozenMcpEntryRoute,
     McpRouteSelectionError,
     OwnerMcpSnapshot,
+    SelectedMcpCall,
     select_mcp_call,
 )
 from openctopus_server.devices.protocol import MAX_TEXT_FRAME_BYTES, ToolResultFrame
 from openctopus_server.devices.registry import (
     DeviceBusyError,
+    DeviceIssueGuard,
     DeviceMcpUnavailableError,
     DeviceOutcomeUnknownError,
     DeviceProtocolError,
@@ -34,8 +36,17 @@ from openctopus_server.devices.registry import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError
+from openctopus_server.mcp.authority import ServerMcpAuthorityFence
+from openctopus_server.mcp.routes import (
+    CompositeMcpSnapshot,
+    FrozenServerMcpEntryRoute,
+    SelectedCompositeMcpCall,
+    ServerMcpRouteSelectionError,
+    select_composite_mcp_call,
+)
 from openctopus_server.network_policy import SsrfPolicy
 from openctopus_server.services.devices import parse_stored_mcp_catalog
+from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
 from openctopus_server.services.system_config import load_web_fetch_policy
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
 from openctopus_server.tools.device_field import (
@@ -100,11 +111,25 @@ class DeviceToolDispatcher(Protocol):
         timeout_seconds: float,
         chat_session_id: UUID | None = None,
         on_issued: Callable[[], None] | None = None,
+        issue_guard: DeviceIssueGuard | None = None,
     ) -> ToolResultFrame: ...
 
 
 DeviceResolver = Callable[[UUID, str], Awaitable[UUID | None]]
 McpRouteResolver = Callable[[UUID, FrozenMcpEntryRoute], Awaitable[bool]]
+
+
+class ServerMcpDispatcher(Protocol):
+    async def dispatch_server_mcp(
+        self,
+        *,
+        route: FrozenServerMcpEntryRoute,
+        user_id: UUID,
+        name: str,
+        args: dict[str, object],
+        on_issued: Callable[[], None] | None = None,
+        issue_guard: Callable[[], bool] | None = None,
+    ) -> ToolResult: ...
 
 
 @lru_cache
@@ -199,9 +224,13 @@ class ToolRegistry:
         *,
         device_resolver: DeviceResolver | None = None,
         mcp_route_resolver: McpRouteResolver | None = None,
+        server_mcp_dispatcher: ServerMcpDispatcher | None = None,
+        server_mcp_authority: ServerMcpAuthorityFence | None = None,
     ) -> None:
         self._device_resolver = device_resolver
         self._mcp_route_resolver = mcp_route_resolver
+        self._server_mcp_dispatcher = server_mcp_dispatcher
+        self._server_mcp_authority = server_mcp_authority
         self._tools: dict[str, Tool] = {}
         self._provider_schema_cache_key: tuple[tuple[str, ...], str | None] | None = None
         self._provider_schema_cache: tuple[dict[str, Any], ...] = ()
@@ -224,7 +253,7 @@ class ToolRegistry:
         self,
         *,
         device_names: Iterable[str] = (),
-        mcp_snapshot: OwnerMcpSnapshot | None = None,
+        mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         device_sites = tuple(device_names)
         cache_key = (
@@ -262,28 +291,49 @@ class ToolRegistry:
         args: dict[str, Any],
         ctx: ToolContext,
         device_targets: Mapping[str, UUID] | None = None,
-        mcp_snapshot: OwnerMcpSnapshot | None = None,
+        mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot | None = None,
         device_registry: DeviceToolDispatcher | None = None,
         on_issued: Callable[[], None] | None = None,
     ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             try:
-                selected = (
-                    select_mcp_call(
+                selected: SelectedMcpCall | SelectedCompositeMcpCall | None
+                if isinstance(mcp_snapshot, CompositeMcpSnapshot):
+                    selected = select_composite_mcp_call(
                         mcp_snapshot,
                         final_name=name,
                         provider_args=args,
                     )
-                    if mcp_snapshot is not None
-                    else None
-                )
-            except McpRouteSelectionError as exc:
+                elif mcp_snapshot is not None:
+                    selected = select_mcp_call(
+                        mcp_snapshot,
+                        final_name=name,
+                        provider_args=args,
+                    )
+                else:
+                    selected = None
+            except (McpRouteSelectionError, ServerMcpRouteSelectionError) as exc:
                 return _normalized_error(_selection_error_code(exc), exc.message)
             if selected is None:
                 return _normalized_error(
                     ErrorCode.TOOL_INVALID_ARGS,
                     f"Unknown tool: {name}",
+                )
+            if isinstance(selected.route, FrozenServerMcpEntryRoute):
+                if self._server_mcp_dispatcher is None:
+                    return _normalized_error(
+                        ErrorCode.TOOL_MCP_UNAVAILABLE,
+                        "Server MCP capability is unavailable",
+                    )
+                return await _execute_mcp_on_server(
+                    dispatcher=self._server_mcp_dispatcher,
+                    route=selected.route,
+                    name=name,
+                    args=selected.source_args,
+                    ctx=ctx,
+                    on_issued=on_issued,
+                    server_mcp_authority=self._server_mcp_authority,
                 )
             if self._mcp_route_resolver is None:
                 return _normalized_error(
@@ -317,6 +367,7 @@ class ToolRegistry:
                 args=selected.source_args,
                 ctx=ctx,
                 on_issued=on_issued,
+                server_mcp_authority=self._server_mcp_authority,
             )
 
         routed_args = dict(args)
@@ -412,6 +463,8 @@ def build_py3_registry(
     transport: httpx.AsyncBaseTransport | None = None,
     web_admission: KeyedAdmission | None = None,
     content_converter: HtmlContentConverter | None = None,
+    server_mcp_dispatcher: ServerMcpDispatcher | None = None,
+    server_mcp_authority: ServerMcpAuthorityFence | None = None,
 ) -> ToolRegistry:
     return ToolRegistry(
         (
@@ -426,6 +479,8 @@ def build_py3_registry(
         mcp_route_resolver=(
             _owned_mcp_route_resolver(engine) if engine is not None else None
         ),
+        server_mcp_dispatcher=server_mcp_dispatcher,
+        server_mcp_authority=server_mcp_authority,
     )
 
 
@@ -438,6 +493,8 @@ def build_py4_registry(
     web_admission: KeyedAdmission | None = None,
     content_converter: DocumentParser | None = None,
     device_registry: DeviceRegistry | None = None,
+    server_mcp_dispatcher: ServerMcpDispatcher | None = None,
+    server_mcp_authority: ServerMcpAuthorityFence | None = None,
 ) -> ToolRegistry:
     settings = get_settings()
     converter = content_converter or get_content_converter()
@@ -477,6 +534,8 @@ def build_py4_registry(
         ),
         device_resolver=_owned_device_resolver(engine),
         mcp_route_resolver=_owned_mcp_route_resolver(engine),
+        server_mcp_dispatcher=server_mcp_dispatcher,
+        server_mcp_authority=server_mcp_authority,
     )
 
 
@@ -714,6 +773,14 @@ def _owned_device_resolver(
 def _owned_mcp_route_resolver(engine: AsyncEngine) -> McpRouteResolver:
     async def resolve(user_id: UUID, route: FrozenMcpEntryRoute) -> bool:
         async with AsyncSession(engine, expire_on_commit=False) as db:
+            if route.server_config_revision is not None:
+                server_envelope = await load_server_mcp_envelope(db)
+                if (
+                    server_envelope.config_revision != route.server_config_revision
+                    or route.server
+                    in {config.name for config in server_envelope.mcp_servers}
+                ):
+                    return False
             row = (
                 await db.execute(
                     select(Device.mcp_catalog).where(
@@ -747,7 +814,9 @@ def _owned_mcp_route_resolver(engine: AsyncEngine) -> McpRouteResolver:
     return resolve
 
 
-def _selection_error_code(exc: McpRouteSelectionError) -> ErrorCode:
+def _selection_error_code(
+    exc: McpRouteSelectionError | ServerMcpRouteSelectionError,
+) -> ErrorCode:
     try:
         return ErrorCode(exc.code)
     except ValueError:
@@ -774,6 +843,7 @@ async def _execute_mcp_on_device(
     args: dict[str, Any],
     ctx: ToolContext,
     on_issued: Callable[[], None] | None,
+    server_mcp_authority: ServerMcpAuthorityFence | None,
 ) -> ToolResult:
     issued = False
 
@@ -793,6 +863,11 @@ async def _execute_mcp_on_device(
             timeout_seconds=_DEVICE_TOOL_TIMEOUT_SECONDS,
             chat_session_id=ctx.session_id,
             on_issued=mark_issued,
+            issue_guard=(
+                None
+                if server_mcp_authority is None
+                else lambda: server_mcp_authority.device_issue(route)
+            ),
         )
     except DeviceBusyError:
         return _normalized_error(
@@ -854,6 +929,49 @@ async def _execute_mcp_on_device(
         is_error=raw.is_error,
         code=code,
     )
+
+
+async def _execute_mcp_on_server(
+    *,
+    dispatcher: ServerMcpDispatcher,
+    route: FrozenServerMcpEntryRoute,
+    name: str,
+    args: dict[str, Any],
+    ctx: ToolContext,
+    on_issued: Callable[[], None] | None,
+    server_mcp_authority: ServerMcpAuthorityFence | None,
+) -> ToolResult:
+    issued = False
+
+    def mark_issued() -> None:
+        nonlocal issued
+        issued = True
+        if on_issued is not None:
+            on_issued()
+
+    try:
+        return await dispatcher.dispatch_server_mcp(
+            route=route,
+            user_id=ctx.user_id,
+            name=name,
+            args=args,
+            on_issued=mark_issued,
+            issue_guard=(
+                None
+                if server_mcp_authority is None
+                else lambda: server_mcp_authority.server_issue_allowed(route)
+            ),
+        )
+    except Exception:
+        if issued:
+            return _normalized_error(
+                ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+                "MCP call may have executed, but its outcome is unknown; do not replay it blindly",
+            )
+        return _normalized_error(
+            ErrorCode.TOOL_MCP_ERROR,
+            "MCP call failed before it was issued",
+        )
 
 
 def _bounded_mcp_content(raw: ToolResultFrame) -> str | list[dict[str, Any]]:

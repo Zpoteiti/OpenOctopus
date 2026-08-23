@@ -6,6 +6,11 @@ Browser ↔ server uses REST: `POST messages` may stream best-effort current-tur
 preview events, while `GET messages` returns canonical Postgres-backed history
 and recovery state (ADR-003, ADR-121). This protocol is for devices only.
 
+Py8a admin shared-service Server MCP runs entirely inside
+`openoctopus_server`; it does not connect through a Device WebSocket and adds no
+frame. Its admin REST API, runtime generation, and fair queue therefore do not
+change this document's strict Protocol v3 wire version.
+
 ---
 
 ## 1. Connection lifecycle
@@ -717,8 +722,9 @@ tolerance. Protocol version is independent from the package version.
 - **Streaming `tool_result`** — results are single-frame even if large (subject to the tool's own result cap). Real streaming would require a slot model like transfers; not justified yet.
 - **Multi-server failover** — single server per device. Multi-server coordination is ruled out (ADR-061).
 - **Resume / range support for transfers** — failed transfers restart from byte 0. Resumable transfers require tracking offsets persistently; not worth the complexity at current file sizes.
-- **Server/admin MCP** — Py7 runs MCP only on user Devices. Shared Server MCP
-  remains a Py8 design.
+- **Server MCP wire frames** — Server MCP is active in Py8a but is an in-process
+  Server route. It deliberately adds no Device frame and does not require
+  Protocol v4.
 - **MCP invocation replay** — transport recovery may resume an existing stream,
   but OpenOctopus never issues a second MCP request for an ambiguous call.
 

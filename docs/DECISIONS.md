@@ -6,6 +6,10 @@ Each record captures **what** was decided and **why**, not how it was implemente
 
 **Current Python-main Device contract:** ADR-133 is the Py7 authority for
 workspace restriction, Protocol v3, Device MCP, and Server `web_fetch` policy.
+The accepted Py8a Server shared-MCP design extends ADR-047/049/071/072/114 with
+admin whole-list CAS, Server-first namespace/capacity, one shared runtime per
+name, bounded fair admission, degraded recovery, and trusted same-UID execution
+without an OS sandbox; it does not change Protocol v3.
 Earlier ADR text is retained as milestone history where explicitly marked
 superseded. Any older-body occurrence of `sandbox_mode`, `enabled_tools`, typed
 MCP name infixes, Protocol v2, or offline optimistic MCP addition describes the
@@ -674,8 +678,9 @@ inventory table in `docs/TOOLS.md`.
 - **Client-only tools** (`exec`, `write_stdin`, `list_exec_sessions`) execute in
   `openoctopus_client`; their fixed schemas are server-canonical and the server
   routes calls without importing client executors.
-- **Py7 MCP-wrapped tools/resources/templates/prompts** are dynamic and run on
-  a user's paired Device. Admin shared-service Server MCP is a Py8 extension.
+- **MCP-wrapped tools/resources/templates/prompts** are dynamic. Device entries
+  run on a user's paired Device; Py8a admin shared-service entries run through
+  one Server runtime per configured name and use install site `server`.
 
 The original server-owned listing included `web_fetch`, but ADR-052 supersedes
 that part: `web_fetch` is a shared server/client tool.
@@ -715,12 +720,22 @@ availability. Each Provider iteration freezes an immutable catalog route;
 dispatch rechecks the durable revision/digest and current accepted runtime.
 Equal logical MCP entries may merge across Devices only when their canonical
 Provider shape and invocation identity match exactly.
+**Py8a clarification:** Persisted Server MCP entries are selected first and
+reserve their structured Server config name. Device entries under a reserved
+name are shadowed even when the Server runtime is down or the Server entry is
+disabled. Remaining Device logical groups are selected deterministically only
+from the Provider count/byte budget left after all enabled Server entries.
+Server and Device routes are frozen together for each Provider iteration.
 **Context:** Without this rule, if `read_file` exists on server + three devices, the agent would see four separate tools or four overlapping schemas. That defeats the point of the unified tool surface (ADR-041) and blows up the agent's tool-registry cognitive load.
 **Decision:** At tool-schema-build time (per session), `tools_registry::build_tool_schemas` deduplicates:
 
 1. Group incoming tool schemas by `(fully_qualified_name, canonical_schema)`.
 2. For each group, emit **one** merged schema whose `openoctopus_device` enum lists every install site that reported it.
-3. If two install sites report the same name but different canonical schemas, REJECT — ADR-049 for MCP collisions; for non-MCP tools, this is a bug (shared tools should have server-owned canonical schemas per ADR-038).
+3. If two same-tenancy install sites report the same name but different
+   canonical schemas, REJECT — ADR-049 for MCP collisions; for non-MCP tools,
+   this is a bug. Py8a Server MCP is authoritative across tenancies: it shadows
+   or suppresses an existing Device entry rather than allowing the Device to
+   block the admin candidate.
 
 **Applies to:**
 - **Shared file tools** (`read_file`, `write_file`, etc.): server schema is canonical (ADR-038). Every paired device is an install site for the same schema. Merge injects `openoctopus_device` as a new property; enum = `["server", <paired_device_1>, <paired_device_2>, ...]`, appended to `required`. Paired-but-offline devices remain visible and fail at dispatch with `device_unreachable`.
@@ -733,7 +748,10 @@ Provider shape and invocation identity match exactly.
 - **Intrinsic-device server tools** (`file_transfer`, `message`): source schema already has its device field(s) — `openoctopus_src_device`/`openoctopus_dst_device` for `file_transfer`, `openoctopus_device` for `message` — with `enum: ["server"]` as a stub. Merge **extends** each such enum with paired device names — no new property injected. Paired-but-offline devices remain visible and fail at dispatch with `device_unreachable`.
 
 **Merger detects intrinsic-device fields via an explicit marker, not by enum-shape heuristic.** Each device-routing field in a source schema carries `"x-openoctopus-device": true` (a JSON Schema extension). The typed helper `openoctopus_device_field()` in `openoctopus_server/tools/` produces the canonical fragment. The merger scans for this marker when extending enums — avoids the "guess a field is device-routing because its enum happens to be `['server']`" trap.
-- **MCP tools** (`mcp_{server}_{tool}`): collision-checked at install (ADR-049); schemas guaranteed identical across sites when install succeeds. Enum lists all install sites of this MCP server.
+- **MCP tools** (`mcp_{server}_{tool}`): Device-to-Device merges require equal
+  logical identity/schema and list those Device sites. A Py8a Server config
+  reserves its structured name and emits only site `server`; same-name Device
+  sites are shadowed rather than merged.
 
 **Canonical schema comparison:** compare the schema after normalizing whitespace, property ordering, and OpenAI-compatibility transforms. Use a stable JSON canonicalization (e.g. sorted keys, trimmed descriptions).
 
@@ -829,7 +847,7 @@ asyncio event loop stays responsive. This applies to both server-side
 | web_fetch | no | 30s total, 10s connect | — |
 | cron | no | 10s (DB op) | — |
 | file_transfer | no | stall-detect: abort if no bytes in 30s; same-device move is atomic (instant) | — |
-| MCP tools | depends on MCP's own schema | varies | rmcp session timeout |
+| MCP tools | no OpenOctopus timeout override | 60s public deadline including Server queue time | Server remote calls may shield-drain for one additional 60s while retaining permits; no automatic replay |
 
 - **Exec background sessions follow nanobot's model.** `exec.timeout` is the
   process hard lifetime. `exec.yield_time_ms` is only the reporting window:
@@ -1120,13 +1138,19 @@ shared workspace is rejected like any other write.
 
 ## 6. MCP
 
-### ADR-047 · MCP client lives in `openoctopus_server`
+### ADR-047 · MCP clients live at their execution site
 
-**Status:** superseded for Device MCP by ADR-133; Server/admin MCP remains deferred to Py8
-**Py7 marker:** The following text is historical. Py7 runs Device MCP clients in
-`openoctopus_client` with FastMCP 3.4.7; it does not implement Server MCP.
-**Decision:** `openoctopus_server/mcp/` contains the MCP session management and wrapping logic (name conventions per ADR-048, URI template parsing per ADR-099). Server-side shared-service MCPs use this directly. Client devices manage their own MCP subprocesses independently per ADR-105 — the server does not need to import client MCP code, and the client does not need to import server MCP code.
-**Consequences:** Single implementation. Per-site specific bits (server loads config from `system_config`; client applies from `ConfigUpdate`) stay in the owning crate. `rmcp` is already a workspace dependency. The agent sees a flat list of callable entries — it never branches on "is this a tool, resource, or prompt", just on the wrapped name.
+**Status:** superseded in detail by ADR-133 for Device MCP and the accepted
+Py8a Server shared-MCP design.
+**Decision:** Device MCP transport/runtime code lives in `openoctopus_client`;
+admin shared-service transport/runtime code lives in `openoctopus_server/mcp`.
+Both use FastMCP 3.4.7 and the same contract fixtures, but neither package
+imports the other and Python-main does not add a shared code package. Server MCP
+supports explicit stdio, Streamable HTTP, and legacy SSE transports and full
+discovery of tools, static resources, resource templates, and prompts.
+**Consequences:** Each configured Server name owns one shared process-lifetime
+runtime/client/session. Per-site persistence and lifecycle remain in their
+owning package while Provider-visible names and result mapping stay identical.
 
 ### ADR-048 · MCP wrapping — tools, resources, prompts as tool-registry entries
 
@@ -1155,57 +1179,40 @@ Merge-time injection (ADR-071) is uniform across all three: `openoctopus_device`
 
 **Consequences:** Wrap is pure name-rewriting + schema-shape generation; merge is where cross-site schema comparison + `openoctopus_device` injection happens. Cleanly separates concerns. The reserved `openoctopus_` prefix on the routing field ensures we never clobber an MCP capability's own args, even if the MCP author used a field named `device`. The agent learns three name patterns and treats them uniformly thereafter.
 
-### ADR-049 · MCP collision rejection — server orchestrates DB cleanup + corrective config_update
+### ADR-049 · MCP validation, collisions, and Server priority
 
-**Status:** superseded by ADR-133
-**Py7 marker:** The offline optimistic-save/corrective-prune flow below is
-historical. Py7 requires online initialize plus complete discovery before any
-add/modify commit; only pure deletion is allowed offline.
-**Decision:** Three distinct rejection cases, all handled by the same server-orchestrated cleanup flow:
+**Status:** accepted; supersedes the optimistic save/corrective-prune design.
 
-1. **Within-server cross-surface or intra-surface dup.** If the same MCP server advertises two capabilities that wrap to the same name — two tools named `search`, or any internal duplicate — the install is rejected. (Cross-surface collisions like tool `search` vs resource `search` are impossible by ADR-048's typed infix, so this rule fires only on within-surface dups, which indicate a malformed MCP server.) OpenOctopus diverges from nanobot here: nanobot silently overwrites (`registry.py:19–22`); OpenOctopus rejects so the agent never sees a half-registered MCP.
-2. **Cross-install-site schema drift.** Same wrapped name (e.g. `mcp_minimax_web_search`) MUST have an identical source schema across every install site. If any schema differs from an existing install of the same `<server>` name, the new registration is rejected.
-3. **Spawn failure on the client side** (ADR-105). The MCP subprocess failed to start, exited during `list_tools/resources/prompts`, or hit the 30-second startup timeout. Same rejection treatment as collisions.
+**Decision:** Every MCP add or effective modification validates before save.
+Device candidates require the current Client to initialize and discover all
+four surfaces; only pure Device deletion may commit offline. Server candidates
+validate through an isolated Server runtime before the whole-list CAS commit;
+pure deletion does not require the removed endpoint to be reachable. No failed
+candidate is persisted or later pruned as a corrective action.
 
-**For device MCPs, the server is the orchestrator.** Online config edits are
-validated before the REST call commits:
+All four surfaces share `mcp_<server>_<alias>`. Enabled intra-server
+cross-surface duplicates, collisions among candidate Server configs, and
+Device-owner schema drift reject the complete candidate; names are never
+truncated, suffixed, hashed, or auto-versioned.
 
-a. `PATCH /api/devices/{name}/config` builds a candidate config and, if the
-device is online and `mcp_servers` changed, sends `config_validate` to the
-client for validation-only MCP spawn/introspection. The client must not replace
-its active config, tear down currently-active MCPs, or send `register_mcp` for
-this probe.
-b. The server waits for the bounded `config_validate_result` and applies the
-same capability collision/schema checks it applies to `register_mcp`, without
-mutating the active device-tool cache. Within-server dup or cross-install
-schema drift returns `409 Conflict`; spawn or initial introspection failure
-returns `400 Bad Request`; validation timeout or device disconnect returns a
-normal REST error. The DB row is not changed.
-c. If validation succeeds, the server writes the new `devices.mcp_servers`
-config and pushes the accepted config via authoritative `config_update`.
+Admin Server MCP has priority across tenancies:
 
-If the device is offline, `PATCH` may store the config because no client is
-available to validate it. On the next reconnect, the client validates local MCP
-servers and reports spawn/introspection failures in `register_mcp`. The server
-then removes the offending entry from `devices.mcp_servers` JSONB and pushes a
-corrective `config_update` to the client. The frontend observes this by normal
-state fetches such as `GET /api/devices`; there is no per-user SSE event.
-`POST /api/devices` follows the same optimistic desired-config rule for
-request bodies that include `mcp_servers`: the new device is usually offline,
-so validation occurs on its first WebSocket connection.
+1. Existing Device config/catalog/runtime never blocks an admin PUT.
+2. A committed Server config reserves its exact structured server name even if
+   disabled or unavailable. Existing same-name Device entries are shadowed in
+   Provider/dispatch projection but are not deleted or stopped.
+3. Existing Device exact-final-name conflicts under another name are likewise
+   suppressed in the derived Provider projection.
+4. Later Device add/effective-modify using a reserved name fails with
+   `mcp_name_reserved_by_server`; an enabled exact Server final-name collision
+   fails with `mcp_schema_collision`. Unchanged preservation, deletion, or
+   rename to an unreserved name remains allowed.
+5. Server and Device final commit paths recheck reservation/collision under the
+   shared catalog fence so concurrent mutations cannot bypass priority.
 
-For the admin shared-service path (`PUT /api/admin/server-mcp`), validation is
-synchronous on the HTTP request. Within-server dup and cross-install schema
-drift return `409 Conflict`; spawn or initial introspection failure returns
-`400 Bad Request`; either way the new list is not applied.
-
-**Coarse-grained removal:** if any tool/resource/prompt within an MCP server triggers rejection, the **whole MCP server** is removed from config — not just the offending capability. Simpler implementation, simpler mental model. User re-adds with a tighter `enabled_tools` filter (ADR-100) or a renamed server if they want partial coexistence.
-
-**Consequences:** Never auto-version / suffix. User renames their local install
-if they want two versions to coexist. Single canonical schema per wrapped name.
-Online device config failures surface synchronously as REST errors. Offline
-device config failures are corrected on reconnect and become visible through
-ordinary device/config reads.
+**Consequences:** One Provider schema and one exact hidden route exist for each
+visible final name. Removing an admin reservation automatically restores still
+valid Device entries without Device writes, discovery, or reconnect.
 
 ### ADR-099 · MCP resource templates — URI placeholders are surfaced as schema properties
 
@@ -1236,7 +1243,7 @@ Agent calls `mcp_notion_resource_page(page_id="abc")` → wrapper computes `noti
 **Py7 marker:** The `enabled_tools` rules below are historical. Py7 uses one
 `enabled_capabilities` allowlist across all four surfaces: `null` means none,
 `[]` explicitly means all, and a non-empty list precisely selects final wrapped names.
-**Python-main clarification:** Python-main simplifies the enabled filter:
+**Historical Python-main draft:** The superseded draft simplified the enabled filter:
 - Field name is `enabled_tools`, not `enabled`.
 - It is a simple string list of exact post-wrap tool names (e.g.
   `["mcp_github_create_issue", "mcp_github_list_issues"]`), not glob
@@ -1264,16 +1271,29 @@ Example:
 ### ADR-114 · Python-main MCP tenancy: admin shared-service + device only
 
 **Status:** accepted
-**Py7 clarification:** Py7 implements only Device MCP. Admin shared-service
-Server MCP remains a Py8 contract and has no Py7 runtime or active REST route.
+**Py8a clarification:** Both accepted tenancy scopes are active. Server MCP is
+managed through `GET/PUT /api/admin/server-mcp`; Device MCP remains managed on
+the Device config route.
 **Context:** MCP sessions can carry credentials and state. A single admin-installed server-side MCP client shared by every user is acceptable for deliberately shared service-account tools (stateless search, internal KB lookup), but unsafe for personal OAuth, browser state, IDE/LSP state, shell/REPL state, or any integration whose state belongs to one user.
 **Decision:** Python-main supports exactly two MCP tenancy scopes:
-- **Admin shared-service MCP.** Configured only by admins under `system_config.server_mcp` via `/api/admin/server-mcp`. Uses admin-provided shared credentials, appears in tool schemas as install site `openoctopus_device="server"`, and is intended only for stateless or low-state service tools. Py8 runs one shared runtime/client per configured MCP server and protects each with a bounded per-MCP FIFO queue; if the queue is saturated, calls fail fast as tool errors. There is no client pool, per-user runtime, session-scoped runtime, or `pool_size` config field in the Py8 contract. Admins are responsible for choosing MCPs that are safe to share across all users.
+- **Admin shared-service MCP.** Configured only by admins in the atomic
+  `system_config.server_mcp` envelope. It uses admin-provided shared
+  credentials, appears as `openoctopus_device="server"`, and is intended only
+  for stateless or low-state service tools. Each configured name has one shared
+  runtime/client/session, a per-runtime concurrency limit, and a bounded fair
+  queue: user FIFO, user round-robin, global 32 and per-user 4 active/draining
+  permits, and a 5-second wait deadline. Runtime failure is degraded state and
+  does not remove its last-good schema or fail `/health`. There is no client
+  pool, per-user runtime, session-scoped runtime, or `pool_size`.
 - **Device MCP.** Configured by a user on a device row (`devices.mcp_servers`). The MCP subprocess runs on that user's device, registers through `register_mcp`, and appears as `openoctopus_device="<device-name>"`. User-specific credentials, browser/IDE state, and resource-heavy tools belong here.
 
 User-scoped server MCP and session-scoped MCP are out of scope for the accepted Python-main contract. They require per-user secret storage, runtime isolation, idle teardown, resource limits, and clear UX around "this runs on the server"; until that design exists, users who need personal MCP integrations install them on a device.
 
-**Consequences:** The server avoids N users × M MCP long-lived subprocess growth and avoids accidentally granting every user access to an admin's personal credentials. Admin server MCP remains useful for shared services, while personal/stateful MCPs stay naturally isolated by device ownership and OS process boundaries.
+**Consequences:** The server avoids N users × M MCP long-lived subprocess growth
+and avoids accidentally granting every user access to an admin's personal
+credentials. Admin Server names authoritatively reserve their logical namespace
+and shadow, rather than delete, existing Device installs. Personal/stateful MCPs
+stay naturally isolated by Device ownership and OS process boundaries.
 
 ### ADR-105 · MCP subprocess lifecycle on openoctopus_client
 
@@ -1976,7 +1996,10 @@ includes partial token previews.
 
 - **File tools** (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `list_dir`, `find_files`, `grep`) — byte-level operations through `WorkspaceService`. Document `read_file` may parse PDF/OOXML as inert data in the ADR-130 resource-limited MarkItDown child; it never executes macros, scripts, plugins, or embedded programs.
 - **`message`** — delivers text/media to a channel. No execution.
-- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the unconditional block-list (RFC-1918, 100.64/10, link-local, loopback, IPv6 equivalents — ADR-052) applies. Bounded HTML may be converted as inert data in the ADR-130 child; scripts and active content are removed, not evaluated.
+- **`web_fetch`** — HTTP GET/POST. When dispatched to the server site, the
+  current admin-managed `web_fetch_denylist` applies. Bounded HTML may be
+  converted as inert data in the ADR-130 child; scripts and active content are
+  removed, not evaluated.
 - **`cron`** — schedules future agent invocations. Does not itself execute anything.
 - **`file_transfer`** — moves bytes between server and a device. No execution.
 
@@ -1984,12 +2007,15 @@ Absent, deliberately: `exec`, `python`, `eval`, any code-execution tool (on the 
 
 **Consequence:** An agent that writes `rm -rf /` into `~/workspace/evil.sh` cannot trigger its execution on the server. Same for anything in MEMORY.md, SOUL.md, `skills/*/SKILL.md`, `.attachments/`. The server treats all user/agent-provided files as inert data.
 
-**Corollary — server-side MCP subprocesses are the one admin-gated exception.** Admin-installed MCPs (ADR-047) run as `TokioChildProcess` via rmcp. This is intentional code execution, but access is:
-- Admin-configured only (`PUT /api/server-mcp`, admin JWT required).
-- Not agent-reachable beyond the MCP's declared tool schemas.
-- Schema-collision-checked at install (ADR-049).
-
-Admin is trusted. Agent is not. The shape of "admin explicitly installs; agent calls tools through protocol" keeps the blast radius bounded to what the MCP itself exposes.
+**Corollary — Server MCP is the one admin-gated execution exception.** Py8a
+stdio MCP runs by direct argv as the OpenOctopus Server OS user; remote MCP is
+reached from the Server network. Only an admin may change the whole config list
+through `PUT /api/admin/server-mcp`, and an MCP is Agent-reachable only through
+its validated last-good schemas. This is trusted same-UID code, not an OS
+sandbox: it can access anything the Server account or network can access.
+Admins must install only audited shared-service MCPs. OpenOctopus bounds env,
+messages, queues, timeouts, and cleanup but does not use bwrap, containers,
+seccomp, or another jail in Py8a.
 
 ### ADR-073 · Client device policy gates — workspace paths, SSRF denylist, env allowlist
 
@@ -2061,13 +2087,18 @@ cannot overlap `workspace_path`.
 
 **Hard boundaries:**
 - Agents never cross user boundaries (user A's agent cannot read user B's workspace).
-- Agents cannot execute code on the server (ADR-072).
+- Agents have no general Server `exec`/Python/eval surface. They may invoke only
+  the declared schemas of admin-installed trusted Server MCP (ADR-072).
 - Server never inspects or executes content users upload (treated as inert data).
 - Cross-account impersonation via JWT forgery is the primary risk and handled by JWT signing (ADR-004); compromise of `JWT_SECRET` is a catastrophic admin-level concern, documented in deployment material.
 
 **What this explicitly does NOT try to defend against:**
 - **The user's own agent going off the rails.** If a user instructs their agent to damage files on a trusted device (`sandbox_mode=false`) and the command is not denied, the agent will comply. That's a user-ergonomics + device-policy question, not a platform security question.
-- **Compromised LLM provider.** If the admin-configured LLM starts returning malicious tool calls, the agent will attempt them. Device policy gates bound structured file tools and `web_fetch`, but permitted `exec`/MCP subprocesses still run with the host user's OS privileges until the later OS sandbox milestone.
+- **Compromised LLM provider.** If the admin-configured LLM starts returning
+  malicious tool calls, the agent will attempt them. Device policy gates bound
+  structured file tools and `web_fetch`, but permitted Client exec/MCP and
+  admin-installed Server MCP still run with their host OS user's privileges.
+  Py8a does not claim an OS sandbox.
 - **Partners on shared channels.** If Alice shares a Discord channel with Bob, Bob's untrusted-wrapped messages reach the agent. Wrap + system prompt teach the agent to reject instructions from non-partners (ADR-007). Not a cryptographic guarantee.
 - **Quota DoS via noisy allowed-users.** If an allowed user (a non-partner human the partner has authorized to message the agent on a shared channel — e.g. a coworker added for after-hours ops) spams files or messages and burns the partner's storage / LLM quota, mitigation is the partner removing them from their per-channel allow-list. Not a platform-level concern.
 
@@ -2915,7 +2946,7 @@ does not count as production code. Numbered implementation milestones start at
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
 | **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
 | **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
-| **Py8** | Server sandbox + server-side MCP | Server sandbox + explicit security design + admin shared-service MCP (one shared runtime per MCP + bounded FIFO queue) | Py7 | Fake admin shared MCP exposes tools via `server`; collision/failure paths covered |
+| **Py8** | Server MCP security boundary + shared runtime | Admin whole-list CAS API and last-good catalog; FastMCP 3.4.7 stdio/Streamable HTTP/SSE; four surfaces; one shared runtime per name; Server-first namespace/capacity; bounded fair queue and degraded recovery; trusted same-UID stdio with no OS sandbox | Py7 | Three-transport fake MCP E2E passes; Server-first shadow/capacity and Device mutation races pass; queue remains bounded/fair under 500-user pressure; MCP-down leaves `/health` healthy; shutdown leaves no child/connection/task leaks |
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
@@ -3734,8 +3765,11 @@ tombstones rather than poisoning a healthy replacement connection.
 MCP is trusted Device-host code: stdio children and remote transports can read
 or reach whatever the Device user can, subject only to their own configuration
 and host controls. `OPENOCTOPUS_*` values are removed from stdio child
-environments. Server/admin shared-service MCP remains deferred to Py8; Py7
-never runs Agent shell or MCP subprocesses on the Server.
+environments. Py8a extends this contract with admin shared-service Server MCP
+without changing Protocol v3: Server runtimes never traverse the Device
+WebSocket. They use a separate atomic config/catalog envelope, reserve their
+Server names ahead of Device MCP, and run as trusted same-UID code without an
+OS sandbox. The Server still never exposes Agent `exec`, Python, or eval.
 
 **Consequences:** Provider schemas are stable across online/offline flaps and
 come from persistent last-good catalogs; each Provider iteration freezes its
@@ -3754,7 +3788,9 @@ Distilled from the ADRs, for fast onboarding of new contributors:
 2. **Workspace is the single source of truth for durable user files.** No parallel durable file caches. Server workspace bytes persist in RustFS behind `WorkspaceService`; Py4 uses bounded memory rather than a local file cache. Online-only device delivery refs are pointers to paired devices, not durable OpenOctopus files.
 3. **DB is the single source of truth for conversation state.** In-memory runners are schedulers, not durable state. Every meaningful state change persists immediately.
 4. **Autonomous flows are user messages.** Cron, heartbeat → inject InboundMessage into bus. No `EventKind` branches in the main agent.
-5. **One schema per tool name.** Collisions across install sites are rejected, not auto-versioned.
+5. **One Provider schema per tool name.** Same-tenancy collisions are rejected,
+   not auto-versioned. Py8a Server entries are authoritative across tenancies;
+   conflicting Device projections are deterministically suppressed.
 6. **No speculative scaffolding.** Fields without consumers are rejected. Add them back in five lines when a consumer appears.
 7. **No rate limiting in v1. No dream in v1.** Admin provisions their LLM; agent maintains MEMORY.md inline.
 8. **Pure functions where possible.** `context::build_context`, the fuzzy matcher, `validate_url` — all pure. Testable with synthetic inputs.
@@ -3783,4 +3819,4 @@ For contributors migrating from the old codebase, here's what changed and why:
 | `cascade_migrations` loop in `db/mod.rs` | Canonical `schema.sql` via `include_str!` | ADR-057 |
 | Shell schema in `openoctopus_server/server_tools/` | Client owns; handshake-advertised | ADR-039 |
 | File tool schemas in `openoctopus_server/server_tools/` | `openoctopus_server/tools/schemas/` | ADR-038 |
-| MCP client code duplicated in server + client | Lives in `openoctopus_server/mcp/` | ADR-047 |
+| One shared/duplicated MCP runtime implementation | Execution-site packages (`openoctopus_server/mcp/`, `openoctopus_client/mcp/`) aligned by contract fixtures | ADR-047, ADR-133 |
