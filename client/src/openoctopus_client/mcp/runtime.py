@@ -15,14 +15,9 @@ from uuid import UUID
 import httpx
 from fastmcp.client.messages import MessageHandler
 from fastmcp.client.transports import ClientTransport, SSETransport, StreamableHttpTransport
-from jsonschema import SchemaError as JsonSchemaSchemaError
-from jsonschema import ValidationError as JsonSchemaValidationError
-from jsonschema import validate as validate_json_schema
 from mcp import types
 from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl, ValidationError
-from referencing import Registry
-from referencing.exceptions import Unresolvable
 
 from openoctopus_client.mcp.catalog import (
     CatalogSession,
@@ -680,23 +675,6 @@ class McpServerRuntime:
         try:
             async with asyncio.timeout(self._invocation_timeout):
                 if route.surface == "tool":
-                    try:
-                        validate_json_schema(
-                            instance=dict(arguments),
-                            schema=route.input_schema,
-                            registry=Registry(),
-                        )
-                    except JsonSchemaValidationError:
-                        return fail(
-                            "tool_invalid_args",
-                            "MCP tool arguments do not match the configured input schema",
-                        )
-                    except (JsonSchemaSchemaError, Unresolvable):
-                        return fail(
-                            "tool_mcp_error",
-                            "MCP tool input schema could not be evaluated; the request was not "
-                            "sent",
-                        )
                     request = types.ClientRequest(
                         root=types.CallToolRequest(
                             params=types.CallToolRequestParams(

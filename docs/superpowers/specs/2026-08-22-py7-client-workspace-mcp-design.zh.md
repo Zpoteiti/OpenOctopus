@@ -1136,6 +1136,9 @@ Py7 不自动接受动态 schema，但不会忽略 server 的变化通知：
   `client.session.send_request(request, CallToolResult)` 取得 raw typed result，保留
   MCP `isError`、content、structuredContent；不调用会依据 `outputSchema` 隐式校验的
   `client.session.call_tool`；
+- OpenOctopus 只校验自己的 envelope、route 和资源边界，不在每次 tool invocation
+  重复执行动态 `inputSchema`；MCP Server 负责校验其工具参数，并通过 `isError` 或
+  JSON-RPC error 返回失败，Agent 可据此修正参数后决定是否再次调用；
 - static/template resource：展开 URI 后 `client.session.read_resource`；
 - prompt：`client.session.get_prompt`；
 - 所有 invocation 使用 60 秒 OpenOctopus outer timeout；FastMCP/SDK 内层 timeout

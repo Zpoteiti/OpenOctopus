@@ -639,18 +639,7 @@ async def test_runtime_rejects_stale_unknown_and_disabled_routes_before_send() -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        {"value": "3", "options": {"mode": "safe"}},
-        {"value": 0, "options": {"mode": "safe"}},
-        {"value": 3, "options": {"mode": "unsafe"}},
-        {"value": 3, "options": {"mode": "safe", "unexpected": True}},
-    ],
-)
-async def test_runtime_rejects_invalid_tool_input_schema_before_send(
-    arguments: dict[str, Any],
-) -> None:
+async def test_runtime_forwards_tool_arguments_without_revalidating_input_schema() -> None:
     session = _FakeSession()
     runtime = McpServerRuntime(
         _config(),
@@ -666,33 +655,7 @@ async def test_runtime_rejects_invalid_tool_input_schema_before_send(
 
     output = await runtime.invoke(
         tool_id,
-        arguments,
-        runtime_generation=runtime.generation,
-    )
-
-    assert output.is_error is True
-    assert output.code == "tool_invalid_args"
-    assert session.sent_requests == []
-
-
-@pytest.mark.asyncio
-async def test_runtime_sends_valid_nested_tool_input() -> None:
-    session = _FakeSession()
-    runtime = McpServerRuntime(
-        _config(),
-        client_factory=_FakeBuilder(lambda _name: _FakeClient(session)),
-    )
-    await runtime.start()
-    persisted = _persisted_server()
-    tool = next(entry for entry in persisted.entries if entry.surface == "tool")
-    tool.input_schema = _TOOL_INPUT_SCHEMA
-    routes = runtime.bind_persisted(persisted)
-    runtime.mark_ready(runtime.generation)
-    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
-
-    output = await runtime.invoke(
-        tool_id,
-        {"value": 3, "options": {"mode": "safe"}},
+        {"value": "3", "options": {"mode": "unsafe", "unexpected": True}},
         runtime_generation=runtime.generation,
     )
 
@@ -700,94 +663,10 @@ async def test_runtime_sends_valid_nested_tool_input() -> None:
     assert len(session.sent_requests) == 1
     request = session.sent_requests[0].root
     assert isinstance(request, types.CallToolRequest)
-    assert request.params.arguments == {"value": 3, "options": {"mode": "safe"}}
-
-
-@pytest.mark.asyncio
-async def test_runtime_sends_valid_tool_input_with_local_ref() -> None:
-    session = _FakeSession()
-    runtime = McpServerRuntime(
-        _config(),
-        client_factory=_FakeBuilder(lambda _name: _FakeClient(session)),
-    )
-    await runtime.start()
-    persisted = _persisted_server()
-    tool = next(entry for entry in persisted.entries if entry.surface == "tool")
-    tool.input_schema = {
-        "type": "object",
-        "$defs": {"value": {"type": "integer"}},
-        "properties": {"value": {"$ref": "#/$defs/value"}},
-        "required": ["value"],
+    assert request.params.arguments == {
+        "value": "3",
+        "options": {"mode": "unsafe", "unexpected": True},
     }
-    routes = runtime.bind_persisted(persisted)
-    runtime.mark_ready(runtime.generation)
-    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
-
-    output = await runtime.invoke(
-        tool_id,
-        {"value": 3},
-        runtime_generation=runtime.generation,
-    )
-
-    assert output.is_error is False
-    assert len(session.sent_requests) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "input_schema",
-    [
-        {
-            "type": "object",
-            "properties": {"value": {"type": "not-a-json-schema-type"}},
-        },
-        {
-            "type": "object",
-            "properties": {
-                "value": {"$ref": "https://schemas.example.test/value.json"}
-            },
-        },
-    ],
-)
-async def test_runtime_schema_evaluation_failure_is_definite_pre_send(
-    input_schema: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    network_calls = 0
-
-    def reject_network(*args: object, **kwargs: object) -> None:
-        nonlocal network_calls
-        del args, kwargs
-        network_calls += 1
-        raise AssertionError("JSON Schema validation must not retrieve external refs")
-
-    monkeypatch.setattr("urllib.request.urlopen", reject_network)
-    session = _FakeSession()
-    client = _FakeClient(session)
-    runtime = McpServerRuntime(
-        _config(),
-        client_factory=_FakeBuilder(lambda _name: client),
-    )
-    await runtime.start()
-    persisted = _persisted_server()
-    tool = next(entry for entry in persisted.entries if entry.surface == "tool")
-    tool.input_schema = input_schema
-    routes = runtime.bind_persisted(persisted)
-    runtime.mark_ready(runtime.generation)
-    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
-
-    output = await runtime.invoke(
-        tool_id,
-        {"value": 3},
-        runtime_generation=runtime.generation,
-    )
-
-    assert output.code == "tool_mcp_error"
-    assert "request was not sent" in str(output.content)
-    assert network_calls == 0
-    assert session.sent_requests == []
-    assert runtime.state is McpRuntimeState.READY
-    assert not client.closed
 
 
 @pytest.mark.asyncio

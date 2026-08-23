@@ -472,8 +472,11 @@ dispatch returns `tool_device_unreachable`. A connected Device with a starting,
 down, drifted, or unacknowledged runtime returns `tool_mcp_unavailable`.
 
 An MCP call is bound to both the OO WS writer generation and MCP runtime
-generation. Once the call enters or may enter MCP transport, timeout, Stop, or
-disconnect returns `tool_execution_outcome_unknown`; it is never replayed.
+generation. After validating the OO envelope and immutable route, the Client
+forwards tool arguments without re-evaluating the dynamic MCP `inputSchema`;
+the MCP Server owns argument validation. Once the call enters or may enter MCP
+transport, timeout, Stop, or disconnect returns
+`tool_execution_outcome_unknown`; it is never replayed.
 Matching late results consume bounded generation tombstones. MCP failures are
 ordinary bounded `tool_result` frames and do not close the healthy Device WS or
 stop the Agent loop.

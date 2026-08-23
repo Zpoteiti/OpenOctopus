@@ -1231,6 +1231,12 @@ Discovery covers four independent MCP surfaces, including cursor pagination:
 | Resource template | bounded RFC 6570 expand, then `read_resource` | required string properties for template variables |
 | Prompt | `get_prompt(name, arguments)` | string properties from prompt arguments |
 
+For MCP tools, OpenOctopus validates its own envelope, immutable route, and
+resource bounds, then forwards the arguments without re-evaluating the dynamic
+MCP `inputSchema`. The MCP Server owns argument validation; its `isError` or
+JSON-RPC error is returned to the model as a bounded tool failure. OpenOctopus
+does not retry the call automatically.
+
 All surfaces share one flat final namespace:
 
 ```text
