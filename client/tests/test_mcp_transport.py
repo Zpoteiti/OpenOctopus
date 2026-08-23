@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 import httpx
 import pytest
@@ -20,6 +21,14 @@ from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from mcp import types
 from mcp.shared.exceptions import McpError
 
+from openoctopus_client.mcp import runtime as runtime_module
+from openoctopus_client.mcp import transport as transport_module
+from openoctopus_client.mcp.models import (
+    PersistedMcpCatalogEntry,
+    PersistedMcpServerCatalog,
+    StreamableHttpMcpServerConfig,
+)
+from openoctopus_client.mcp.runtime import McpRuntimeError, McpServerRuntime
 from openoctopus_client.mcp.transport import (
     MCP_MESSAGE_BYTES_MAX,
     BoundedHttpTransport,
@@ -27,6 +36,7 @@ from openoctopus_client.mcp.transport import (
     McpMessageTooLargeError,
     McpTransportClosingError,
     McpTransportError,
+    McpTransportFailureSignal,
     UnsupportedMcpContentEncodingError,
     _spawn_stdio_process,
     _stdio_argv,
@@ -40,6 +50,7 @@ from openoctopus_client.mcp.transport import (
     create_mcp_http_client,
     install_mcp_log_discard_boundary,
 )
+from openoctopus_client.protocol import new_uuid7
 
 
 def test_stdio_environment_uses_safe_baseline_and_redacts_client_secrets() -> None:
@@ -493,6 +504,11 @@ class _ChunkStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class _RaisingCloseStream(_ChunkStream):
+    async def aclose(self) -> None:
+        raise RuntimeError("close failed")
+
+
 class _ResponseTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
@@ -512,6 +528,16 @@ class _ResponseTransport(httpx.AsyncBaseTransport):
             self.status_code,
             headers=self.headers,
             stream=_ChunkStream(self.chunks),
+        )
+
+
+class _RaisingCloseEncodingTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=_RaisingCloseStream([b"not-read"]),
         )
 
 
@@ -558,6 +584,146 @@ class _StreamableMcpTransport(httpx.AsyncBaseTransport):
         if "id" not in payload:
             return _json_response({}, status_code=202)
         return _json_response(_mcp_response(payload))
+
+
+class _RuntimeOverflowTransport(httpx.AsyncBaseTransport):
+    def __init__(self, stage: str, *, include_content_length: bool = True) -> None:
+        self.stage = stage
+        self.include_content_length = include_content_length
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(await request.aread()))
+        if "id" not in payload:
+            return _json_response({}, status_code=202)
+        method = payload["method"]
+        if method == "initialize":
+            params = cast(dict[str, object], payload["params"])
+            result: dict[str, object] = {
+                "protocolVersion": params["protocolVersion"],
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                "serverInfo": {"name": "overflow", "version": "1"},
+            }
+        elif method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": (
+                            "x" * 2_000 if self.stage == "discovery" else "Echo text."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                    }
+                ]
+            }
+        elif method == "resources/list":
+            result = {"resources": []}
+        elif method == "resources/templates/list":
+            result = {"resourceTemplates": []}
+        elif method == "prompts/list":
+            result = {"prompts": []}
+        elif method == "tools/call":
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "x" * 2_000,
+                    }
+                ]
+            }
+        else:  # pragma: no cover - reports unexpected SDK traffic
+            raise AssertionError(f"unexpected MCP request: {method}")
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.stage == "encoding" or (
+            self.stage == "invocation_encoding" and method == "tools/call"
+        ):
+            headers["Content-Encoding"] = "gzip"
+        if self.include_content_length:
+            headers["Content-Length"] = str(len(body))
+        return httpx.Response(200, headers=headers, stream=_ChunkStream([body]))
+
+
+def _runtime_overflow_client_factory(backend: httpx.AsyncBaseTransport) -> Any:
+    def client_factory(_config, **kwargs):  # type: ignore[no-untyped-def]
+        transport = StreamableHttpTransport(
+            "https://mcp.invalid/mcp",
+            httpx_client_factory=partial(
+                create_mcp_http_client,
+                _transport=backend,
+                transport_failure_signal=kwargs.get("transport_failure_signal"),
+            ),
+        )
+        return create_fastmcp_client(
+            transport,
+            message_handler=kwargs.get("message_handler"),
+        )
+
+    return client_factory
+
+
+def _runtime_overflow_config() -> StreamableHttpMcpServerConfig:
+    return StreamableHttpMcpServerConfig(
+        name="overflow",
+        transport="streamable_http",
+        url="https://mcp.invalid/mcp",
+        headers={},
+        enabled_capabilities=[],
+    )
+
+
+def _real_overflow_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: httpx.AsyncBaseTransport,
+) -> McpServerRuntime:
+    monkeypatch.setattr(
+        runtime_module,
+        "build_runtime_client",
+        _runtime_overflow_client_factory(backend),
+    )
+    return McpServerRuntime(
+        _runtime_overflow_config(),
+        connect_timeout=2,
+        discovery_timeout=2,
+        invocation_timeout=2,
+        cleanup_timeout=0.2,
+    )
+
+
+async def _bind_runtime_overflow_tool(
+    runtime: McpServerRuntime,
+) -> UUID:
+    source = await runtime.start()
+    assert len(source.tools) == 1
+    tool = source.tools[0]
+    entry_id = new_uuid7()
+    runtime.bind_persisted(
+        PersistedMcpServerCatalog(
+            name="overflow",
+            entries=[
+                PersistedMcpCatalogEntry(
+                    entry_id=entry_id,
+                    server="overflow",
+                    surface="tool",
+                    raw_name=tool.raw_name,
+                    invocation_identity=tool.raw_name,
+                    final_name="mcp_overflow_echo",
+                    provider_description=tool.description or "Echo text.",
+                    input_schema=tool.input_schema,
+                    output_schema=tool.output_schema,
+                    enabled=True,
+                )
+            ],
+        )
+    )
+    runtime.mark_ready(runtime.generation)
+    return entry_id
 
 
 class _QueueSseStream(httpx.AsyncByteStream):
@@ -607,9 +773,16 @@ async def test_http_entity_limit_is_enforced_before_decode(monkeypatch: pytest.M
         assert await response.aread() == b"12345678"
 
     overflow = _ResponseTransport([b"1234", b"56789"])
-    async with httpx.AsyncClient(transport=BoundedHttpTransport(overflow)) as client:
+    failure_signal = McpTransportFailureSignal()
+    async with httpx.AsyncClient(
+        transport=BoundedHttpTransport(
+            overflow,
+            transport_failure_signal=failure_signal,
+        )
+    ) as client:
         with pytest.raises(McpMessageTooLargeError):
             await client.get("https://mcp.invalid/messages")
+    assert failure_signal.kind == "message_too_large"
 
 
 @pytest.mark.asyncio
@@ -618,14 +791,39 @@ async def test_http_rejects_length_and_encoding_before_read(
 ) -> None:
     monkeypatch.setattr("openoctopus_client.mcp.transport.MCP_MESSAGE_BYTES_MAX", 8)
     too_long = _ResponseTransport([b"not-read"], headers={"Content-Length": "9"})
-    async with httpx.AsyncClient(transport=BoundedHttpTransport(too_long)) as client:
+    length_failure = McpTransportFailureSignal()
+    async with httpx.AsyncClient(
+        transport=BoundedHttpTransport(
+            too_long,
+            transport_failure_signal=length_failure,
+        )
+    ) as client:
         with pytest.raises(McpMessageTooLargeError):
             await client.get("https://mcp.invalid/messages")
+    assert length_failure.kind == "message_too_large"
 
     compressed = _ResponseTransport([b"not-read"], headers={"Content-Encoding": "gzip"})
-    async with httpx.AsyncClient(transport=BoundedHttpTransport(compressed)) as client:
+    encoding_failure = McpTransportFailureSignal()
+    async with httpx.AsyncClient(
+        transport=BoundedHttpTransport(
+            compressed,
+            transport_failure_signal=encoding_failure,
+        )
+    ) as client:
         with pytest.raises(UnsupportedMcpContentEncodingError):
             await client.get("https://mcp.invalid/messages")
+    assert encoding_failure.kind == "unsupported_content_encoding"
+
+    close_failure = McpTransportFailureSignal()
+    async with httpx.AsyncClient(
+        transport=BoundedHttpTransport(
+            _RaisingCloseEncodingTransport(),
+            transport_failure_signal=close_failure,
+        )
+    ) as client:
+        with pytest.raises(UnsupportedMcpContentEncodingError):
+            await client.get("https://mcp.invalid/messages")
+    assert close_failure.kind == "unsupported_content_encoding"
 
 
 @pytest.mark.asyncio
@@ -713,6 +911,164 @@ async def test_real_streamable_http_transport_initializes_explicitly() -> None:
     assert fake.requests
     assert all(request.headers["accept-encoding"] == "identity" for request in fake.requests)
     assert all(request.headers["x-mcp-test"] == "present" for request in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_real_fastmcp_initialize_overflow_keeps_specific_failure_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport("initialize"),
+    )
+    monkeypatch.setattr(transport_module, "MCP_MESSAGE_BYTES_MAX", 64)
+
+    try:
+        with pytest.raises(McpRuntimeError) as captured:
+            async with asyncio.timeout(2):
+                await runtime.start()
+
+        assert captured.value.failure.code == "mcp_message_too_large"
+        assert captured.value.failure.stage == "connect"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_real_fastmcp_discovery_overflow_keeps_specific_failure_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport("discovery"),
+    )
+    monkeypatch.setattr(transport_module, "MCP_MESSAGE_BYTES_MAX", 1_024)
+
+    try:
+        with pytest.raises(McpRuntimeError) as captured:
+            async with asyncio.timeout(2):
+                await runtime.start()
+
+        assert captured.value.failure.code == "mcp_message_too_large"
+        assert captured.value.failure.stage == "discovery"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_real_fastmcp_unsupported_encoding_is_permanent_during_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport("encoding"),
+    )
+
+    try:
+        with pytest.raises(McpRuntimeError) as captured:
+            async with asyncio.timeout(2):
+                await runtime.start()
+
+        assert captured.value.failure.code == "config_validation_failed"
+        assert captured.value.failure.stage == "connect"
+        assert runtime.permanent_failure is True
+        assert runtime.enter_backoff(jitter=0.5) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_content_length", [True, False])
+async def test_real_fastmcp_invocation_overflow_keeps_specific_tool_code(
+    monkeypatch: pytest.MonkeyPatch,
+    include_content_length: bool,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport(
+            "invocation",
+            include_content_length=include_content_length,
+        ),
+    )
+    monkeypatch.setattr(transport_module, "MCP_MESSAGE_BYTES_MAX", 1_024)
+
+    try:
+        entry_id = await _bind_runtime_overflow_tool(runtime)
+        async with asyncio.timeout(2):
+            output = await runtime.invoke(
+                entry_id,
+                {"text": "hello"},
+                runtime_generation=runtime.generation,
+                request_id=new_uuid7(),
+                max_result_bytes=4_096,
+            )
+
+        assert output.code == "tool_mcp_message_too_large"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_real_fastmcp_invocation_encoding_failure_stays_suspended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport("invocation_encoding"),
+    )
+
+    try:
+        entry_id = await _bind_runtime_overflow_tool(runtime)
+        async with asyncio.timeout(2):
+            output = await runtime.invoke(
+                entry_id,
+                {"text": "hello"},
+                runtime_generation=runtime.generation,
+                request_id=new_uuid7(),
+                max_result_bytes=4_096,
+            )
+
+        assert output.code == "tool_execution_outcome_unknown"
+        assert runtime.permanent_failure is True
+        assert runtime.code == "config_validation_failed"
+        assert runtime.enter_backoff(jitter=0.5) is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_idle_waiter_does_not_lose_transport_overflow_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _real_overflow_runtime(
+        monkeypatch,
+        _RuntimeOverflowTransport("idle"),
+    )
+    monkeypatch.setattr(transport_module, "MCP_MESSAGE_BYTES_MAX", 1_024)
+
+    try:
+        await _bind_runtime_overflow_tool(runtime)
+        cancelled_waiter = asyncio.create_task(runtime.next_event())
+        await asyncio.sleep(0)
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+
+        signal = getattr(runtime, "_transport_failure_signal")
+        signal.report("message_too_large")
+        async with asyncio.timeout(2):
+            event = await runtime.next_event()
+        assert event.kind == "transport_failed"
+
+        await runtime.mark_transport_unavailable()
+        assert runtime.code == "tool_mcp_message_too_large"
+        assert runtime.enter_backoff(jitter=0.5) == 1
+        runtime.begin_retry()
+        replacement_signal = getattr(runtime, "_transport_failure_signal")
+        assert replacement_signal is not signal
+        assert replacement_signal.kind is None
+    finally:
+        await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -908,13 +1264,19 @@ async def test_stdio_limit_rejects_oversize_record_before_lf(
         "sys.stdout.buffer.flush();"
         "sys.stdin.buffer.read()"
     )
-    transport = BoundedStdioTransport(command=sys.executable, args=("-c", code))
+    failure_signal = McpTransportFailureSignal()
+    transport = BoundedStdioTransport(
+        command=sys.executable,
+        args=("-c", code),
+        transport_failure_signal=failure_signal,
+    )
     client = create_fastmcp_client(transport)
 
     with pytest.raises(McpError, match="Connection closed"):
         async with client:
             pass
     assert isinstance(transport.terminal_error, McpMessageTooLargeError)
+    assert failure_signal.kind == "message_too_large"
     assert transport.process is not None and transport.process.returncode is not None
 
 

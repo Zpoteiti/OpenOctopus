@@ -228,7 +228,7 @@ class _FakeBuilder:
         self.factory = factory or (lambda _name: _FakeClient(_FakeSession()))
         self.clients: dict[str, _FakeClient] = {}
 
-    def __call__(self, config: McpServerConfig) -> _FakeClient:
+    def __call__(self, config: McpServerConfig, **_kwargs: object) -> _FakeClient:
         client = self.factory(config.name)
         self.clients[config.name] = client
         return client
@@ -290,6 +290,27 @@ async def test_idle_http_message_limit_failure_keeps_specific_code_and_retries()
     assert runtime.state is McpRuntimeState.UNAVAILABLE
     assert runtime.code == "tool_mcp_message_too_large"
     assert runtime.enter_backoff(jitter=0.5) == 1
+
+
+@pytest.mark.asyncio
+async def test_wrapped_idle_message_limit_keeps_specific_code() -> None:
+    client = _FakeClient(_FakeSession())
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: client),
+    )
+    await runtime.start()
+    wrapped = RuntimeError("FastMCP reader failed")
+    wrapped.__cause__ = ExceptionGroup(
+        "transport task failed",
+        [McpMessageTooLargeError("secret grouped raw detail")],
+    )
+
+    await runtime.message_handler.on_exception(wrapped)
+    await runtime.mark_transport_unavailable()
+
+    assert runtime.code == "tool_mcp_message_too_large"
+    assert "secret" not in str(runtime.last_failure)
 
 
 @pytest.mark.asyncio
@@ -888,6 +909,35 @@ async def test_stdio_message_limit_survives_sdk_connection_closed_translation() 
     assert output.code == "tool_mcp_message_too_large"
     assert "secret raw detail" not in str(output.content)
     assert runtime.state is McpRuntimeState.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_pre_send_protocol_signal_rejects_without_ambiguous_outcome() -> None:
+    session = _FakeSession()
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: _FakeClient(session)),
+    )
+    await runtime.start()
+    routes = runtime.bind_persisted(_persisted_server())
+    runtime.mark_ready(runtime.generation)
+    tool_id = next(entry_id for entry_id, route in routes.items() if route.surface == "tool")
+    signal = getattr(runtime, "_transport_failure_signal")
+    signal.report("unsupported_content_encoding")
+
+    output = await runtime.invoke(
+        tool_id,
+        {},
+        runtime_generation=runtime.generation,
+        request_id=_RESULT_REQUEST_ID,
+        max_result_bytes=_RESULT_CREDIT,
+    )
+
+    assert session.sent_requests == []
+    assert output.code == "tool_mcp_unavailable"
+    assert runtime.state is McpRuntimeState.UNAVAILABLE
+    assert runtime.code == "config_validation_failed"
+    assert runtime.permanent_failure is True
 
 
 @pytest.mark.asyncio

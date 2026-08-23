@@ -833,6 +833,13 @@ class McpSupervisor:
                 await asyncio.sleep(delay)
                 if self._slots.get(slot.config.name) is not slot:
                     return
+                watcher = slot.watcher
+                slot.watcher = None
+                if watcher is not None and not watcher.done():
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+                if self._slots.get(slot.config.name) is not slot:
+                    return
                 slot.runtime.begin_retry()
                 self._mark_dirty()
                 self._start(slot)
