@@ -394,21 +394,21 @@ async def test_real_client_validates_registers_and_runs_all_mcp_surfaces(
                             "args": [str(_MCP_FIXTURE)],
                             "cwd": str(_MCP_FIXTURE.parent),
                             "env": {},
-                            "enabled_capabilities": None,
+                            "enabled_capabilities": [],
                         },
                         {
                             "name": "remote",
                             "transport": "streamable_http",
                             "url": f"{server_url}/_test/mcp/streamable",
                             "headers": {},
-                            "enabled_capabilities": None,
+                            "enabled_capabilities": [],
                         },
                         {
                             "name": "legacy",
                             "transport": "sse",
                             "url": f"{server_url}/_test/mcp/sse",
                             "headers": {},
-                            "enabled_capabilities": None,
+                            "enabled_capabilities": [],
                         }
                     ],
                 },
@@ -511,7 +511,7 @@ async def test_real_client_validates_registers_and_runs_all_mcp_surfaces(
                             "args": [str(_MCP_FIXTURE)],
                             "cwd": str(_MCP_FIXTURE.parent),
                             "env": {},
-                            "enabled_capabilities": None,
+                            "enabled_capabilities": [],
                         }
                     ],
                 },

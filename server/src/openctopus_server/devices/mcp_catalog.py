@@ -59,6 +59,16 @@ def _validation_error(message: str) -> McpCatalogError:
     return McpCatalogError("config_validation_failed", message)
 
 
+def _selected_capabilities(
+    known_names: set[str], configured: list[str] | None
+) -> set[str]:
+    if configured is None:
+        return set()
+    if not configured:
+        return known_names
+    return set(configured)
+
+
 def _normalized_json(value: object, *, depth: int = 0) -> object:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -361,9 +371,7 @@ def _build_server_entries(
                 output_schema,
             )
         )
-    selected = (
-        known_names if config.enabled_capabilities is None else set(config.enabled_capabilities)
-    )
+    selected = _selected_capabilities(known_names, config.enabled_capabilities)
     unknown = selected - known_names
     if unknown:
         raise _validation_error("enabled_capabilities contains an unknown wrapped name")
@@ -494,9 +502,7 @@ def build_persisted_catalog(
         if existing_server is None:
             raise _validation_error(f"source catalog is missing configured MCP server: {name}")
         known_names = {entry.final_name for entry in existing_server.entries}
-        selected = (
-            known_names if config.enabled_capabilities is None else set(config.enabled_capabilities)
-        )
+        selected = _selected_capabilities(known_names, config.enabled_capabilities)
         if selected - known_names or any(
             entry.enabled != (entry.final_name in selected) for entry in existing_server.entries
         ):

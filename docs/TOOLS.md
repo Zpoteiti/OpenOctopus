@@ -1253,14 +1253,15 @@ hashed, or suffixed.
 Each server applies one exact allowlist across all four surfaces:
 
 ```text
-enabled_capabilities: null / omitted  -> all discovered capabilities
-enabled_capabilities: []              -> none
+enabled_capabilities: null / omitted  -> no discovered capabilities
+enabled_capabilities: []              -> explicitly all discovered capabilities
 enabled_capabilities: ["..."]         -> exactly those final wrapped names
 ```
 
 Discovery always persists the complete bounded catalog, including disabled
 entries. Unknown allowlist names reject the candidate. A useful first install
-uses `[]`, reads `mcp_discovered`, then submits the desired exact names.
+uses `null`, reads `mcp_discovered`, then submits the desired exact names or
+`[]` to explicitly enable everything.
 
 ### Schema merge and routing
 

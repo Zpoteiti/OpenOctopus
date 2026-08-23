@@ -59,12 +59,14 @@ MCP session 的磁盘恢复。用户安装的 stdio MCP、exec 和 PTY 都是以
 11. **统一 allowlist。** `enabled_capabilities` 的语义固定为：
 
     ```text
-    null / omitted  -> 全部启用
-    []              -> 全部禁用
+    null / omitted  -> 全部禁用
+    []              -> 显式全部启用
     ["..."]         -> 只启用列出的最终 wrapped names
     ```
 
     列表对四个 surface 一视同仁，精确匹配，无 glob。
+    这条约定只适用于有限正向选择器；denylist、环境变量 allowlist 和普通配置集合
+    保留各自的空列表语义，PATCH 顶层字段 omitted 仍表示不修改。
 12. **在线 validate-before-save。** 新增或修改 MCP 必须在当前 Client 在线时完成
     真实 initialize 与完整 discovery；任一步失败都不写 DB、不改变 active runtime。
 13. **离线只允许删除 MCP。** 纯删除可离线提交；任何混合的新增或修改使整个 PATCH
@@ -295,7 +297,7 @@ stdio：
   "args": ["-y", "@example/github-mcp"],
   "cwd": null,
   "env": {"GITHUB_TOKEN": "secret"},
-  "enabled_capabilities": null
+  "enabled_capabilities": []
 }
 ```
 
@@ -327,7 +329,7 @@ legacy SSE：
   "transport": "sse",
   "url": "http://10.0.0.20:8000/sse",
   "headers": {},
-  "enabled_capabilities": []
+  "enabled_capabilities": null
 }
 ```
 
@@ -629,14 +631,14 @@ identity，则 validation 失败。
 
 discovery 总是收集并保存所有四类能力，然后解释 allowlist：
 
-- `null` 或字段 omitted：选择 catalog 中全部 final names；
-- `[]`：选择零项，但仍真实 initialize/discover/validate bounded catalog；
+- `null` 或字段 omitted：选择零项，但仍真实 initialize/discover/validate bounded catalog；
+- `[]`：显式选择 catalog 中全部 final names；
 - 非空 list：唯一、最多 512 项，精确选择列出的 final names；
 - 任一 unknown final name：整个 candidate 失败；
 - 不支持 raw names、surface object、glob、prefix 或 negative filter。
 
 REST `mcp_discovered` 显示 full catalog 与每项 enabled 状态，供用户构造下一次 PATCH。
-首次接入不熟悉的 MCP 时，推荐先用 `enabled_capabilities=[]` 完成安全 discovery，读取
+首次接入不熟悉的 MCP 时，推荐先用 `enabled_capabilities=null` 完成安全 discovery，读取
 返回的 final names，再进行第二次精确 allowlist PATCH；这样 discovery 期间不会短暂
 向 Agent 发布未知能力。
 

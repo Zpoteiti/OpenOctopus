@@ -402,7 +402,7 @@ async def test_device_rename_revalidates_owner_provider_schema_limit_atomically(
                 "args": [],
                 "cwd": None,
                 "env": {},
-                "enabled_capabilities": None,
+                "enabled_capabilities": [],
             }
         ]
     )

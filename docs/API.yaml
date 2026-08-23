@@ -2902,8 +2902,8 @@ components:
         maxLength: 64
         pattern: '^[a-zA-Z0-9_-]{1,64}$'
       description: |
-        `null` or omission enables every discovered capability; `[]` enables
-        none; a non-empty list precisely selects final names across tools,
+        `null` or omission enables no discovered capability; `[]` explicitly
+        enables all; a non-empty list precisely selects final names across tools,
         static resources, resource templates, and prompts.
 
     StdioMcpServerConfig:

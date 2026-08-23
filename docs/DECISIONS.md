@@ -1234,8 +1234,8 @@ Agent calls `mcp_notion_resource_page(page_id="abc")` → wrapper computes `noti
 
 **Status:** superseded by ADR-133
 **Py7 marker:** The `enabled_tools` rules below are historical. Py7 uses one
-`enabled_capabilities` allowlist across all four surfaces: `null` means all,
-`[]` means none, and a non-empty list precisely selects final wrapped names.
+`enabled_capabilities` allowlist across all four surfaces: `null` means none,
+`[]` explicitly means all, and a non-empty list precisely selects final wrapped names.
 **Python-main clarification:** Python-main simplifies the enabled filter:
 - Field name is `enabled_tools`, not `enabled`.
 - It is a simple string list of exact post-wrap tool names (e.g.
@@ -3713,9 +3713,12 @@ Discovery covers tools, static resources, resource templates, and prompts.
 All four surfaces share the final namespace `mcp_<server>_<alias>`; the
 surface and immutable source identity remain hidden route data. There is no
 typed name infix. `enabled_capabilities` has one three-state meaning across all
-surfaces: omitted/`null` enables all, `[]` enables none, and a non-empty unique
+surfaces: omitted/`null` enables none, `[]` explicitly enables all, and a non-empty unique
 list precisely enables those final names. Unknown names and collisions reject
 the complete candidate.
+This convention applies to finite positive selectors. Denylists, environment
+allowlists, and ordinary configuration collections retain their type-specific
+empty-list meaning; PATCH omission continues to mean unchanged.
 
 Every MCP add or modification requires the current Device Client to perform a
 real initialize and complete bounded discovery before the Server commits the

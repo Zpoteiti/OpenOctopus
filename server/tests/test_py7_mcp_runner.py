@@ -41,7 +41,7 @@ _MCP_SERVERS = [
         "args": [],
         "cwd": None,
         "env": {},
-        "enabled_capabilities": None,
+        "enabled_capabilities": [],
     }
 ]
 

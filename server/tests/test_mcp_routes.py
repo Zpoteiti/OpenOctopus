@@ -120,6 +120,7 @@ def _config(name: str = "demo") -> StdioMcpServerConfig:
         name=name,
         transport="stdio",
         command="mcp-demo",
+        enabled_capabilities=[],
     )
 
 

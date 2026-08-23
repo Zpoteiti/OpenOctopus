@@ -74,6 +74,17 @@ def _source(*, tool_name: str = "search", server: str = "demo") -> SourceMcpCata
     )
 
 
+def _four_surface_source() -> SourceMcpCatalog:
+    source = _source()
+    server = source.servers[0]
+    server.resources = [SourceMcpResource(raw_name="guide", uri="docs://guide")]
+    server.resource_templates = [
+        SourceMcpResourceTemplate(raw_name="record", uri_template="docs://record/{id}")
+    ]
+    server.prompts = [SourceMcpPrompt(raw_name="review")]
+    return source
+
+
 def _build(
     configs: list[StdioMcpServerConfig],
     source: SourceMcpCatalog,
@@ -173,8 +184,8 @@ def test_build_wraps_all_four_surfaces_and_computes_stable_digest() -> None:
         ],
     )
 
-    first = _build([_config()], source)
-    second = _build([_config()], source)
+    first = _build([_config(enabled=[])], source)
+    second = _build([_config(enabled=[])], source)
 
     entries = first.servers[0].entries
     assert [entry.final_name for entry in entries] == [
@@ -205,16 +216,22 @@ def test_empty_catalog_digest_matches_contract_fixture() -> None:
 
 
 def test_enabled_capabilities_three_states_and_unknown_selector() -> None:
-    all_enabled = _build([_config(enabled=None)], _source())
-    none_enabled = _build([_config(enabled=[])], _source())
-    exact_enabled = _build([_config(enabled=["mcp_demo_search"])], _source())
+    source = _four_surface_source()
+    none_enabled = _build([_config(enabled=None)], source)
+    all_enabled = _build([_config(enabled=[])], source)
+    exact_enabled = _build(
+        [_config(enabled=["mcp_demo_search", "mcp_demo_record"])],
+        source,
+    )
 
-    assert all_enabled.servers[0].entries[0].enabled is True
-    assert none_enabled.servers[0].entries[0].enabled is False
-    assert exact_enabled.servers[0].entries[0].enabled is True
+    assert not any(entry.enabled for entry in none_enabled.servers[0].entries)
+    assert all(entry.enabled for entry in all_enabled.servers[0].entries)
+    assert {
+        entry.final_name for entry in exact_enabled.servers[0].entries if entry.enabled
+    } == {"mcp_demo_search", "mcp_demo_record"}
 
     with pytest.raises(McpCatalogError, match="unknown"):
-        _build([_config(enabled=["mcp_demo_missing"])], _source())
+        _build([_config(enabled=["mcp_demo_missing"])], source)
 
 
 def test_filter_precedes_collision_and_built_in_reservation() -> None:
@@ -227,15 +244,15 @@ def test_filter_precedes_collision_and_built_in_reservation() -> None:
         )
     )
 
-    disabled = _build([_config(enabled=[])], source)
+    disabled = _build([_config(enabled=None)], source)
     assert all(not entry.enabled for entry in disabled.servers[0].entries)
 
     with pytest.raises(McpCatalogError) as collision:
-        _build([_config()], source)
+        _build([_config(enabled=[])], source)
     assert collision.value.code == "mcp_within_server_collision"
 
     with pytest.raises(McpCatalogError) as built_in:
-        _build([_config()], _source(), built_in_names={"mcp_demo_search"})
+        _build([_config(enabled=[])], _source(), built_in_names={"mcp_demo_search"})
     assert built_in.value.code == "mcp_within_server_collision"
 
 
@@ -294,6 +311,53 @@ def test_partial_source_catalog_reuses_unchanged_persisted_servers() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("selector", "enabled"),
+    [(None, False), ([], True)],
+    ids=("null_disables", "empty_enables_all"),
+)
+def test_existing_catalog_reuses_entries_for_unchanged_filter_only_selector(
+    selector: list[str] | None,
+    enabled: bool,
+) -> None:
+    original = _build([_config(enabled=selector)], _source())
+    candidate = build_persisted_catalog(
+        [_config(enabled=selector)],
+        SourceMcpCatalog(version=1, servers=[]),
+        existing_catalog=original,
+        entry_id_factory=lambda: pytest.fail("unchanged filter must not allocate an id"),
+    )
+
+    original_entry = original.servers[0].entries[0]
+    candidate_entry = candidate.servers[0].entries[0]
+    assert candidate_entry.entry_id == original_entry.entry_id
+    assert candidate_entry.enabled is enabled
+
+
+@pytest.mark.parametrize(
+    ("selector", "enabled"),
+    [(None, False), (["mcp_demo_search"], True)],
+    ids=("null_disables", "exact_selects"),
+)
+def test_existing_catalog_applies_filter_only_update_and_preserves_entry_ids(
+    selector: list[str] | None,
+    enabled: bool,
+) -> None:
+    source = _source()
+    original = _build([_config(enabled=[])], source)
+    candidate = build_persisted_catalog(
+        [_config(enabled=selector)],
+        source,
+        existing_catalog=original,
+        entry_id_factory=lambda: pytest.fail("filter-only update must preserve entry ids"),
+    )
+
+    original_entry = original.servers[0].entries[0]
+    candidate_entry = candidate.servers[0].entries[0]
+    assert candidate_entry.entry_id == original_entry.entry_id
+    assert candidate_entry.enabled is enabled
+
+
 def test_cross_config_enabled_name_collision_is_rejected() -> None:
     source = SourceMcpCatalog(
         version=1,
@@ -304,7 +368,10 @@ def test_cross_config_enabled_name_collision_is_rejected() -> None:
     )
 
     with pytest.raises(McpCatalogError) as captured:
-        _build([_config(name="a_b"), _config(name="a")], source)
+        _build(
+            [_config(name="a_b", enabled=[]), _config(name="a", enabled=[])],
+            source,
+        )
 
     assert captured.value.code == "mcp_schema_collision"
 
@@ -315,7 +382,7 @@ def test_tool_prompt_and_template_reserved_field_validation() -> None:
         "type": "string"
     }
     with pytest.raises(McpCatalogError, match="openoctopus_device"):
-        _build([_config()], reserved_tool)
+        _build([_config(enabled=[])], reserved_tool)
 
     prompt = SourceMcpCatalog(
         version=1,
@@ -335,7 +402,7 @@ def test_tool_prompt_and_template_reserved_field_validation() -> None:
         ],
     )
     with pytest.raises(McpCatalogError, match="openoctopus_device"):
-        _build([_config()], prompt)
+        _build([_config(enabled=[])], prompt)
 
     template = SourceMcpCatalog(
         version=1,
@@ -355,17 +422,17 @@ def test_tool_prompt_and_template_reserved_field_validation() -> None:
         ],
     )
     with pytest.raises(McpCatalogError, match="openoctopus_device"):
-        _build([_config()], template)
+        _build([_config(enabled=[])], template)
 
 
 def test_existing_logical_entry_keeps_uuid_and_digest_excludes_uuid() -> None:
-    original = _build([_config()], _source())
+    original = _build([_config(enabled=[])], _source())
 
     def unexpected_id() -> UUID:
         raise AssertionError("an unchanged entry must not allocate a replacement UUID")
 
     replacement = build_persisted_catalog(
-        [_config()],
+        [_config(enabled=[])],
         _source(),
         existing_catalog=original,
         entry_id_factory=unexpected_id,
@@ -393,8 +460,8 @@ def test_digest_is_independent_of_discovery_order_for_equal_invocation_identity(
         servers=[SourceMcpServerCatalog(name="demo", resources=list(reversed(resources)))],
     )
 
-    first = _build([_config()], forward)
-    second = _build([_config()], reverse)
+    first = _build([_config(enabled=[])], forward)
+    second = _build([_config(enabled=[])], reverse)
 
     assert first.digest == second.digest
     assert [entry.raw_name for entry in first.servers[0].entries] == ["guide", "manual"]
@@ -422,17 +489,17 @@ def test_per_server_capability_and_catalog_byte_bounds(monkeypatch: pytest.Monke
         for index in range(257)
     ]
     with pytest.raises(McpCatalogError, match="256"):
-        _build([_config()], source)
+        _build([_config(enabled=[])], source)
 
     monkeypatch.setattr(mcp_catalog, "DEVICE_CATALOG_BYTES_MAX", 10)
     with pytest.raises(McpCatalogError, match="catalog"):
-        _build([_config()], _source())
+        _build([_config(enabled=[])], _source())
 
 
 def test_per_capability_and_device_count_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mcp_catalog, "CAPABILITY_BYTES_MAX", 10)
     with pytest.raises(McpCatalogError, match="capability"):
-        _build([_config()], _source())
+        _build([_config(enabled=[])], _source())
     monkeypatch.setattr(mcp_catalog, "CAPABILITY_BYTES_MAX", 256 * 1024)
 
     servers: list[SourceMcpServerCatalog] = []
@@ -459,8 +526,8 @@ def test_per_capability_and_device_count_bounds(monkeypatch: pytest.MonkeyPatch)
 def test_owner_equal_merge_injects_exact_device_enum_and_schema_drift_rejects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    laptop = _build([_config()], _source())
-    desktop = _build([_config()], _source())
+    laptop = _build([_config(enabled=[])], _source())
+    desktop = _build([_config(enabled=[])], _source())
 
     merged = merge_owner_catalogs({"desktop": desktop, "laptop": laptop})
 
@@ -474,7 +541,7 @@ def test_owner_equal_merge_injects_exact_device_enum_and_schema_drift_rejects(
 
     drift_source = _source()
     drift_source.servers[0].tools[0].description = "Different schema identity"
-    drift = _build([_config()], drift_source)
+    drift = _build([_config(enabled=[])], drift_source)
     with pytest.raises(McpCatalogError) as captured:
         merge_owner_catalogs({"desktop": drift, "laptop": laptop})
     assert captured.value.code == "mcp_schema_collision"
@@ -508,7 +575,7 @@ def test_owner_merge_uses_invocation_identity_not_provider_hidden_resource_name(
                 )
             ],
         )
-        return _build([_config()], source)
+        return _build([_config(enabled=[])], source)
 
     merged = merge_owner_catalogs(
         {

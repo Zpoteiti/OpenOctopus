@@ -315,7 +315,7 @@ deferred to Py8.
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
 | ADR-099 | MCP resource templates — URI placeholders are surfaced as schema properties | `Supersede` | Py7 keeps template arguments but uses bounded RFC 6570 validation and `uritemplate`, not regex substitution. Static resources remain zero-arg. |
-| ADR-100 | MCP `enabled_tools` filter — tools only, simple string list | `Supersede` | Py7 uses `enabled_capabilities` across tools, static resources, templates, and prompts: `null` all, `[]` none, list exact final names. |
+| ADR-100 | MCP `enabled_tools` filter — tools only, simple string list | `Supersede` | Py7 uses `enabled_capabilities` across tools, static resources, templates, and prompts: `null` none, `[]` explicitly all, list exact final names. |
 | ADR-105 | MCP subprocess lifecycle on openoctopus_client | `Supersede` | Py7 uses generation-bound runtimes, background retry, drift detection, single-flight aggregate registration, explicit cleanup, and no invocation replay. MCP sessions survive ordinary OO WS reconnect. |
 | ADR-114 | Python-main MCP tenancy: admin shared-service + device only | `Supersede for Py7 scope` | Py7 implements Device MCP only. The admin shared-service runtime/route remains deferred to Py8. |
 
