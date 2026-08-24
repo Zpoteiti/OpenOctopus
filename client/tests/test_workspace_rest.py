@@ -294,6 +294,36 @@ def test_workspace_rest_local_copy_and_move_return_digest_without_overwrite(
     assert (tmp_path / "moved.bin").read_bytes() == payload
 
 
+def test_workspace_rest_local_transfer_honors_source_if_match(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
+    fingerprint = dispatcher_module._stat_fingerprint(source)
+    assert fingerprint is not None
+
+    matched = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="matched.bin",
+        mode="copy",
+        if_match=fingerprint,
+    )
+    stale = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="missing-parent/stale.bin",
+        mode="copy",
+        if_match="stale",
+    )
+
+    assert matched.is_error is False
+    assert (tmp_path / "matched.bin").read_bytes() == b"payload"
+    assert stale.code == "workspace_file_changed"
+    assert (tmp_path / "missing-parent").exists() is False
+
+
 def test_workspace_rest_local_transfer_waits_for_shared_runtime_capacity(
     tmp_path: Path,
 ) -> None:

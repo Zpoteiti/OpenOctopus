@@ -458,6 +458,14 @@ class ClientToolDispatcher:
             active_source_fd, initial = opened_source
             source_fd = active_source_fd
             try:
+                if (
+                    action.if_match is not None
+                    and action.if_match != opaque_stat_fingerprint(initial[:4])
+                ):
+                    raise ToolFailure(
+                        "workspace_file_changed",
+                        "Source changed before transfer",
+                    )
                 await self._run_transfer_blocking(
                     abandoned_drains, _check_transfer_destination, destination
                 )
