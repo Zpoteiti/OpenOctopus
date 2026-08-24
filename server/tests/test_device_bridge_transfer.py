@@ -3493,3 +3493,113 @@ async def test_abort_ack_is_rejected_before_its_endpoint_issue_boundary(
     finally:
         transport.release_abort.set()
         await _cancel_bridge_task(task)
+
+
+async def test_already_admitted_bridge_uses_exact_id_without_releasing_outer_lease() -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = transfer_module.new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+
+    task = asyncio.create_task(
+        manager.start_client_to_client_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            user_id=user_id,
+            slot_id=slot_id,
+            operation_lease=lease,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+    assert request.id == slot_id
+    assert admission.active_count == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.active_slots == 0
+    assert admission.active_count == 1
+
+    await lease.aclose()
+    assert admission.active_count == 0
+
+
+async def test_already_admitted_bridge_strips_destination_metadata_from_source_ack() -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = transfer_module.new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    task = asyncio.create_task(
+        manager.start_client_to_client_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+    await _send_source_begin(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        request,
+        total_bytes=0,
+    )
+    await _make_destination_ready(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    destination_end = await _issue_source_success(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    await manager.handle_frame(
+        destination_route.handle,
+        destination_end.model_copy(
+            update={
+                "ack": True,
+                "etag": "destination-v1",
+                "created": True,
+            }
+        ),
+    )
+
+    result = await task
+    assert result.etag == "destination-v1"
+    assert result.created is True
+    source_ack = _text_frames(
+        transport,
+        source_route.handle,
+        TransferEndFrame,
+        ack=True,
+    )[-1]
+    assert source_ack.etag is None
+    assert source_ack.created is None
+    assert admission.active_count == 1
+    await lease.aclose()
