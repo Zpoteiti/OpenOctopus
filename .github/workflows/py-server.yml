@@ -129,4 +129,5 @@ jobs:
           PY6_REAL_E2E: "1"
           PY7_REAL_E2E: "1"
           PY8A_REAL_E2E: "1"
+          PY8C_REAL_E2E: "1"
         run: pytest -v
