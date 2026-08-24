@@ -219,6 +219,7 @@ class ServerDirectoryTransferBackend:
             ),
             owner=self._operation_id,
         )
+        self._workspace.directory_transfer_committed(self._destination)
 
     async def cleanup_destination(
         self,

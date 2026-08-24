@@ -1,10 +1,11 @@
 import asyncio
+import hashlib
 import io
 import threading
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -85,6 +86,30 @@ async def test_upload_collection_does_not_take_an_agent_materialization_slot() -
         pass
     release_upload.set()
     await upload
+
+
+async def test_private_directory_validation_staging_has_bounded_lifecycle() -> None:
+    storage = AsyncMock()
+    sink = object()
+    stream = object()
+    storage.begin_upload = Mock(return_value=sink)
+    storage.open_stream.return_value = stream
+    workspace_fs = WorkspaceFS(storage)
+
+    actual_sink, object_name = workspace_fs.begin_directory_validation_staging(size=7)
+    assert actual_sink is sink
+    assert object_name.startswith("_openoctopus-transfers/")
+    storage.begin_upload.assert_called_once_with(object_name, length=7)
+
+    assert await workspace_fs.open_directory_validation_staging(object_name) is stream
+    storage.open_stream.assert_awaited_once_with(object_name)
+    await workspace_fs.delete_directory_validation_staging(object_name)
+    storage.delete.assert_awaited_once_with(object_name)
+
+    with pytest.raises(ValueError, match="private transfer temporary"):
+        await workspace_fs.open_directory_validation_staging(
+            "personal/user/skills/example/SKILL.md"
+        )
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -719,6 +744,44 @@ async def test_server_destination_plan_maps_files_only_and_checks_root_shape() -
     with pytest.raises(WorkspaceError) as caught:
         await fs.preflight_directory_destination(target, "backup", manifest)
     assert caught.value.code is ErrorCode.WORKSPACE_STORAGE_ERROR
+
+
+async def test_server_directory_phases_report_only_completed_storage_progress() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(),
+        entries=(DirectoryManifestEntry(relative_path="file.txt", size=1, fingerprint="source"),),
+    )
+    progress: list[str] = []
+
+    plan = await fs.preflight_directory_destination(
+        target,
+        "backup",
+        manifest,
+        on_progress=lambda: progress.append("preflight"),
+    )
+    reservation = await fs.reserve_directory_quota(
+        target,
+        owner="operation",
+        total_bytes=1,
+        quota_bytes=10,
+        on_progress=lambda: progress.append("quota"),
+    )
+    client._objects[f"users/{target.id}/backup/file.txt"] = (b"x", "destination")
+    await fs.verify_directory_destination(
+        plan,
+        (DirectoryCommittedFile("backup/file.txt", 1, "destination"),),
+        owner="operation",
+        on_progress=lambda: progress.append("verify"),
+    )
+
+    assert progress.count("preflight") >= 3
+    assert progress.count("quota") == 1
+    assert progress.count("verify") >= 2
+    await reservation.release()
 
 
 async def test_server_destination_plan_rejects_file_parent_and_oversized_mapping() -> None:
@@ -1598,6 +1661,95 @@ async def test_server_move_uses_open_source_etag_for_conditional_delete(
     assert warnings == ("source_delete_failed",)
     assert delete_calls == ["source-v1"]
     commit.assert_awaited_once()
+
+
+async def test_server_regular_admitted_transfer_reuses_outer_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        def __init__(self) -> None:
+            self.read_count = 0
+
+        async def read(self) -> bytes:
+            self.read_count += 1
+            return b"payload" if self.read_count == 1 else b""
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        async def write(self, chunk: bytes) -> None:
+            assert chunk == b"payload"
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            pass
+
+    fs = WorkspaceFS(AsyncMock())
+    source = Source()
+    sink = Sink()
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", AsyncMock(return_value=(sink, "temp")))
+    monkeypatch.setattr(fs, "commit_uploaded_object", AsyncMock())
+    monkeypatch.setattr(
+        fs._server_transfers,
+        "acquire",
+        AsyncMock(side_effect=AssertionError("admitted transfer reacquired capacity")),
+    )
+    target = WorkspaceTarget.personal(uuid4())
+
+    transferred, digest, warnings = await fs.transfer_server_to_server_admitted(
+        target,
+        "source.txt",
+        target,
+        "destination.txt",
+        quota_bytes=100,
+        mode="copy",
+        expected_source_size=7,
+        expected_source_fingerprint="source-v1",
+    )
+
+    assert transferred == 7
+    assert digest == hashlib.sha256(b"payload").hexdigest()
+    assert warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("expected_size", "expected_fingerprint"),
+    [(8, "source-v1"), (7, "source-v2")],
+)
+async def test_server_regular_admitted_transfer_fences_source_before_destination_begin(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_size: int,
+    expected_fingerprint: str,
+) -> None:
+    source = AsyncMock(size=7, etag="source-v1")
+    fs = WorkspaceFS(AsyncMock())
+    begin = AsyncMock(side_effect=AssertionError("destination began before source fence"))
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", begin)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.transfer_server_to_server_admitted(
+            target,
+            "source.txt",
+            target,
+            "destination.txt",
+            quota_bytes=100,
+            mode="copy",
+            expected_source_size=expected_size,
+            expected_source_fingerprint=expected_fingerprint,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+    begin.assert_not_awaited()
+    source.aclose.assert_awaited_once()
 
 
 async def test_server_move_finishes_after_publish_observes_cancellation(

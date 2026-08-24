@@ -15,6 +15,7 @@ from openctopus_server.directory_contract import (
 from openctopus_server.tools.directory_transfer import (
     DirectoryChildCommittedAfterCancellation,
     DirectoryChildResult,
+    DirectoryDestinationFinalizedAfterCancellation,
     DirectoryTransferCoordinator,
 )
 
@@ -52,6 +53,7 @@ class _Backend:
     fail_child: int | None = None
     cleanup_complete: bool = True
     source_warnings: tuple[str, ...] = ()
+    child_warnings: tuple[str, ...] = ()
     issued_callbacks: list[object] = field(default_factory=list)
     child_ids: list[UUID] = field(default_factory=list)
     child_paths: list[str] = field(default_factory=list)
@@ -92,6 +94,7 @@ class _Backend:
                 verified_size=entry.size,
                 verified_sha256=digest,
                 destination_fingerprint=f"destination-{index}",
+                warnings=self.child_warnings,
             )
             self.committed.append(result)
             return result
@@ -276,6 +279,50 @@ async def test_move_starts_source_cleanup_only_after_destination_finalize() -> N
     assert result.warnings == ("source_changed_after_copy",)
 
 
+async def test_child_and_move_warnings_are_deduplicated_in_canonical_order() -> None:
+    backend = _Backend(
+        child_warnings=("source_cleanup_incomplete", "transfer_ack_failed"),
+        source_warnings=("source_changed_after_copy", "transfer_ack_failed"),
+    )
+
+    result = await DirectoryTransferCoordinator().run(
+        manifest=_manifest(),
+        mode="move",
+        backend=backend,
+        operation_lease=_Lease(),
+    )
+
+    assert result.warnings == (
+        "transfer_ack_failed",
+        "source_changed_after_copy",
+        "source_cleanup_incomplete",
+    )
+
+
+def test_directory_child_warning_contract_is_bounded_and_canonical() -> None:
+    child = DirectoryChildResult(
+        relative_path="a.txt",
+        verified_size=1,
+        verified_sha256=hashlib.sha256(b"a").hexdigest(),
+        destination_fingerprint="destination-v1",
+        warnings=(
+            "source_cleanup_incomplete",
+            "transfer_ack_failed",
+            "transfer_ack_failed",
+        ),
+    )
+
+    assert child.warnings == ("transfer_ack_failed", "source_cleanup_incomplete")
+    repeated = DirectoryChildResult(
+        relative_path="a.txt",
+        verified_size=1,
+        verified_sha256=hashlib.sha256(b"a").hexdigest(),
+        destination_fingerprint="destination-v1",
+        warnings=("transfer_ack_failed",) * 9,
+    )
+    assert repeated.warnings == ("transfer_ack_failed",)
+
+
 async def test_cancellation_after_issue_cleans_destination_and_releases_once() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -391,7 +438,45 @@ async def test_cancellation_during_started_source_cleanup_returns_destination_su
     assert lease.close_count == 1
 
 
-async def test_backend_release_failure_still_closes_operation_lease() -> None:
+@pytest.mark.parametrize(
+    ("mode", "expected_warnings"),
+    [
+        ("copy", ()),
+        ("move", ("source_cleanup_incomplete",)),
+    ],
+)
+async def test_finalized_destination_cancellation_returns_committed_success(
+    mode: str,
+    expected_warnings: tuple[str, ...],
+) -> None:
+    @dataclass
+    class FinalizedThenCancelledBackend(_Backend):
+        async def finalize_destination(
+            self,
+            committed: tuple[DirectoryChildResult, ...],
+        ) -> None:
+            assert committed == tuple(self.committed)
+            raise DirectoryDestinationFinalizedAfterCancellation
+
+    backend = FinalizedThenCancelledBackend()
+    lease = _Lease()
+
+    result = await DirectoryTransferCoordinator().run(
+        manifest=_manifest(),
+        mode=mode,  # type: ignore[arg-type]
+        backend=backend,
+        operation_lease=lease,
+    )
+
+    assert result.files_transferred == 2
+    assert result.warnings == expected_warnings
+    assert backend.destination_cleanup_calls == 0
+    assert backend.source_cleanup_calls == 0
+    assert backend.release_calls == 1
+    assert lease.close_count == 1
+
+
+async def test_backend_release_failure_keeps_known_success_and_closes_lease() -> None:
     @dataclass
     class FailingReleaseBackend(_Backend):
         async def release(self) -> None:
@@ -400,7 +485,29 @@ async def test_backend_release_failure_still_closes_operation_lease() -> None:
 
     backend = FailingReleaseBackend()
     lease = _Lease()
-    with pytest.raises(RuntimeError, match="release failed"):
+    result = await DirectoryTransferCoordinator().run(
+        manifest=_manifest(),
+        mode="copy",
+        backend=backend,
+        operation_lease=lease,
+    )
+
+    assert result.warnings == ("transfer_ack_failed",)
+    assert backend.release_calls == 1
+    assert lease.close_count == 1
+
+
+async def test_release_failure_does_not_mask_the_primary_copy_failure() -> None:
+    @dataclass
+    class FailingReleaseBackend(_Backend):
+        async def release(self) -> None:
+            self.release_calls += 1
+            raise RuntimeError("release failed")
+
+    backend = FailingReleaseBackend(fail_child=1)
+    lease = _Lease()
+
+    with pytest.raises(RuntimeError, match="child failed"):
         await DirectoryTransferCoordinator().run(
             manifest=_manifest(),
             mode="copy",
@@ -408,5 +515,41 @@ async def test_backend_release_failure_still_closes_operation_lease() -> None:
             operation_lease=lease,
         )
 
+    assert backend.destination_cleanup_calls == 1
+    assert backend.release_calls == 1
+    assert lease.close_count == 1
+
+
+async def test_cancellation_during_release_keeps_known_success() -> None:
+    release_started = asyncio.Event()
+    finish_release = asyncio.Event()
+
+    @dataclass
+    class BlockingReleaseBackend(_Backend):
+        async def release(self) -> None:
+            self.release_calls += 1
+            release_started.set()
+            await finish_release.wait()
+
+    backend = BlockingReleaseBackend()
+    lease = _Lease()
+    task = asyncio.create_task(
+        DirectoryTransferCoordinator().run(
+            manifest=_manifest(),
+            mode="copy",
+            backend=backend,
+            operation_lease=lease,
+        )
+    )
+    await release_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish_release.set()
+
+    result = await task
+    assert result.files_transferred == 2
+    assert result.warnings == ()
     assert backend.release_calls == 1
     assert lease.close_count == 1

@@ -40,6 +40,7 @@ from openctopus_server.workspace.locks import (
 )
 from openctopus_server.workspace.search import MAX_SCAN_OBJECTS, NOISE_DIRECTORIES, SearchObject
 from openctopus_server.workspace.storage import (
+    TRANSFER_TEMP_PREFIX,
     DirectoryObject,
     ObjectMetadata,
     ObjectStorage,
@@ -387,6 +388,8 @@ class WorkspaceFS:
         target: WorkspaceTarget,
         destination_root: str,
         manifest: DirectoryManifest,
+        *,
+        on_progress: Callable[[], None] | None = None,
     ) -> DirectoryDestinationPlan:
         self._ensure_active(target)
         root_object_name = _object_key(target, destination_root)
@@ -401,6 +404,7 @@ class WorkspaceFS:
             _join_relative_path(destination_root, entry.relative_path)
             for entry in manifest.entries
         )
+        _report_progress(on_progress)
         if any(len(path) > 4096 for path in mapped_paths):
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_INVALID_REQUEST,
@@ -415,8 +419,11 @@ class WorkspaceFS:
                     ErrorCode.TOOL_NOT_A_DIRECTORY,
                     "A workspace path parent is a file",
                 )
+            _report_progress(on_progress)
         exact = await _stat_optional(self._storage, root_object_name)
+        _report_progress(on_progress)
         prefix_page = await self._storage.list_page(f"{root_object_name}/", limit=1)
+        _report_progress(on_progress)
         has_prefix = bool(prefix_page.items)
         if exact is not None and has_prefix:
             raise _workspace_storage_shape_error()
@@ -439,6 +446,7 @@ class WorkspaceFS:
         owner: Hashable,
         total_bytes: int,
         quota_bytes: int,
+        on_progress: Callable[[], None] | None = None,
     ) -> DirectoryQuotaReservation:
         if total_bytes < 0:
             raise WorkspaceError(
@@ -455,7 +463,7 @@ class WorkspaceFS:
                         ErrorCode.WORKSPACE_INVALID_REQUEST,
                         "Directory quota reservation already exists",
                     )
-                usage = await self._authoritative_usage(target)
+                usage = await self._authoritative_usage(target, on_progress=on_progress)
                 reserved = self._reserved_directory_bytes(target)
                 _validate_projected_quota(
                     usage=usage,
@@ -503,6 +511,25 @@ class WorkspaceFS:
             await self._ensure_destination_absent(record.target, relative_path)
         temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
         return self._storage.begin_upload(temporary_object, length=size), temporary_object
+
+    def begin_directory_validation_staging(self, *, size: int) -> tuple[ObjectUpload, str]:
+        """Create one bounded private object used only for pre-publish validation."""
+
+        if not 0 <= size <= MAX_DIRECTORY_INTEGER:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory validation size is invalid",
+            )
+        object_name = f"{TRANSFER_TEMP_PREFIX}{secrets.token_hex(16)}"
+        return self._storage.begin_upload(object_name, length=size), object_name
+
+    async def open_directory_validation_staging(self, object_name: str) -> ObjectStream:
+        _validate_private_transfer_object(object_name)
+        return await self._storage.open_stream(object_name)
+
+    async def delete_directory_validation_staging(self, object_name: str) -> None:
+        _validate_private_transfer_object(object_name)
+        await self._storage.delete(object_name)
 
     async def commit_directory_child_upload(
         self,
@@ -553,6 +580,7 @@ class WorkspaceFS:
         committed: tuple[DirectoryCommittedFile, ...],
         *,
         owner: Hashable,
+        on_progress: Callable[[], None] | None = None,
     ) -> None:
         """Verify the destination prefix contains exactly the committed objects."""
         if tuple(item.relative_path for item in committed) != plan.mapped_paths:
@@ -572,6 +600,7 @@ class WorkspaceFS:
             self._ensure_active(plan.target)
             if await _stat_optional(self._storage, root_object_name) is not None:
                 raise _workspace_directory_finalize_error()
+            _report_progress(on_progress)
             actual: dict[str, tuple[int, str]] = {}
             prefix = f"{root_object_name}/"
             async for objects in _metadata_pages(self._storage, prefix):
@@ -579,6 +608,7 @@ class WorkspaceFS:
                     if not item.object_name.startswith(prefix) or item.object_name in actual:
                         raise _workspace_storage_shape_error()
                     actual[item.object_name] = (item.size, item.etag)
+                _report_progress(on_progress)
             if actual != expected:
                 raise _workspace_directory_finalize_error()
 
@@ -608,10 +638,16 @@ class WorkspaceFS:
                 return False
             return not bool((await self._storage.list_page(prefix, limit=1)).items)
 
-    async def _authoritative_usage(self, target: WorkspaceTarget) -> int:
+    async def _authoritative_usage(
+        self,
+        target: WorkspaceTarget,
+        *,
+        on_progress: Callable[[], None] | None = None,
+    ) -> int:
         usage = 0
         async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
             usage += sum(item.size for item in objects)
+            _report_progress(on_progress)
         return usage
 
     def _reserved_directory_bytes(self, target: WorkspaceTarget) -> int:
@@ -798,6 +834,33 @@ class WorkspaceFS:
                 "Workspace transfer capacity is busy; retry later",
             ) from exc
 
+    async def transfer_server_to_server_admitted(
+        self,
+        source_target: WorkspaceTarget,
+        source_path: str,
+        destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
+        quota_bytes: int,
+        mode: str,
+        expected_source_size: int,
+        expected_source_fingerprint: str,
+        on_issued: Callable[[], None] | None = None,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        """Transfer one pre-probed file while the caller retains admission."""
+
+        return await self._transfer_server_to_server(
+            source_target,
+            source_path,
+            destination_target,
+            destination_path,
+            quota_bytes=quota_bytes,
+            mode=mode,
+            on_issued=on_issued,
+            expected_source_size=expected_source_size,
+            expected_source_fingerprint=expected_source_fingerprint,
+        )
+
     async def _transfer_server_to_server(
         self,
         source_target: WorkspaceTarget,
@@ -808,11 +871,25 @@ class WorkspaceFS:
         quota_bytes: int,
         mode: str,
         on_issued: Callable[[], None] | None,
+        expected_source_size: int | None = None,
+        expected_source_fingerprint: str | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Stream one server workspace object through a temporary RustFS object."""
         if mode not in {"copy", "move"}:
             raise WorkspaceError(ErrorCode.WORKSPACE_INVALID_REQUEST, "Transfer mode is invalid")
         source = await self.open_stream(source_target, source_path)
+        if (
+            expected_source_size is not None
+            and (
+                source.size != expected_source_size
+                or source.etag != expected_source_fingerprint
+            )
+        ):
+            await source.aclose()
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace source changed after it was probed",
+            )
         try:
             sink, temporary_object = await self.begin_transfer_upload(
                 destination_target,
@@ -1742,6 +1819,16 @@ async def _release_subtree_leases(leases: tuple[SubtreeLease, ...]) -> None:
         await lease.release()
 
 
+def _validate_private_transfer_object(object_name: str) -> None:
+    suffix = object_name.removeprefix(TRANSFER_TEMP_PREFIX)
+    if (
+        not object_name.startswith(TRANSFER_TEMP_PREFIX)
+        or len(suffix) != 32
+        or any(character not in "0123456789abcdef" for character in suffix)
+    ):
+        raise ValueError("private transfer temporary object is invalid")
+
+
 def _subtree_scope(
     target: WorkspaceTarget,
     relative_path: str,
@@ -1842,6 +1929,11 @@ async def _run_optional_transform(
 ) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
     return await await_future_cancellation_safe(worker)
+
+
+def _report_progress(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 async def _metadata_pages(

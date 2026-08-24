@@ -35,6 +35,7 @@ class DirectoryChildResult:
     verified_size: int
     verified_sha256: str
     destination_fingerprint: str
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.verified_size < 0:
@@ -53,6 +54,7 @@ class DirectoryChildResult:
             )
         ):
             raise ValueError("directory destination fingerprint is invalid")
+        object.__setattr__(self, "warnings", _normalize_warnings(self.warnings))
 
 
 class DirectoryChildCommittedAfterCancellation(asyncio.CancelledError):
@@ -61,6 +63,10 @@ class DirectoryChildCommittedAfterCancellation(asyncio.CancelledError):
     def __init__(self, result: DirectoryChildResult) -> None:
         super().__init__()
         self.result = result
+
+
+class DirectoryDestinationFinalizedAfterCancellation(asyncio.CancelledError):
+    """The destination was fully verified before cancellation took effect."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,13 +86,7 @@ class DirectoryTransferResult:
             character not in "0123456789abcdef" for character in self.sha256
         ):
             raise ValueError("directory transfer digest is invalid")
-        unknown = set(self.warnings).difference(_WARNING_PRIORITY)
-        if unknown:
-            raise ValueError("directory transfer warning is invalid")
-        normalized = tuple(
-            warning for warning in _WARNING_PRIORITY if warning in self.warnings
-        )
-        object.__setattr__(self, "warnings", normalized)
+        object.__setattr__(self, "warnings", _normalize_warnings(self.warnings))
 
 
 class DirectoryTransferBackend(Protocol):
@@ -139,6 +139,9 @@ class DirectoryTransferCoordinator:
                 on_issued()
 
         committed: list[DirectoryChildResult] = []
+        destination_finalized_after_cancellation = False
+        result: DirectoryTransferResult | None = None
+        failure: BaseException | None = None
         try:
             await backend.preflight(manifest)
             try:
@@ -152,7 +155,10 @@ class DirectoryTransferCoordinator:
                         raise asyncio.CancelledError from None
                     _validate_child(entry, child)
                     committed.append(child)
-                await backend.finalize_destination(tuple(committed))
+                try:
+                    await backend.finalize_destination(tuple(committed))
+                except DirectoryDestinationFinalizedAfterCancellation:
+                    destination_finalized_after_cancellation = True
             except BaseException:
                 if issued and not await _cleanup_destination(
                     backend,
@@ -163,9 +169,14 @@ class DirectoryTransferCoordinator:
                     ) from None
                 raise
 
-            warnings: tuple[str, ...] = ()
+            warnings = tuple(
+                warning for child in committed for warning in child.warnings
+            )
             if mode == "move":
-                warnings = await _finish_source_cleanup(backend, manifest)
+                if destination_finalized_after_cancellation:
+                    warnings += ("source_cleanup_incomplete",)
+                else:
+                    warnings += await _finish_source_cleanup(backend, manifest)
             content = tuple(
                 DirectoryContentEntry(
                     relative_path=child.relative_path,
@@ -174,15 +185,37 @@ class DirectoryTransferCoordinator:
                 )
                 for child in committed
             )
-            return DirectoryTransferResult(
+            result = DirectoryTransferResult(
                 kind="directory",
                 files_transferred=len(committed),
                 bytes_transferred=sum(child.verified_size for child in committed),
                 sha256=directory_content_sha256(content),
                 warnings=warnings,
             )
-        finally:
-            await _release_resources(backend, operation_lease)
+        except BaseException as exc:
+            failure = exc
+
+        release_error, release_cancelled = await _release_resources(
+            backend,
+            operation_lease,
+        )
+        if result is not None:
+            if release_error is not None:
+                result = DirectoryTransferResult(
+                    kind=result.kind,
+                    files_transferred=result.files_transferred,
+                    bytes_transferred=result.bytes_transferred,
+                    sha256=result.sha256,
+                    warnings=result.warnings + ("transfer_ack_failed",),
+                )
+            return result
+        if failure is not None:
+            raise failure
+        if release_cancelled:
+            raise asyncio.CancelledError
+        if release_error is not None:
+            raise release_error
+        raise AssertionError("directory transfer completed without an outcome")
 
 
 def _validate_child(
@@ -231,14 +264,36 @@ async def _finish_source_cleanup(
 async def _release_resources(
     backend: DirectoryTransferBackend,
     operation_lease: DirectoryOperationLease,
-) -> None:
-    release_error: BaseException | None = None
+) -> tuple[BaseException | None, bool]:
     release_task = asyncio.create_task(backend.release())
-    try:
-        await await_future_cancellation_safe(release_task)
-    except BaseException as exc:
-        release_error = exc
+    release_error, release_cancelled = await _settle_resource(release_task)
     lease_task = asyncio.create_task(operation_lease.aclose())
-    await await_future_cancellation_safe(lease_task)
-    if release_error is not None:
-        raise release_error
+    lease_error, lease_cancelled = await _settle_resource(lease_task)
+    return release_error or lease_error, release_cancelled or lease_cancelled
+
+
+async def _settle_resource(
+    task: asyncio.Task[None],
+) -> tuple[BaseException | None, bool]:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, cancelled
+    return None, cancelled
+
+
+def _normalize_warnings(warnings: tuple[str, ...]) -> tuple[str, ...]:
+    if set(warnings).difference(_WARNING_PRIORITY):
+        raise ValueError("directory transfer warning is invalid")
+    normalized = tuple(warning for warning in _WARNING_PRIORITY if warning in warnings)
+    if len(normalized) > 8:
+        raise ValueError("too many directory transfer warnings")
+    return normalized

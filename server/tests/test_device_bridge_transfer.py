@@ -16,6 +16,7 @@ from openctopus_server.devices.protocol import (
     TransferReadyFrame,
     TransferRequestFrame,
     decode_binary_chunk,
+    new_uuid7,
     parse_server_frame,
 )
 from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
@@ -24,6 +25,7 @@ from openctopus_server.devices.transfer import (
     TRANSFER_QUEUE_CHUNKS,
     FairTransferAdmission,
     TransferBusyError,
+    TransferCommittedAfterCancellation,
     TransferDisconnectedError,
     TransferError,
     TransferIntegrityError,
@@ -3512,6 +3514,8 @@ async def test_already_admitted_bridge_uses_exact_id_without_releasing_outer_lea
             operation_lease=lease,
             src_path="source.bin",
             dst_path="destination.bin",
+            expected_source_size=0,
+            expected_source_fingerprint="source-v1",
             on_issued=None,
         )
     )
@@ -3533,6 +3537,138 @@ async def test_already_admitted_bridge_uses_exact_id_without_releasing_outer_lea
     assert admission.active_count == 0
 
 
+async def test_regular_admitted_bridge_preserves_move_and_outer_lease() -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    deleted: list[str] = []
+
+    async def delete_source(fingerprint: str) -> None:
+        deleted.append(fingerprint)
+
+    task = asyncio.create_task(
+        manager.start_client_to_client_regular_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            expected_source_size=0,
+            expected_source_fingerprint="source-v1",
+            mode="move",
+            delete_source=delete_source,
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+    assert request.id == slot_id
+    await _send_source_begin(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        request,
+        total_bytes=0,
+    )
+    await _make_destination_ready(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    destination_end = await _issue_source_success(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    await manager.handle_frame(
+        destination_route.handle,
+        destination_end.model_copy(update={"ack": True}),
+    )
+
+    result = await task
+    assert result.etag is None
+    assert result.created is None
+    assert result.warnings == ()
+    assert deleted == ["source-v1"]
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_regular_admitted_bridge_forwards_source_fence_before_destination_issue() -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    task = asyncio.create_task(
+        manager.start_client_to_client_regular_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            expected_source_size=1,
+            expected_source_fingerprint="source-v1",
+            mode="copy",
+            delete_source=None,
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+    await manager.handle_frame(
+        source_route.handle,
+        TransferBeginFrame(
+            id=request.id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_device=source_route.device_name,
+            src_path="source.bin",
+            dst_device="server",
+            dst_path="destination.bin",
+            total_bytes=1,
+            etag="source-v2",
+        ),
+    )
+    failure = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferEndFrame,
+        ack=False,
+    )
+
+    assert failure.code == "workspace_file_changed"
+    assert _text_frames(transport, destination_route.handle, TransferBeginFrame) == []
+    with pytest.raises(TransferError) as caught:
+        await task
+    assert caught.value.code == "workspace_file_changed"
+    assert admission.active_count == 1
+    await manager.handle_frame(
+        source_route.handle,
+        failure.model_copy(update={"ack": True}),
+    )
+    await lease.aclose()
+
+
 async def test_already_admitted_bridge_strips_destination_metadata_from_source_ack() -> None:
     transport = _BridgeTransport()
     manager, admission = _manager(transport)
@@ -3549,6 +3685,8 @@ async def test_already_admitted_bridge_strips_destination_metadata_from_source_a
             user_id=user_id,
             src_path="source.bin",
             dst_path="destination.bin",
+            expected_source_size=0,
+            expected_source_fingerprint="source-v1",
             on_issued=None,
         )
     )
@@ -3601,5 +3739,163 @@ async def test_already_admitted_bridge_strips_destination_metadata_from_source_a
     )[-1]
     assert source_ack.etag is None
     assert source_ack.created is None
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+@pytest.mark.parametrize(
+    ("actual_size", "actual_fingerprint"),
+    [(1, "source-v2"), (2, "source-v1")],
+)
+async def test_admitted_bridge_rejects_source_drift_before_destination_issue(
+    actual_size: int,
+    actual_fingerprint: str,
+) -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = transfer_module.new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    task = asyncio.create_task(
+        manager.start_client_to_client_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            expected_source_size=1,
+            expected_source_fingerprint="source-v1",
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+
+    await manager.handle_frame(
+        source_route.handle,
+        TransferBeginFrame(
+            id=request.id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_device=source_route.device_name,
+            src_path="source.bin",
+            dst_device="server",
+            dst_path="destination.bin",
+            total_bytes=actual_size,
+            etag=actual_fingerprint,
+        ),
+    )
+    failure = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferEndFrame,
+        ack=False,
+    )
+
+    assert failure.code == "workspace_file_changed"
+    assert _text_frames(transport, destination_route.handle, TransferBeginFrame) == []
+    with pytest.raises(TransferError) as caught:
+        await task
+    assert caught.value.code == "workspace_file_changed"
+    assert admission.active_count == 1
+
+    # The exact late failure ACK belongs to this closed generation and must not
+    # poison the healthy socket after the coordinator has observed the drift.
+    await manager.handle_frame(
+        source_route.handle,
+        failure.model_copy(update={"ack": True}),
+    )
+    await lease.aclose()
+    assert admission.active_count == 0
+
+
+async def test_admitted_bridge_reports_commit_after_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source_route, destination_route = _routes()
+    user_id = uuid4()
+    slot_id = transfer_module.new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    finish_started = asyncio.Event()
+    release_finish = asyncio.Event()
+    original_finish = manager._finish_bridge_once
+
+    async def blocked_finish(
+        bridge: object,
+        *,
+        result: TransferResult | None,
+        error: BaseException | None,
+    ) -> None:
+        if result is not None:
+            finish_started.set()
+            await release_finish.wait()
+        await original_finish(bridge, result=result, error=error)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(manager, "_finish_bridge_once", blocked_finish)
+    task = asyncio.create_task(
+        manager.start_client_to_client_admitted(
+            source_route=source_route,
+            destination_route=destination_route,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            expected_source_size=0,
+            expected_source_fingerprint="source-v1",
+            on_issued=None,
+        )
+    )
+    request = await _wait_for_text_frame(
+        transport,
+        source_route.handle,
+        TransferRequestFrame,
+    )
+    await _send_source_begin(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        request,
+        total_bytes=0,
+    )
+    await _make_destination_ready(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    destination_end = await _issue_source_success(
+        manager,
+        transport,
+        source_route,
+        destination_route,
+        slot_id,
+    )
+    await manager.handle_frame(
+        destination_route.handle,
+        destination_end.model_copy(
+            update={"ack": True, "etag": "destination-v1", "created": True}
+        ),
+    )
+    await finish_started.wait()
+
+    task.cancel()
+    release_finish.set()
+    with pytest.raises(TransferCommittedAfterCancellation) as caught:
+        await task
+
+    assert caught.value.result.etag == "destination-v1"
+    assert caught.value.result.created is True
+    assert caught.value.result.warnings == ()
     assert admission.active_count == 1
     await lease.aclose()

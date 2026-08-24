@@ -208,6 +208,7 @@ def _controller(
     outcomes: list[object],
     *,
     idle_timeout_seconds: float = 3.0,
+    poll_interval_seconds: float = 1.0,
     clock: _Clock | _TickClock | None = None,
 ) -> tuple[DeviceDirectoryJobController, _Registry]:
     registry = _Registry(deque(outcomes))
@@ -218,7 +219,7 @@ def _controller(
         user_id=new_uuid7(),
         directory_operation_id=new_uuid7(),
         idle_timeout_seconds=idle_timeout_seconds,
-        poll_interval_seconds=1.0,
+        poll_interval_seconds=poll_interval_seconds,
         monotonic=(clock.now if clock is not None else None),
         sleep=(clock.sleep if clock is not None else None),
     )
@@ -235,6 +236,10 @@ def _timeouts(registry: _Registry, operation: str) -> list[float]:
         for call in registry.calls
         if call["args"]["operation"] == operation  # type: ignore[index]
     ]
+
+
+async def _append_progress(values: list[int], value: int) -> None:
+    values.append(value)
 
 
 @pytest.mark.asyncio
@@ -433,6 +438,44 @@ async def test_duplicate_progress_does_not_extend_no_progress_deadline() -> None
     assert result.state == "failed"
     assert _operations(registry).count("transfer_source_probe_cancel") == 1
     assert clock.value == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_forwards_only_real_progress_and_survives_one_idle_window() -> None:
+    clock = _Clock()
+    digest = _source_request_digest("source")
+    controller, _ = _controller(
+        [
+            _command("running", digest),
+            _TimedOutcome(_source_status(digest=digest, progress_seq=1), clock, 0.4),
+            _TimedOutcome(_source_status(digest=digest, progress_seq=1), clock, 0.2),
+            _TimedOutcome(_source_status(digest=digest, progress_seq=2), clock, 0.4),
+            _TimedOutcome(
+                _source_status(
+                    digest=digest,
+                    state="succeeded",
+                    progress_seq=3,
+                    probe={"kind": "file", "size": 1, "fingerprint": "etag"},
+                ),
+                clock,
+                0.4,
+            ),
+        ],
+        idle_timeout_seconds=1.0,
+        poll_interval_seconds=0.1,
+        clock=clock,
+    )
+    forwarded: list[int] = []
+    await controller.start_source_probe("source")
+
+    result = await controller.wait_source_until(
+        frozenset({"succeeded"}),
+        progress_callback=lambda value: _append_progress(forwarded, value),
+    )
+
+    assert result.state == "succeeded"
+    assert forwarded == [1, 2]
+    assert clock.value == pytest.approx(1.7)
 
 
 @pytest.mark.asyncio

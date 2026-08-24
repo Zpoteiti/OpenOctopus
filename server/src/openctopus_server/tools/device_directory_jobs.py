@@ -651,6 +651,7 @@ class DeviceDirectoryJobController:
         states: frozenset[_SourceState],
         *,
         outer_progress_seq: int | None = None,
+        progress_callback: Callable[[int], Awaitable[None]] | None = None,
     ) -> SourceDirectoryJobStatus:
         async with self._wait_locks["source"]:
             return cast(
@@ -665,6 +666,7 @@ class DeviceDirectoryJobController:
                     cancel=lambda deadline: self.cancel_source_probe(_deadline=deadline),
                     terminal_states=_SOURCE_TERMINAL_STATES,
                     mutation_issued=lambda: self._source_mutation_issued,
+                    progress_callback=progress_callback,
                 ),
             )
 
@@ -673,6 +675,7 @@ class DeviceDirectoryJobController:
         states: frozenset[_DestinationState],
         *,
         outer_progress_seq: int | None = None,
+        progress_callback: Callable[[int], Awaitable[None]] | None = None,
     ) -> DestinationDirectoryJobStatus:
         async with self._wait_locks["destination"]:
             return cast(
@@ -687,6 +690,7 @@ class DeviceDirectoryJobController:
                     cancel=lambda deadline: self.cancel_destination(_deadline=deadline),
                     terminal_states=_DESTINATION_TERMINAL_STATES,
                     mutation_issued=lambda: self._destination_mutation_issued,
+                    progress_callback=progress_callback,
                 ),
             )
 
@@ -1086,6 +1090,7 @@ class DeviceDirectoryJobController:
         cancel: Callable[[float], Awaitable[Any]],
         terminal_states: frozenset[str],
         mutation_issued: Callable[[], bool],
+        progress_callback: Callable[[int], Awaitable[None]] | None = None,
     ) -> Any:
         if not states:
             raise ValueError("directory wait states must not be empty")
@@ -1108,11 +1113,14 @@ class DeviceDirectoryJobController:
                 await self._poll_sleep(deadline)
                 continue
             progress_seq = cast(int, snapshot.progress_seq)
-            if progress_seq > last_progress:
+            advanced = progress_seq > last_progress
+            if advanced:
                 last_progress = progress_seq
                 deadline = self._monotonic() + self._idle_timeout
             if snapshot.state in states:
                 return snapshot
+            if advanced and progress_callback is not None:
+                await progress_callback(progress_seq)
             if self._monotonic() >= deadline:
                 break
             await self._poll_sleep(deadline)
