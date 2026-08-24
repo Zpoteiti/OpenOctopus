@@ -39,6 +39,22 @@ def test_shared_protocol_v3_golden_frames_round_trip() -> None:
         assert frame_to_wire_dict(frame) == case["frame"]
 
 
+def test_transfer_success_ack_metadata_shape_round_trips_from_client() -> None:
+    case = next(
+        case
+        for case in _fixtures()["valid"]
+        if case["direction"] == "client_to_server"
+        and case["frame"].get("type") == "transfer_end"
+        and case["frame"].get("id") == "0190d5a7-0000-7000-8000-000000000008"
+        and case["frame"].get("created") is True
+    )
+
+    frame = parse_client_frame(json.dumps(case["frame"]))
+
+    assert frame_to_wire_dict(frame) == case["frame"]
+    assert case["frame"]["etag"] == "destination-fingerprint"
+
+
 def test_shared_protocol_v3_invalid_frames_are_strictly_rejected() -> None:
     for case in _fixtures()["invalid"]:
         payload = json.dumps(case["frame"], ensure_ascii=False, separators=(",", ":"))
