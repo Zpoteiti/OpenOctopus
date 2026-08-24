@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -2151,7 +2152,8 @@ async def test_retired_manager_allows_prepare_and_finish_result_retries(
 async def test_source_probe_rejects_special_file(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
-    os.mkfifo(source / "pipe")
+    mkfifo = cast(Callable[[Path], None], getattr(os, "mkfifo"))
+    mkfifo(source / "pipe")
     manager = _manager(tmp_path)
     operation_id = _operation_id()
     try:

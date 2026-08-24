@@ -1916,23 +1916,36 @@ def _commit_directory_no_replace(
             "workspace_file_changed", "Destination already exists"
         ) from exc
 
-    linked_identity = expected_identity[:2]
+    published_identity: tuple[int, int, int, int, int] | None = None
     try:
         temporary_info = os.lstat(temporary)
         destination_info = os.lstat(destination)
         if (
             not stat.S_ISREG(temporary_info.st_mode)
             or not stat.S_ISREG(destination_info.st_mode)
-            or (temporary_info.st_dev, temporary_info.st_ino) != linked_identity
-            or (destination_info.st_dev, destination_info.st_ino) != linked_identity
+            or _identity(temporary_info)[:4] != expected_identity[:4]
+            or _identity(destination_info)[:4] != expected_identity[:4]
         ):
             raise TransferOperationError(
                 "workspace_file_changed", "Published destination changed during transfer"
             )
+        published_identity = _identity(destination_info)
         temporary.unlink()
+        destination_info = os.lstat(destination)
+        if (
+            not stat.S_ISREG(destination_info.st_mode)
+            or _identity(destination_info)[:4] != expected_identity[:4]
+        ):
+            raise TransferOperationError(
+                "workspace_file_changed", "Published destination changed during transfer"
+            )
+        published_identity = _identity(destination_info)
         _fsync_parent_strict(destination.parent)
     except BaseException:
-        if _unlink_regular_if_identity(destination, linked_identity):
+        if published_identity is not None and _unlink_regular_if_identity(
+            destination,
+            published_identity,
+        ):
             with contextlib.suppress(OSError):
                 _fsync_parent_strict(destination.parent)
         with contextlib.suppress(OSError):
@@ -1940,14 +1953,17 @@ def _commit_directory_no_replace(
         raise
 
 
-def _unlink_regular_if_identity(destination: Path, expected_identity: tuple[int, int]) -> bool:
+def _unlink_regular_if_identity(
+    destination: Path,
+    expected_identity: tuple[int, int, int, int, int],
+) -> bool:
     try:
         info = os.lstat(destination)
     except FileNotFoundError:
         return True
     except OSError:
         return False
-    if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != expected_identity:
+    if not stat.S_ISREG(info.st_mode) or _identity(info) != expected_identity:
         return False
     try:
         destination.unlink()

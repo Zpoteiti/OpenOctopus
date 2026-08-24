@@ -945,6 +945,30 @@ def test_directory_destination_parent_fsync_eio_never_records_success(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_directory_cleanup_uses_full_published_identity(tmp_path: Path) -> None:
+    owned = tmp_path / "owned.bin"
+    owned.write_bytes(b"owned")
+    owned_identity = transfer_module._identity(os.lstat(owned))
+
+    assert transfer_module._unlink_regular_if_identity(owned, owned_identity) is True
+    assert not owned.exists()
+
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"external")
+    info = os.lstat(external)
+    recycled_identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_size + 1,
+        info.st_mtime_ns - 1,
+        info.st_ctime_ns - 1,
+    )
+
+    assert transfer_module._unlink_regular_if_identity(external, recycled_identity) is False
+    assert external.read_bytes() == b"external"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
 def test_directory_destination_fsync_cleanup_preserves_external_replacement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
