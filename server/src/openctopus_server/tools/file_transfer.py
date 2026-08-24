@@ -7,12 +7,13 @@ from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import Device
 from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
+    BridgeRoutePair,
     ConnectionHandle,
     DeviceBusyError,
     DeviceOutcomeUnknownError,
@@ -20,6 +21,7 @@ from openctopus_server.devices.registry import (
     DeviceUnavailableError,
 )
 from openctopus_server.devices.transfer import (
+    BRIDGE_SOURCE_DELETE_TIMEOUT_SECONDS,
     TransferBusyError,
     TransferDisconnectedError,
     TransferError,
@@ -44,9 +46,9 @@ from openctopus_server.workspace.service import TransferPathTicket
 FILE_TRANSFER_SCHEMA: dict[str, Any] = {
     "name": "file_transfer",
     "description": (
-        "Transfer one regular file between the server and a paired device. Use mode='copy' "
-        "to leave source intact, mode='move' to remove source after successful transfer. "
-        "Destination is rejected if it already exists."
+        "Transfer one regular file between the server or paired devices. Use mode='copy' "
+        "to leave the source intact, or mode='move' to remove it after the destination "
+        "commits. Destination is rejected if it already exists."
     ),
     "input_schema": {
         "type": "object",
@@ -88,15 +90,6 @@ FILE_TRANSFER_SCHEMA: dict[str, Any] = {
             "openoctopus_dst_device",
             "dst_path",
         ],
-        # At least one endpoint must remain the server.  The paired names are
-        # injected into both marked enums for provider compatibility.  The
-        # registry adds one same-device branch for every paired name; runtime
-        # validation remains authoritative for stale or hand-written calls.
-        "anyOf": [
-            {"properties": {"openoctopus_src_device": {"const": "server"}}},
-            {"properties": {"openoctopus_dst_device": {"const": "server"}}},
-        ],
-        "x-openoctopus-same-device": True,
         "additionalProperties": False,
     },
 }
@@ -231,6 +224,16 @@ class _TransferRegistry(Protocol):
         expected_device_name: str,
     ) -> DeviceRouteSnapshot | None: ...
 
+    async def get_bridge_route_pair(
+        self,
+        *,
+        user_id: UUID,
+        source_device_id: UUID,
+        source_device_name: str,
+        destination_device_id: UUID,
+        destination_device_name: str,
+    ) -> BridgeRoutePair | None: ...
+
     async def dispatch_tool(
         self,
         *,
@@ -349,15 +352,6 @@ class FileTransferTool(Tool):
         exceptions at their boundary.
         """
 
-        if (
-            request.openoctopus_src_device != "server"
-            and request.openoctopus_dst_device != "server"
-            and request.openoctopus_src_device != request.openoctopus_dst_device
-        ):
-            raise OpenOctopusError(
-                ErrorCode.TOOL_INVALID_ARGS,
-                "Client-to-client file transfer is not supported in Py6",
-            )
         if self._workspace is None and (
             request.openoctopus_src_device == "server" or request.openoctopus_dst_device == "server"
         ):
@@ -388,6 +382,13 @@ class FileTransferTool(Tool):
             )
         elif request.openoctopus_src_device == "server":
             result = await self._server_to_client(
+                request,
+                user_id,
+                device_targets,
+                on_issued,
+            )
+        elif request.openoctopus_dst_device != "server":
+            result = await self._client_to_distinct_client(
                 request,
                 user_id,
                 device_targets,
@@ -616,6 +617,58 @@ class FileTransferTool(Tool):
             warnings=tuple(result.warnings),
         )
 
+    async def _client_to_distinct_client(
+        self,
+        parsed: FileTransferRequest,
+        user_id: UUID,
+        device_targets: Mapping[str, UUID] | None,
+        on_issued: Callable[[], None] | None,
+    ) -> Any:
+        registry = self._require_registry()
+        source_device_id, destination_device_id = await self._bridge_device_ids_for_call(
+            user_id,
+            parsed.openoctopus_src_device,
+            parsed.openoctopus_dst_device,
+            device_targets,
+        )
+        routes = await registry.get_bridge_route_pair(
+            user_id=user_id,
+            source_device_id=source_device_id,
+            source_device_name=parsed.openoctopus_src_device,
+            destination_device_id=destination_device_id,
+            destination_device_name=parsed.openoctopus_dst_device,
+        )
+        if routes is None:
+            raise DeviceUnavailableError("File transfer devices are unavailable")
+
+        async def delete_source(source_fingerprint: str) -> None:
+            result = await registry.dispatch_tool_on_snapshot(
+                route=routes.source,
+                user_id=user_id,
+                expected_device_name=parsed.openoctopus_src_device,
+                name=INTERNAL_WORKSPACE_ACTION,
+                args={
+                    "operation": "delete_file",
+                    "path": parsed.src_path,
+                    "if_match": source_fingerprint,
+                },
+                max_result_bytes=16 * 1024,
+                timeout_seconds=BRIDGE_SOURCE_DELETE_TIMEOUT_SECONDS,
+            )
+            if getattr(result, "is_error", False):
+                raise RuntimeError("client source deletion failed")
+
+        return await registry.transfers.start_client_to_client(
+            source_route=routes.source,
+            destination_route=routes.destination,
+            user_id=user_id,
+            src_path=parsed.src_path,
+            dst_path=parsed.dst_path,
+            mode=parsed.mode,
+            delete_source=delete_source if parsed.mode == "move" else None,
+            on_issued=on_issued,
+        )
+
     def _require_workspace(self) -> _TransferWorkspace:
         if self._workspace is None:
             raise RuntimeError("Workspace transfer service is not configured")
@@ -638,6 +691,62 @@ class FileTransferTool(Tool):
             if expected_device_id is None:
                 raise DeviceUnavailableError("Paired device was not captured for this turn")
         return await self._device_id(user_id, name, expected_device_id)
+
+    async def _bridge_device_ids_for_call(
+        self,
+        user_id: UUID,
+        source_name: str,
+        destination_name: str,
+        device_targets: Mapping[str, UUID] | None,
+    ) -> tuple[UUID, UUID]:
+        expected_source_id: UUID | None = None
+        expected_destination_id: UUID | None = None
+        if device_targets is not None:
+            expected_source_id = device_targets.get(source_name)
+            expected_destination_id = device_targets.get(destination_name)
+            if expected_source_id is None or expected_destination_id is None:
+                raise DeviceUnavailableError("Paired devices were not captured for this turn")
+
+        predicates = []
+        source_predicate = Device.name == source_name
+        if expected_source_id is not None:
+            source_predicate = and_(source_predicate, Device.id == expected_source_id)
+        predicates.append(source_predicate)
+        destination_predicate = Device.name == destination_name
+        if expected_destination_id is not None:
+            destination_predicate = and_(
+                destination_predicate,
+                Device.id == expected_destination_id,
+            )
+        predicates.append(destination_predicate)
+
+        async with AsyncSession(self._require_engine(), expire_on_commit=False) as db:
+            rows = (
+                await db.execute(
+                    select(Device.name, Device.id).where(
+                        Device.user_id == user_id,
+                        or_(*predicates),
+                    )
+                )
+            ).all()
+        resolved = {name: device_id for name, device_id in rows}
+        source_device_id = resolved.get(source_name)
+        destination_device_id = resolved.get(destination_name)
+        if (
+            not isinstance(source_device_id, UUID)
+            or not isinstance(destination_device_id, UUID)
+            or source_device_id == destination_device_id
+            or (
+                expected_source_id is not None
+                and source_device_id != expected_source_id
+            )
+            or (
+                expected_destination_id is not None
+                and destination_device_id != expected_destination_id
+            )
+        ):
+            raise DeviceUnavailableError("Paired devices were not found")
+        return source_device_id, destination_device_id
 
     async def _device_id(
         self,
@@ -709,6 +818,8 @@ def _stable_client_transfer_error(code: str | None) -> ErrorCode | None:
     except ValueError:
         error_code = None
     if error_code in {
+        ErrorCode.TOOL_DEVICE_BUSY,
+        ErrorCode.TOOL_DEVICE_UNREACHABLE,
         ErrorCode.WORKSPACE_NOT_FOUND,
         ErrorCode.WORKSPACE_PERMISSION_DENIED,
         ErrorCode.WORKSPACE_SYMLINK_ESCAPE,

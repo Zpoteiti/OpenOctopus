@@ -18,15 +18,27 @@ config-applied acknowledgement. It inserts uniquely prefixed `users` and
 tasks in one process—not 500 PyInstaller processes, and not provider/Agent
 turns. The JSON report states those limits explicitly.
 
-The script also runs one bounded server-to-client transfer per connection while
-heartbeats remain active. It raises the `RLIMIT_NOFILE` soft limit only up to the
-hard limit when needed, records RSS/fd/task/queue/transfer high-water metrics,
-measures actual online connections before shutdown and after cleanup. It also
-creates one bounded offline MCP catalog per connected Device, projects each
-owner's Provider schemas/routes, and records catalog high-water metrics. The
-lightweight peers do not start MCP runtimes, so `mcp_runtime_high_water` is zero;
-the native/frozen Client E2E is the real-runtime gate. The harness deletes
-only the exact rows it created in `finally`. It never truncates existing tables.
+The script also runs one bounded server-to-client transfer per connection and a
+burst of same-owner, distinct-client bridges while heartbeats and unrelated
+Device tool calls remain active. Each bridge consumes one Server admission
+permit and two endpoint indexes. The burst reaches the effective global limit,
+reaches the per-user limit of two, fills the bounded fair wait queue, and records
+stable busy results for excess work. One owner's destinations delay readiness
+and Server-side writes to model a slow network sink, so the relay queue applies
+backpressure while another owner still completes first. Each lightweight peer
+enforces the Client's two-slot transfer limit.
+
+The JSON records bridge wall time and p50/p95 latency, warnings/errors, peak RSS,
+FDs, tasks, active/waiting permits, endpoint/tombstone counts, and the four-chunk
+relay queue high-water. It verifies active indexes, pinned tombstones, reserved
+credits, tasks, local slots, and admission counters return to zero after bridge
+cleanup; finalized protocol tombstones remain bounded for their normal TTL. The
+script also creates one bounded offline MCP catalog per connected Device,
+projects each owner's Provider schemas/routes, and records catalog high-water
+metrics. The lightweight peers do not start MCP runtimes, so
+`mcp_runtime_high_water` is zero; the native/frozen Client E2E is the real-runtime
+gate. The harness deletes only the exact rows it created in `finally`. It never
+truncates existing tables.
 The ordinary `device_capacity_harness.py` remains the faster in-memory registry probe; its
 `network_exercised` value stays `false`.
 

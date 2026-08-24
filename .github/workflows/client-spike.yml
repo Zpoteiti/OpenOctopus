@@ -7,6 +7,7 @@ on:
       - "client/**"
       - "server/**"
       - "server/tests/fixtures/documents/**"
+      - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/client-spike.yml"
   pull_request:
     branches: [main]
@@ -14,6 +15,7 @@ on:
       - "client/**"
       - "server/**"
       - "server/tests/fixtures/documents/**"
+      - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/client-spike.yml"
 
 jobs:
@@ -281,5 +283,6 @@ jobs:
           pytest -v \
             tests/test_device_client_e2e.py::test_real_chat_runtime_source_client_read_write_and_offline \
             tests/test_device_client_transfer_e2e.py::test_real_file_transfer_and_device_workspace_relay \
+            tests/test_device_client_transfer_e2e.py::test_real_distinct_clients_copy_move_and_failure_contracts \
             tests/test_py6_client_exec_e2e.py::test_real_client_exec_pipe_tty_reconnect_and_chat_isolation \
             tests/test_py7_client_mcp_e2e.py::test_real_client_validates_registers_and_runs_all_mcp_surfaces

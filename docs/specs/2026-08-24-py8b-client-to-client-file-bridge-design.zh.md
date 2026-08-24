@@ -1,6 +1,6 @@
 # Py8b 不同 Client 单文件桥接设计
 
-**状态：** proposed，implementation-ready
+**状态：** accepted，implemented
 **Milestone：** Py8b Client-to-client single-file bridge
 **依赖：** 已完成的 Py5 Python Client/device files、Py6 cross-platform exec 与
 Py7 Protocol v3
@@ -808,8 +808,9 @@ slot尚未收敛时提前过期；不能为同一endpoint并存provisional与fin
   ACK语义：若`source_timeout_ack_sent=false`，第一个exact timeout获得matching failure ACK
   并原子置true；否则只幂等消费。Late B ACK由destination side验证/消费但绝不再转发A；
   destination/caller result不被改写，move不触发source delete/replay，也不关闭A；
-- known failed slot 在 peer 尚未看到 failure 前已排队的有限 binary chunks：只丢弃，
-  不转发、不写 destination；
+- known failed slot 在 peer 尚未看到 failure 前已进入 WebSocket/OS buffer 的 non-empty
+  binary chunks：只在累计 source bytes 不超过 begin 声明的 total 且 tombstone TTL 未过期时
+  丢弃，不按 Client writer lane 猜测 frame 数量；payload 不保留、不转发、不写 destination；
 - known-failed source provisional/tombstone还可丢弃最多Server contract constant
   `LATE_PROGRESS_MAX=64`个well-formed、monotonic、未超过declared bytes的late
   `transfer_progress`。这是critical failure ACK可能越过的Client `SerializedWriter` normal
@@ -984,8 +985,8 @@ destination partial 永不暴露，committed destination 永不回滚，新 gene
 - route config update按A/B各自initial-frame issued边界独立fence；issued endpoint继续captured
   Client config，同epoch以外的move delete只warning且不迁移；
 - idle timeout 覆盖 begin/ready/chunk/end/ACK/failure ACK；
-- exact late ACK、duplicate terminal、known-failed late chunks、unknown/conflicting/expired
-  frames；
+- exact late ACK、duplicate terminal、declared-byte/TTL bound 内的 known-failed late chunks、
+  unknown/conflicting/expired frames；
 - known-failed late progress在`LATE_PROGRESS_MAX=64`内drop，逐帧耗尽且不续TTL；第65帧/
   malformed仍protocol error；failure ACK越过全部64帧不关闭健康A；cross-runtime fixture
   断言它等于Client normal-lane capacity；

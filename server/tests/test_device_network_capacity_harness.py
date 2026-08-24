@@ -36,9 +36,9 @@ async def test_real_network_capacity_smoke(
     )
     get_settings.cache_clear()
     get_engine.cache_clear()
-    # Eight transfers exceed the configured admission's two active plus two
-    # waiting slots unless the harness bounds launches at the active limit.
-    monkeypatch.setattr(capacity_harness, "_TRANSFER_MAX_CONCURRENCY", 2)
+    # Eight ordinary transfers exceed the configured active limit, while the
+    # bridge burst additionally fills its bounded wait queue and reports busy.
+    monkeypatch.setattr(capacity_harness, "_TRANSFER_MAX_CONCURRENCY", 4)
     sampler_started = False
     catalog_samples = 0
     original_sampler_start = capacity_harness._MetricsSampler.start
@@ -82,6 +82,7 @@ async def test_real_network_capacity_smoke(
     assert catalog_samples >= 3
     assert result["network_exercised"] is True
     assert result["transfers_exercised"] is True
+    assert result["client_bridges_exercised"] is True
     assert result["offline_catalogs_exercised"] is True
     assert result["transport"] == "real_fastapi_uvicorn_websocket"
     assert result["client_kind"] == "lightweight source-protocol peers; not PyInstaller bundles"
@@ -93,6 +94,10 @@ async def test_real_network_capacity_smoke(
     assert result["cross_user_result_errors"] == 0
     assert result["cross_user_dispatch_rejected"] is True
     assert result["successful_transfers"] == 8
+    assert result["successful_client_bridges"] > 0
+    assert result["busy_client_bridges"] > 0
+    assert result["bridge_errors"] == {"TransferBusyError": result["busy_client_bridges"]}
+    assert result["bridge_warnings"] == {"none": result["successful_client_bridges"]}
     assert result["offline_catalog_devices"] == 8
     assert result["transfer_bytes_received"] > 0
     assert result["heartbeat_peers"] == result["authenticated_connections"]
@@ -104,6 +109,15 @@ async def test_real_network_capacity_smoke(
     assert isinstance(metrics, dict)
     assert metrics["source_peer_queue_high_water"] <= metrics["source_peer_queue_capacity"]
     assert metrics["transfer_active_high_water"] > 0
+    assert metrics["bridge_active_high_water"] == 4
+    assert metrics["bridge_admission_active_high_water"] == 4
+    assert metrics["bridge_per_user_active_high_water"] == 2
+    assert metrics["bridge_endpoint_high_water"] == 8
+    assert 0 < metrics["bridge_queue_high_water"] <= metrics["bridge_queue_capacity"] == 4
+    assert metrics["client_local_slot_high_water"] == 2
+    assert metrics["client_local_slot_capacity"] == 2
+    assert metrics["bridge_admission_waiting_high_water"] > 0
+    assert metrics["bridge_task_high_water"] > 0
     assert metrics["transfer_bytes_received"] == result["transfer_bytes_received"]
     assert metrics["offline_catalog_routes_high_water"] == 2
     assert metrics["offline_catalog_schemas_high_water"] == 1
@@ -114,3 +128,9 @@ async def test_real_network_capacity_smoke(
     assert metrics["after_cleanup"]["pending_calls"] == 0
     assert metrics["after_cleanup"]["transfer_slots"] == 0
     assert metrics["after_cleanup"]["transfer_waiters"] == 0
+    assert metrics["after_cleanup"]["bridge_slots"] == 0
+    assert metrics["after_cleanup"]["bridge_endpoints"] == 0
+    assert metrics["after_cleanup"]["bridge_pinned_tombstones"] == 0
+    assert metrics["after_cleanup"]["bridge_reserved_tombstones"] == 0
+    assert metrics["after_cleanup"]["bridge_tasks"] == 0
+    assert metrics["after_cleanup"]["client_local_slots"] == 0

@@ -93,7 +93,9 @@ class TransferResponse(BaseModel):
 
     bytes_transferred: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    warnings: list[str] = Field(max_length=8)
+    warnings: list[Literal["transfer_ack_failed", "source_delete_failed"]] = Field(
+        max_length=8
+    )
 
 
 class GrepContextLine(BaseModel):

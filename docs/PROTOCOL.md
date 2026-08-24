@@ -488,19 +488,25 @@ stop the Agent loop.
 
 ---
 
-## 4. File transfer (Option A — binary frames)
+## 4. File transfer (binary frames)
 
-Python-main server implements `server -> server` `file_transfer`.
-Py6 implements `server -> client` and `client -> server` regular-file
-streaming. When both endpoints are the same paired device, the server dispatches
-one coordinated local copy/move call; it does not send bytes over the server.
-Different client-to-client endpoints are rejected. Folder transfer, range, and
-resume are not supported. Disconnected device targets surface
-`tool_device_unreachable` to the agent.
+Python-main implements regular-file `file_transfer` for every install-site
+combination: `server -> server`, `server -> client`, `client -> server`, one
+paired Client to itself, and two distinct Clients owned by the same
+authenticated user. A same-Client transfer is one coordinated local action.
+A distinct-Client transfer is a process-local pure relay between two captured
+online routes: the Server retains bounded chunks plus verification metadata,
+but creates no Server temporary file, durable byte cache, or RustFS staging
+object. Folder transfer, range, and resume are not supported. Disconnected or
+stale device targets surface `tool_device_unreachable`.
+
+Py8b does not change Protocol v3. A bridge reuses the existing control DTOs,
+binary layout, and one UUIDv7 slot ID on both endpoint routes; there is no
+`bridge` field, second slot ID, capability flag, or version negotiation.
 
 ### 4.1 Slot lifecycle
 
-A Py6 transfer has one unambiguous state sequence:
+A Protocol v3 transfer has one unambiguous endpoint state sequence:
 
 1. **Requester → sender:** optional `transfer_request` — asks the other side to
    open one regular-file source.
@@ -523,6 +529,10 @@ The server sends `transfer_request` only when it needs bytes from a client. The
 client validates and opens its local regular file, then becomes the byte sender
 by sending `transfer_begin`. For server-to-client transfer and browser upload,
 the server already owns the source and starts with `transfer_begin`.
+For a distinct-Client bridge, the Server validates the source begin, rewrites
+its route metadata into a `server_to_client` begin for the destination, and
+forwards destination ready to the source. Source bytes cannot flow before that
+ready gate.
 
 ### 4.2 `transfer_request` / `transfer_ready` / `transfer_begin` / `transfer_end`
 
@@ -616,12 +626,25 @@ WebSocket binary frame, payload bytes:
 The payload is exactly `16 UUID bytes + 0..65536 bytes`; the complete binary
 frame is therefore at most 65,552 bytes. Both endpoints reject larger frames
 and invalid UUID-v7 slot IDs. Chunks for unknown, normally completed, or
-expired slots are protocol errors; the narrow exception is a bounded late
-chunk for a known failure tombstone created from `transfer_end(ack=false,
-ok=false)` (or its matching failure acknowledgement), which may be discarded
-without writing it to another slot. Receivers stream chunks to a temporary
-destination/HTTP consumer and never collect a whole file in memory. There is
-no client-to-client bridge in Py6.
+expired slots are protocol errors. For a known failure tombstone created from
+`transfer_end(ack=false, ok=false)` (or its matching failure acknowledgement),
+non-empty late chunks may be discarded while their cumulative bytes remain
+within the source's declared total and the tombstone TTL has not expired. This
+uses a byte/time bound rather than a frame-count bound because WebSocket and OS
+buffers may already contain more frames than the Client writer lane; discarded
+payloads are not retained or written to another slot. Receivers stream chunks
+to a temporary destination/HTTP consumer and never collect a whole file in memory. A
+distinct-Client bridge forwards chunks through a four-entry Server queue and
+the existing bounded destination writer lane; it does not materialize the
+complete payload.
+
+A known-failed bridge source may also have normal-lane `transfer_progress`
+frames already queued ahead of its critical failure acknowledgement. The
+Server drops at most 64 well-formed, monotonic late progress frames for that
+failed endpoint. The limit equals the Client normal-control-lane capacity;
+the 65th frame, malformed progress, wrong-role progress, and progress for a
+normally completed slot remain protocol errors. This bound is a cross-runtime
+contract, not a negotiated wire field.
 
 ### 4.4 Verification
 
@@ -637,6 +660,16 @@ the receiver discards the partial file. Client-to-server writes promote a
 verified temporary RustFS object atomically; a failed write does not expose a
 partial destination.
 
+A receiver may reject after the sender has emitted a successful non-ACK
+terminal—for example, because digest verification, fsync, or atomic
+no-replace commit fails. Its `ack=true, ok=false` frame is a valid response to
+that sender success terminal. A Client sender accepts it and releases its
+source slot. If the Client sender's local timeout races the destination result,
+the Server chooses exactly one source acknowledgement: either the matching
+timeout ACK or the validated destination success/failure ACK. The Client
+accepts the chosen destination ACK even if it has already emitted its timeout;
+neither side sends a second competing ACK.
+
 If the receiver runs out of local staging space or object-storage capacity
 mid-transfer, it sends `transfer_end(ack=false, ok=false,
 code="workspace_storage_unavailable")` immediately and stops accepting binary
@@ -644,18 +677,36 @@ frames for that slot.
 
 ### 4.5 Device → device
 
-`file_transfer` between two different clients (for example,
-`alice-laptop` → `alice-phone`) is rejected with `tool_invalid_args`; Py6 does
-not implement a client-to-client bridge. When both device fields name the same
-paired client, the server sends an internal workspace action and the client
-performs a coordinated local regular-file copy or move.
+When both device fields name the same paired Client, the Server sends an
+internal workspace action and the Client performs a coordinated local
+regular-file copy or move.
+
+For two distinct Clients, both Device rows and live routes must belong to the
+authenticated user. The Server atomically captures both ready generations,
+requests the source, forwards a rewritten begin to the destination, and relays
+bounded chunks without using RustFS. It validates the declared length and
+SHA-256 before forwarding the source success terminal. The destination uses
+its ordinary temporary-file and atomic no-replace commit path, so an existing
+destination always rejects and is never overwritten.
+
+`mode="copy"` leaves the source intact. `mode="move"` deletes the source only
+after the destination has committed and its chosen success ACK has been
+delivered to the source. Deletion is conditional on the source fingerprint
+captured by `transfer_begin`; a changed or unavailable source remains in place
+and yields `source_delete_failed`. If destination commit is known but source
+ACK delivery is not confirmed, the result includes `transfer_ack_failed` and
+move also includes `source_delete_failed`; OpenOctopus does not guess, replay,
+or delete the source.
 
 ### 4.6 Caller-facing semantics
 
-The agent's cross-endpoint `file_transfer` tool blocks until the final
-`transfer_end(ack=true)` arrives. Same-device local transfers return after the
-client's coordinated operation. The tool returns success when `ok=true`, or
-surfaces the error per ADR-031 when `ok=false`.
+The agent's cross-endpoint `file_transfer` tool blocks until the authoritative
+destination result and source-resolution boundary. Same-device local transfers
+return after the Client's coordinated operation. Confirmed destination failure
+surfaces per ADR-031. A committed destination remains a success even if later
+source acknowledgement or conditional deletion fails; those conditions return
+only `transfer_ack_failed` and/or `source_delete_failed` warnings and never
+trigger automatic retry.
 
 The current Py6 `message` tool is web-session only. With `media: [...]` and a
 paired `openoctopus_device`, it writes an online-only device-file reference to
@@ -745,3 +796,5 @@ tolerance. Protocol version is independent from the package version.
   its wire version and trusted-only gate are superseded.
 - **ADR-133** — Protocol v3, workspace restriction, Device MCP, last-good
   catalog, validate-before-save, WSS secrets, and no replay.
+- **ADR-134** — Py8b same-owner distinct-Client single-file pure relay over
+  unchanged Protocol v3.

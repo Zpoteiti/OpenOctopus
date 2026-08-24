@@ -34,12 +34,14 @@ from openctopus_server.devices.protocol import (
     new_uuid7,
 )
 from openctopus_server.devices.registry import (
+    BridgeRoutePair,
     ConnectionHandle,
     DeviceBusyError,
     DeviceMcpUnavailableError,
     DeviceOutcomeUnknownError,
     DeviceProtocolError,
     DeviceRegistry,
+    DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
 from openctopus_server.devices.transfer import TransferUnavailableError
@@ -1669,6 +1671,149 @@ async def test_private_dispatch_rejects_a_changed_config_snapshot() -> None:
         "config_update",
         "config_applied_ack",
     ]
+
+
+async def test_bridge_route_pair_captures_both_current_routes_atomically() -> None:
+    registry = DeviceRegistry()
+    user_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+    source_handle = await registry.register(
+        device_id=source_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    destination_handle = await registry.register(
+        device_id=destination_id,
+        user_id=user_id,
+        device_name="phone",
+        transport=FakeTransport(),
+    )
+    assert source_handle is not None
+    assert destination_handle is not None
+
+    pair = await registry.get_bridge_route_pair(
+        user_id=user_id,
+        source_device_id=source_id,
+        source_device_name="laptop",
+        destination_device_id=destination_id,
+        destination_device_name="phone",
+    )
+
+    assert pair == BridgeRoutePair(
+        source=DeviceRouteSnapshot(source_handle, 0, "laptop"),
+        destination=DeviceRouteSnapshot(destination_handle, 0, "phone"),
+    )
+    assert await registry.bridge_routes_current(
+        pair.source,
+        pair.destination,
+        user_id=user_id,
+    )
+    assert not await registry.bridge_routes_current(
+        pair.source,
+        pair.source,
+        user_id=user_id,
+    )
+    assert not await registry.bridge_routes_current(
+        pair.source,
+        DeviceRouteSnapshot(destination_handle, 1, "phone"),
+        user_id=user_id,
+    )
+
+
+async def test_bridge_route_pair_fails_closed_for_identity_or_route_drift() -> None:
+    registry = DeviceRegistry()
+    user_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+    source_handle = await registry.register(
+        device_id=source_id,
+        user_id=user_id,
+        device_name="laptop",
+        transport=FakeTransport(),
+    )
+    destination_handle = await registry.register(
+        device_id=destination_id,
+        user_id=user_id,
+        device_name="phone",
+        transport=FakeTransport(),
+    )
+    assert source_handle is not None
+    assert destination_handle is not None
+    pair = BridgeRoutePair(
+        source=DeviceRouteSnapshot(source_handle, 0, "laptop"),
+        destination=DeviceRouteSnapshot(destination_handle, 0, "phone"),
+    )
+
+    assert (
+        await registry.get_bridge_route_pair(
+            user_id=uuid4(),
+            source_device_id=source_id,
+            source_device_name="laptop",
+            destination_device_id=destination_id,
+            destination_device_name="phone",
+        )
+        is None
+    )
+    assert (
+        await registry.get_bridge_route_pair(
+            user_id=user_id,
+            source_device_id=source_id,
+            source_device_name="renamed",
+            destination_device_id=destination_id,
+            destination_device_name="phone",
+        )
+        is None
+    )
+    assert (
+        await registry.get_bridge_route_pair(
+            user_id=user_id,
+            source_device_id=source_id,
+            source_device_name="laptop",
+            destination_device_id=source_id,
+            destination_device_name="laptop",
+        )
+        is None
+    )
+
+    assert await registry.begin_config_update(
+        device_id=destination_id,
+        user_id=user_id,
+    )
+    try:
+        assert (
+            await registry.get_bridge_route_pair(
+                user_id=user_id,
+                source_device_id=source_id,
+                source_device_name="laptop",
+                destination_device_id=destination_id,
+                destination_device_name="phone",
+            )
+            is None
+        )
+        assert not await registry.bridge_routes_current(
+            pair.source,
+            pair.destination,
+            user_id=user_id,
+        )
+    finally:
+        await registry.abort_config_update(
+            device_id=destination_id,
+            user_id=user_id,
+        )
+
+    assert await registry.unregister(destination_handle)
+    assert (
+        await registry.get_bridge_route_pair(
+            user_id=user_id,
+            source_device_id=source_id,
+            source_device_name="laptop",
+            destination_device_id=destination_id,
+            destination_device_name="phone",
+        )
+        is None
+    )
 
 
 async def test_config_push_send_failure_marks_the_device_offline() -> None:

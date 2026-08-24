@@ -7,7 +7,7 @@ import os
 import secrets
 import stat
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -99,6 +99,14 @@ class _Tombstone:
     etag: str | None
     created: bool | None
     expires_at: float
+    sender_success_end: TransferEnd | None = None
+    local_failure_end: TransferEnd | None = None
+    remote_failure_end: TransferEnd | None = None
+    crossing_failure_ack_sent: bool = False
+    receiver_ready: bool = False
+    receiver_failed: bool = False
+    declared_bytes: int | None = None
+    binary_bytes_seen: int = 0
 
 
 @dataclass(frozen=True)
@@ -137,6 +145,12 @@ class _Slot:
     destination_created: bool | None = None
     temporary_identity: tuple[int, int, int, int, int] | None = None
     final_end: TransferEnd | None = None
+    sender_success_end: TransferEnd | None = None
+    local_failure_end: TransferEnd | None = None
+    remote_failure_end: TransferEnd | None = None
+    crossing_failure_ack_sent: bool = False
+    receiver_ready: bool = False
+    late_binary_bytes: int = 0
 
 
 class TransferManager:
@@ -259,9 +273,19 @@ class TransferManager:
         slot = self._slots.get(slot_id)
         if slot is None:
             tombstone = self._tombstones.get(slot_id)
-            if tombstone is not None and not tombstone.ack and not tombstone.ok:
-                # The peer may already have queued bounded binary frames before
-                # it observes our local failure terminal.
+            if (
+                tombstone is not None
+                and tombstone.receiver_failed
+                and tombstone.receiver_ready
+                and chunk
+                and tombstone.declared_bytes is not None
+                and tombstone.binary_bytes_seen + len(chunk)
+                <= tombstone.declared_bytes
+            ):
+                self._tombstones[slot_id] = replace(
+                    tombstone,
+                    binary_bytes_seen=tombstone.binary_bytes_seen + len(chunk),
+                )
                 return
             if tombstone is not None:
                 raise TransferProtocolError("Binary data arrived for a closed transfer")
@@ -274,14 +298,14 @@ class TransferManager:
             if (
                 slot.role == "receiver"
                 and slot.state == "ABORTED"
-                and slot.final_end is not None
-                and not slot.final_end.ack
-                and not slot.final_end.ok
+                and slot.receiver_ready
+                and chunk
+                and slot.begin is not None
+                and slot.begin.total_bytes is not None
+                and slot.inbound_bytes + slot.late_binary_bytes + len(chunk)
+                <= slot.begin.total_bytes
             ):
-                # The receiver already sent its terminal timeout/failure.  A
-                # peer may still have queued binary data until it observes
-                # that frame; do not turn that expected drain into a socket
-                # protocol failure.
+                slot.late_binary_bytes += len(chunk)
                 return
             raise TransferProtocolError("Binary data arrived before transfer_ready")
         declared = slot.begin.total_bytes if slot.begin is not None else None
@@ -418,6 +442,7 @@ class TransferManager:
         except WriterOverflowError:
             await self._cleanup_slot(slot)
             raise
+        slot.receiver_ready = True
         slot.state = "READY"
         slot.task = self._spawn(self._receive_destination(slot))
 
@@ -432,11 +457,61 @@ class TransferManager:
         slot = self._slots.get(end.id)
         if slot is None:
             tombstone = self._tombstones.get(end.id)
-            if tombstone is not None and self._same_terminal(tombstone, end):
+            if (
+                tombstone is not None
+                and not end.ack
+                and not end.ok
+                and tombstone.local_failure_end == end
+            ):
+                if not tombstone.crossing_failure_ack_sent:
+                    self._enqueue_critical(
+                        encode_frame(end.model_copy(update={"ack": True}))
+                    )
+                    self._tombstones[end.id] = replace(
+                        tombstone,
+                        crossing_failure_ack_sent=True,
+                    )
+                return
+            if (
+                tombstone is not None
+                and not end.ack
+                and not end.ok
+                and tombstone.remote_failure_end == end
+            ):
+                return
+            if tombstone is not None and (
+                self._same_terminal(tombstone, end)
+                or self._tombstone_accepts_chosen_ack(tombstone, end)
+            ):
                 if end.ack and not tombstone.ack:
-                    self._remember_tombstone(end.id, end)
+                    self._remember_tombstone(
+                        end.id,
+                        end,
+                        sender_success_end=tombstone.sender_success_end,
+                        local_failure_end=tombstone.local_failure_end,
+                        crossing_failure_ack_sent=tombstone.crossing_failure_ack_sent,
+                    )
                 return
             raise TransferProtocolError("transfer_end arrived for an unknown transfer")
+        if (
+            not end.ack
+            and not end.ok
+            and slot.state == "ABORTED"
+            and slot.local_failure_end == end
+        ):
+            if not slot.crossing_failure_ack_sent:
+                self._enqueue_critical(
+                    encode_frame(end.model_copy(update={"ack": True}))
+                )
+                slot.crossing_failure_ack_sent = True
+            return
+        if (
+            not end.ack
+            and not end.ok
+            and slot.state == "ABORTED"
+            and slot.remote_failure_end == end
+        ):
+            return
         if end.ack:
             if slot.role == "receiver" and slot.state == "ABORTED":
                 if not self._ack_matches_terminal(slot, end):
@@ -450,6 +525,7 @@ class TransferManager:
                 raise TransferProtocolError("transfer acknowledgement is out of order")
             if not self._ack_matches_terminal(slot, end):
                 raise TransferProtocolError("transfer acknowledgement conflicts with terminal")
+            slot.final_end = end
             slot.remote_end = end
             slot.sender_ack.set()
             return
@@ -460,6 +536,7 @@ class TransferManager:
         ):
             cancel_sender = slot.state != "SENDER_ENDED"
             slot.remote_end = end
+            slot.remote_failure_end = end
             slot.state = "ABORTED"
             receiver_overflow: WriterOverflowError | None = None
             try:
@@ -480,6 +557,7 @@ class TransferManager:
             and not end.ok
         ):
             slot.remote_end = end
+            slot.remote_failure_end = end
             slot.state = "ABORTED"
             overflow: WriterOverflowError | None = None
             try:
@@ -921,6 +999,7 @@ class TransferManager:
             )
             self._enqueue_critical(encode_frame(final_end))
             slot.final_end = final_end
+            slot.sender_success_end = final_end
             await asyncio.wait_for(slot.sender_ack.wait(), self._idle_timeout)
             remote_end = slot.remote_end
             if remote_end is None or not remote_end.ok:
@@ -994,6 +1073,8 @@ class TransferManager:
         )
         self._enqueue_critical(encode_frame(end))
         slot.final_end = end
+        if not end.ack and not end.ok:
+            slot.local_failure_end = end
 
     async def _wait_for_failure_ack(self, slot: _Slot, *, had_begun: bool) -> None:
         """Keep a begun failed sender alive long enough to consume its ACK."""
@@ -1008,10 +1089,21 @@ class TransferManager:
     def _send_terminal_rejection(self, slot_id: UUID, code: str) -> None:
         end = TransferEnd(id=slot_id, ack=False, ok=False, code=code)
         self._enqueue_critical(encode_frame(end))
-        self._remember_tombstone(slot_id, end)
+        self._remember_tombstone(slot_id, end, local_failure_end=end)
 
     async def _finish_slot(self, slot: _Slot) -> None:
-        self._remember_tombstone(slot.slot_id, slot.final_end)
+        self._remember_tombstone(
+            slot.slot_id,
+            slot.final_end,
+            sender_success_end=slot.sender_success_end,
+            local_failure_end=slot.local_failure_end,
+            remote_failure_end=slot.remote_failure_end,
+            crossing_failure_ack_sent=slot.crossing_failure_ack_sent,
+            receiver_ready=slot.receiver_ready,
+            receiver_failed=slot.role == "receiver" and slot.state == "ABORTED",
+            declared_bytes=slot.begin.total_bytes if slot.begin is not None else None,
+            binary_bytes_seen=slot.inbound_bytes + slot.late_binary_bytes,
+        )
 
     async def _cleanup_slot(self, slot: _Slot) -> None:
         if slot.temporary is not None:
@@ -1023,12 +1115,36 @@ class TransferManager:
             slot.lock_stack = None
         self._slots.pop(slot.slot_id, None)
         if slot.final_end is not None:
-            self._remember_tombstone(slot.slot_id, slot.final_end)
+            self._remember_tombstone(
+                slot.slot_id,
+                slot.final_end,
+                sender_success_end=slot.sender_success_end,
+                local_failure_end=slot.local_failure_end,
+                remote_failure_end=slot.remote_failure_end,
+                crossing_failure_ack_sent=slot.crossing_failure_ack_sent,
+                receiver_ready=slot.receiver_ready,
+                receiver_failed=slot.role == "receiver" and slot.state == "ABORTED",
+                declared_bytes=slot.begin.total_bytes if slot.begin is not None else None,
+                binary_bytes_seen=slot.inbound_bytes + slot.late_binary_bytes,
+            )
 
-    def _remember_tombstone(self, slot_id: UUID, end: TransferEnd | None) -> None:
+    def _remember_tombstone(
+        self,
+        slot_id: UUID,
+        end: TransferEnd | None,
+        *,
+        sender_success_end: TransferEnd | None = None,
+        local_failure_end: TransferEnd | None = None,
+        remote_failure_end: TransferEnd | None = None,
+        crossing_failure_ack_sent: bool = False,
+        receiver_ready: bool = False,
+        receiver_failed: bool = False,
+        declared_bytes: int | None = None,
+        binary_bytes_seen: int = 0,
+    ) -> None:
         if end is None:
             return
-        self._tombstones.pop(slot_id, None)
+        existing = self._tombstones.pop(slot_id, None)
         self._tombstones[slot_id] = _Tombstone(
             ack=end.ack,
             ok=end.ok,
@@ -1037,7 +1153,41 @@ class TransferManager:
             sha256=end.sha256,
             etag=end.etag,
             created=end.created,
-            expires_at=asyncio.get_running_loop().time() + TOMBSTONE_TTL_SECONDS,
+            expires_at=(
+                existing.expires_at
+                if existing is not None
+                else asyncio.get_running_loop().time() + TOMBSTONE_TTL_SECONDS
+            ),
+            sender_success_end=(
+                sender_success_end
+                if sender_success_end is not None
+                else existing.sender_success_end if existing is not None else None
+            ),
+            local_failure_end=(
+                local_failure_end
+                if local_failure_end is not None
+                else existing.local_failure_end if existing is not None else None
+            ),
+            remote_failure_end=(
+                remote_failure_end
+                if remote_failure_end is not None
+                else existing.remote_failure_end if existing is not None else None
+            ),
+            crossing_failure_ack_sent=(
+                crossing_failure_ack_sent
+                or (existing.crossing_failure_ack_sent if existing is not None else False)
+            ),
+            receiver_ready=receiver_ready or (existing.receiver_ready if existing else False),
+            receiver_failed=receiver_failed or (existing.receiver_failed if existing else False),
+            declared_bytes=(
+                declared_bytes
+                if declared_bytes is not None
+                else existing.declared_bytes if existing is not None else None
+            ),
+            binary_bytes_seen=max(
+                binary_bytes_seen,
+                existing.binary_bytes_seen if existing is not None else 0,
+            ),
         )
         while len(self._tombstones) > TOMBSTONE_MAX_ENTRIES:
             self._tombstones.pop(next(iter(self._tombstones)))
@@ -1076,17 +1226,67 @@ class TransferManager:
         )
 
     @staticmethod
+    def _tombstone_accepts_chosen_ack(tombstone: _Tombstone, end: TransferEnd) -> bool:
+        success = tombstone.sender_success_end
+        if (
+            success is None
+            or success.ack
+            or not success.ok
+            or tombstone.ack
+            or tombstone.ok
+            or tombstone.code != "workspace_transfer_timeout"
+            or not end.ack
+        ):
+            return False
+        if not end.ok:
+            return True
+        return (
+            end.bytes_sent == success.bytes_sent
+            and end.sha256 == success.sha256
+            and end.etag == success.etag
+            and end.created == success.created
+        )
+
+    @staticmethod
     def _ack_matches_terminal(slot: _Slot, end: TransferEnd) -> bool:
         terminal = slot.final_end
-        return (
-            terminal is not None
-            and terminal.ok == end.ok
-            and terminal.code == end.code
-            and terminal.bytes_sent == end.bytes_sent
-            and terminal.sha256 == end.sha256
-            and terminal.etag == end.etag
-            and terminal.created == end.created
+
+        def matches(expected: TransferEnd | None) -> bool:
+            return (
+                expected is not None
+                and expected.ok == end.ok
+                and expected.code == end.code
+                and expected.bytes_sent == end.bytes_sent
+                and expected.sha256 == end.sha256
+                and expected.etag == end.etag
+                and expected.created == end.created
+            )
+
+        if slot.remote_end is not None and slot.remote_end.ack:
+            return slot.remote_end == end
+        if matches(terminal):
+            return True
+
+        success = slot.sender_success_end
+        awaiting_success_resolution = (
+            slot.role == "sender"
+            and success is not None
+            and terminal is not None
+            and not terminal.ack
+            and (
+                terminal == success
+                or (
+                    not terminal.ok
+                    and terminal.code == "workspace_transfer_timeout"
+                )
+            )
         )
+        if not awaiting_success_resolution:
+            return False
+        # A receiver may reject a valid sender success terminal during its own
+        # digest, fsync, or no-replace commit.  If our timeout raced that result,
+        # the server still chooses exactly one of these ACK shapes.
+        return not end.ok or matches(success)
 
 
 def _resolve_destination(

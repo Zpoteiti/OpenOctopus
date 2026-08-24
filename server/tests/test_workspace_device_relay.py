@@ -118,6 +118,7 @@ def _settings() -> SimpleNamespace:
     return SimpleNamespace(
         rest_transfer_idle_timeout_seconds=0.2,
         rest_transfer_queue_timeout_seconds=0.1,
+        device_transfer_queue_timeout_seconds=0.1,
     )
 
 

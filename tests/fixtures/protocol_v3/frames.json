@@ -262,6 +262,100 @@
           "runtime_generation": "0190d5a7-0000-7000-8000-000000000020"
         }
       }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "transfer_begin",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "direction": "client_to_server",
+        "purpose": "file_transfer",
+        "src_device": "source-device",
+        "src_path": "reports/a.pdf",
+        "dst_device": "server",
+        "dst_path": "archive/a.pdf",
+        "total_bytes": 3,
+        "sha256": null,
+        "mime": null,
+        "etag": "source-fingerprint",
+        "if_match": null,
+        "if_none_match": null
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "transfer_begin",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "direction": "server_to_client",
+        "purpose": "file_transfer",
+        "src_device": "source-device",
+        "src_path": "reports/a.pdf",
+        "dst_device": "destination-device",
+        "dst_path": "archive/a.pdf",
+        "total_bytes": 3,
+        "sha256": null,
+        "mime": null,
+        "etag": "source-fingerprint",
+        "if_match": null,
+        "if_none_match": null
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": false,
+        "ok": true,
+        "code": null,
+        "bytes_sent": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "etag": null,
+        "created": null
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": true,
+        "ok": false,
+        "code": "workspace_file_changed",
+        "bytes_sent": null,
+        "sha256": null,
+        "etag": null,
+        "created": null
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": true,
+        "ok": false,
+        "code": "workspace_file_changed",
+        "bytes_sent": null,
+        "sha256": null,
+        "etag": null,
+        "created": null
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": false,
+        "ok": false,
+        "code": "workspace_transfer_timeout",
+        "bytes_sent": null,
+        "sha256": null,
+        "etag": null,
+        "created": null
+      }
     }
   ],
   "invalid": [

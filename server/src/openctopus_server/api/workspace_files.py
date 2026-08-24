@@ -47,6 +47,7 @@ from openctopus_server.devices.workspace import (
     DeviceWorkspaceAction,
     dispatch_workspace_action,
 )
+from openctopus_server.dto.error import ErrorResponse
 from openctopus_server.dto.workspace_file import (
     DirectoryEntryPage,
     FileEditRequest,
@@ -908,6 +909,38 @@ async def grep_workspace_files(
     "/transfer",
     response_model=TransferResponse,
     response_model_exclude_none=True,
+    responses={
+        400: {
+            "model": ErrorResponse,
+            "description": "The transfer request or path is invalid.",
+        },
+        408: {
+            "model": ErrorResponse,
+            "description": "Transfer made no progress before the idle timeout.",
+        },
+        409: {
+            "model": ErrorResponse,
+            "description": "The transfer conflicts or a target device is unavailable.",
+        },
+        429: {
+            "model": ErrorResponse,
+            "description": "Transfer capacity is busy; retry after the indicated delay.",
+            "headers": {
+                "Retry-After": {
+                    "description": "Seconds to wait before retrying",
+                    "schema": {"type": "integer", "minimum": 1},
+                }
+            },
+        },
+        502: {
+            "model": ErrorResponse,
+            "description": "Streamed transfer failed integrity verification.",
+        },
+        503: {
+            "model": ErrorResponse,
+            "description": "Transfer storage or service is unavailable.",
+        },
+    },
 )
 async def transfer_workspace_file(
     body: FileTransferRequest,
@@ -1104,7 +1137,7 @@ def _device_busy(settings: Settings) -> WorkspaceError:
     return WorkspaceError(
         ErrorCode.TOOL_DEVICE_BUSY,
         "Workspace device is busy; retry later",
-        headers={"Retry-After": str(math.ceil(settings.rest_transfer_queue_timeout_seconds))},
+        headers={"Retry-After": str(math.ceil(settings.device_transfer_queue_timeout_seconds))},
     )
 
 

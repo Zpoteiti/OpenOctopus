@@ -193,28 +193,7 @@ def extend_openoctopus_device_enums(
         if not isinstance(current, list):
             raise ValueError("marked device field must define an enum list")
         value["enum"] = [*current, *(site for site in extra if site not in current)]
-    if input_schema.get("x-openoctopus-same-device") is True:
-        _extend_same_device_constraint(input_schema, extra=extra)
     return merged
-
-
-def _extend_same_device_constraint(
-    input_schema: dict[str, Any], *, extra: list[str] | tuple[str, ...]
-) -> None:
-    """Advertise server endpoints plus equal paired-client endpoints.
-
-    JSON Schema has no portable operator for equality between two arbitrary
-    string properties.  Paired device names are a finite snapshot at schema
-    construction time, so adding one branch per name keeps different-client
-    combinations outside the provider-visible contract.
-    """
-
-    branches = input_schema.get("anyOf")
-    if not isinstance(branches, list):
-        raise ValueError("same-device schema must define anyOf branches")
-    pair_fields = ("openoctopus_src_device", "openoctopus_dst_device")
-    for name in extra:
-        branches.append({"properties": {field: {"const": name} for field in pair_fields}})
 
 
 class ToolRegistry:
