@@ -1,8 +1,10 @@
 """Opt-in real TCP transfer and device Workspace Files E2E.
 
-The test deliberately starts Uvicorn on a loopback TCP socket and launches the
-source client as a subprocess.  It is skipped in the normal suite because it
-needs the real PostgreSQL fixture and is slower than the protocol tests.
+The tests start Uvicorn on a loopback TCP socket and launch real client
+subprocesses.  ``OO_CLIENT_BIN`` selects a frozen client where configured; the
+distinct-client bridge uses it as the source and keeps the destination on the
+current source checkout.  The module is opt-in because it needs the real
+PostgreSQL fixture and is slower than the protocol tests.
 """
 
 from __future__ import annotations
@@ -25,8 +27,6 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
 from storage_http import object_storage_for_fake
 from test_device_client_e2e import (
-    _CLIENT_CWD,
-    _client_environment,
     _start_client,
     _start_server,
     _stop_client,
@@ -41,6 +41,7 @@ from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.errors.http import register_error_handler
 from openctopus_server.tools.base import ToolContext
 from openctopus_server.tools.file_transfer import FileTransferTool
+from openctopus_server.tools.registry import ToolRegistry
 from openctopus_server.workspace.fs import WorkspaceFS
 from openctopus_server.workspace.service import WorkspaceService, get_workspace_service
 
@@ -190,25 +191,44 @@ async def _wait_for_transfer_cleanup(registry: Any) -> None:
     raise AssertionError("device transfer slot did not clean up")
 
 
+async def _assert_client_running(
+    process: asyncio.subprocess.Process,
+    *,
+    secret: str,
+) -> None:
+    if process.returncode is None:
+        return
+    stdout, stderr = await process.communicate()
+    secret_bytes = secret.encode("utf-8")
+    assert secret_bytes not in (stdout or b"")
+    assert secret_bytes not in (stderr or b"")
+    raise AssertionError(
+        f"client exited unexpectedly with {process.returncode}; "
+        f"stderr={stderr[-2000:]!r}"
+    )
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-async def _start_real_client(server_url: str, token: str) -> asyncio.subprocess.Process:
-    """Run a frozen client when supplied, otherwise use source mode."""
+async def _start_source_and_configured_clients(
+    server_url: str,
+    source_token: str,
+    destination_token: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[asyncio.subprocess.Process, asyncio.subprocess.Process]:
+    """Start an optionally frozen source plus one source-checkout destination."""
 
-    executable = os.environ.get("OO_CLIENT_BIN")
-    if executable is None:
-        return await _start_client(server_url, token)
-    return await asyncio.create_subprocess_exec(
-        executable,
-        "run",
-        cwd=_CLIENT_CWD,
-        env=_client_environment(server_url, token),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    source = await _start_client(server_url, source_token)
+    try:
+        with monkeypatch.context() as destination_mode:
+            destination_mode.delenv("OO_CLIENT_BIN", raising=False)
+            destination = await _start_client(server_url, destination_token)
+    except BaseException:
+        await _stop_client(source, expected_returncode=0, secret=source_token)
+        raise
+    return source, destination
 
 
 async def test_real_file_transfer_and_device_workspace_relay(
@@ -273,7 +293,7 @@ async def test_real_file_transfer_and_device_workspace_relay(
             created = create_response.json()
             token = created["token"]
             device_name = created["device"]["name"]
-            process = await _start_real_client(server_url, token)
+            process = await _start_client(server_url, token)
             client_processes.append(process)
             await _wait_online(
                 http_client,
@@ -569,6 +589,397 @@ async def test_real_file_transfer_and_device_workspace_relay(
             if process.returncode is None:
                 with contextlib.suppress(Exception):
                     await _stop_client(process, expected_returncode=0, secret=token)
+        try:
+            await _stop_server(
+                server,
+                server_task,
+                listener,
+                registry,
+                get_engine(),
+            )
+        finally:
+            await object_storage.close()
+            get_settings.cache_clear()
+            get_engine.cache_clear()
+            get_device_registry.cache_clear()
+
+
+async def test_real_distinct_clients_copy_move_and_failure_contracts(
+    pg_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Bridge a configurable frozen source to one source-checkout destination."""
+
+    monkeypatch.setenv(
+        "OPENOCTOPUS_DATABASE_URL", pg_engine.url.render_as_string(hide_password=False)
+    )
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_device_registry.cache_clear()
+    registry = get_device_registry()
+
+    fake_rustfs = _TrackingMemoryMinio()
+    object_storage = object_storage_for_fake(fake_rustfs, "test", max_connections=2)
+    workspace_service = WorkspaceService(WorkspaceFS(object_storage))
+    app = FastAPI()
+    app.include_router(api_router)
+    app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    register_error_handler(app)
+    server, server_task, server_url, listener = await _start_server(app)
+    clients: list[tuple[asyncio.subprocess.Process, str]] = []
+
+    source_workspace = tmp_path / "source-client"
+    destination_workspace = tmp_path / "destination-client"
+    source_workspace.mkdir()
+    destination_workspace.mkdir()
+    try:
+        async with httpx.AsyncClient(
+            base_url=server_url,
+            timeout=15,
+            trust_env=False,
+        ) as http_client:
+            auth_response = await http_client.post(
+                "/api/auth/register",
+                json={
+                    "email": f"bridge-e2e-{uuid4().hex}@example.com",
+                    "password": "testpassword",
+                    "name": "Bridge E2E",
+                },
+            )
+            assert auth_response.status_code == 201, auth_response.text
+            auth = auth_response.json()
+            jwt = auth["jwt"]
+            user_id = UUID(auth["user"]["id"])
+            headers = {"Authorization": f"Bearer {jwt}"}
+
+            async def create_device(name: str, workspace: Path) -> tuple[str, str, UUID]:
+                response = await http_client.post(
+                    "/api/devices",
+                    headers=headers,
+                    json={
+                        "name": name,
+                        "workspace_path": str(workspace),
+                        "restrict_to_workspace": True,
+                        "ssrf_denylist": [],
+                    },
+                )
+                assert response.status_code == 201, response.text
+                created = response.json()
+                return (
+                    created["device"]["name"],
+                    created["token"],
+                    UUID(created["device"]["id"]),
+                )
+
+            source_name, source_token, source_id = await create_device(
+                "bridge-source",
+                source_workspace,
+            )
+            destination_name, destination_token, destination_id = await create_device(
+                "bridge-destination",
+                destination_workspace,
+            )
+            source_process, destination_process = await _start_source_and_configured_clients(
+                server_url,
+                source_token,
+                destination_token,
+                monkeypatch,
+            )
+            clients.extend(
+                (
+                    (source_process, source_token),
+                    (destination_process, destination_token),
+                )
+            )
+            await _wait_online(
+                http_client,
+                jwt,
+                source_name,
+                online=True,
+                process=source_process,
+            )
+            await _wait_online(
+                http_client,
+                jwt,
+                destination_name,
+                online=True,
+                process=destination_process,
+            )
+
+            async def transfer(
+                src_path: str,
+                dst_path: str,
+                *,
+                mode: str,
+            ) -> httpx.Response:
+                response = await http_client.post(
+                    "/api/workspace/transfer",
+                    headers=headers,
+                    json={
+                        "openoctopus_src_device": source_name,
+                        "src_path": src_path,
+                        "openoctopus_dst_device": destination_name,
+                        "dst_path": dst_path,
+                        "mode": mode,
+                    },
+                )
+                await _wait_for_transfer_cleanup(registry)
+                await _assert_client_running(source_process, secret=source_token)
+                assert destination_process.returncode is None
+                return response
+
+            copy_bytes = (b"distinct-client-copy\x00" * 8192) + b"end"
+            (source_workspace / "copy-source.bin").write_bytes(copy_bytes)
+            copy = await transfer("copy-source.bin", "copy-result.bin", mode="copy")
+            assert copy.status_code == 200, copy.text
+            assert copy.json() == {
+                "bytes_transferred": len(copy_bytes),
+                "sha256": _sha256(copy_bytes),
+                "warnings": [],
+            }
+            assert (source_workspace / "copy-source.bin").read_bytes() == copy_bytes
+            assert (destination_workspace / "copy-result.bin").read_bytes() == copy_bytes
+
+            move_bytes = (b"distinct-client-move\xff" * 4096) + b"end"
+            (source_workspace / "move-source.bin").write_bytes(move_bytes)
+            transfer_registry = ToolRegistry(
+                (FileTransferTool(pg_engine, workspace_service, registry),)
+            )
+            move = await transfer_registry.execute(
+                name="file_transfer",
+                args={
+                    "openoctopus_src_device": source_name,
+                    "src_path": "move-source.bin",
+                    "openoctopus_dst_device": destination_name,
+                    "dst_path": "move-result.bin",
+                    "mode": "move",
+                },
+                ctx=ToolContext(user_id=user_id, session_id=uuid4()),
+                device_targets={
+                    source_name: source_id,
+                    destination_name: destination_id,
+                },
+            )
+            await _wait_for_transfer_cleanup(registry)
+            await _assert_client_running(source_process, secret=source_token)
+            assert destination_process.returncode is None
+            assert move.is_error is False
+            assert str(len(move_bytes)) in str(move.content)
+            assert _sha256(move_bytes) in str(move.content)
+            assert not (source_workspace / "move-source.bin").exists()
+            assert (destination_workspace / "move-result.bin").read_bytes() == move_bytes
+
+            collision_source = b"source must remain"
+            collision_destination = b"destination must not change"
+            (source_workspace / "collision-source.bin").write_bytes(collision_source)
+            (destination_workspace / "collision-result.bin").write_bytes(collision_destination)
+            collision = await transfer(
+                "collision-source.bin",
+                "collision-result.bin",
+                mode="copy",
+            )
+            assert collision.status_code == 409, collision.text
+            assert collision.json()["code"] == "workspace_file_changed"
+            assert (source_workspace / "collision-source.bin").read_bytes() == collision_source
+            assert (
+                destination_workspace / "collision-result.bin"
+            ).read_bytes() == collision_destination
+
+            disconnect_bytes = (b"destination-disconnect\x00\xff" * 131_072) + b"end"
+            (source_workspace / "disconnect-source.bin").write_bytes(disconnect_bytes)
+            old_destination_route = await registry.get_route_snapshot(
+                destination_id,
+                user_id=user_id,
+                expected_device_name=destination_name,
+            )
+            assert old_destination_route is not None
+            original_send_binary = registry.send_binary
+            first_destination_chunk = asyncio.Event()
+            release_destination_chunk = asyncio.Event()
+
+            async def pause_after_first_destination_chunk(
+                handle: Any,
+                payload: bytes,
+                **kwargs: Any,
+            ) -> bool:
+                delivered = await original_send_binary(handle, payload, **kwargs)
+                if (
+                    handle == old_destination_route.handle
+                    and not first_destination_chunk.is_set()
+                ):
+                    first_destination_chunk.set()
+                    await release_destination_chunk.wait()
+                return delivered
+
+            with monkeypatch.context() as streaming_disconnect:
+                streaming_disconnect.setattr(
+                    registry,
+                    "send_binary",
+                    pause_after_first_destination_chunk,
+                )
+                interrupted = asyncio.create_task(
+                    http_client.post(
+                        "/api/workspace/transfer",
+                        headers=headers,
+                        json={
+                            "openoctopus_src_device": source_name,
+                            "src_path": "disconnect-source.bin",
+                            "openoctopus_dst_device": destination_name,
+                            "dst_path": "disconnect-result.bin",
+                            "mode": "copy",
+                        },
+                    )
+                )
+                try:
+                    await asyncio.wait_for(first_destination_chunk.wait(), timeout=5)
+                    for _ in range(500):
+                        partials = list(
+                            destination_workspace.glob(
+                                ".disconnect-result.bin.openoctopus-*.tmp"
+                            )
+                        )
+                        if partials and partials[0].stat().st_size > 0:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        raise AssertionError("destination did not enter streaming")
+
+                    await _stop_client(
+                        destination_process,
+                        expected_returncode=0,
+                        secret=destination_token,
+                    )
+                    await _wait_online(
+                        http_client,
+                        jwt,
+                        destination_name,
+                        online=False,
+                    )
+                    reconnected_destination = await _start_client(
+                        server_url,
+                        destination_token,
+                    )
+                    destination_process = reconnected_destination
+                    clients.append((destination_process, destination_token))
+                    await _wait_online(
+                        http_client,
+                        jwt,
+                        destination_name,
+                        online=True,
+                        process=destination_process,
+                    )
+                    new_destination_route = await registry.get_route_snapshot(
+                        destination_id,
+                        user_id=user_id,
+                        expected_device_name=destination_name,
+                    )
+                    assert new_destination_route is not None
+                    assert (
+                        new_destination_route.handle.generation
+                        > old_destination_route.handle.generation
+                    )
+                finally:
+                    release_destination_chunk.set()
+
+                interrupted_response = await asyncio.wait_for(interrupted, timeout=10)
+            await _wait_for_transfer_cleanup(registry)
+            assert interrupted_response.status_code == 409, interrupted_response.text
+            await _assert_client_running(source_process, secret=source_token)
+            assert destination_process.returncode is None
+            assert not (destination_workspace / "disconnect-result.bin").exists()
+            assert not list(
+                destination_workspace.glob(".disconnect-result.bin.openoctopus-*.tmp")
+            )
+
+            reconnect_bytes = (b"new-generation-transfer\xff" * 8192) + b"end"
+            (source_workspace / "reconnect-source.bin").write_bytes(reconnect_bytes)
+            reconnected = await transfer(
+                "reconnect-source.bin",
+                "reconnect-result.bin",
+                mode="copy",
+            )
+            assert reconnected.status_code == 200, reconnected.text
+            assert reconnected.json() == {
+                "bytes_transferred": len(reconnect_bytes),
+                "sha256": _sha256(reconnect_bytes),
+                "warnings": [],
+            }
+            assert not (destination_workspace / "disconnect-result.bin").exists()
+            assert not list(
+                destination_workspace.glob(".disconnect-result.bin.openoctopus-*.tmp")
+            )
+            assert (
+                destination_workspace / "reconnect-result.bin"
+            ).read_bytes() == reconnect_bytes
+            # Graceful shutdown publishes a verified tool_device_unreachable failure
+            # before closing; verified pre-commit failures outrank outcome-unknown.
+            assert (
+                interrupted_response.json()["code"]
+                == "tool_device_unreachable"
+            )
+
+            changed_original = b"copy this version before conditional delete"
+            changed_after_copy = changed_original + b"; changed after copy"
+            changed_source = source_workspace / "changed-source.bin"
+            changed_source.write_bytes(changed_original)
+            original_dispatch = registry.dispatch_tool_on_snapshot
+            changed_before_delete = False
+
+            async def mutate_before_conditional_delete(**kwargs: Any) -> Any:
+                nonlocal changed_before_delete
+                args = kwargs.get("args")
+                if (
+                    not changed_before_delete
+                    and isinstance(args, dict)
+                    and args.get("operation") == "delete_file"
+                    and args.get("path") == "changed-source.bin"
+                ):
+                    assert isinstance(args.get("if_match"), str)
+                    changed_source.write_bytes(changed_after_copy)
+                    changed_before_delete = True
+                return await original_dispatch(**kwargs)
+
+            with monkeypatch.context() as source_change:
+                source_change.setattr(
+                    registry,
+                    "dispatch_tool_on_snapshot",
+                    mutate_before_conditional_delete,
+                )
+                changed = await transfer(
+                    "changed-source.bin",
+                    "changed-result.bin",
+                    mode="move",
+                )
+            assert changed.status_code == 200, changed.text
+            assert changed.json() == {
+                "bytes_transferred": len(changed_original),
+                "sha256": _sha256(changed_original),
+                "warnings": ["source_delete_failed"],
+            }
+            assert changed_before_delete is True
+            assert changed_source.read_bytes() == changed_after_copy
+            assert (
+                destination_workspace / "changed-result.bin"
+            ).read_bytes() == changed_original
+
+            assert fake_rustfs.objects == {}
+            assert (fake_rustfs.put_calls, fake_rustfs.copy_calls, fake_rustfs.remove_calls) == (
+                0,
+                0,
+                0,
+            )
+            assert not list(source_workspace.glob(".*.openoctopus-*.tmp"))
+            assert not list(destination_workspace.glob(".*.openoctopus-*.tmp"))
+    finally:
+        for process, client_token in clients:
+            if process.returncode is None:
+                with contextlib.suppress(Exception):
+                    await _stop_client(
+                        process,
+                        expected_returncode=0,
+                        secret=client_token,
+                    )
         try:
             await _stop_server(
                 server,

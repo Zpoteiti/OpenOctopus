@@ -8,16 +8,19 @@ import pytest
 
 from openoctopus_client.protocol import (
     CONTROL_FRAME_MAX_BYTES,
+    PROTOCOL_VERSION,
     HelloAck,
     ProtocolError,
     decode_client_frame,
     decode_server_frame,
     frame_to_wire_dict,
 )
+from openoctopus_client.writer import SerializedWriter
 
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "protocol_v3" / "frames.json"
 )
+_LIMITS_PATH = _FIXTURE_PATH.with_name("limits.json")
 
 
 def _fixtures() -> dict[str, list[dict[str, Any]]]:
@@ -65,3 +68,10 @@ def test_both_decoders_enforce_the_12_mib_text_frame_limit_before_json() -> None
         decode_client_frame(payload)
     with pytest.raises(ProtocolError, match="maximum size"):
         decode_server_frame(payload)
+
+
+def test_protocol_version_and_late_progress_lane_limit_are_shared_contracts() -> None:
+    limits = cast(dict[str, int], json.loads(_LIMITS_PATH.read_text(encoding="utf-8")))
+
+    assert PROTOCOL_VERSION == "3"
+    assert SerializedWriter._NORMAL_MAX == limits["late_progress_max"] == 64

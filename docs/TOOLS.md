@@ -1,11 +1,14 @@
 # OpenOctopus — Tool Catalog
 
-Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131). When the implementation drifts from this doc, fix one or the other.
+Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131, 134). When the implementation drifts from this doc, fix one or the other.
 
 **Py8a milestone:** the fixed surface is the eleven shared tools plus
 server-orchestrated single-regular-file `file_transfer` and the three
 client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). Device
 and admin shared-service Server MCP add dynamic tools from four surfaces.
+Py8b allows `file_transfer` between any two install sites owned by the same
+user, including two distinct online Clients; recursive directory transfer
+remains outside the current tool contract.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -72,7 +75,7 @@ This is a *design* document. Use it during implementation as the source of truth
 | `notebook_edit` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Edit Jupyter notebook cells |
 | `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — Server admin denylist and independent per-Device Client denylist |
 | `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
-| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between server and a paired device |
+| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between any two same-owner install sites |
 | `cron` | future placeholder | — | — | Not registered in the current tool registry |
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
 | `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
@@ -916,13 +919,15 @@ web session. Py6 does not expose channel, chat, or button arguments.
 
 **Lives in:** `openctopus_server/tools/file_transfer.py`
 
-**Purpose:** Copy or move one regular file. Py6 supports `server -> server`,
-`server -> client`, `client -> server`, and a coordinated local copy/move when
-both endpoints name the same paired device. Different client-to-client
-endpoints are rejected; recursive folder transfer is not supported.
-Server-to-server uses `WorkspaceService`; server/client directions stream over
-the device WebSocket. Destination exists always rejects (no overwrite flag).
-Disconnected device targets return `tool_device_unreachable`.
+**Purpose:** Copy or move one regular file across any two same-owner install
+sites: `server -> server`, `server -> client`, `client -> server`, same-client
+local, or two distinct Clients. Recursive folder transfer is not supported.
+Server-to-server uses `WorkspaceService`; Client legs use the device WebSocket.
+A distinct-Client transfer is a bounded pure relay: the Server forwards bytes
+from the source Client to the destination Client without a Server temporary
+file, durable cache, or RustFS staging object. An existing destination is
+always rejected (no overwrite flag). Disconnected device targets return
+`tool_device_unreachable`.
 
 **Agent-visible schema after merge:** the source schema contains the two
 intrinsic device fields, `src_path`, `dst_path`, and optional `mode` (default
@@ -931,7 +936,7 @@ exposing the tool to the model.
 ```json
 {
   "name": "file_transfer",
-  "description": "Transfer one regular file between the server and a paired device. Use mode='copy' to leave source intact, mode='move' to remove source after successful transfer. Destination is rejected if it already exists.",
+  "description": "Transfer one regular file between the server or paired devices. Use mode='copy' to leave the source intact, or mode='move' to remove it after the destination commits. Destination is rejected if it already exists.",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -941,57 +946,66 @@ exposing the tool to the model.
         "description": "Device where the source regular file lives.",
         "x-openoctopus-device": true
       },
-      "src_path": { "type": "string", "description": "Path on openoctopus_src_device." },
+      "src_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_src_device." },
       "openoctopus_dst_device": {
         "type": "string",
         "enum": ["server"],
         "description": "Device where the regular file should land.",
         "x-openoctopus-device": true
       },
-      "dst_path": { "type": "string", "description": "Path on openoctopus_dst_device. Must not already exist." },
+      "dst_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_dst_device. Must not already exist." },
       "mode": {
         "type": "string",
         "enum": ["copy", "move"],
-        "description": "copy: source intact. move: source deleted after successful transfer."
+        "description": "copy: source intact. move: source deleted after successful transfer.",
+        "default": "copy"
       }
     },
     "required": ["openoctopus_src_device", "src_path", "openoctopus_dst_device", "dst_path"],
-    "anyOf": [
-      { "properties": { "openoctopus_src_device": { "const": "server" } } },
-      { "properties": { "openoctopus_dst_device": { "const": "server" } } }
-    ],
-    "x-openoctopus-same-device": true,
     "additionalProperties": false
   }
 }
 ```
 
 **Merge-time injection:** both `openoctopus_src_device.enum` and
-`openoctopus_dst_device.enum` are **extended** with paired device names, and
-the `x-openoctopus-same-device` constraint adds one equal-device branch for
-each paired name. Post-merge example: `["server", "alice-laptop",
-"alice-phone"]` for both fields. Detection is via the
-`x-openoctopus-device: true` marker, not enum shape. Paired-but-offline targets
+`openoctopus_dst_device.enum` are independently **extended** with paired device
+names. Post-merge example: `["server", "alice-laptop", "alice-phone"]` for
+both fields, so any two values from that owner snapshot are schema-valid.
+Detection is via the `x-openoctopus-device: true` marker, not enum shape.
+Paired-but-offline targets
 remain visible and return `tool_device_unreachable` at dispatch.
 
 **Mechanism:**
-- Source schema in `openctopus_server` — the server merge step injects `openoctopus_src_device` and `openoctopus_dst_device`, then extends both enums with paired device names.
+- The source schema in `openctopus_server` declares
+  `openoctopus_src_device` and `openoctopus_dst_device`; the merge step extends
+  both enums with paired device names.
 - `server -> server` reads, writes, and conditionally deletes through `WorkspaceService`, rejecting an existing destination before the copy.
-- Py6 `server -> client` and `client -> server` first resolve the named user device and require it to be connected. For client sources the server sends `transfer_request`; the byte sender then sends `transfer_begin`, waits for the receiver's `transfer_ready`, streams bounded binary chunks, and finishes with `transfer_end(ack=false)`. The receiver returns the final `transfer_end(ack=true)` acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with SHA-256 verification and bounded queues, without a durable local file cache.
+- `server -> client` and `client -> server` first resolve the named user device and require it to be connected. For client sources the server sends `transfer_request`; the byte sender then sends `transfer_begin`, waits for the receiver's `transfer_ready`, streams bounded binary chunks, and finishes with `transfer_end(ack=false)`. The receiver returns the final `transfer_end(ack=true)` acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with SHA-256 verification and bounded queues, without a durable local file cache.
 - When both device fields name the same paired client, the server dispatches
   the private `transfer_local` action; the client copies or moves one regular
   file under its path policy without a WebSocket transfer slot.
-- Different client-to-client endpoints are rejected with `tool_invalid_args`;
-  Py6 has no client-to-client bridge.
+- For two distinct Clients, the Server atomically captures two online routes
+  owned by the authenticated user and relays one slot through a bounded
+  four-chunk queue. It verifies byte count and SHA-256 but never persists the
+  payload. The destination Client performs its normal temporary-file,
+  verification, fsync, and atomic no-replace commit.
+- `move` is copy-then-conditional-delete. The source is deleted only after the
+  destination success ACK is delivered. A failed conditional delete leaves
+  both copies and returns `source_delete_failed`; an unconfirmed source ACK
+  after destination commit returns `transfer_ack_failed` and prevents source
+  deletion. These are success warnings, not automatic retry signals.
 - **Reject** if `dst_path` already exists (no implicit overwrite, no overwrite flag), `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
 
 **Timeout:** Server-to-server path is normal workspace I/O. Device transfer stall detection belongs to the transfer-slot implementation.
 **Result cap:** short status text normalized as a normal tool result.
-**Errors:** `tool_invalid_args` for malformed args or unsupported endpoint
-combinations; `tool_device_unreachable` for offline device targets;
-`workspace_transfer_timeout` and `workspace_transfer_integrity_failed` for
-stream failures.
-**Related ADRs:** 040 (server-only), 044, 045, 078, 087.
+**Errors:** `tool_invalid_args` for malformed args;
+`tool_device_unreachable` for offline or stale device targets;
+`tool_device_busy` for bounded transfer admission; destination/path policy
+errors such as `workspace_file_changed`; `workspace_transfer_timeout`,
+`workspace_transfer_integrity_failed`, and `workspace_storage_unavailable` for
+stream or storage failures; `tool_execution_outcome_unknown` when an issued
+result cannot be established.
+**Related ADRs:** 040 (server-only), 044, 045, 078, 087, 131, 134.
 
 ---
 
@@ -1395,11 +1409,8 @@ MCP shapes from that snapshot, and applies these transformations:
    is `['server', *device_names]`.
 2. Intrinsic-device tools extend the enum of every property marked
    `x-openoctopus-device: true` with `device_names` (without duplicates).
-3. `file_transfer` additionally carries `x-openoctopus-same-device: true`; for
-   each paired name the registry appends an `anyOf` branch requiring both
-   transfer endpoints to use that same name.
-4. Pure-server tools are returned as a deep copy without routing changes.
-5. Enabled Server MCP entries enter first with site `server`. Their structured
+3. Pure-server tools are returned as a deep copy without routing changes.
+4. Enabled Server MCP entries enter first with site `server`. Their structured
    server names reserve the corresponding Device namespaces; remaining Device
    entries merge only by equal logical identity and canonical Provider schema,
    then fit deterministically in the remaining Provider budget. A separate
@@ -1475,16 +1486,6 @@ def extend_openoctopus_device_enums(schema, extra):
                 *prop["enum"],
                 *(name for name in extra if name not in prop["enum"]),
             ]
-    if input_schema.get("x-openoctopus-same-device") is True:
-        for name in extra:
-            input_schema["anyOf"].append(
-                {
-                    "properties": {
-                        "openoctopus_src_device": {"const": name},
-                        "openoctopus_dst_device": {"const": name},
-                    }
-                }
-            )
 ```
 
 The merger never inspects enum contents to decide what to mutate — only the explicit marker.

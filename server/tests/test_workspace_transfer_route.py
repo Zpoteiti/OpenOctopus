@@ -8,6 +8,8 @@ from pydantic import ValidationError
 
 from openctopus_server.api.workspace_files import transfer_workspace_file
 from openctopus_server.config import get_settings
+from openctopus_server.devices.transfer import TransferBusyError
+from openctopus_server.dto.workspace_file import TransferResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.main import create_app
@@ -82,6 +84,40 @@ async def test_transfer_route_maps_busy_to_retryable_device_error() -> None:
     assert raised.value.code is ErrorCode.TOOL_DEVICE_BUSY
 
 
+@pytest.mark.asyncio
+async def test_transfer_route_busy_retry_after_uses_device_transfer_queue_timeout() -> None:
+    class BusyWorkspace:
+        async def transfer_server_to_server(self, db: object, **kwargs: object) -> object:
+            del db, kwargs
+            raise TransferBusyError
+
+    body = FileTransferRequest.model_validate(
+        {
+            "openoctopus_src_device": "server",
+            "src_path": "from.bin",
+            "openoctopus_dst_device": "server",
+            "dst_path": "to.bin",
+            "mode": "copy",
+        }
+    )
+
+    with pytest.raises(WorkspaceError) as raised:
+        await transfer_workspace_file(
+            body=body,
+            user=SimpleNamespace(id=uuid4()),
+            engine=None,
+            service=BusyWorkspace(),
+            registry=None,  # type: ignore[arg-type]
+            settings=SimpleNamespace(
+                rest_transfer_queue_timeout_seconds=1.1,
+                device_transfer_queue_timeout_seconds=4.2,
+            ),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code is ErrorCode.TOOL_DEVICE_BUSY
+    assert raised.value.headers == {"Retry-After": "5"}
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -144,8 +180,30 @@ def test_runtime_openapi_documents_transfer_result_and_strict_request() -> None:
     assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/TransferResponse"
     }
+    assert {"400", "408", "409", "429", "502", "503"} <= operation["responses"].keys()
+    for status in ("400", "408", "409", "429", "502", "503"):
+        assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ErrorResponse"
+        }
+    assert operation["responses"]["429"]["headers"]["Retry-After"] == {
+        "description": "Seconds to wait before retrying",
+        "schema": {"type": "integer", "minimum": 1},
+    }
     assert response_schema["required"] == ["bytes_transferred", "sha256", "warnings"]
     assert response_schema["additionalProperties"] is False
+    assert response_schema["properties"]["warnings"]["items"] == {
+        "enum": ["transfer_ack_failed", "source_delete_failed"],
+        "type": "string",
+    }
+
+
+def test_transfer_response_rejects_unknown_warning() -> None:
+    with pytest.raises(ValidationError):
+        TransferResponse(
+            bytes_transferred=12,
+            sha256="a" * 64,
+            warnings=["unexpected_warning"],
+        )
 
 
 async def test_transfer_route_requires_authentication(async_client) -> None:
@@ -164,7 +222,7 @@ async def test_transfer_route_requires_authentication(async_client) -> None:
     assert response.json()["code"] == "auth_unauthorized"
 
 
-async def test_transfer_route_rejects_different_clients_before_io(user_client) -> None:
+async def test_transfer_route_hides_missing_distinct_clients(user_client) -> None:
     response = await user_client.post(
         "/api/workspace/transfer",
         json={
@@ -176,8 +234,8 @@ async def test_transfer_route_rejects_different_clients_before_io(user_client) -
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["code"] == "tool_invalid_args"
+    assert response.status_code == 409
+    assert response.json()["code"] == "tool_device_unreachable"
 
 
 async def test_transfer_route_hides_missing_or_offline_devices(user_client) -> None:

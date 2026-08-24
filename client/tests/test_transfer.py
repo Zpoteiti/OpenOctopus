@@ -7,7 +7,9 @@ import os
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -73,6 +75,31 @@ async def _wait_receiver_ready(manager: TransferManager, slot_id: UUID = SLOT) -
 async def _wait_slot_closed(manager: TransferManager, slot_id: UUID) -> None:
     async with asyncio.timeout(5):
         while manager.slot_state(slot_id) is not None:
+            await asyncio.sleep(0.001)
+
+
+async def _wait_for_transfer_end(
+    socket: Socket,
+    slot_id: UUID,
+    *,
+    ack: bool,
+    ok: bool,
+    code: str | None = None,
+) -> dict[str, object]:
+    async with asyncio.timeout(5):
+        while True:
+            for payload in socket.sent:
+                if not isinstance(payload, str):
+                    continue
+                frame = cast(dict[str, object], json.loads(payload))
+                if (
+                    frame.get("type") == "transfer_end"
+                    and frame.get("id") == str(slot_id)
+                    and frame.get("ack") is ack
+                    and frame.get("ok") is ok
+                    and (code is None or frame.get("code") == code)
+                ):
+                    return frame
             await asyncio.sleep(0.001)
 
 
@@ -176,6 +203,52 @@ def test_client_tombstones_are_bounded_and_evict_oldest(tmp_path: Path) -> None:
     first, last, count = asyncio.run(exercise())
     assert count == TOMBSTONE_MAX_ENTRIES
     assert first != last
+
+
+def test_third_local_transfer_start_is_rejected_without_allocating_a_slot(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        third_slot = new_uuid7()
+        try:
+            for slot_id, destination in (
+                (SLOT, "first.bin"),
+                (SLOT_2, "second.bin"),
+                (third_slot, "third.bin"),
+            ):
+                await manager.handle_control(
+                    TransferBegin(
+                        id=slot_id,
+                        direction="server_to_client",
+                        purpose="file_transfer",
+                        src_path="source.bin",
+                        dst_path=destination,
+                        total_bytes=1,
+                    )
+                )
+            await writer.drain()
+
+            assert manager.active_count == 2
+            assert manager.active_slot_ids == {SLOT, SLOT_2}
+            rejection = next(
+                json.loads(item)
+                for item in socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("id") == str(third_slot)
+            )
+            assert rejection == {
+                "type": "transfer_end",
+                "id": str(third_slot),
+                "ack": False,
+                "ok": False,
+                "code": "tool_device_busy",
+            }
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
 
 
 def test_writer_round_robins_binary_lanes_and_prioritizes_controls() -> None:
@@ -808,7 +881,7 @@ def test_receiver_queue_timeout_sends_terminal_and_cleans_resources(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_receiver_local_failure_before_sender_end_uses_non_ack_and_accepts_late_ack(
+def test_receiver_failure_before_ready_rejects_binary_and_accepts_late_ack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def fail_open(_path: Path) -> tuple[object, tuple[int, int, int, int, int]]:
@@ -851,10 +924,10 @@ def test_receiver_local_failure_before_sender_end_uses_non_ack_and_accepts_late_
             assert failure["ok"] is False
             assert failure["code"] == "workspace_storage_unavailable"
 
-            # The server may already have queued bounded binary frames before
-            # it receives the failure terminal.  They are expected drain for
-            # this failed slot, not a connection-level protocol violation.
-            await manager.handle_binary(encode_binary_chunk(SLOT, b"queued-before-failure"))
+            with pytest.raises(ProtocolError):
+                await manager.handle_binary(
+                    encode_binary_chunk(SLOT, b"binary-before-ready")
+                )
 
             matching_ack = TransferEnd(
                 id=SLOT,
@@ -869,6 +942,110 @@ def test_receiver_local_failure_before_sender_end_uses_non_ack_and_accepts_late_
                 await manager.handle_control(
                     matching_ack.model_copy(update={"code": "workspace_file_changed"})
                 )
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_failed_active_receiver_drops_only_ready_bounded_nonempty_binary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        manager, writer, _, writer_task = await _manager(tmp_path)
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = manager._cleanup_slot
+
+        async def blocked_cleanup(slot: object) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await original_cleanup(slot)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(manager, "_cleanup_slot", blocked_cleanup)
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                    total_bytes=3,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"a"))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=False,
+                    code="peer_disconnected",
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"bc"))
+            with pytest.raises(ProtocolError):
+                await manager.handle_binary(encode_binary_chunk(SLOT, b""))
+            with pytest.raises(ProtocolError):
+                await manager.handle_binary(encode_binary_chunk(SLOT, b"d"))
+
+            release_cleanup.set()
+            await _wait_slot_closed(manager, SLOT)
+            assert manager._tombstones[SLOT].binary_bytes_seen == 3
+        finally:
+            release_cleanup.set()
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_failed_receiver_tombstone_bounds_binary_without_extending_ttl(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        manager, writer, _, writer_task = await _manager(tmp_path)
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                    total_bytes=4,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"a"))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=False,
+                    code="peer_disconnected",
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+            expires_at = manager._tombstones[SLOT].expires_at
+
+            await manager.handle_binary(encode_binary_chunk(SLOT, b"bc"))
+            assert manager._tombstones[SLOT].binary_bytes_seen == 3
+            assert manager._tombstones[SLOT].expires_at == expires_at
+            with pytest.raises(ProtocolError):
+                await manager.handle_binary(encode_binary_chunk(SLOT, b""))
+            with pytest.raises(ProtocolError):
+                await manager.handle_binary(encode_binary_chunk(SLOT, b"de"))
+
+            manager._tombstones[SLOT] = replace(
+                manager._tombstones[SLOT],
+                expires_at=asyncio.get_running_loop().time() - 1,
+            )
+            with pytest.raises(ProtocolError, match="unknown transfer"):
+                await manager.handle_binary(encode_binary_chunk(SLOT, b"d"))
         finally:
             await _stop(manager, writer, writer_task)
 
@@ -1231,6 +1408,642 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
                 await asyncio.sleep(0.001)
             assert manager.active_count == 0
         finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("after_timeout", "ack_ok"),
+    (
+        pytest.param(False, True, id="success-before-timeout"),
+        pytest.param(False, False, id="failure-before-timeout"),
+        pytest.param(True, True, id="success-after-timeout"),
+        pytest.param(True, False, id="failure-after-timeout"),
+    ),
+)
+def test_sender_accepts_destination_ack_before_or_after_local_timeout(
+    tmp_path: Path,
+    *,
+    after_timeout: bool,
+    ack_ok: bool,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        manager._idle_timeout = 0.1 if after_timeout else 1.0
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            success = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+
+            if after_timeout:
+                await _wait_for_transfer_end(
+                    socket,
+                    SLOT,
+                    ack=False,
+                    ok=False,
+                    code="workspace_transfer_timeout",
+                )
+
+            if ack_ok:
+                acknowledgement = TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, success["bytes_sent"]),
+                    sha256=cast(str, success["sha256"]),
+                )
+            else:
+                acknowledgement = TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code="workspace_file_changed",
+                )
+            await manager.handle_control(acknowledgement)
+            await _wait_slot_closed(manager, SLOT)
+
+            assert manager.path_locks.reservation_count == 0
+            assert writer.has_binary_lane(SLOT) is False
+
+            # A valid chosen ACK must leave the connection usable for another slot.
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT_2,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="next.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT_2) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT_2,
+                    ack=False,
+                    ok=False,
+                    code="workspace_file_changed",
+                )
+            )
+            await _wait_slot_closed(manager, SLOT_2)
+            await writer.drain()
+            assert writer_task.done() is False
+            assert manager.failed.done() is False
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_sender_rejects_wrong_success_digest_without_closing_slot(tmp_path: Path) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            success = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+
+            with pytest.raises(ProtocolError, match="acknowledgement conflicts"):
+                await manager.handle_control(
+                    TransferEnd(
+                        id=SLOT,
+                        ack=True,
+                        ok=True,
+                        bytes_sent=cast(int, success["bytes_sent"]),
+                        sha256="0" * 64,
+                    )
+                )
+            assert manager.slot_state(SLOT) is TransferState.SENDER_ENDED
+
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, success["bytes_sent"]),
+                    sha256=cast(str, success["sha256"]),
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("ack_ok", [True, False], ids=["success", "failure"])
+def test_sender_tombstone_accepts_late_chosen_ack_after_timeout_cleanup(
+    tmp_path: Path,
+    *,
+    ack_ok: bool,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        manager._idle_timeout = 0.05
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            success = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_transfer_timeout",
+            )
+            await _wait_slot_closed(manager, SLOT)
+
+            acknowledgement = (
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, success["bytes_sent"]),
+                    sha256=cast(str, success["sha256"]),
+                )
+                if ack_ok
+                else TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code="workspace_file_changed",
+                )
+            )
+            await manager.handle_control(acknowledgement)
+            assert manager.failed.done() is False
+            assert writer_task.done() is False
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_sender_ack_during_timeout_cleanup_fixes_the_chosen_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        manager._idle_timeout = 0.05
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = manager._cleanup_slot
+
+        async def blocked_cleanup(slot: object) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await original_cleanup(slot)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(manager, "_cleanup_slot", blocked_cleanup)
+        first_ack = TransferEnd(
+            id=SLOT,
+            ack=True,
+            ok=False,
+            code="workspace_file_changed",
+        )
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_transfer_timeout",
+            )
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+
+            await manager.handle_control(first_ack)
+            release_cleanup.set()
+            await _wait_slot_closed(manager, SLOT)
+
+            with pytest.raises(ProtocolError, match="unknown transfer"):
+                await manager.handle_control(
+                    first_ack.model_copy(update={"code": "workspace_storage_unavailable"})
+                )
+            await manager.handle_control(first_ack)
+            assert manager.failed.done() is False
+            assert writer_task.done() is False
+        finally:
+            release_cleanup.set()
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_sender_local_failure_without_a_success_terminal_requires_matching_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+    monkeypatch.setattr(transfer_module, "_source_unchanged", lambda *_args: False)
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            assert manager.slot_state(SLOT) is TransferState.ABORTED
+
+            with pytest.raises(ProtocolError, match="acknowledgement conflicts"):
+                await manager.handle_control(
+                    TransferEnd(
+                        id=SLOT,
+                        ack=True,
+                        ok=False,
+                        code="workspace_storage_unavailable",
+                    )
+                )
+            assert manager.slot_state(SLOT) is TransferState.ABORTED
+
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code="workspace_file_changed",
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+def test_active_local_failure_accepts_exact_crossing_peer_failure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    role: str,
+) -> None:
+    if role == "sender":
+        (tmp_path / "source.bin").write_bytes(b"abc")
+        monkeypatch.setattr(transfer_module, "_source_unchanged", lambda *_args: False)
+    else:
+        (tmp_path / "result.bin").write_bytes(b"occupied")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        try:
+            if role == "sender":
+                await manager.handle_control(
+                    TransferRequest(
+                        id=SLOT,
+                        purpose="file_transfer",
+                        src_path="source.bin",
+                        dst_path="result.bin",
+                    )
+                )
+                async with asyncio.timeout(1):
+                    while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                        await asyncio.sleep(0.001)
+                await manager.handle_control(TransferReady(id=SLOT))
+            else:
+                await manager.handle_control(
+                    TransferBegin(
+                        id=SLOT,
+                        direction="server_to_client",
+                        purpose="file_transfer",
+                        src_path="source.bin",
+                        dst_path="result.bin",
+                        total_bytes=3,
+                    )
+                )
+
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            assert manager.slot_state(SLOT) is TransferState.ABORTED
+
+            crossing = TransferEnd(
+                id=SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            await manager.handle_control(crossing)
+            await manager.handle_control(crossing)
+            await writer.drain()
+
+            acknowledgements = [
+                json.loads(item)
+                for item in socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("ack") is True
+            ]
+            assert acknowledgements == [
+                {
+                    "type": "transfer_end",
+                    "id": str(SLOT),
+                    "ack": True,
+                    "ok": False,
+                    "code": "workspace_file_changed",
+                }
+            ]
+            assert manager.slot_state(SLOT) is TransferState.ABORTED
+
+            await manager.handle_control(crossing.model_copy(update={"ack": True}))
+            await _wait_slot_closed(manager, SLOT)
+            assert manager.failed.done() is False
+            assert writer_task.done() is False
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_remote_failure_duplicate_is_idempotent_while_active_and_tombstoned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = manager._cleanup_slot
+
+        async def blocked_cleanup(slot: object) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await original_cleanup(slot)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(manager, "_cleanup_slot", blocked_cleanup)
+        failure = TransferEnd(
+            id=SLOT,
+            ack=False,
+            ok=False,
+            code="peer_disconnected",
+        )
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+
+            await manager.handle_control(failure)
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            await manager.handle_control(failure)
+            await writer.drain()
+            acknowledgements = [
+                json.loads(item)
+                for item in socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("ack") is True
+            ]
+            assert len(acknowledgements) == 1
+
+            release_cleanup.set()
+            await _wait_slot_closed(manager, SLOT)
+            await manager.handle_control(failure)
+            await writer.drain()
+            acknowledgements = [
+                json.loads(item)
+                for item in socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("ack") is True
+            ]
+            assert len(acknowledgements) == 1
+            with pytest.raises(ProtocolError, match="unknown transfer"):
+                await manager.handle_control(
+                    failure.model_copy(update={"code": "workspace_file_changed"})
+                )
+        finally:
+            release_cleanup.set()
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("ack_first", [False, True], ids=["failure-first", "ack-first"])
+def test_local_failure_tombstone_accepts_exact_crossing_peer_failure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    ack_first: bool,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+    monkeypatch.setattr(transfer_module, "_source_unchanged", lambda *_args: False)
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        manager._idle_timeout = 0.05
+        acknowledgement = TransferEnd(
+            id=SLOT,
+            ack=True,
+            ok=False,
+            code="workspace_file_changed",
+        )
+        crossing = acknowledgement.model_copy(update={"ack": False})
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            if ack_first:
+                await manager.handle_control(acknowledgement)
+            await _wait_slot_closed(manager, SLOT)
+
+            await manager.handle_control(crossing)
+            await manager.handle_control(crossing)
+            if not ack_first:
+                await manager.handle_control(acknowledgement)
+            await writer.drain()
+
+            acknowledgements = [
+                json.loads(item)
+                for item in socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("ack") is True
+            ]
+            assert acknowledgements == [
+                {
+                    "type": "transfer_end",
+                    "id": str(SLOT),
+                    "ack": True,
+                    "ok": False,
+                    "code": "workspace_file_changed",
+                }
+            ]
+            assert manager.failed.done() is False
+            assert writer_task.done() is False
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_peer_failure_discards_sender_binary_lane_and_keeps_writer_healthy(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"x" * (8 * 64 * 1024))
+
+    class BlockingBinarySocket(Socket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.binary_started = asyncio.Event()
+            self.release_binary = asyncio.Event()
+
+        async def send(self, payload: str | bytes) -> None:
+            self.sent.append(payload)
+            if isinstance(payload, bytes) and not self.release_binary.is_set():
+                self.binary_started.set()
+                await self.release_binary.wait()
+
+    async def exercise() -> None:
+        socket = BlockingBinarySocket()
+        writer = SerializedWriter()
+        writer_task = asyncio.create_task(writer.run(socket))
+        manager = TransferManager(tmp_path, writer)
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            await asyncio.wait_for(socket.binary_started.wait(), timeout=1)
+            async with asyncio.timeout(1):
+                while writer.binary_queued_chunks != 4:
+                    await asyncio.sleep(0.001)
+
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=False,
+                    code="workspace_file_changed",
+                )
+            )
+            assert writer.has_binary_lane(SLOT) is False
+            assert writer.binary_queued_chunks == 0
+
+            socket.release_binary.set()
+            await _wait_slot_closed(manager, SLOT)
+            await writer.drain()
+            matching_acks = [
+                frame
+                for frame in (
+                    json.loads(payload) for payload in socket.sent if isinstance(payload, str)
+                )
+                if frame["type"] == "transfer_end"
+                and frame["ack"] is True
+                and frame["code"] == "workspace_file_changed"
+            ]
+            assert len(matching_acks) == 1
+            assert len([payload for payload in socket.sent if isinstance(payload, bytes)]) == 1
+            assert manager.path_locks.reservation_count == 0
+            assert writer_task.done() is False
+            assert manager.failed.done() is False
+        finally:
+            socket.release_binary.set()
             await _stop(manager, writer, writer_task)
 
     asyncio.run(exercise())

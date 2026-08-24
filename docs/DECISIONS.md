@@ -6,6 +6,8 @@ Each record captures **what** was decided and **why**, not how it was implemente
 
 **Current Python-main Device contract:** ADR-133 is the Py7 authority for
 workspace restriction, Protocol v3, Device MCP, and Server `web_fetch` policy.
+ADR-134 is the Py8b authority for same-owner distinct-Client regular-file
+transfer over that unchanged Protocol v3 contract.
 The accepted Py8a Server shared-MCP design extends ADR-047/049/071/072/114 with
 admin whole-list CAS, Server-first namespace/capacity, one shared runtime per
 name, bounded fair admission, degraded recovery, and trusted same-UID execution
@@ -3777,6 +3779,42 @@ hidden routes and dispatch revalidates them. Device MCP errors remain normal
 tool results so the Agent loop continues. `sandbox_mode`, device
 `enabled_tools`, Protocol v2, typed MCP infixes, and offline optimistic MCP
 addition are no longer Python-main contracts.
+
+---
+
+### ADR-134 · Py8b distinct-Client single-file bridge over unchanged Protocol v3
+
+**Status:** accepted (2026-08-24)
+
+**Supersedes and clarifies:** ADR-131's deferral of Client-to-Client transfer is
+superseded for one regular file between two distinct online Devices owned by
+the same authenticated user. ADR-087's four-direction matrix and
+copy-then-conditional-delete rule now apply to regular files. Its recursive
+folder/manifest and multi-file cleanup clauses are not part of Py8b and remain
+deferred to Py8c. The historical ADR bodies remain milestone records.
+
+**Decision:** The Server atomically captures both live Device routes and relays
+one existing Protocol v3 transfer slot from source to destination. It retains
+only bounded chunks and verification/lifecycle metadata; it creates no Server
+temporary file, durable cache, or RustFS staging object. The same UUIDv7,
+control DTOs, binary frame layout, and `file_transfer` purpose are used on both
+routes, so Protocol v3 and Client capability negotiation do not change. The
+destination uses its normal atomic no-replace path; an existing destination is
+never overwritten.
+
+Move deletes the source conditionally only after destination commit and the
+chosen source ACK boundary. An unconfirmed source ACK returns
+`transfer_ack_failed` and prevents deletion; a failed conditional delete
+returns `source_delete_failed`. Destination commit remains authoritative, and
+neither warning triggers replay or rollback. Routing, admission, bridge state,
+and late-frame containment are process-local under the current single-ASGI-
+worker boundary.
+
+**Consequences:** All server/Client and same-owner Client/Client regular-file
+combinations share one public tool and REST shape. Cross-user routing fails
+closed before transfer frames. Recursive directory transfer, resume, range,
+compression, RustFS-backed staging, and cross-worker bridge routing remain out
+of scope.
 
 ---
 

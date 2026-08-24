@@ -9,10 +9,17 @@ from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 import openctopus_server.tools.file_transfer as file_transfer_module
+from openctopus_server.db.models import Device, User
 from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
-from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
+from openctopus_server.devices.registry import (
+    BridgeRoutePair,
+    ConnectionHandle,
+    DeviceRouteSnapshot,
+)
 from openctopus_server.devices.transfer import TransferError, TransferUnavailableError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext
@@ -39,10 +46,8 @@ def test_file_transfer_schema_marks_both_device_fields() -> None:
     assert properties["openoctopus_dst_device"]["enum"] == ["server"]
     assert properties["openoctopus_src_device"]["x-openoctopus-device"] is True
     assert properties["openoctopus_dst_device"]["x-openoctopus-device"] is True
-    assert schema["input_schema"]["anyOf"] == [
-        {"properties": {"openoctopus_src_device": {"const": "server"}}},
-        {"properties": {"openoctopus_dst_device": {"const": "server"}}},
-    ]
+    assert "anyOf" not in schema["input_schema"]
+    assert "x-openoctopus-same-device" not in schema["input_schema"]
     assert schema["input_schema"]["required"] == [
         "openoctopus_src_device",
         "src_path",
@@ -51,7 +56,20 @@ def test_file_transfer_schema_marks_both_device_fields() -> None:
     ]
 
 
-def test_file_transfer_schema_adds_equal_paired_device_branches() -> None:
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [
+        ("server", "server"),
+        ("server", "laptop"),
+        ("laptop", "server"),
+        ("laptop", "laptop"),
+        ("laptop", "phone"),
+    ],
+)
+def test_file_transfer_schema_accepts_every_install_site_combination(
+    source: str,
+    destination: str,
+) -> None:
     schema = ToolRegistry((FileTransferTool(None, None, None),)).get_tool_schemas(
         device_names=["laptop", "phone"]
     )[0]["input_schema"]
@@ -61,23 +79,35 @@ def test_file_transfer_schema_adds_equal_paired_device_branches() -> None:
         "laptop",
         "phone",
     ]
-    assert {
-        "properties": {
-            "openoctopus_src_device": {"const": "laptop"},
-            "openoctopus_dst_device": {"const": "laptop"},
+    Draft202012Validator(schema).validate(
+        {
+            "openoctopus_src_device": source,
+            "src_path": "source.txt",
+            "openoctopus_dst_device": destination,
+            "dst_path": "destination.txt",
         }
-    } in schema["anyOf"]
-    assert {
-        "properties": {
-            "openoctopus_src_device": {"const": "phone"},
-            "openoctopus_dst_device": {"const": "phone"},
-        }
-    } in schema["anyOf"]
+    )
+
+
 @pytest.mark.asyncio
-async def test_client_to_client_is_rejected_before_any_io() -> None:
+async def test_distinct_clients_resolve_once_then_dispatch_one_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+    session = _BridgeLookupSession(
+        [("laptop", source_id), ("phone", destination_id)]
+    )
+    registry = _DistinctClientRegistry(
+        user_id=user_id,
+        source_id=source_id,
+        destination_id=destination_id,
+        lookup_session=session,
+    )
     workspace = _NoIoWorkspace()
-    registry = _NoIoRegistry()
-    tool = FileTransferTool(None, workspace, registry)
+    tool = FileTransferTool(object(), workspace, registry)  # type: ignore[arg-type]
+    monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
 
     result = await tool.execute(
         {
@@ -86,14 +116,180 @@ async def test_client_to_client_is_rejected_before_any_io() -> None:
             "openoctopus_dst_device": "phone",
             "dst_path": "b.txt",
         },
-        _ctx(),
+        ToolContext(
+            user_id=user_id,
+            session_id=uuid4(),
+            device_targets={"laptop": source_id, "phone": destination_id},
+        ),
     )
 
-    assert result.is_error is True
-    assert result.code is ErrorCode.TOOL_INVALID_ARGS
-    assert "client-to-client" in str(result.content).lower()
+    assert result.is_error is False
+    assert "12 bytes" in str(result.content)
+    assert session.execute_calls == 1
+    assert session.closed is True
     assert workspace.calls == []
+    assert registry.bridge_calls == [
+        {
+            "source_route": registry.routes.source,
+            "destination_route": registry.routes.destination,
+            "user_id": user_id,
+            "src_path": "a.txt",
+            "dst_path": "b.txt",
+            "mode": "copy",
+            "delete_source": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_distinct_client_move_uses_source_snapshot_conditional_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+    session = _BridgeLookupSession(
+        [("laptop", source_id), ("phone", destination_id)]
+    )
+    registry = _DistinctClientRegistry(
+        user_id=user_id,
+        source_id=source_id,
+        destination_id=destination_id,
+        lookup_session=session,
+        source_fingerprint="source-v1",
+    )
+    tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
+    monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
+
+    outcome = await tool.transfer(
+        FileTransferRequest(
+            openoctopus_src_device="laptop",
+            src_path="source.txt",
+            openoctopus_dst_device="phone",
+            dst_path="destination.txt",
+            mode="move",
+        ),
+        user_id=user_id,
+    )
+
+    assert outcome.bytes_transferred == 12
+    assert registry.delete_call == {
+        "route": registry.routes.source,
+        "user_id": user_id,
+        "expected_device_name": "laptop",
+        "name": "__workspace_rest__",
+        "args": {
+            "operation": "delete_file",
+            "path": "source.txt",
+            "if_match": "source-v1",
+        },
+        "max_result_bytes": 16 * 1024,
+        "timeout_seconds": 30.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_distinct_client_turn_snapshot_name_reuse_fails_before_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    captured_source_id = uuid4()
+    captured_destination_id = uuid4()
+    session = _BridgeLookupSession(
+        [("laptop", uuid4()), ("phone", captured_destination_id)]
+    )
+    registry = _NoIoRegistry()
+    tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
+    monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
+
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "laptop",
+            "src_path": "a.txt",
+            "openoctopus_dst_device": "phone",
+            "dst_path": "b.txt",
+        },
+        ToolContext(
+            user_id=user_id,
+            session_id=uuid4(),
+            device_targets={
+                "laptop": captured_source_id,
+                "phone": captured_destination_id,
+            },
+        ),
+    )
+
+    assert result.code is ErrorCode.TOOL_DEVICE_UNREACHABLE
+    assert session.execute_calls == 1
+    assert session.closed is True
     assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_distinct_client_db_lookup_is_scoped_to_one_owner(
+    pg_engine: AsyncEngine,
+) -> None:
+    owner = User(
+        email=f"bridge-owner-{uuid4().hex}@example.com",
+        password_hash="hash",
+        name="Bridge Owner",
+    )
+    other = User(
+        email=f"bridge-other-{uuid4().hex}@example.com",
+        password_hash="hash",
+        name="Bridge Other",
+    )
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add_all([owner, other])
+        await db.flush()
+        owner_source = Device(
+            user_id=owner.id,
+            name="laptop",
+            token_hash=b"a" * 32,
+            token_hint="owner-source",
+        )
+        owner_destination = Device(
+            user_id=owner.id,
+            name="phone",
+            token_hash=b"b" * 32,
+            token_hint="owner-destination",
+        )
+        other_source = Device(
+            user_id=other.id,
+            name="laptop",
+            token_hash=b"c" * 32,
+            token_hint="other-source",
+        )
+        other_destination = Device(
+            user_id=other.id,
+            name="phone",
+            token_hash=b"d" * 32,
+            token_hint="other-destination",
+        )
+        db.add_all(
+            [
+                owner_source,
+                owner_destination,
+                other_source,
+                other_destination,
+            ]
+        )
+        await db.commit()
+
+    tool = FileTransferTool(pg_engine, None, _NoIoRegistry())
+    assert await tool._bridge_device_ids_for_call(
+        owner.id,
+        "laptop",
+        "phone",
+        None,
+    ) == (owner_source.id, owner_destination.id)
+    with pytest.raises(file_transfer_module.DeviceUnavailableError):
+        await tool._bridge_device_ids_for_call(
+            owner.id,
+            "laptop",
+            "phone",
+            {"laptop": other_source.id, "phone": other_destination.id},
+        )
 
 
 @pytest.mark.asyncio
@@ -216,6 +412,8 @@ async def test_client_to_server_move_uses_private_conditional_source_delete(
         ErrorCode.WORKSPACE_NOT_FOUND,
         ErrorCode.WORKSPACE_FILE_CHANGED,
         ErrorCode.TOOL_PATH_OUTSIDE_WORKSPACE,
+        ErrorCode.TOOL_DEVICE_BUSY,
+        ErrorCode.TOOL_DEVICE_UNREACHABLE,
     ],
 )
 @pytest.mark.asyncio
@@ -425,6 +623,86 @@ class _NoIoWorkspace:
 
 class _NoIoRegistry:
     calls: list[object] = []
+
+
+class _BridgeLookupSession:
+    def __init__(self, rows: list[tuple[str, UUID]]) -> None:
+        self._rows = rows
+        self.execute_calls = 0
+        self.closed = False
+
+    async def __aenter__(self) -> _BridgeLookupSession:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.closed = True
+
+    async def execute(self, _statement: object) -> object:
+        self.execute_calls += 1
+        return SimpleNamespace(all=lambda: list(self._rows))
+
+
+class _DistinctClientRegistry:
+    def __init__(
+        self,
+        *,
+        user_id: UUID,
+        source_id: UUID,
+        destination_id: UUID,
+        lookup_session: _BridgeLookupSession,
+        source_fingerprint: str | None = None,
+    ) -> None:
+        self.user_id = user_id
+        self.lookup_session = lookup_session
+        self.routes = BridgeRoutePair(
+            source=DeviceRouteSnapshot(
+                ConnectionHandle(source_id, 1),
+                2,
+                "laptop",
+            ),
+            destination=DeviceRouteSnapshot(
+                ConnectionHandle(destination_id, 3),
+                4,
+                "phone",
+            ),
+        )
+        self.source_fingerprint = source_fingerprint
+        self.bridge_calls: list[dict[str, object]] = []
+        self.delete_call: dict[str, object] | None = None
+        self.transfers = self
+
+    async def get_bridge_route_pair(
+        self,
+        *,
+        user_id: UUID,
+        source_device_id: UUID,
+        source_device_name: str,
+        destination_device_id: UUID,
+        destination_device_name: str,
+    ) -> BridgeRoutePair:
+        assert self.lookup_session.closed is True
+        assert user_id == self.user_id
+        assert source_device_id == self.routes.source.handle.device_id
+        assert source_device_name == "laptop"
+        assert destination_device_id == self.routes.destination.handle.device_id
+        assert destination_device_name == "phone"
+        return self.routes
+
+    async def start_client_to_client(self, **kwargs: object) -> _TransferResult:
+        call = dict(kwargs)
+        on_issued = call.pop("on_issued")
+        if callable(on_issued):
+            on_issued()
+        delete_source = call.get("delete_source")
+        if self.source_fingerprint is not None:
+            assert callable(delete_source)
+            await delete_source(self.source_fingerprint)
+        self.bridge_calls.append(call)
+        return _TransferResult(12, "a" * 64, ())
+
+    async def dispatch_tool_on_snapshot(self, **kwargs: object) -> object:
+        self.delete_call = dict(kwargs)
+        return SimpleNamespace(is_error=False, code=None)
 
 
 class _SameClientRegistry:

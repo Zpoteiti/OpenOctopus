@@ -7,6 +7,7 @@ on:
       - "server/**"
       - "client/**"
       - "docs/API.yaml"
+      - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/py-server.yml"
   pull_request:
     branches: [main]
@@ -14,6 +15,7 @@ on:
       - "server/**"
       - "client/**"
       - "docs/API.yaml"
+      - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/py-server.yml"
 
 jobs:

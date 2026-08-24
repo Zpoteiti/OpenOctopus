@@ -105,6 +105,12 @@ class DeviceRouteSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class BridgeRoutePair:
+    source: DeviceRouteSnapshot
+    destination: DeviceRouteSnapshot
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceLiveMetadata:
     os: str
     default_shell: str
@@ -939,6 +945,98 @@ class DeviceRegistry:
                 connection.config_epoch,
                 connection.device_name,
             )
+
+    async def get_bridge_route_pair(
+        self,
+        *,
+        user_id: UUID,
+        source_device_id: UUID,
+        source_device_name: str,
+        destination_device_id: UUID,
+        destination_device_name: str,
+    ) -> BridgeRoutePair | None:
+        """Atomically capture two distinct, ready routes owned by one user."""
+        if source_device_id == destination_device_id:
+            return None
+        async with self._lock:
+            source = self._connections.get(source_device_id)
+            destination = self._connections.get(destination_device_id)
+            if (
+                self._closed
+                or not self._bridge_connection_matches_locked(
+                    source,
+                    user_id=user_id,
+                    device_name=source_device_name,
+                )
+                or not self._bridge_connection_matches_locked(
+                    destination,
+                    user_id=user_id,
+                    device_name=destination_device_name,
+                )
+            ):
+                return None
+            assert source is not None
+            assert destination is not None
+            return BridgeRoutePair(
+                source=DeviceRouteSnapshot(
+                    source.handle,
+                    source.config_epoch,
+                    source.device_name,
+                ),
+                destination=DeviceRouteSnapshot(
+                    destination.handle,
+                    destination.config_epoch,
+                    destination.device_name,
+                ),
+            )
+
+    async def bridge_routes_current(
+        self,
+        source_route: DeviceRouteSnapshot,
+        destination_route: DeviceRouteSnapshot,
+        *,
+        user_id: UUID,
+    ) -> bool:
+        """Revalidate both bridge endpoints in one registry critical section."""
+        if source_route.handle.device_id == destination_route.handle.device_id:
+            return False
+        async with self._lock:
+            source = self._connections.get(source_route.handle.device_id)
+            destination = self._connections.get(destination_route.handle.device_id)
+            return (
+                not self._closed
+                and self._bridge_connection_matches_locked(
+                    source,
+                    user_id=user_id,
+                    device_name=source_route.device_name,
+                )
+                and self._bridge_connection_matches_locked(
+                    destination,
+                    user_id=user_id,
+                    device_name=destination_route.device_name,
+                )
+                and source is not None
+                and destination is not None
+                and source.handle == source_route.handle
+                and destination.handle == destination_route.handle
+                and source.config_epoch == source_route.config_epoch
+                and destination.config_epoch == destination_route.config_epoch
+            )
+
+    @staticmethod
+    def _bridge_connection_matches_locked(
+        connection: _Connection | None,
+        *,
+        user_id: UUID,
+        device_name: str,
+    ) -> bool:
+        return (
+            connection is not None
+            and connection.ready
+            and connection.user_id == user_id
+            and connection.device_name == device_name
+            and connection.config_update_in_flight is None
+        )
 
     async def handle_transfer_frame(self, handle: ConnectionHandle, frame: object) -> bool:
         """Handle one inbound transfer frame only for the current generation."""

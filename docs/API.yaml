@@ -34,7 +34,7 @@ info:
     | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
     | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
     | `notebook_edit` | — | Agent-only in Py6; no REST equivalent |
-    | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args; REST requires explicit `mode` |
+    | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args; any two same-owner install sites; REST requires explicit `mode` |
     | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
     | `message` | — | No REST parallel (browser composes via chat) |
@@ -1220,14 +1220,16 @@ paths:
   /api/workspace/transfer:
     description: |
       Workspace file transfer route. Mirrors the `file_transfer` tool args,
-      accepts one regular file between the server and one paired device, or a
-      coordinated local copy/move on one paired device. Client-to-client
-      bridging and destination overwrite are rejected. Streamed transfers
-      verify SHA-256 and perform moves as copy-then-delete only after the
-      destination write is verified.
+      accepts one regular file between any two same-owner install sites, and
+      supports a coordinated local copy/move when both Client names are equal.
+      A distinct-Client transfer is a bounded pure relay between two online
+      Device routes: the Server verifies and forwards bytes without creating a
+      temporary file, durable cache, or RustFS staging object. Destination
+      overwrite is always rejected. Streamed moves delete the source
+      conditionally only after the destination commit and source ACK boundary.
     post:
       tags: [Workspace Files]
-      summary: Copy or move one regular file through the server or paired device
+      summary: Copy or move one regular file between same-owner install sites
       requestBody:
         required: true
         content:
@@ -1244,7 +1246,7 @@ paths:
           description: Transfer made no progress before the idle timeout.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: Destination exists, quota/precondition conflict, or target device is offline/unreachable.
+          description: Destination exists, a path/precondition conflicts, a target Device is unreachable, or an issued outcome is unknown.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: Transfer capacity is busy; retry after the indicated delay.
@@ -1255,7 +1257,7 @@ paths:
           description: Streamed transfer failed integrity verification.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
-          description: Workspace storage or transfer service unavailable.
+          description: Server workspace storage, Client destination storage, or the transfer service is unavailable.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   #
@@ -2820,17 +2822,13 @@ components:
       additionalProperties: false
       required: [openoctopus_src_device, src_path, openoctopus_dst_device, dst_path, mode]
       description: |
-        Mirrors the Py6 `file_transfer` tool's args. At least one endpoint must
-        be `server`, unless both endpoints are the same paired device for a
-        coordinated local transfer. Both paths must identify regular files.
-        Different-device client-to-client bridging and folder transfer are
-        deferred. The reserved `openoctopus_` prefix on the two device fields
-        matches the agent-visible tool schema. The endpoint relation is
-        enforced at runtime: either endpoint may be `server`, or both endpoint
-        values may be the same paired device. Standard JSON Schema has no
-        portable equality operator for two arbitrary string properties, so
-        `x-openoctopus-same-device: true` marks the additional same-device
-        case; different client device names remain invalid.
+        Mirrors the `file_transfer` tool's args. Every server/paired-Device
+        combination is valid, including two distinct paired Clients owned by
+        the authenticated user. Client endpoints must be online when the
+        transfer starts. Both paths identify one regular file; recursive folder
+        transfer remains unsupported. The reserved `openoctopus_` prefix on the
+        two device fields matches the agent-visible tool schema. Existing
+        destinations are rejected without overwrite.
       properties:
         openoctopus_src_device:
           type: string
@@ -2853,7 +2851,6 @@ components:
           minLength: 1
           maxLength: 4096
         mode: { type: string, enum: [copy, move] }
-      x-openoctopus-same-device: true
 
     TransferResponse:
       type: object
@@ -2870,8 +2867,13 @@ components:
         warnings:
           type: array
           maxItems: 8
-          items: { type: string }
-          description: Non-fatal issues, such as source deletion after a move.
+          items:
+            type: string
+            enum: [transfer_ack_failed, source_delete_failed]
+          description: |
+            Non-fatal post-commit issues. `transfer_ack_failed` means the
+            destination committed but source ACK delivery was not confirmed;
+            `source_delete_failed` means a move left the source in place.
 
     FileMutation:
       type: object

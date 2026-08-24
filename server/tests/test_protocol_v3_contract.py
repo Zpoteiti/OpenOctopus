@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from openctopus_server.devices.protocol import (
     MAX_TEXT_FRAME_BYTES,
+    PROTOCOL_VERSION,
     HelloAckFrame,
     encode_server_frame,
     frame_to_wire_dict,
     parse_client_frame,
     parse_server_frame,
 )
+from openctopus_server.devices.transfer import LATE_PROGRESS_MAX
 
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "protocol_v3" / "frames.json"
 )
+_LIMITS_PATH = _FIXTURE_PATH.with_name("limits.json")
 
 
 def _fixtures() -> dict[str, list[dict[str, Any]]]:
@@ -64,3 +67,10 @@ def test_both_parsers_enforce_the_12_mib_text_frame_limit_before_json() -> None:
         parse_client_frame(payload)
     with pytest.raises(ValueError, match="maximum size"):
         parse_server_frame(payload)
+
+
+def test_protocol_version_and_late_progress_limit_are_shared_contracts() -> None:
+    limits = cast(dict[str, int], json.loads(_LIMITS_PATH.read_text(encoding="utf-8")))
+
+    assert PROTOCOL_VERSION == "3"
+    assert LATE_PROGRESS_MAX == limits["late_progress_max"] == 64
