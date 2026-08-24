@@ -159,8 +159,11 @@ rename 原样保留其中的空子目录，因为删除它们会破坏单次 ren
 - manifest/copy 的 preserve-empty-directory、directory marker objects 或公开 `mkdir`
   工具；same-Client atomic rename 原样保留 source tree，不属于重建 empty dirs；
 - symlink/junction/reparse-point copy、dereference 或 allow-inside-workspace 例外；
-- ownership、mode bits、ACL、xattr、resource fork、creation time、mtime preservation；
-- sparse-file、hardlink identity、reflink 或 clone preservation；
+- copy 路径的 ownership、mode bits、ACL、xattr、resource fork、creation time、mtime
+  preservation；same-Client native rename 因目录项移动而附带保留这些 metadata，但该附带
+  行为不形成 copy/cross-site preservation contract；
+- copy 路径的 sparse-file、hardlink identity、reflink 或 clone preservation；same-Client
+  native rename 的附带保留同样不形成跨路径 contract；
 - archive/tar/ZIP packaging、compression；
 - range、resume、checkpoint、断点续传；
 - dedup、content-addressed cache、delta sync；
@@ -204,9 +207,13 @@ rename 原样保留其中的空子目录，因为删除它们会破坏单次 ren
 11. Move 只有在整棵 destination tree 完成并验证后才可开始 source delete。一旦 source
     cleanup 开始，绝不 rollback destination。
 12. Source file fingerprint/directory identity 不匹配时不读、也不删该 source path。一个后来
-    占用同名路径的文件或目录不能被当作 manifest 中的旧 entry。
+    占用同名路径的文件或目录不能被当作 manifest 中的旧 entry。该保证覆盖 OpenOctopus
+    协调写者与实际观察到的 identity mismatch；宿主外部进程仍受下述 check-to-use race
+    boundary 约束。
 13. Destination cleanup fingerprint 不匹配时不删。Cleanup 无法证明 complete 就必须
-    outcome unknown，不能声称失败且 destination absent。
+    outcome unknown，不能声称失败且 destination absent。Fingerprint check 与 unlink/rmdir
+    在 portable filesystem API 上不是跨外部进程的原子条件删除；实现不得把它表述为 OS
+    sandbox 或对恶意本地写者的强保证。
 14. Server quota reservation 与普通写入看到同一 projected usage；两个并发目录
     preflight 不能分别通过后合计超配。
 15. 不在 DB transaction 内等待 admission、Device、RustFS body、文件 hash、skill
@@ -310,9 +317,11 @@ final destinations:
 Source root 的 basename 不再追加。`dst_path` 的 trailing separator 只参与正常 path
 canonicalization，不改变映射。
 
-### 5.3 Same-site overlap
+### 5.3 Same-site overlap 与 Device namespace
 
-当两端最终解析到同一个 physical install site 和同一个 workspace/storage target 时：
+Overlap只在OpenOctopus能够证明两端属于同一个logical install-site namespace时判断：Server
+shared/personal alias先解析成immutable workspace/storage target；Client使用immutable Device ID，
+同一Device的不同名称或generation仍属于同一namespace。当两端命中同一namespace时：
 
 - source 与 destination 相同：拒绝；
 - destination 是 source 的 descendant：拒绝；
@@ -325,6 +334,12 @@ canonicalization，不改变映射。
 
 该规则避免 local copy 把自己新建的 destination 再扫描进 source，也避免 move 把目录
 移动到自身后代。
+
+不同Device ID按独立filesystem namespace处理。Py8c不新增host/volume/root identity协议，也不
+尝试从Server判断两个Client workspace是否实际指向同一或重叠的宿主目录、bind mount、junction
+或network share。把两个Device配置到相同或祖先/后代物理workspace属于unsupported topology；
+两侧进程内subtree lock不能互相协调，OpenOctopus不为该配置提供overlap、move或cleanup正确性
+保证。部署文档必须明确该约束，不能把“不同Device”宣传成已证明物理隔离。
 
 ### 5.4 Result shape
 
@@ -404,6 +419,24 @@ Client directory manifest在source-probe job内冻结并分页返回时，完整
 MAX_DIRECTORY_MANIFEST_BYTES = 5 * 1024 * 1024
 ```
 
+“Canonical UTF-8 JSON”固定为以下唯一编码，Server 与三平台 Client 不得使用各自默认值：
+
+- filename/path保留filesystem返回的Unicode scalar sequence，不做NFC/NFD/NFKC
+  normalization；lone surrogate或不能UTF-8 round-trip的名称拒绝；
+- manifest的`directories`、`entries`以及merged stream都按`relative_path.encode("utf-8")`
+  的unsigned byte lexicographic order排序；同一path出现两个kind属于冲突，不以kind打破平局；
+- JSON使用`ensure_ascii=false`、lexicographic key order、紧凑`,`/`:` separators、禁止NaN，
+  string只执行JSON要求的quote、backslash与control-character escaping，不escape `/`；
+- 编码结果是无BOM的UTF-8 bytes。5 MiB计算完整`DirectoryManifest` DTO（包括
+  `manifest_sha256`）的最终bytes，边界值可接受，超过一个byte即拒绝；
+- 256 KiB page cap计算完整page value
+  `{offset,next_offset,items}`的同种canonical UTF-8 JSON bytes，边界值可接受；外层
+  `tool_result` frame另行遵守Protocol v3 12 MiB text-frame上限。Page builder加入下一项会
+  超限时在该项前结束；若单项自身无法放入空page，整体manifest在preflight失败。
+
+该JSON只用于wire、retained-size与page-size一致性；`manifest_sha256`仍严格使用§6.4的
+length-prefix encoding，不hash JSON，也不存在把digest字段hash进自身的循环。
+
 Server 本地生成的 manifest 也必须用同一个 canonical encoder 测量同一上限，不能因
 “不走 wire”获得更大 contract。这个 dedicated cap 低于 Protocol v3 12 MiB text
 frame；不复用普通 `list_dir` 的 display result、offset 或 noise filter。
@@ -425,6 +458,9 @@ Client 在 worker thread 中使用 no-follow `lstat/scandir` 和显式有界队�
 - POSIX 无法无损表示为 JSON Unicode string 的 filename 整体拒绝；
 - Windows reserved names、separator、drive-relative、UNC 和 reparse rules 在 source 与
   destination 各自 resolver 中验证；
+- POSIX mount point/bind mount在path policy中是real directory，不作为link/special entry
+  拒绝；`restrict_to_workspace`仍只约束解析后的路径层级，不建立filesystem/mount namespace
+  边界；
 - zero-byte regular file 是有效 entry；
 - permission/stat error 整体失败，不当作“文件不存在所以 skip”；
 - `_NOISE`、`.gitignore`、find/list filters 完全不参与。
@@ -514,18 +550,59 @@ Client 增加一个由当前 WebSocket generation拥有、仅内存的`Directory
   阻塞directory status/cancel，且control worker不执行filesystem work；
 - private control action只做bounded schema decode、O(1)状态转换或有界page/snapshot读取，
   不同步等待walk/hash/copy/fsync/final scan；所有filesystem work由manager-owned worker执行；
+- directory worker使用两个job-owned cooperative events：`stop_forward_work`停止scan/copy/new
+  commit，进入destination rollback或move source cleanup时使用独立、初始未置位的
+  `stop_cleanup`。否则Agent Stop会让cleanup在第一个unlink前自行取消。Worker在每个scandir
+  entry、64 KiB read/write、文件边界以及开始下一个对应phase syscall前检查正确event；Python
+  thread一旦进入
+  `scandir/read/write/fsync/unlink/rmdir/rename`等filesystem syscall不能被强制取消；cancel只禁止
+  后续步骤，job保持`cancelling`，当前subtree reservation与shared local-slot lease继续持有，直到
+  syscall返回并完成结果/cleanup收敛后才可进入terminal。不得先释放锁或报告local terminal，
+  再让被放弃线程产生晚到mutation；
+- Py8c不引入filesystem helper process。极端故障的syscall可以让一个job与一个shared slot持续
+  到syscall返回或Client进程退出；control worker、WebSocket reader与另一个shared slot仍保持
+  可用。Client crash、强制终止或断电继续按既有无disk recovery边界处理；
+- ClientRuntime持有runtime-owned shared admission，并强引用所有current/retired
+  `DirectoryJobManager`及其drain records直到quiescent。Connection finally不能只清空当前manager
+  引用；Client shutdown向current/retired managers同时置对应stop event并等待同一grace，尚未返回
+  的syscall继续由drain registry追踪到进程退出；
 - worker真实执行walk/hash/copy/prepare/finalize/cleanup时，从§12.1同一个shared local-slot
   admission取得lease；等待slot不占tool worker，wire slot与job work合计始终不超过2；
 - 每个active worker phase在转入`READY_RETRIEVAL/HELD/FINALIZED_HELD`或任一terminal snapshot
-  前，必须在`finally`恰好一次释放shared local-slot lease；metadata、manifest retention和
+  前，必须在`finally`恰好一次释放shared local-slot lease；cooperative cancellation不取消thread
+  wrapper future，`finally`只有真实thread/drain完成后才执行。Metadata、manifest retention和
   subtree reservation本身不占该capacity。后续active phase重新取得lease；
 - `progress_seq`只因真实work推进而增加。Server polling、重复status或等待slot不算progress；
 - SCANNING/PREFLIGHTING/PREPARING/FINALIZING/CLEANING等worker状态使用真实work no-progress
-  deadline。Source `READY_RETRIEVAL`暂停work deadline，改用retrieval-idle lease：只有请求
+  deadline。Deadline触发cooperative cancel，不承诺杀掉正在运行的thread syscall；Server只在
+  有限reconciliation window内等待，尚不能得到local terminal时按issued boundary与已有mutation
+  证据投影`tool_execution_outcome_unknown`。该window固定复用当前
+  `device_transfer_idle_timeout_seconds`，从Server首次发出cancel或确认route loss/no-progress
+  deadline的时刻开始，只计一次且重复status不重置；不增加配置。Source `READY_RETRIEVAL`暂停
+  work deadline，改用
+  retrieval-idle lease：只有请求
   新的contiguous `next_offset`才刷新，同offset retry/status不刷新；最后一页后必须进入
   HELD或release；
+
+- 只读source scan或destination preflight尚未发送prepare/local-start等mutation-capable command
+  时，即使本地read-only syscall仍阻塞，Server也可在window结束后稳定返回原timeout/unreachable，
+  且destination unchanged；Client job仍保持cancelling与shared slot直到thread真实返回。只有已经
+  越过mutation-capable issued boundary、或cleanup本身无法确认结果时，才投影outcome unknown；
 - source `HELD`期间，status可携Server coordinator的monotonic `outer_progress_seq`，但只有该
   值因真实其它端preflight/child/cleanup progress而增加才刷新idle lease；重复值不刷新；
+- destination `READY`（same-Client status投影为`ready_not_started`）使用同一个existing
+  transfer-idle duration作为prepare-idle lease；重复status不刷新，只有一次有效prepare、local
+  start、cancel或release消费该状态。到期时因尚无destination mutation，job稳定转
+  `failed(workspace_transfer_timeout)`，释放manifest/reservation metadata并进入terminal
+  retained outcome，第三个job必须能够进入；
+- destination已claim root后的`RESERVED/COPYING`也不能因Server coordinator消失而永久持锁。
+  Child byte/commit进度由job本身刷新idle lease；child之间只有Server携带严格增加的
+  `outer_progress_seq`才刷新，重复poll不刷新。Move进入source cleanup后，Server把真实、严格递增的
+  source cleanup progress继续作为destination status的`outer_progress_seq`转发；只要cleanup推进，
+  `FINALIZED_HELD`不得expiry。到期后pre-finalized job自动进入background conditional cleanup，
+  cleanup complete投影原timeout，否则`outcome_unknown`。Stalled `FINALIZED_HELD`到期时绝不删除
+  已验证destination：释放subtree reservation，把bounded finalized outcome压入tombstone；尚未
+  开始或不再推进的move source cleanup视为放弃并带`source_cleanup_incomplete`；
 - `READY_RETRIEVAL` lease到期时source job转
   `failed(workspace_transfer_timeout)`，释放manifest/active metadata并按下述terminal outcome
   tombstone保留结果；此时完整manifest尚未交付，destination mutation必为零。
@@ -535,15 +612,25 @@ Client 增加一个由当前 WebSocket generation拥有、仅内存的`Directory
   delete，release destination并返回success + `source_cleanup_incomplete`。已经进入
   `source_cleanup`的不再使用HELD lease，而按
   active-work no-progress deadline有界best-effort收敛；
-- `succeeded | failed | outcome_unknown` terminal job在Server显式release后删除。Terminal
-  transition启动terminal-release TTL；TTL到期但没有release时，释放terminal job残留metadata/
-  locks、删除bulk manifest/records，并把同一bounded aggregate outcome移入generation-scoped
-  tombstone。即使Server从未观察原job terminal，后续same-key status仍返回该outcome，不能只
-  返回ID+digest；tombstone再按existing transfer TTL/entry bound回收。
-  `READY_RETRIEVAL`、source `HELD`与
-  destination `FINALIZED_HELD`都不是terminal，绝不使用terminal TTL静默release/解锁；
+- `succeeded | failed | outcome_unknown` transition在释放active-work lease、subtree lock与bulk
+  manifest/records后，原子移出active registry并写入bounded retained-terminal map；retained
+  terminal与tombstone均不计入`MAX_ACTIVE_DIRECTORY_JOBS=2`。因此READY expiry及任何正常terminal
+  都立即让后续job获得active名额。Server显式release删除retained outcome并写exact `released`
+  tombstone；未release则启动terminal-release TTL，TTL到期把同一bounded aggregate outcome移入
+  generation-scoped outcome tombstone。即使Server从未观察原job terminal，后续same-key status仍
+  返回完整outcome，不能只返回ID+digest；exact release对retained/outcome tombstone都返回
+  `released`并转成released tombstone；wrong digest拒绝。所有tombstone再按existing transfer
+  TTL回收。ClientRuntime另持有一个固定4096-credit的directory lifecycle pool（复用既有
+  `TOMBSTONE_MAX_ENTRIES`数值，不新增配置），current/retired managers共享；每个job在start被接受
+  前预留一个credit，并由active record、retained terminal、outcome tombstone、released tombstone
+  依次转交，直到最终TTL purge才释放。Purge后仍满则新start在任何work/mutation前稳定busy；未被
+  Server release且TTL未到的完整bounded outcome不得为腾空间提前驱逐。Terminal snapshot不含path、
+  manifest或per-file records，因此总retained bytes由4096个aggregate snapshots硬约束；
+  `READY_RETRIEVAL`、source `HELD`与destination `READY/RESERVED/FINALIZED_HELD`都不是terminal，
+  不使用terminal TTL；它们只按上述各自idle lease收敛，且`FINALIZED_HELD` expiry绝不rollback；
 - config epoch改变时按§13.3进入cancel/cleanup但仍允许同WS generation的exact owner控制；
-  connection generation retire对pre-finalized jobs做bounded cancel/cleanup；
+  connection generation retire对pre-finalized jobs请求cancel/cleanup；没有阻塞syscall时在bounded
+  grace内收敛，仍阻塞时按上述旧manager持锁/slot边界继续后台等待；
   `FINALIZED_HELD`只保留verified destination并释放进程内reservation，绝不rollback。Client
   process crash不恢复。
 
@@ -611,6 +698,17 @@ Page按operation ID + manifest digest + offset幂等读取；丢失可重取同o
 取得全部pages后验证无缺页/重复/乱序，重建§6.1 model并重算count/sum/digest，之后才进入
 destination preflight。单个5 MiB result不进入普通tool-result lane。
 
+File probe在exact stat完成后释放其active-worker shared local-slot lease并进入terminal
+`succeeded`；`FileSourceProbe`作为immutable terminal snapshot保留，start/result丢失后仍用同
+operation ID查询，重复status不重stat。它使用§6.5统一terminal-release TTL并最终压入包含完整
+bounded probe outcome的tombstone；destination始终unchanged。Server取得snapshot后先用
+`transfer_source_probe_release`收敛到`released` tombstone，再把同一个outer Server operation
+lease交给already-admitted Py8b file入口；后者的Client wire slot才重新取得shared local-slot
+lease，因此scan与file slot不会双占。正式source begin/open必须再次匹配probe size/fingerprint；
+漂移在destination mutation前返回`workspace_file_changed`。Release结果丢失只重试exact release
+或查询tombstone，不重启probe；release完成到file begin之间的source变化由上述fingerprint fence
+处理。
+
 missing、link/reparse/special成为job的稳定terminal path error。File variant选择Py8b单文件
 路径，且source `transfer_begin`的size/fingerprint必须仍匹配probe；directory variant进入
 本文coordinator。Probe不创建destination、不占binary slot，也不触发public`on_issued`。
@@ -675,6 +773,28 @@ Preflight 不只检查每条 path 长度。Destination side 必须对完整 mapp
 - Windows reserved/device names、trailing dot/space 和不支持的 path form 被拒绝；
 - destination root 当前不存在且其现有 ancestor 都是真实 directory；
 - 任何 ancestor 是 link/reparse/special 都拒绝。
+
+Collision不在preflight阶段创建probe文件，也不根据当前volume的可变挂载选项产生不同wire
+contract。它使用确定、保守的destination-platform key：
+
+```text
+Linux/其它POSIX：每个component的原始UTF-8 bytes
+macOS：           NFC(component).casefold()的UTF-8 bytes
+Windows：         NFC(component).casefold()的UTF-8 bytes
+```
+
+Windows trailing dot/space与reserved-name先独立拒绝。macOS/Windows即使实际volume或目录开启
+case-sensitive mode，也仍使用上述保守key；因此实现可以拒绝少量底层filesystem本可同时表示的
+名称，但同一目标平台policy不会随volume配置产生不同结果。Collision set只包含
+regular-file mapped paths及为它们实际创建的derived parent paths。纯scan-only directory若不是
+任一file的derived parent，不参与copy destination collision，因为copy不会创建它；它仍参与
+manifest digest、bounds、source revalidation与same-Client rename snapshot。由file导出的parent
+与另一file path/key冲突仍整体拒绝。
+
+Linux/其它POSIX的支持topology要求destination filesystem执行case-sensitive、byte-distinct名称
+语义；启用ext4 casefold、case-insensitive network mount或其它不符合该语义的volume属于
+unsupported topology。Py8c不通过创建probe文件猜测mount行为，也不能把raw UTF-8 key宣传为对
+这些volume的collision防护；其commit仍由no-replace兜底并稳定失败，但不保证完整preflight零写入。
 
 Client destination以同一个generation-bound job贯穿preflight、prepare、children、finish/
 cleanup；它使用`destination` role。`transfer_directory_preflight`只登记manifest与job并立即返回running；worker完成
@@ -887,7 +1007,8 @@ snapshot不含paths/fingerprints/per-file arrays。只有真实walk/hash/copy/fs
 状态推进才增加`progress_seq`并刷新existing transfer no-progress deadline；重复poll本身不
 算progress。每个start/status/cancel/release tool_call仍受existing bounded private-call
 timeout，但job没有独立whole-operation hard deadline。no-progress timeout触发Client cancel/
-cleanup；Server失去generation或Agent Stop时发送一次cancel，随后bounded poll终态。Start
+cleanup；Server失去generation或Agent Stop时发送一次cancel，随后只在bounded window内poll；
+未观察terminal时按§13.2返回outcome unknown，不能把`cancelling`伪装成terminal。Start
 result丢失表示job可能已启动：只允许按operation ID cancel/inspect，绝不duplicate start。
 `transfer_local_directory_status`命中尚未升级的同key READY destination record时固定返回
 `ready_not_started`，证明start未执行且destination unchanged；Server结束/取消该preflight并
@@ -1014,7 +1135,8 @@ Move copy phase 与 copy 完全相同。全部 destination files 完成后，sou
 manifest 中每个 path 使用原 fingerprint/ETag 条件删除：
 
 - 未变的 listed file 被删除；
-- 已变、已替换或不可达的 path 保留；
+- 已missing的listed file视为已达到删除目的，不产生warning；已变、已替换或不可达的path
+  保留并产生对应warning；
 - manifest 后新增的 file/directory 从未在 delete list 中，始终保留；
 - 只对 manifest 中 identity 仍匹配的 scan-only directory entries deepest-first
   `rmdir-if-empty`；无法取得或不匹配 identity 时保留，绝不 recursive delete 未知内容；
@@ -1022,6 +1144,9 @@ manifest 中每个 path 使用原 fingerprint/ETag 条件删除：
 
 Destination 此时是完整、已验证的 manifest snapshot，所以 source cleanup failure 是
 成功加 warning，不是 copy failure，也不触发 destination rollback。
+
+上述“保留mismatch path”保证覆盖OpenOctopus协调写者与cleanup实际观察到的identity；宿主外部
+进程在最后check与unlink/rmdir syscall之间完成替换时，仍适用§10.2 check-to-use race boundary。
 
 Same-Client atomic rename 不逐项复制或删除：它按 §8.3 在 syscall 前 full revalidate。
 重扫比较root/directory identity、merged entry set、file kind/size/fingerprint与manifest
@@ -1062,6 +1187,12 @@ Copy phase 失败/Stop/cancellation 后：
    exclusive mkdir 已确定 EEXIST、`root_claimed=false` 且 owned parents 已收敛，竞争者的
    root 保持存在仍是 cleanup complete，保留原始 `workspace_file_changed`。
 
+Filesystem条件删除是identity check后立即调用no-follow unlink/rmdir的best-effort序列；Py8c
+不新增完整的跨平台handle-relative filesystem层。OpenOctopus subtree lock能排除本进程协调
+写者，但宿主外部进程仍可在最后一次check与syscall之间替换component。实现检测到mismatch时
+必须保留并投影incomplete；无法观察到的
+check-to-unlink race属于Py5/Py7既有诚实边界，文档与测试不得宣称恶意本地写者隔离。
+
 Client destination cleanup不由Server回传一份可伪造的committed path batch；job按自身登记的
 commit/root/parent identities在后台串行清理，status只返回aggregate counts/complete boolean。
 Client move source cleanup同样不回传delete list：Server只发一次O(1)
@@ -1076,10 +1207,17 @@ Provider-visible path list。
 - cleanup complete：保留原始 failure code；
 - cleanup 因 fingerprint conflict、Device disconnect、timeout、storage ambiguity 或
   cancellation 无法证明 complete：`tool_execution_outcome_unknown`；
-- caller cancellation 不能中断已经启动的 bounded cleanup；cleanup task 通过 shield
-  收敛后再投影最终结果；
-- Server restart 没有 durable directory journal，若已有 commits，恢复后无法证明
-  cleanup，调用 outcome unknown；不自动 replay。
+- caller cancellation不能中断已经启动的Server-owned bounded cleanup；cleanup task通过shield
+  收敛后再投影最终结果。Client filesystem cleanup按§6.5 cooperative thread边界执行；Server
+  reconciliation window到期仍未terminal时投影outcome unknown；
+- graceful Server shutdown在进程仍持有coordinator state时shield当前child停止与有界cleanup；若
+  原HTTP/Agent transport仍可交付结果，按cleanup证据投影原错误或
+  `tool_execution_outcome_unknown`；
+- Server crash、SIGKILL或进程丢失没有durable directory journal，原HTTP/Agent调用只表现为
+  transport loss，重启后的新进程无法也不得伪造一条结构化`outcome_unknown`旧响应。Caller必须
+  把该transport loss视为outcome unknown并检查destination；新进程绝不replay directory child；
+- 启动恢复只复用既有`_openoctopus-transfers/`私有temporary-object清扫；没有operation journal时
+  不自动删除任何user-visible destination object/root，即使其看起来像不完整directory。
 
 `tool_execution_outcome_unknown` 明确表示 caller 必须检查 destination；Agent/Server
 不得自动用相同 `dst_path` 重试，因为 destination 可能已经部分存在。
@@ -1107,7 +1245,7 @@ destination必须保持`FINALIZED_HELD`；只有cleanup完成或明确放弃后�
 | Warning | 含义 |
 |---|---|
 | `source_cleanup_incomplete` | 至少一个 source file/directory 未能按 manifest 条件删除 |
-| `source_changed_after_copy` | 至少一个 listed source version 在 copy 后发生变化，因此被保留 |
+| `source_changed_after_copy` | 至少一个 listed source version 在 copy 后变化或被替换，因此冲突项被保留 |
 | `transfer_ack_failed` | Destination 已 commit，但最终 ACK/cleanup communication 未完整；沿用单文件既有警告语义 |
 
 实现可把多个底层相同原因折叠成一个 warning，最多 8 个，固定顺序。Warning 不包含
@@ -1115,8 +1253,10 @@ destination必须保持`FINALIZED_HELD`；只有cleanup完成或明确放弃后�
 
 一旦第一个 source delete 开始，Stop/cancellation 不再把 operation 改判为普通失败。
 Coordinator 必须有界完成/放弃剩余 source cleanup，然后返回 destination success +
-warnings。这样不会因取消把已经删掉的 source 与随后 rollback 的 destination 同时
-移除。
+warnings。Client thread仍阻塞在当前delete syscall时，Server可放弃等待并返回
+`source_cleanup_incomplete`，但Client job保持cancelling并且只允许继续原先已启动的cleanup
+收敛，不重新开始新plan。这样不会因取消把已经删掉的 source 与随后 rollback 的 destination
+同时移除。
 
 ## 12. Admission、并发与公平
 
@@ -1144,6 +1284,13 @@ queue timeout，绝不占tool worker；不能出现“2个wire slots + 1个activ
 `TransferManager`与job worker接受already-acquired lease，不能双重acquire；每个phase的
 terminal/cancel/config replacement/generation retire路径恰好释放一次。
 
+该规则也修正既有wire/local-file thread abandonment：coroutine或slot cleanup在blocking thread
+仍运行时，lease必须原子转交给ClientRuntime-owned drain record，直到真实thread task以及其
+`on_abandoned` cleanup全部完成才释放。Receiver `fsync/commit`、sender `read`、regular
+`transfer_local`与directory worker使用同一所有权规则；connection replacement不能靠0.1秒grace
+提前归还slot。Runtime同时强引用draining manager/task，防止connection finally后失去watchdog与
+shutdown ownership。
+
 ### 12.2 Fairness
 
 Fairness 层次固定为：
@@ -1168,7 +1315,9 @@ Fairness 层次固定为：
   reconcile，绝不重放mutation command；
 - 每个 file slot 使用现有 no-progress idle timeout；
 - source scan、destination preflight/prepare/finalize/cleanup与`LocalDirectoryJob`本体都用
-  `progress_seq`驱动现有no-progress deadline；连续status polling不能续期；
+  `progress_seq`驱动现有no-progress deadline；连续status polling不能续期。Deadline只请求
+  cooperative cancel；若当前thread syscall尚未返回，Client job保持cancelling并继续持有其
+  shared slot/lock，Server有界reconcile后返回outcome unknown而不伪造local terminal；
 - 整个directory operation没有额外wall-clock hard deadline；Client scan/preflight、
   cross-site child bytes与same-Client job的真实progress持续时都可运行超过60秒；
 - source status/page与destination preflight/status在mutation command前丢失，允许按同ID
@@ -1242,8 +1391,10 @@ admission、quota reservation、temp staging 和 route refs 全部只能 release
 | atomic rename 已进入 irreversible syscall | 等待 syscall true result；不把线程取消误报为未执行 |
 
 Agent Stop 不发送 10,000 个 cancel，也不 replay child。单文件 slot 的 late chunks/ACK
-仍由原 generation tombstone 消费。Same-Client job只发送一次`cancel`并bounded poll terminal；
-若generation已失去且无法确认cleanup，返回outcome unknown。
+仍由原 generation tombstone 消费。Same-Client job只发送一次`cancel`并在Server侧bounded poll；
+若cooperative worker已收敛则返回真实terminal，若thread syscall仍在运行、generation已失去或
+无法确认cleanup则返回outcome unknown。后者不会把Client job标成terminal：旧generation manager
+继续持有runtime-shared slot与subtree reservation，直到worker返回并收敛，或Client进程退出。
 
 ### 13.3 Device disconnect/replacement
 
@@ -1264,9 +1415,18 @@ Agent Stop 不发送 10,000 个 cancel，也不 replay child。单文件 slot �
   按该reservation/job捕获的旧path-policy snapshot执行，避免已创建root/job泄漏。它们不得
   扩展path set或重新开始copy；
 - connection replacement 后不能再向旧 generation 发action。旧Client的retire hook负责本地
-  按状态收敛：pre-finalized job执行bounded cancel/conditional cleanup，`FINALIZED_HELD`按上文
-  保留destination并只解锁；任一active phase释放shared slot。Server不能确认时投影outcome
+  按状态请求收敛：pre-finalized job触发cooperative cancel/conditional cleanup，
+  `FINALIZED_HELD`按上文保留destination并只解锁；没有阻塞syscall的active phase正常释放shared
+  slot。同一ClientRuntime内普通reconnect时，仍在syscall中的旧manager继续持有runtime-owned
+  shared slot/lock直到真实退出，防止新generation额外获得两个slot；Server不能确认时投影outcome
   unknown。Cleanup不迁移到新generation，也不重放可能已进入旧transport的action；
+- 若另一个Client进程使用同一Device token触发`connection_replaced`，两进程没有共享semaphore或
+  subtree lock。旧Client收到replacement后永久停止重连、请求job收敛并在grace后退出；但新进程
+  可能已开始工作，旧阻塞syscall到真实进程退出前仍属于明确的external-process race boundary。
+  Replacement路径必须复用现有ClientRuntime shutdown watchdog：立即arm，只有所有retired
+  manager/drain quiescent才cancel；否则现有15秒`_SHUTDOWN_WATCHDOG_SECONDS`到期调用hard exit，
+  不能让default-executor thread无限阻止进程退出。同一Device token同时运行多个Client进程仍是
+  unsupported topology，不能声称runtime-owned lock能跨进程隔离；
 - late result/chunk 不能推进已 terminal 的 directory state。
 
 Route identity 使用 immutable device ID + captured name/config generation。Device 被删除
@@ -1437,7 +1597,8 @@ message 必须明确“检查 destination 后再决定”，不能建议自动 r
 - 不解包 archive，因此没有 archive traversal/zip bomb contract；
 - 临时文件/objects 使用随机私有名字，不进入 user-visible tree；
 - no-overwrite 由 commit primitive 保证，不靠 preflight check alone；
-- cleanup 使用 fingerprint/ETag，不删除后来替换的 path；
+- cleanup 使用 fingerprint/ETag；实际观察到后来替换的path不删除，最后check之后的宿主外部
+  race按§10.2诚实边界处理；
 - source/destination bytes、manifest paths、headers/token 不写日志。
 
 ### 17.2 Memory、task 与 temp bounds
@@ -1569,6 +1730,8 @@ single-op cap；RustFS 没有 partial object/root marker 泄漏。
 - REST/Agent 进入同一 orchestration；
 - Client source probe 对 file/directory 返回 strict union，且 file probe 后的 begin
   fingerprint必须匹配；绝不先 issue单文件再fallback；
+- file probe覆盖terminal`succeeded`、start/result loss后的status、terminal TTL、exact release
+  tombstone，以及release后already-admitted file slot不与scan worker双占Client capacity；
 - source scan超过60秒但持续progress时status仍响应；manifest只在READY后分页，覆盖page
   256/257与256 KiB边界、丢失重取、重复/缺失/乱序、digest/offset mismatch、retrieval lease、
   terminal outcome tombstone与release TTL；
@@ -1577,8 +1740,19 @@ single-op cap；RustFS 没有 partial object/root marker 泄漏。
   HELD在partial copy前/中触发destination cleanup，以及`FINALIZED_HELD`后expiry不删source、
   copy保持success、move返回source-cleanup warning并release destination；source_cleanup active
   仍按no-progress规则收敛；
+- destination `READY/ready_not_started` abandon不被重复status续期，到期回收后第三个job可进入；
+  已claim root的stalled job到期执行conditional cleanup，`FINALIZED_HELD`到期保留destination、
+  release reservation并留下bounded outcome tombstone；
 - destination preflight/prepare/final scan超过60秒但status/cancel仍响应，且manager-owned
   worker不被dispatcher `_wait_for_dispatcher_blocking`等待；
+- fault-injected filesystem syscall阻塞时，cancel后job保持cancelling、锁与shared slot不释放且
+  不出现late-terminal mutation；解除阻塞后才收敛并回baseline。Server reconciliation window
+  到期时，纯source scan/read-only preflight稳定返回timeout且destination unchanged；
+  mutation-capable phase返回outcome unknown。另一个shared slot与directory control lane仍可用；
+- Server reconciliation window精确复用一次`device_transfer_idle_timeout_seconds`，重复status或
+  第二次cancel不重置deadline；
+- Stop在partial copy时只置`stop_forward_work`，随后destination rollback仍能执行unlink/rmdir；
+  cleanup自身stall时才置独立`stop_cleanup`并按证据投影outcome unknown；
 - 无关普通`delete_folder`、`grep`或长`__workspace_rest__`占用`_ToolWorker`时，独立directory
   control lane的status/cancel仍在bounded时间返回；第9个pending control稳定busy；
 - source exact file、directory、missing、link、junction/reparse、FIFO/socket/device；
@@ -1593,21 +1767,31 @@ single-op cap；RustFS 没有 partial object/root marker 泄漏。
   读前/读后 identity 一致；成功 aggregate digest 与相同 tree 的 copy path fixed vector一致；
 - native fault test 在 revalidation 后由外部进程竞态新增 entry，验证实现不宣称
   snapshot，并记录该 entry 可能随 directory rename 的允许结果；
-- manifest entry/byte exact boundaries、integer overflow、path length；
+- manifest entry/byte exact boundaries、integer overflow、path length；canonical JSON覆盖中文、
+  combining Unicode、quote、backslash、control escaping、5 MiB与256 KiB exact/+1 bytes，且
+  Server/Client encoder与page split完全一致；
 - manifest/content digest fixed vectors；
 - local rename manifest-digest revalidation vectors，覆盖 empty directory 与
   file/directory kind；
 - Client filesystem manifest root/directory identity、同名删除重建，以及identity unavailable
   时在destination mutation前整体拒绝；
-- duplicate、ancestor-file conflict、case/Unicode collision；
+- duplicate、ancestor-file conflict、case/Unicode collision；覆盖macOS/Windows保守key在
+  case-sensitive volume上仍拒绝，以及scan-only empty dir不参与copy collision；
 - destination root file/dir/link/special/absent races；
 - filesystem preflight-to-exclusive-mkdir race、owned root/parent cleanup、expected child set、
   EEXIST时不删除/等待竞争者root、prepare result loss、finish exact-root
   rescan/extra entry/fingerprint drift与release；
 - destination进入`FINALIZED_HELD`后，copy由显式release解锁；move在source cleanup完成/放弃前
-  reservation持续阻止其它OpenOctopus mutation，且generation retire保留destination不做rollback；
+  reservation持续阻止其它OpenOctopus mutation；严格递增的source-cleanup progress刷新其idle
+  lease，重复值不刷新，stall expiry才release并产生warning；generation retire保留destination
+  不做rollback；
 - source/destination job start/status/page/command result loss与same-ID idempotency；同ID不同
-  digest拒绝、generation replacement、active/retained job count与5 MiB memory回baseline；
+  digest拒绝、generation replacement、active/retained job count与5 MiB memory回baseline；terminal
+  transition立即移出active count，retained/outcome tombstone的status/release都返回exact完整结果，
+  两个terminal记录不能阻止第三个active job；
+- directory lifecycle credits在current/retired managers之间固定为4096；覆盖4096/4097 boundary、
+  start cancellation、active→retained→outcome/released tombstone所有权转移、TTL purge回收，以及
+  满载时新start在work前稳定busy；
 - same-Client同一operation的`source`与`destination` role key互不冲突；source release后local
   start只原子升级既有READY destination job，缺失/mismatched preflight不能创建第三个job，
   role-scoped tombstone不会吞掉另一role的result；
@@ -1630,7 +1814,8 @@ single-op cap；RustFS 没有 partial object/root marker 泄漏。
   outcome unknown；
 - Client source cleanup只发送一次command，内部256-record yield/checkpoint前后都通过status
   推进且不产生第二个wire cleanup call；
-- move delete 顺序与 warnings；
+- move delete 顺序与 warnings；listed source missing算删除目的已达到且不产生warning，
+  fingerprint mismatch产生`source_changed_after_copy`；
 - no Provider-visible per-item arrays；
 - file/directory success 都返回 kind/count/bytes/digest/warnings；file count固定为1。
 - same-Client local job持续真实progress超过60秒仍成功；stalled job触发no-progress timeout，
@@ -1639,8 +1824,18 @@ single-op cap；RustFS 没有 partial object/root marker 泄漏。
 - config epoch在root claimed、child active、local job running三处变化时停止新child，但同一
   WS generation的exact owner cleanup/status/cancel/release可用旧snapshot收敛；connection
   replacement只靠旧Client retire hook，Server不向新generation迁移或重放；
+- `connection_replaced`碰到blocked directory/wire syscall时arm既有shutdown watchdog；quiescent
+  时取消watchdog，未quiescent时15秒后hard-exit callback恰好调用一次；
 - shared local-slot capacity同时覆盖wire source/receiver、regular local file与directory job，
   任意组合都不超过2且无double-acquire/release。
+- blocked wire sender-read/receiver-fsync/regular-local worker在connection retire后把shared lease
+  转交runtime drain owner；真实thread与abandoned-result cleanup完成前，新generation不能重用该
+  capacity，ClientRuntime始终强引用retired manager/drain record；
+- 相同Device ID的source/destination执行overlap拒绝；两个不同Device ID不交换或比较物理
+  workspace identity，相关部署约束在canonical docs中明确为unsupported topology。
+- graceful Server shutdown收敛当前coordinator；SIGKILL/restart只产生transport loss、不会伪造
+  old-call result或replay child，启动恢复只清理private transfer temporaries而不删除partial
+  user-visible destination。
 
 ### 19.2 Direction E2E
 
@@ -1662,7 +1857,8 @@ source cleanup 第一个/中间/最后一个 delete、Client disconnect、Server
 ### 19.3 平台 native tests
 
 - Linux：symlink、FIFO、Unix socket、`renameat2(RENAME_NOREPLACE)` directory、不同
-  mount/volume；
+  mount/volume；case-sensitive raw UTF-8 collision vectors，并记录casefold/case-insensitive
+  volume为unsupported topology；
 - macOS：symlink、NFD/NFC filename collision、`renameatx_np(RENAME_EXCL)` directory；
 - Windows：file/directory junction、generic reparse point、reserved names、case-insensitive
   collisions、directory no-replace rename、locked file cleanup；
@@ -1763,7 +1959,8 @@ Py8c 只有同时满足以下条件才完成：
 7. 10,000 entries/5 MiB bounds、canonical digest 和跨端 vectors 全通过。
 8. Listed source drift 失败；manifest/copy 扫描后新增 entry 不被传输；same-Client
    rename 前用root/directory identity与file fingerprint做full revalidation并捕获已可见漂移；move cleanup
-   不删除同名重建目录，且文档明确 syscall 前外部 race 不属于 point-in-time snapshot。
+   不删除已观察到identity mismatch的同名重建目录，且文档明确最后check后的外部race不属于
+   point-in-time snapshot或OS sandbox保证。
 9. Server destination 在写入前按 total bytes 完成 quota/single-operation reservation，
    并发写不超配。
 10. 所有目标 personal Server SKILL.md 在第一笔 destination commit 前验证；任一 invalid
@@ -1777,7 +1974,8 @@ Py8c 只有同时满足以下条件才完成：
 14. Admission 对 user 公平、队列/内存/task/temp/manifest/cleanup 全部有界，ping/health
     在压力下保持响应。
 15. Client wire slots、regular local file与directory job共用capacity=2 admission；local job
-    可超过60秒持续progress、可被Stop/config/retire收敛，且没有ghost job/lock/lease。
+    可超过60秒持续progress、可被Stop/config/retire请求收敛；filesystem syscall返回后没有ghost
+    job/lock/lease，syscall尚未返回时保持cancelling与原lease而不虚假释放。
 16. 没有公开新 WS frame、没有 Protocol v4、没有 replay/resume/range/dedup/compression。
 17. Server/Client 完整 tests、Ruff、mypy、frozen/native CI、真实双 Client E2E 和
     canonical docs audit 全通过。
