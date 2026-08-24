@@ -2095,7 +2095,6 @@ def _copy_regular_file(
         prefix=f".{destination.name}.openoctopus-", dir=destination.parent
     )
     temporary = Path(temporary_value)
-    published = False
     try:
         if _file_fingerprint(opened) != expected.fingerprint:
             raise ToolFailure("workspace_file_changed", "Source file changed before copy")
@@ -2134,9 +2133,12 @@ def _copy_regular_file(
             raise ToolFailure(
                 "workspace_storage_unavailable", "Atomic destination publish failed"
             ) from exc
-        published = True
-        _fsync_directory(destination.parent)
-        destination_info = destination.stat(follow_symlinks=False)
+        try:
+            _fsync_directory(destination.parent)
+            destination_info = destination.stat(follow_symlinks=False)
+        except BaseException:
+            _unlink_if_same_file(temporary, destination)
+            raise
         return _CommittedDestination(
             relative_path=expected.relative_path,
             destination_fingerprint=_file_fingerprint(destination_info),
@@ -2151,9 +2153,27 @@ def _copy_regular_file(
                 os.close(temporary_fd)
         with contextlib.suppress(OSError):
             temporary.unlink()
-        if not published:
-            with contextlib.suppress(OSError):
-                destination.unlink()
+
+
+def _unlink_if_same_file(source: Path, destination: Path) -> bool:
+    """Remove only the destination hard link published from this exact temp."""
+
+    source_info = _lstat_optional(source)
+    destination_info = _lstat_optional(destination)
+    if (
+        source_info is None
+        or destination_info is None
+        or not stat.S_ISREG(source_info.st_mode)
+        or not stat.S_ISREG(destination_info.st_mode)
+        or (source_info.st_dev, source_info.st_ino)
+        != (destination_info.st_dev, destination_info.st_ino)
+    ):
+        return False
+    try:
+        destination.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def _execute_local_move(

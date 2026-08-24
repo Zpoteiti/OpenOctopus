@@ -638,6 +638,103 @@ async def test_local_directory_copy_is_recursive_atomic_per_file_and_omits_empty
 
 
 @pytest.mark.asyncio
+async def test_local_copy_does_not_delete_a_competing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"payload")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    original_link = directory_jobs_module.os.link
+
+    def competing_link(
+        source_path: Path,
+        destination_path: Path,
+        *,
+        follow_symlinks: bool,
+    ) -> None:
+        destination_path.write_bytes(b"competitor")
+        original_link(
+            source_path,
+            destination_path,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(directory_jobs_module.os, "link", competing_link)
+    try:
+        manifest, _, destination_digest = await _prepare_local_job(
+            manager, operation_id, "source", "copied"
+        )
+        await manager.handle(
+            {
+                "operation": "transfer_local_directory_start",
+                "directory_operation_id": operation_id,
+                "expected_digest": destination_digest,
+                "source_path": "source",
+                "dst_path": "copied",
+                "mode": "copy",
+                "manifest_sha256": manifest.manifest_sha256,
+            }
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            destination_digest,
+            {"failed", "outcome_unknown"},
+            local=True,
+        )
+        assert status.state == "outcome_unknown"
+        assert (tmp_path / "copied" / "file").read_bytes() == b"competitor"
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_local_copy_cleans_its_published_link_when_parent_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"payload")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+
+    def fail_fsync(_path: Path) -> None:
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(directory_jobs_module, "_fsync_directory", fail_fsync)
+    try:
+        manifest, _, destination_digest = await _prepare_local_job(
+            manager, operation_id, "source", "copied"
+        )
+        await manager.handle(
+            {
+                "operation": "transfer_local_directory_start",
+                "directory_operation_id": operation_id,
+                "expected_digest": destination_digest,
+                "source_path": "source",
+                "dst_path": "copied",
+                "mode": "copy",
+                "manifest_sha256": manifest.manifest_sha256,
+            }
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            destination_digest,
+            {"failed", "outcome_unknown"},
+            local=True,
+        )
+        assert status.state == "failed"
+        assert not (tmp_path / "copied").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(not os.sys.platform.startswith("linux"), reason="Linux native proof")
 async def test_local_directory_move_uses_native_no_replace_and_preserves_empty_dirs(
     tmp_path: Path,
