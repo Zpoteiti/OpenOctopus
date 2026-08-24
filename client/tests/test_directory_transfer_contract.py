@@ -335,3 +335,25 @@ def test_destination_collision_keys_are_platform_deterministic() -> None:
     )
     with pytest.raises(contract.DirectoryContractError, match="parent"):
         contract.destination_collision_keys(parent_collision, platform="macos")
+
+    merged_parent_collision = contract.create_directory_manifest(
+        root_identity="root",
+        directories=(_directory("A"), _directory("a")),
+        entries=(_entry("A/x"), _entry("a/y")),
+    )
+    assert len(
+        contract.destination_collision_keys(
+            merged_parent_collision,
+            platform="linux",
+        )
+    ) == 2
+    with pytest.raises(contract.DirectoryContractError, match="parent"):
+        contract.destination_collision_keys(
+            merged_parent_collision,
+            platform="macos",
+        )
+    with pytest.raises(contract.DirectoryContractError, match="parent"):
+        contract.destination_collision_keys(
+            merged_parent_collision,
+            platform="windows",
+        )

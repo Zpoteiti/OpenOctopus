@@ -344,10 +344,20 @@ def destination_collision_keys(
         raise DirectoryContractError("unsupported destination platform")
     file_keys: list[DestinationCollisionKey] = []
     derived_parent_keys: set[DestinationCollisionKey] = set()
+    derived_parent_sources: dict[DestinationCollisionKey, str] = {}
     for entry in manifest.entries:
         key = _destination_key(entry.relative_path, platform)
         file_keys.append(key)
-        derived_parent_keys.update(key[:end] for end in range(1, len(key)))
+        components = entry.relative_path.split("/")
+        for end in range(1, len(key)):
+            parent_key = key[:end]
+            parent_source = "/".join(components[:end])
+            previous_source = derived_parent_sources.setdefault(
+                parent_key, parent_source
+            )
+            if previous_source != parent_source:
+                raise DirectoryContractError("destination parent collision")
+            derived_parent_keys.add(parent_key)
     if len(set(file_keys)) != len(file_keys):
         raise DirectoryContractError("destination path collision")
     if set(file_keys) & derived_parent_keys:
