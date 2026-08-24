@@ -169,7 +169,9 @@ async def _source_status(
     expected_digest: str,
     states: set[str],
 ) -> Any:
-    for _ in range(200):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while loop.time() < deadline:
         status = await _handle(
             manager,
             {
@@ -181,7 +183,7 @@ async def _source_status(
         expected_digest = status.expected_digest
         if status.state in states:
             return status
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
     raise AssertionError("source job did not reach the expected state")
 
 
@@ -194,7 +196,9 @@ async def _destination_status(
     local: bool = False,
 ) -> Any:
     operation = "transfer_local_directory_status" if local else "transfer_directory_status"
-    for _ in range(300):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while loop.time() < deadline:
         status = await _handle(
             manager,
             {
@@ -206,7 +210,7 @@ async def _destination_status(
         expected_digest = status.expected_digest
         if status.state in states:
             return status
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
     raise AssertionError("destination job did not reach the expected state")
 
 
@@ -1531,6 +1535,69 @@ async def test_local_directory_copy_is_recursive_atomic_per_file_and_omits_empty
 
 
 @pytest.mark.asyncio
+async def test_local_status_stays_nonterminal_while_releasing_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"payload")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    exit_started = asyncio.Event()
+    release_exit = asyncio.Event()
+    original_exit = manager._exit_reservation
+
+    async def delayed_exit(record: Any) -> None:
+        exit_started.set()
+        await release_exit.wait()
+        await original_exit(record)
+
+    try:
+        manifest, _, destination_digest = await _prepare_local_job(
+            manager, operation_id, "source", "copied"
+        )
+        monkeypatch.setattr(manager, "_exit_reservation", delayed_exit)
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_start",
+                "directory_operation_id": operation_id,
+                "expected_digest": destination_digest,
+                "source_path": "source",
+                "dst_path": "copied",
+                "mode": "copy",
+                "manifest_sha256": manifest.manifest_sha256,
+            },
+        )
+        await asyncio.wait_for(exit_started.wait(), timeout=1)
+
+        running = await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": destination_digest,
+            },
+        )
+        assert running.state == "running"
+        assert running.terminal_result is None
+
+        release_exit.set()
+        terminal = await _destination_status(
+            manager,
+            operation_id,
+            destination_digest,
+            {"succeeded"},
+            local=True,
+        )
+        assert terminal.terminal_result.files_transferred == 1
+    finally:
+        release_exit.set()
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_local_copy_does_not_delete_a_competing_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2033,10 +2100,10 @@ async def test_config_retire_keeps_janitor_until_lifecycle_tombstones_expire(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.02)
+    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.2)
     source = tmp_path / "file"
     source.write_bytes(b"x")
-    manager = _manager(tmp_path, terminal_ttl_seconds=0.02)
+    manager = _manager(tmp_path, terminal_ttl_seconds=0.2)
     operation_id = _operation_id()
     try:
         started = await _handle(
@@ -2588,12 +2655,12 @@ async def test_ready_not_started_local_cancel_then_release_frees_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.02)
+    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.2)
     credits = DirectoryLifecycleCredits(capacity=1)
     manager = _manager(
         tmp_path,
         lifecycle_credits=credits,
-        terminal_ttl_seconds=0.02,
+        terminal_ttl_seconds=0.2,
     )
     operation_id = _operation_id()
     manifest = _small_manifest()

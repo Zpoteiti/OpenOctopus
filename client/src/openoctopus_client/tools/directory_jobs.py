@@ -1361,8 +1361,8 @@ class DirectoryJobManager:
                 record.destination_path,
                 record.manifest,
             )
-            record.terminal_result = result
             await self._exit_reservation(record)
+            record.terminal_result = result
             await self._terminalize(record, state="succeeded", local=True)
         except TimeoutError:
             await self._terminalize(

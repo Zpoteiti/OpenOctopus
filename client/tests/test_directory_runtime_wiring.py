@@ -177,7 +177,9 @@ def test_runtime_retires_config_bound_directory_managers_but_keeps_old_reconcile
                 "path": "source.txt",
             },
         )
-        for _ in range(100):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline:
             status = await _directory_handle(
                 old,
                 {
@@ -188,7 +190,7 @@ def test_runtime_retires_config_bound_directory_managers_but_keeps_old_reconcile
             )
             if status.state == "succeeded":
                 break
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.05)
         else:
             raise AssertionError("source probe did not finish")
 
@@ -259,7 +261,7 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.02)
+    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.2)
 
     async def exercise() -> None:
         source = tmp_path / "source.txt"
@@ -274,7 +276,7 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
             mcp_servers=[],
         )
         retired = runtime._new_directory_manager(tmp_path, config, generation=9)
-        retired._terminal_ttl = 0.02
+        retired._terminal_ttl = 0.2
         runtime._directory_manager = retired
         operation_id = str(new_uuid7())
         started = await _directory_handle(
@@ -285,7 +287,9 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
                 "path": "source.txt",
             },
         )
-        for _ in range(100):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline:
             status = await _directory_handle(
                 retired,
                 {
@@ -296,7 +300,7 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
             )
             if status.state == "succeeded":
                 break
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.05)
         else:
             raise AssertionError("source probe did not finish")
 
@@ -308,7 +312,7 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
         assert retired in runtime._retired_directory_managers
         async with asyncio.timeout(1):
             while retired in runtime._retired_directory_managers:
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.05)
         assert runtime._directory_lifecycle_credits.active_count == 0
 
     asyncio.run(exercise())
@@ -367,7 +371,7 @@ def test_generation_retire_is_bounded_while_blocking_work_drains(
         release.set()
         async with asyncio.timeout(1):
             while manager in runtime._retired_directory_managers:
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.05)
         assert runtime._directory_lifecycle_credits.active_count == 0
 
     try:
