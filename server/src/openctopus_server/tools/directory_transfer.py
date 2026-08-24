@@ -55,6 +55,14 @@ class DirectoryChildResult:
             raise ValueError("directory destination fingerprint is invalid")
 
 
+class DirectoryChildCommittedAfterCancellation(asyncio.CancelledError):
+    """A child publish completed before caller cancellation took effect."""
+
+    def __init__(self, result: DirectoryChildResult) -> None:
+        super().__init__()
+        self.result = result
+
+
 @dataclass(frozen=True, slots=True)
 class DirectoryTransferResult:
     kind: Literal["directory"]
@@ -136,7 +144,12 @@ class DirectoryTransferCoordinator:
             try:
                 await backend.prepare_destination(mark_issued)
                 for entry in manifest.entries:
-                    child = await backend.copy_child(entry, new_uuid7(), mark_issued)
+                    try:
+                        child = await backend.copy_child(entry, new_uuid7(), mark_issued)
+                    except DirectoryChildCommittedAfterCancellation as exc:
+                        _validate_child(entry, exc.result)
+                        committed.append(exc.result)
+                        raise asyncio.CancelledError from None
                     _validate_child(entry, child)
                     committed.append(child)
                 await backend.finalize_destination(tuple(committed))

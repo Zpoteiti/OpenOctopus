@@ -13,6 +13,7 @@ from openctopus_server.directory_contract import (
     create_directory_manifest,
 )
 from openctopus_server.tools.directory_transfer import (
+    DirectoryChildCommittedAfterCancellation,
     DirectoryChildResult,
     DirectoryTransferCoordinator,
 )
@@ -313,6 +314,42 @@ async def test_cancellation_after_issue_cleans_destination_and_releases_once() -
     assert backend.release_calls == 1
     assert lease.close_count == 1
     release.set()
+
+
+async def test_committed_child_cancellation_records_metadata_before_cleanup() -> None:
+    committed = DirectoryChildResult(
+        relative_path="a.txt",
+        verified_size=1,
+        verified_sha256=hashlib.sha256(b"a").hexdigest(),
+        destination_fingerprint="destination-a",
+    )
+
+    @dataclass
+    class CommitThenCancelBackend(_Backend):
+        async def copy_child(
+            self,
+            entry: DirectoryManifestEntry,
+            slot_id: UUID,
+            mark_issued: object,
+        ) -> DirectoryChildResult:
+            callback = mark_issued
+            assert callable(callback)
+            callback()
+            self.committed.append(committed)
+            raise DirectoryChildCommittedAfterCancellation(committed)
+
+    backend = CommitThenCancelBackend()
+
+    with pytest.raises(asyncio.CancelledError):
+        await DirectoryTransferCoordinator().run(
+            manifest=_manifest(),
+            mode="copy",
+            backend=backend,
+            operation_lease=_Lease(),
+        )
+
+    assert backend.destination_cleanup_calls == 1
+    assert backend.committed == [committed]
 
 
 async def test_cancellation_during_started_source_cleanup_returns_destination_success() -> None:

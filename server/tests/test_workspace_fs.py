@@ -20,6 +20,9 @@ from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryCommittedFile,
+    DirectoryDestinationPlan,
+    FileMetadata,
     FileTransform,
     ServerDirectorySourceProbe,
     ServerFileSourceProbe,
@@ -656,6 +659,29 @@ async def test_server_directory_manifest_pages_exact_prefix_without_noise_filter
     assert all(prefix == object_prefix for prefix in client.list_prefixes)
 
 
+async def test_server_directory_probe_supports_authorized_workspace_root() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    client._objects[f"users/{target.id}/root.txt"] = (b"root", "root-etag")
+
+    probe = await fs.probe_directory_source(target, "")
+
+    assert isinstance(probe, ServerDirectorySourceProbe)
+    assert probe.manifest.entries == (
+        DirectoryManifestEntry(
+            relative_path="root.txt",
+            size=4,
+            fingerprint="root-etag",
+        ),
+    )
+    assert not await fs.directory_root_is_absent(target, "", owner="operation")
+
+    client._objects.clear()
+
+    assert await fs.directory_root_is_absent(target, "", owner="operation")
+
+
 async def test_server_destination_plan_maps_files_only_and_checks_root_shape() -> None:
     client = _MemoryMinio()
     fs = _fs(client)
@@ -887,6 +913,62 @@ async def test_conditional_cleanup_deletes_only_matching_etag() -> None:
         )
         == "missing"
     )
+
+
+async def test_directory_destination_verification_requires_exact_paths_and_etags() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    prefix = f"users/{target.id}/backup/"
+    client._objects[f"{prefix}a.txt"] = (b"a", "etag-a")
+    client._objects[f"{prefix}nested/b.txt"] = (b"bb", "etag-b")
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="backup",
+        manifest_sha256="0" * 64,
+        mapped_paths=("backup/a.txt", "backup/nested/b.txt"),
+    )
+    committed = (
+        DirectoryCommittedFile("backup/a.txt", 1, "etag-a"),
+        DirectoryCommittedFile("backup/nested/b.txt", 2, "etag-b"),
+    )
+
+    await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert not await fs.directory_root_is_absent(
+        target,
+        "backup",
+        owner="operation",
+    )
+
+    client._objects[f"{prefix}extra.txt"] = (b"extra", "etag-extra")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+    client._objects.pop(f"{prefix}extra.txt")
+    client._objects[f"{prefix}a.txt"] = (b"a", "changed")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+
+async def test_server_transfer_operation_lease_is_transferable_and_busy_is_stable() -> None:
+    storage = AsyncMock()
+    storage.max_connections = 2
+    fs = WorkspaceFS(
+        storage,
+        server_transfer_max_concurrency_per_user=1,
+        server_transfer_queue_timeout_seconds=0.01,
+    )
+    first = await fs.acquire_server_transfer_operation(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.acquire_server_transfer_operation(uuid4())
+    assert caught.value.code is ErrorCode.WORKSPACE_TRANSFER_BUSY
+
+    await first.aclose()
+    replacement = await fs.acquire_server_transfer_operation(uuid4())
+    await replacement.aclose()
 
 
 @pytest.mark.parametrize(
@@ -1692,8 +1774,13 @@ async def test_uploaded_object_publish_propagates_cancellation_after_true_result
 
     assert task.done() is False
     release_publish.set()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(UploadCommittedAfterCancellation) as caught:
         await task
+    assert caught.value.metadata == FileMetadata(
+        size=1,
+        etag="destination-etag",
+        created=True,
+    )
     storage.promote_if_absent.assert_awaited_once()
 
 

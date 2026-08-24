@@ -68,6 +68,21 @@ async def test_timeout_releases_partial_acquisition_and_evicts_key() -> None:
     assert admission.entry_count == 0
 
 
+async def test_keyed_lease_can_be_transferred_and_closed_idempotently() -> None:
+    admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=0.01)
+    lease = await admission.acquire("user-a")
+
+    with pytest.raises(AdmissionTimeoutError):
+        await admission.acquire("user-b")
+
+    await lease.aclose()
+    await lease.aclose()
+    replacement = await admission.acquire("user-b")
+    await replacement.aclose()
+
+    assert admission.entry_count == 0
+
+
 async def test_cancelled_waiter_releases_keyed_lease() -> None:
     admission = KeyedAdmission(global_limit=1, per_key_limit=1, timeout_seconds=10)
 

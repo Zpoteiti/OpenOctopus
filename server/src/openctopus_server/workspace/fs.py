@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import Depends
 
-from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
+from openctopus_server.admission import AdmissionLease, AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.config import get_settings
 from openctopus_server.directory_contract import (
@@ -63,6 +63,10 @@ class FileMetadata:
 
 class UploadCommittedAfterCancellation(asyncio.CancelledError):
     """The destination was published before caller cancellation took effect."""
+
+    def __init__(self, metadata: FileMetadata | None = None) -> None:
+        super().__init__()
+        self.metadata = metadata
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,13 @@ class DirectoryDestinationPlan:
     destination_root: str
     manifest_sha256: str
     mapped_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryCommittedFile:
+    relative_path: str
+    size: int
+    etag: str
 
 
 @dataclass(eq=False, slots=True)
@@ -277,9 +288,13 @@ class WorkspaceFS:
     ) -> ServerSourceProbe:
         """Probe exact object and prefix independently before selecting file or directory."""
         self._ensure_active(target)
-        object_name = _object_key(target, relative_path)
-        exact = await _stat_optional(self._storage, object_name)
-        prefix = f"{object_name}/"
+        if relative_path:
+            object_name = _object_key(target, relative_path)
+            exact = await _stat_optional(self._storage, object_name)
+            prefix = f"{object_name}/"
+        else:
+            exact = None
+            prefix = _workspace_prefix(target)
         prefix_page = await self._storage.list_page(prefix, limit=1)
         has_prefix = bool(prefix_page.items)
         if exact is not None and has_prefix:
@@ -532,6 +547,67 @@ class WorkspaceFS:
             await self._storage.delete(object_name)
             return "deleted"
 
+    async def verify_directory_destination(
+        self,
+        plan: DirectoryDestinationPlan,
+        committed: tuple[DirectoryCommittedFile, ...],
+        *,
+        owner: Hashable,
+    ) -> None:
+        """Verify the destination prefix contains exactly the committed objects."""
+        if tuple(item.relative_path for item in committed) != plan.mapped_paths:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                "Directory destination records do not match their transfer plan",
+            )
+        expected = {
+            _object_key(plan.target, item.relative_path): (item.size, item.etag)
+            for item in committed
+        }
+        root_object_name = _object_key(plan.target, plan.destination_root)
+        async with self._hold_mutations(
+            (_subtree_scope(plan.target, plan.destination_root),),
+            owner=owner,
+        ):
+            self._ensure_active(plan.target)
+            if await _stat_optional(self._storage, root_object_name) is not None:
+                raise _workspace_directory_finalize_error()
+            actual: dict[str, tuple[int, str]] = {}
+            prefix = f"{root_object_name}/"
+            async for objects in _metadata_pages(self._storage, prefix):
+                for item in objects:
+                    if not item.object_name.startswith(prefix) or item.object_name in actual:
+                        raise _workspace_storage_shape_error()
+                    actual[item.object_name] = (item.size, item.etag)
+            if actual != expected:
+                raise _workspace_directory_finalize_error()
+
+    async def directory_root_is_absent(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        owner: Hashable,
+    ) -> bool:
+        """Return whether neither an exact object nor any prefix child exists."""
+        if relative_path:
+            object_name = _object_key(target, relative_path)
+            prefix = f"{object_name}/"
+        else:
+            object_name = None
+            prefix = _workspace_prefix(target)
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=owner,
+        ):
+            self._ensure_active(target)
+            if (
+                object_name is not None
+                and await _stat_optional(self._storage, object_name) is not None
+            ):
+                return False
+            return not bool((await self._storage.list_page(prefix, limit=1)).items)
+
     async def _authoritative_usage(self, target: WorkspaceTarget) -> int:
         usage = 0
         async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
@@ -706,6 +782,16 @@ class WorkspaceFS:
                     mode=mode,
                     on_issued=on_issued,
                 )
+        except AdmissionTimeoutError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_BUSY,
+                "Workspace transfer capacity is busy; retry later",
+            ) from exc
+
+    async def acquire_server_transfer_operation(self, user_id: UUID) -> AdmissionLease:
+        """Acquire one transferable Server workspace transfer operation lease."""
+        try:
+            return await self._server_transfers.acquire(user_id)
         except AdmissionTimeoutError as exc:
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_TRANSFER_BUSY,
@@ -1154,7 +1240,7 @@ class WorkspaceFS:
             cleanup.add_done_callback(self._transfer_cleanup_tasks.discard)
             metadata = FileMetadata(size=size, etag=uploaded.etag, created=True)
             if cancelled:
-                raise UploadCommittedAfterCancellation
+                raise UploadCommittedAfterCancellation(metadata)
             return metadata
 
     async def _write(
@@ -1694,6 +1780,13 @@ def _workspace_directory_too_large() -> WorkspaceError:
     return WorkspaceError(
         ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE,
         "Workspace directory exceeds the recursive transfer limit",
+    )
+
+
+def _workspace_directory_finalize_error() -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_FILE_CHANGED,
+        "Workspace destination directory changed before finalization",
     )
 
 

@@ -83,9 +83,18 @@ class KeyedAdmission:
 
     @asynccontextmanager
     async def slot(self, key: Hashable) -> AsyncIterator[None]:
+        lease = await self.acquire(key)
+        try:
+            yield
+        finally:
+            await lease.aclose()
+
+    async def acquire(self, key: Hashable) -> AdmissionLease:
+        """Acquire capacity whose ownership may outlive the current stack frame."""
         entry = self._keyed.lease(key)
         keyed_acquired = False
         global_acquired = False
+        transferred = False
         try:
             try:
                 async with asyncio.timeout(self._timeout_seconds):
@@ -95,13 +104,20 @@ class KeyedAdmission:
                     global_acquired = True
             except TimeoutError as exc:
                 raise AdmissionTimeoutError from exc
-            yield
+            transferred = True
+            return AdmissionLease(lambda: self._release_capacity(key, entry))
         finally:
-            if global_acquired:
+            if global_acquired and not transferred:
                 self._global.release()
-            if keyed_acquired:
+            if keyed_acquired and not transferred:
                 entry.semaphore.release()
-            self._keyed.release(key, entry)
+            if not transferred:
+                self._keyed.release(key, entry)
+
+    def _release_capacity(self, key: Hashable, entry: _Entry) -> None:
+        self._global.release()
+        entry.semaphore.release()
+        self._keyed.release(key, entry)
 
 
 class KeyedDirectionalAdmission:
