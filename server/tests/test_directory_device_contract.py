@@ -60,6 +60,12 @@ def _directory_result() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("fingerprint", ["line\nbreak", "non-ascii-é", "delete-\x7f"])
+def test_file_source_probe_rejects_non_visible_ascii_fingerprint(fingerprint: str) -> None:
+    with pytest.raises(ValidationError, match="visible ASCII"):
+        FileSourceProbe(size=1, fingerprint=fingerprint)
+
+
 def test_build_directory_action_returns_strict_wire_payload() -> None:
     operation_id = _operation_id()
     action = build_directory_action(

@@ -17,7 +17,7 @@ import openoctopus_client.transfer as transfer_module
 from openoctopus_client.tools import ClientToolDispatcher
 from openoctopus_client.tools.common import ToolFailure, ToolOutput
 from openoctopus_client.tools.locks import PathLocks
-from openoctopus_client.tools.workspace_rest import INTERNAL_WORKSPACE_ACTION
+from openoctopus_client.tools.workspace_rest import INTERNAL_WORKSPACE_ACTION, FileSourceProbe
 from openoctopus_client.transfer_admission import (
     LocalTransferAdmission,
     LocalTransferDrainRegistry,
@@ -63,6 +63,12 @@ def _make_directory_link(link: Path, target: Path) -> None:
     )
     if completed.returncode != 0:
         raise OSError("unable to create a Windows directory junction")
+
+
+@pytest.mark.parametrize("fingerprint", ["line\nbreak", "non-ascii-é", "delete-\x7f"])
+def test_file_source_probe_rejects_non_visible_ascii_fingerprint(fingerprint: str) -> None:
+    with pytest.raises(ValueError, match="visible ASCII"):
+        FileSourceProbe(size=1, fingerprint=fingerprint)
 
 
 def test_workspace_rest_returns_machine_results_and_etag_guard(tmp_path: Path) -> None:

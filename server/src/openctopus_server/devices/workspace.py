@@ -31,6 +31,7 @@ from openctopus_server.directory_contract import (
     MAX_DIRECTORY_PAGE_BYTES,
     DirectoryManifest,
     DirectoryManifestPage,
+    _validate_visible_ascii,
     canonical_json_bytes,
 )
 from openctopus_server.errors.codes import ErrorCode
@@ -402,6 +403,8 @@ class FileSourceProbe(_StrictModel):
     kind: Literal["file"] = "file"
     size: int = Field(ge=0, le=MAX_DIRECTORY_INTEGER)
     fingerprint: str = Field(min_length=1, max_length=512)
+
+    _fingerprint = field_validator("fingerprint")(_validate_visible_ascii)
 
 
 class DirectorySourceProbe(_StrictModel):
