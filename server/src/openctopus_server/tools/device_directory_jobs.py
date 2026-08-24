@@ -42,6 +42,7 @@ from openctopus_server.directory_contract import (
     create_directory_manifest,
 )
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.tools.directory_transfer import DirectoryMutationNotAppliedError
 
 _CONTROL_RESULT_BYTES = 64 * 1024
 _PAGE_RESULT_BYTES = MAX_DIRECTORY_PAGE_BYTES + 4 * 1024
@@ -588,7 +589,9 @@ class DeviceDirectoryJobController:
             if not isinstance(status, LocalDirectoryJobStatus):
                 raise TransferIntegrityError("local reconciliation returned the wrong type")
             if status.state == "ready_not_started":
-                _raise_reconciliation_failure(original, mutation_issued=False)
+                raise DirectoryMutationNotAppliedError(
+                    "Local directory start was not applied"
+                ) from original
             return status
 
         result = await self._one_shot(
@@ -800,6 +803,10 @@ class DeviceDirectoryJobController:
             if not isinstance(status, DestinationDirectoryJobStatus):
                 raise TransferIntegrityError("destination reconciliation returned the wrong type")
             if evidence_states is not None and status.state not in evidence_states:
+                if not not_applied_mutation_issued:
+                    raise DirectoryMutationNotAppliedError(
+                        "Directory mutation was not applied"
+                    ) from original
                 _raise_reconciliation_failure(
                     original,
                     mutation_issued=not_applied_mutation_issued,
@@ -1131,6 +1138,7 @@ class DeviceDirectoryJobController:
         try:
             cancelled = await cancel(reconcile_deadline)
             if getattr(cancelled, "state", None) in reconciled_states:
+                _raise_no_progress_timeout_for_cancelled_terminal(cancelled, original)
                 return cancelled
         except (
             DeviceBusyError,
@@ -1162,6 +1170,7 @@ class DeviceDirectoryJobController:
             ):
                 snapshot = None
             if snapshot is not None and snapshot.state in reconciled_states:
+                _raise_no_progress_timeout_for_cancelled_terminal(snapshot, original)
                 return snapshot
             if self._monotonic() >= reconcile_deadline:
                 _raise_reconciliation_failure(
@@ -1295,6 +1304,18 @@ def _raise_device_error(code: str | None) -> None:
     if error_code is None:
         raise TransferIntegrityError("Device omitted its directory error code")
     raise TransferError(error_code.value)
+
+
+def _raise_no_progress_timeout_for_cancelled_terminal(
+    snapshot: object,
+    original: TimeoutError,
+) -> None:
+    terminal_error = getattr(snapshot, "terminal_error", None)
+    if (
+        getattr(snapshot, "state", None) == "failed"
+        and getattr(terminal_error, "code", None) == "tool_execution_cancelled"
+    ):
+        raise original
 
 
 def _raise_reconciliation_failure(

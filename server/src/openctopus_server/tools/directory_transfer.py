@@ -8,7 +8,10 @@ from uuid import UUID
 
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.devices.protocol import new_uuid7
-from openctopus_server.devices.registry import DeviceOutcomeUnknownError
+from openctopus_server.devices.registry import (
+    DeviceOutcomeUnknownError,
+    DeviceUnavailableError,
+)
 from openctopus_server.devices.transfer import TransferIntegrityError
 from openctopus_server.directory_contract import (
     DirectoryContentEntry,
@@ -67,6 +70,10 @@ class DirectoryChildCommittedAfterCancellation(asyncio.CancelledError):
 
 class DirectoryDestinationFinalizedAfterCancellation(asyncio.CancelledError):
     """The destination was fully verified before cancellation took effect."""
+
+
+class DirectoryMutationNotAppliedError(DeviceUnavailableError):
+    """A lost mutation call was reconciled as definitely not applied."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,8 +166,12 @@ class DirectoryTransferCoordinator:
                     await backend.finalize_destination(tuple(committed))
                 except DirectoryDestinationFinalizedAfterCancellation:
                     destination_finalized_after_cancellation = True
-            except BaseException:
-                if issued and not await _cleanup_destination(
+            except BaseException as exc:
+                mutation_may_have_started = issued and not isinstance(
+                    exc,
+                    DirectoryMutationNotAppliedError,
+                )
+                if mutation_may_have_started and not await _cleanup_destination(
                     backend,
                     tuple(committed),
                 ):

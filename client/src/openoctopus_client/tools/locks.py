@@ -81,18 +81,37 @@ class PathLocks:
 
             yield
         finally:
-            async with self._condition:
-                if registered:
-                    if acquired:
-                        self._active.remove(reservation)
-                    else:
-                        self._pending.remove(reservation)
-                    for path in requested:
-                        entry = self._locks[path]
-                        entry.references -= 1
-                        if entry.references == 0:
-                            self._locks.pop(path, None)
-                    self._condition.notify_all()
+            cleanup = asyncio.create_task(
+                self._release_reservation(
+                    reservation,
+                    requested,
+                    registered=registered,
+                    acquired=acquired,
+                )
+            )
+            await _await_task_cancellation_safe(cleanup)
+
+    async def _release_reservation(
+        self,
+        reservation: _Reservation,
+        requested: tuple[str, ...],
+        *,
+        registered: bool,
+        acquired: bool,
+    ) -> None:
+        async with self._condition:
+            if not registered:
+                return
+            if acquired:
+                self._active.remove(reservation)
+            else:
+                self._pending.remove(reservation)
+            for path in requested:
+                entry = self._locks[path]
+                entry.references -= 1
+                if entry.references == 0:
+                    self._locks.pop(path, None)
+            self._condition.notify_all()
 
     def _blocked(self, reservation: _Reservation) -> bool:
         if any(
@@ -134,6 +153,22 @@ class _Reservation:
 class _LockEntry:
     def __init__(self) -> None:
         self.references = 0
+
+
+async def _await_task_cancellation_safe(task: asyncio.Task[None]) -> None:
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                task.result()
+                raise
+            cancelled = True
+            continue
+        break
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _compact_paths(paths: tuple[str, ...]) -> tuple[str, ...]:

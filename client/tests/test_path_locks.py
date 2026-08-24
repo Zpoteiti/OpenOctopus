@@ -304,3 +304,30 @@ def test_path_locks_cancelled_subtree_reservation_does_not_leak() -> None:
         assert locks.reservation_count == 0
 
     asyncio.run(exercise())
+
+
+def test_path_locks_finish_release_after_repeated_cancellation() -> None:
+    async def exercise() -> None:
+        locks = PathLocks()
+        reservation = locks.reserve_subtree("operation-a", "/workspace/project")
+        await reservation.__aenter__()
+
+        await locks._condition.acquire()
+        try:
+            release = asyncio.create_task(reservation.__aexit__(None, None, None))
+            await asyncio.sleep(0)
+
+            release.cancel()
+            await asyncio.sleep(0)
+            release.cancel()
+            await asyncio.sleep(0)
+            assert release.done() is False
+        finally:
+            locks._condition.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await release
+        assert locks.entry_count == 0
+        assert locks.reservation_count == 0
+
+    asyncio.run(exercise())

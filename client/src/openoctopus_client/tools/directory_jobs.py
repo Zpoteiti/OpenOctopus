@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import errno
 import hashlib
+import ntpath
 import os
 import stat
 import sys
@@ -449,6 +450,8 @@ class DirectoryJobManager:
         try:
             lease = await self._admission.acquire(timeout_seconds=self._queue_timeout)
             assert record.source_value is not None
+            if _current_destination_platform() == "windows":
+                _validate_windows_caller_path(record.source_value)
             source = await asyncio.to_thread(
                 self._paths.resolve, record.source_value, directory=None
             )
@@ -483,8 +486,13 @@ class DirectoryJobManager:
                 state="failed",
                 error=_stable_error("tool_execution_cancelled", "Directory probe was cancelled"),
             )
-        except ToolFailure as exc:
-            await self._terminalize(record, state="failed", error=_tool_error(exc))
+        except (ToolFailure, PathLockBusyError) as exc:
+            error = (
+                _tool_error(exc)
+                if isinstance(exc, ToolFailure)
+                else _stable_error("workspace_transfer_busy", "Source subtree is busy")
+            )
+            await self._terminalize(record, state="failed", error=error)
         except (OSError, ValidationError, DirectoryContractError):
             await self._terminalize(
                 record,
@@ -730,6 +738,12 @@ class DirectoryJobManager:
                     "tool_execution_outcome_unknown", "Source cleanup could not acquire capacity"
                 ),
             )
+        except PathLockBusyError:
+            record.terminal_result = DirectoryCleanupResult(
+                cleanup_complete=False,
+                warnings=["source_cleanup_incomplete"],
+            )
+            await self._terminalize(record, state="succeeded")
         except (ToolFailure, OSError, _CleanupCancelledError) as exc:
             error = (
                 _tool_error(exc)
@@ -779,6 +793,9 @@ class DirectoryJobManager:
             lease = await self._admission.acquire(timeout_seconds=self._queue_timeout)
             _check_forward(record.stop_forward_work)
             assert record.destination_value is not None and record.manifest is not None
+            platform = _current_destination_platform()
+            if platform == "windows":
+                _validate_windows_caller_path(record.destination_value)
             destination = await asyncio.to_thread(
                 self._paths.resolve, record.destination_value, directory=None
             )
@@ -786,7 +803,7 @@ class DirectoryJobManager:
                 _preflight_destination,
                 destination,
                 record.manifest,
-                _current_destination_platform(),
+                platform,
                 record.stop_forward_work,
                 record.bump,
             )
@@ -811,7 +828,16 @@ class DirectoryJobManager:
                 else _stable_error("workspace_transfer_busy", "Destination subtree is busy")
             )
             await self._terminalize(record, state="failed", error=error)
-        except (OSError, DirectoryContractError):
+        except DirectoryContractError:
+            await self._terminalize(
+                record,
+                state="failed",
+                error=_stable_error(
+                    "workspace_invalid_request",
+                    "Destination path cannot represent the directory manifest",
+                ),
+            )
+        except OSError:
             await self._terminalize(
                 record,
                 state="failed",
@@ -2295,11 +2321,11 @@ def _preflight_destination(
         raise ToolFailure("workspace_symlink_escape", "Destination ancestor is not a directory")
     for entry in manifest.entries:
         _check_forward(stop)
+        if platform == "windows":
+            _validate_windows_components(entry.relative_path)
         mapped = destination.joinpath(*entry.relative_path.split("/"))
         if len(str(mapped)) > 4096:
             raise ToolFailure("workspace_invalid_request", "Destination path is too long")
-        if platform == "windows":
-            _validate_windows_components(entry.relative_path)
         progress(entries=1)
 
 
@@ -2309,13 +2335,59 @@ def _validate_windows_components(relative_path: str) -> None:
         "prn",
         "aux",
         "nul",
+        "conin$",
+        "conout$",
         *(f"com{index}" for index in range(1, 10)),
         *(f"lpt{index}" for index in range(1, 10)),
+        *(f"com{index}" for index in "¹²³"),
+        *(f"lpt{index}" for index in "¹²³"),
     }
+    invalid_characters = frozenset('<>:"/\\|?*')
     for component in relative_path.split("/"):
-        stem = component.split(".", 1)[0].casefold()
-        if component.endswith((".", " ")) or stem in reserved:
+        stem = component.split(".", 1)[0].rstrip(" ").casefold()
+        if (
+            component.endswith((".", " "))
+            or stem in reserved
+            or any(
+                ord(character) < 32 or character in invalid_characters
+                for character in component
+            )
+        ):
             raise ToolFailure("workspace_invalid_request", "Path is not representable on Windows")
+
+
+def _validate_windows_caller_path(value: str) -> None:
+    def invalid() -> None:
+        raise ToolFailure(
+            "workspace_invalid_request",
+            "Path is not representable on Windows",
+        )
+
+    if not value or "\x00" in value:
+        invalid()
+    drive, tail = ntpath.splitdrive(value)
+    normalized_drive = drive.replace("/", "\\")
+    if drive:
+        if not ntpath.isabs(value) or normalized_drive.startswith(("\\\\?\\", "\\\\.\\")):
+            invalid()
+        if normalized_drive.startswith("\\\\"):
+            anchor = normalized_drive[2:].split("\\")
+            if len(anchor) != 2 or not all(anchor):
+                invalid()
+        elif not (
+            len(normalized_drive) == 2
+            and normalized_drive[0].isascii()
+            and normalized_drive[0].isalpha()
+            and normalized_drive[1] == ":"
+        ):
+            invalid()
+    elif value.startswith(("\\", "/")):
+        invalid()
+
+    for component in tail.replace("\\", "/").split("/"):
+        if component in {"", ".", ".."}:
+            continue
+        _validate_windows_components(component)
 
 
 def _reject_overlap(source: Path, destination: Path, platform: DestinationPlatform) -> None:

@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import httpx
@@ -36,7 +37,12 @@ from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRout
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import ToolRegistry, build_py3_registry, build_py4_registry
 from openctopus_server.tools.result import UNTRUSTED_TOOL_RESULT_WARNING
-from openctopus_server.workspace.fs import DirectoryEntry, DirectoryPage, FileMetadata
+from openctopus_server.workspace.fs import (
+    DirectoryEntry,
+    DirectoryPage,
+    FileMetadata,
+    WorkspaceFS,
+)
 from openctopus_server.workspace.skills import SkillsCache
 
 
@@ -531,7 +537,11 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
     runtime = ChatRuntime(
         pg_engine,
         provider_factory=lambda config: provider,
-        tool_registry=build_py4_registry(pg_engine, workspace),  # type: ignore[arg-type]
+        tool_registry=build_py4_registry(
+            pg_engine,
+            workspace,  # type: ignore[arg-type]
+            Mock(spec=WorkspaceFS),
+        ),
         workspace_service=workspace,  # type: ignore[arg-type]
     )
     test_app.state.chat_runtime = runtime

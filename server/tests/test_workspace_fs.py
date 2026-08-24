@@ -1719,6 +1719,77 @@ async def test_server_regular_admitted_transfer_reuses_outer_admission(
     assert warnings == ()
 
 
+async def test_server_regular_admitted_transfer_validates_staging_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        def __init__(self) -> None:
+            self._read = False
+
+        async def read(self) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            return b"payload"
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        object_name = "temp"
+
+        async def write(self, _chunk: bytes) -> None:
+            pass
+
+        async def finish(self) -> None:
+            events.append("finish")
+
+        async def abort(self) -> None:
+            events.append("abort")
+
+    async def validate_staging(object_name: str, size: int) -> None:
+        assert object_name == "temp"
+        assert size == 7
+        events.append("validate")
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT,
+            "invalid Skill manifest",
+        )
+
+    fs = WorkspaceFS(AsyncMock())
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=Source()))
+    monkeypatch.setattr(
+        fs,
+        "begin_transfer_upload",
+        AsyncMock(return_value=(Sink(), "temp")),
+    )
+    commit = AsyncMock()
+    monkeypatch.setattr(fs, "commit_uploaded_object", commit)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.transfer_server_to_server_admitted(
+            target,
+            "source.txt",
+            target,
+            "skills/demo/SKILL.md",
+            quota_bytes=100,
+            mode="copy",
+            expected_source_size=7,
+            expected_source_fingerprint="source-v1",
+            validate_staging=validate_staging,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    assert events == ["finish", "validate", "abort"]
+    commit.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("expected_size", "expected_fingerprint"),
     [(8, "source-v1"), (7, "source-v2")],

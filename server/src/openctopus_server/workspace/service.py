@@ -906,6 +906,26 @@ class WorkspaceService:
             cleanup = asyncio.create_task(stream.aclose())
             await await_future_cancellation_safe(cleanup)
 
+    async def validate_transfer_skill_staging(
+        self,
+        destination: TransferPathTicket,
+        object_name: str,
+        *,
+        expected_size: int,
+    ) -> None:
+        """Validate a staged personal Skill before a single-file publish."""
+
+        if (
+            destination.target != WorkspaceTarget.personal(destination.user_id)
+            or not is_skill_manifest(destination.relative_path)
+        ):
+            return
+        await self.validate_staged_directory_skill_manifest(
+            destination.relative_path,
+            object_name,
+            expected_size=expected_size,
+        )
+
     def directory_transfer_committed(self, destination: TransferPathTicket) -> None:
         """Invalidate personal Skill discovery after an exact directory finalize."""
 
@@ -962,6 +982,11 @@ class WorkspaceService:
     ) -> bool:
         del sha256
         try:
+            await self.validate_transfer_skill_staging(
+                ticket,
+                sink.object_name,
+                expected_size=size,
+            )
             try:
                 await self._fs.commit_uploaded_object(
                     ticket.target,
@@ -997,6 +1022,14 @@ class WorkspaceService:
         # while the transfer streams through object storage or waits for the
         # source-delete cleanup.
         await db.close()
+
+        async def validate_staging(object_name: str, size: int) -> None:
+            await self.validate_transfer_skill_staging(
+                destination,
+                object_name,
+                expected_size=size,
+            )
+
         try:
             transferred, digest, warnings = await self._fs.transfer_server_to_server(
                 source.target,
@@ -1007,6 +1040,7 @@ class WorkspaceService:
                 quota_bytes=destination.quota_bytes,
                 mode=mode,
                 on_issued=on_issued,
+                validate_staging=validate_staging,
             )
             return WorkspaceTransferResult(transferred, digest, warnings)
         finally:

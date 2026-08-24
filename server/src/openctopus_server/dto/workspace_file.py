@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -95,11 +95,9 @@ class StructuredPatchResponse(BaseModel):
     committed: int
 
 
-class TransferResponse(BaseModel):
+class _TransferResponseFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["file", "directory"]
-    files_transferred: int = Field(ge=1, le=10_000)
     bytes_transferred: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     warnings: list[
@@ -109,7 +107,7 @@ class TransferResponse(BaseModel):
             "source_changed_after_copy",
             "source_cleanup_incomplete",
         ]
-    ] = Field(max_length=8)
+    ] = Field(max_length=8, json_schema_extra={"uniqueItems": True})
 
     @field_validator("warnings")
     @classmethod
@@ -121,11 +119,27 @@ class TransferResponse(BaseModel):
             raise ValueError("transfer warnings must be unique and canonically ordered")
         return value
 
-    @model_validator(mode="after")
-    def validate_kind_count(self) -> TransferResponse:
-        if self.kind == "file" and self.files_transferred != 1:
-            raise ValueError("file transfer count must be one")
-        return self
+
+class FileTransferResponse(_TransferResponseFields):
+    kind: Literal["file"]
+    files_transferred: Literal[1]
+
+
+class DirectoryTransferResponse(_TransferResponseFields):
+    kind: Literal["directory"]
+    files_transferred: int = Field(ge=1, le=10_000)
+
+
+type TransferResponse = Annotated[
+    FileTransferResponse | DirectoryTransferResponse,
+    Field(
+        discriminator="kind",
+        description=(
+            "Bounded file or directory aggregate. File responses always report one file; "
+            "directory responses report 1..10000 regular files."
+        ),
+    ),
+]
 
 
 class GrepContextLine(BaseModel):

@@ -701,7 +701,7 @@ async def test_client_exec_stable_errors_are_preserved(code: str) -> None:
 async def test_transfer_disconnect_is_outcome_unknown_at_agent_and_rest_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
 
     async def disconnected(*_args: object, **_kwargs: object) -> Any:
         raise TransferDisconnectedError("lost after issue")

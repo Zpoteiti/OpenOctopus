@@ -1171,6 +1171,101 @@ async def test_staged_directory_skill_validation_streams_and_closes() -> None:
     assert caught.value.code is ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED
 
 
+async def test_single_file_transfer_validates_personal_skill_staging_before_commit() -> None:
+    user_id = uuid4()
+    content = b"not a Skill manifest"
+    stream = SimpleNamespace(
+        size=len(content),
+        read=AsyncMock(side_effect=[content, b""]),
+        aclose=AsyncMock(),
+    )
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.open_directory_validation_staging.return_value = stream
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills/demo/SKILL.md",
+        target=WorkspaceTarget.personal(user_id),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    with pytest.raises(WorkspaceError) as caught:
+        await service.commit_transfer_upload(
+            ticket,
+            sink,
+            size=len(content),
+            sha256="0" * 64,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    workspace_fs.commit_uploaded_object.assert_not_awaited()
+    stream.aclose.assert_awaited_once()
+
+
+async def test_single_file_transfer_publishes_valid_personal_skill_staging() -> None:
+    user_id = uuid4()
+    content = b"---\nname: demo\ndescription: valid\n---\nbody"
+    stream = SimpleNamespace(
+        size=len(content),
+        read=AsyncMock(side_effect=[content, b""]),
+        aclose=AsyncMock(),
+    )
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.open_directory_validation_staging.return_value = stream
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills/demo/SKILL.md",
+        target=WorkspaceTarget.personal(user_id),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    cancelled_after_commit = await service.commit_transfer_upload(
+        ticket,
+        sink,
+        size=len(content),
+        sha256="0" * 64,
+    )
+
+    assert cancelled_after_commit is False
+    workspace_fs.commit_uploaded_object.assert_awaited_once_with(
+        ticket.target,
+        ticket.relative_path,
+        sink.object_name,
+        size=len(content),
+        quota_bytes=ticket.quota_bytes,
+    )
+    stream.aclose.assert_awaited_once()
+
+
+async def test_single_file_transfer_does_not_validate_shared_skill_namespace() -> None:
+    user_id = uuid4()
+    workspace_fs = _workspace_fs_mock()
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="/shared@12345678/skills/demo/SKILL.md",
+        target=WorkspaceTarget.shared(uuid4()),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    await service.commit_transfer_upload(
+        ticket,
+        sink,
+        size=1,
+        sha256="0" * 64,
+    )
+
+    workspace_fs.open_directory_validation_staging.assert_not_awaited()
+    workspace_fs.commit_uploaded_object.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     "relative_path",
     ["", "skills", "skills/demo", "skills/demo/SKILL.md"],

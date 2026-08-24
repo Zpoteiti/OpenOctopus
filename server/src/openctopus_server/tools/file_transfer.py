@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -10,8 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.db.models import Device
-from openctopus_server.devices.protocol import TransferBeginFrame
+from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
 from openctopus_server.devices.registry import (
     BridgeRoutePair,
     ConnectionHandle,
@@ -26,22 +28,43 @@ from openctopus_server.devices.transfer import (
     TransferDisconnectedError,
     TransferError,
     TransferIntegrityError,
+    TransferLease,
+    TransferManager,
     TransferUnavailableError,
 )
 from openctopus_server.devices.workspace import (
     INTERNAL_WORKSPACE_ACTION,
     DeviceTransferLocalResult,
+    DirectorySourceProbe,
+    FileSourceProbe,
 )
+from openctopus_server.directory_contract import DirectoryManifest
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import OpenOctopusError
+from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
 from openctopus_server.tools.base import (
     Tool,
     ToolContext,
     ToolResult,
     ToolRoutingMode,
 )
+from openctopus_server.tools.cross_site_directory_backend import (
+    ClientToClientDirectoryBackend,
+    ClientToServerDirectoryBackend,
+    ServerToClientDirectoryBackend,
+)
+from openctopus_server.tools.device_directory_jobs import DeviceDirectoryJobController
 from openctopus_server.tools.device_field import DEVICE_FIELD_MARKER
-from openctopus_server.workspace.service import TransferPathTicket
+from openctopus_server.tools.directory_transfer import (
+    DirectoryMutationNotAppliedError,
+    DirectoryTransferCoordinator,
+    DirectoryTransferResult,
+)
+from openctopus_server.tools.server_directory_backend import ServerDirectoryTransferBackend
+from openctopus_server.workspace.fs import ServerFileSourceProbe, WorkspaceFS
+from openctopus_server.workspace.service import (
+    TransferPathTicket,
+    WorkspaceService,
+)
 
 FILE_TRANSFER_SCHEMA: dict[str, Any] = {
     "name": "file_transfer",
@@ -57,7 +80,7 @@ FILE_TRANSFER_SCHEMA: dict[str, Any] = {
             "openoctopus_src_device": {
                 "type": "string",
                 "enum": ["server"],
-                "description": "Device where the source regular file lives.",
+                "description": "Device where the source file or directory lives.",
                 DEVICE_FIELD_MARKER: True,
             },
             "src_path": {
@@ -69,7 +92,7 @@ FILE_TRANSFER_SCHEMA: dict[str, Any] = {
             "openoctopus_dst_device": {
                 "type": "string",
                 "enum": ["server"],
-                "description": "Device where the regular file should land.",
+                "description": "Device where the file or directory should land.",
                 DEVICE_FIELD_MARKER: True,
             },
             "dst_path": {
@@ -184,17 +207,6 @@ class FileTransferOutcome:
 
 
 class _TransferWorkspace(Protocol):
-    async def transfer_server_to_server(
-        self,
-        db: AsyncSession,
-        *,
-        user_id: UUID,
-        src_path: str,
-        dst_path: str,
-        mode: str,
-        on_issued: Callable[[], None] | None = None,
-    ) -> Any: ...
-
     async def authorize_transfer_source(
         self,
         db: AsyncSession,
@@ -231,9 +243,19 @@ class _TransferWorkspace(Protocol):
         sha256: str,
     ) -> bool: ...
 
+    async def validate_transfer_skill_staging(
+        self,
+        destination: TransferPathTicket,
+        object_name: str,
+        *,
+        expected_size: int,
+    ) -> None: ...
+
+    def transfer_ticket_changed(self, ticket: TransferPathTicket) -> None: ...
+
 
 class _TransferRegistry(Protocol):
-    transfers: Any
+    transfers: TransferManager
 
     async def get_handle(
         self,
@@ -261,18 +283,6 @@ class _TransferRegistry(Protocol):
         destination_device_name: str,
     ) -> BridgeRoutePair | None: ...
 
-    async def dispatch_tool(
-        self,
-        *,
-        device_id: UUID,
-        user_id: UUID,
-        name: str,
-        args: dict[str, object],
-        max_result_bytes: int,
-        timeout_seconds: float,
-        expected_device_name: str | None = None,
-    ) -> Any: ...
-
     async def dispatch_tool_on_snapshot(
         self,
         *,
@@ -285,6 +295,10 @@ class _TransferRegistry(Protocol):
         timeout_seconds: float,
         on_issued: Callable[[], None] | None = None,
     ) -> Any: ...
+
+
+class _OperationLease(Protocol):
+    async def aclose(self) -> None: ...
 
 
 class FileTransferTool(Tool):
@@ -303,10 +317,12 @@ class FileTransferTool(Tool):
         engine: AsyncEngine | None,
         workspace_service: _TransferWorkspace | None,
         device_registry: _TransferRegistry | None,
+        workspace_fs: WorkspaceFS | None,
     ) -> None:
         self._engine = engine
         self._workspace = workspace_service
         self._devices = device_registry
+        self._fs = workspace_fs
 
     def name(self) -> str:
         return "file_transfer"
@@ -381,82 +397,157 @@ class FileTransferTool(Tool):
         exceptions at their boundary.
         """
 
-        if self._workspace is None and (
-            request.openoctopus_src_device == "server" or request.openoctopus_dst_device == "server"
-        ):
+        uses_server = (
+            request.openoctopus_src_device == "server"
+            or request.openoctopus_dst_device == "server"
+        )
+        uses_client = (
+            request.openoctopus_src_device != "server"
+            or request.openoctopus_dst_device != "server"
+        )
+        if self._engine is None:
             raise OpenOctopusError(ErrorCode.TOOL_INVALID_ARGS, "File transfer is not configured")
-        if (
-            self._engine is None
-            and not (
-                request.openoctopus_src_device == "server"
-                and request.openoctopus_dst_device == "server"
-            )
-        ) or (request.openoctopus_src_device != "server" and self._devices is None):
+        if uses_server and (self._workspace is None or self._fs is None):
+            raise OpenOctopusError(ErrorCode.TOOL_INVALID_ARGS, "File transfer is not configured")
+        if uses_client and self._devices is None:
             raise OpenOctopusError(ErrorCode.TOOL_INVALID_ARGS, "File transfer is not configured")
 
-        if (
-            request.openoctopus_src_device == "server"
-            and request.openoctopus_dst_device == "server"
-        ):
-            result = await self._server_to_server(request, user_id, on_issued)
-        elif (
-            request.openoctopus_src_device != "server"
-            and request.openoctopus_dst_device == request.openoctopus_src_device
-        ):
-            result = await self._client_to_client(
+        server_tickets: list[TransferPathTicket] = []
+        try:
+            if (
+                request.openoctopus_src_device == "server"
+                and request.openoctopus_dst_device == "server"
+            ):
+                return await self._server_to_server(
+                    request,
+                    user_id,
+                    on_issued,
+                    server_tickets,
+                )
+            if (
+                request.openoctopus_src_device != "server"
+                and request.openoctopus_dst_device == request.openoctopus_src_device
+            ):
+                return await self._client_to_client(
+                    request,
+                    user_id,
+                    device_targets,
+                    on_issued,
+                )
+            if request.openoctopus_src_device == "server":
+                return await self._server_to_client(
+                    request,
+                    user_id,
+                    device_targets,
+                    on_issued,
+                    server_tickets,
+                )
+            if request.openoctopus_dst_device != "server":
+                return await self._client_to_distinct_client(
+                    request,
+                    user_id,
+                    device_targets,
+                    on_issued,
+                )
+            return await self._client_to_server(
                 request,
                 user_id,
                 device_targets,
                 on_issued,
+                server_tickets,
             )
-        elif request.openoctopus_src_device == "server":
-            result = await self._server_to_client(
-                request,
-                user_id,
-                device_targets,
-                on_issued,
-            )
-        elif request.openoctopus_dst_device != "server":
-            result = await self._client_to_distinct_client(
-                request,
-                user_id,
-                device_targets,
-                on_issued,
-            )
-        else:
-            result = await self._client_to_server(
-                request,
-                user_id,
-                device_targets,
-                on_issued,
-            )
-        return _coerce_transfer_outcome(result)
+        finally:
+            workspace = self._workspace
+            if workspace is not None:
+                seen: set[int] = set()
+                for ticket in server_tickets:
+                    identity = id(ticket)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    workspace.transfer_ticket_changed(ticket)
 
     async def _server_to_server(
         self,
         parsed: FileTransferRequest,
         user_id: UUID,
         on_issued: Callable[[], None] | None,
-    ) -> Any:
+        server_tickets: list[TransferPathTicket],
+    ) -> FileTransferOutcome:
         workspace = self._require_workspace()
-        if self._engine is None:
-            return await workspace.transfer_server_to_server(
-                cast(AsyncSession, None),
-                user_id=user_id,
-                src_path=parsed.src_path,
-                dst_path=parsed.dst_path,
-                mode=parsed.mode,
-                on_issued=on_issued,
-            )
-        async with AsyncSession(self._engine, expire_on_commit=False) as db:
-            return await workspace.transfer_server_to_server(
+        workspace_fs = self._require_fs()
+        async with AsyncSession(self._require_engine(), expire_on_commit=False) as db:
+            source = await workspace.authorize_transfer_source(
                 db,
                 user_id=user_id,
-                src_path=parsed.src_path,
-                dst_path=parsed.dst_path,
+                path=parsed.src_path,
+            )
+            server_tickets.append(source)
+            destination = await workspace.authorize_transfer_destination(
+                db,
+                user_id=user_id,
+                path=parsed.dst_path,
+            )
+            server_tickets.append(destination)
+
+        lease = await workspace_fs.acquire_server_transfer_operation(user_id)
+        handed_off = False
+
+        async def validate_staging(object_name: str, size: int) -> None:
+            await workspace.validate_transfer_skill_staging(
+                destination,
+                object_name,
+                expected_size=size,
+            )
+
+        try:
+            probe = await workspace_fs.probe_directory_source(
+                source.target,
+                source.relative_path,
+            )
+            if isinstance(probe, ServerFileSourceProbe):
+                transferred, digest, warnings = (
+                    await workspace_fs.transfer_server_to_server_admitted(
+                        source.target,
+                        source.relative_path,
+                        destination.target,
+                        destination.relative_path,
+                        quota_bytes=destination.quota_bytes,
+                        mode=parsed.mode,
+                        expected_source_size=probe.size,
+                        expected_source_fingerprint=probe.fingerprint,
+                        on_issued=on_issued,
+                        validate_staging=validate_staging,
+                    )
+                )
+                return FileTransferOutcome(
+                    kind="file",
+                    files_transferred=1,
+                    bytes_transferred=transferred,
+                    sha256=digest,
+                    warnings=warnings,
+                )
+
+            backend = ServerDirectoryTransferBackend(
+                workspace_fs=workspace_fs,
+                workspace_service=cast(WorkspaceService, workspace),
+                source=source,
+                destination=destination,
+                manifest=probe.manifest,
+                operation_id=new_uuid7(),
+            )
+            handed_off = True
+            directory_result = await DirectoryTransferCoordinator().run(
+                manifest=probe.manifest,
                 mode=parsed.mode,
+                backend=backend,
+                operation_lease=lease,
                 on_issued=on_issued,
             )
+            return _directory_outcome(directory_result)
+        finally:
+            if not handed_off:
+                await _close_operation_lease(lease)
 
     async def _server_to_client(
         self,
@@ -464,8 +555,10 @@ class FileTransferTool(Tool):
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
         on_issued: Callable[[], None] | None,
-    ) -> Any:
+        server_tickets: list[TransferPathTicket],
+    ) -> FileTransferOutcome:
         workspace = self._require_workspace()
+        workspace_fs = self._require_fs()
         registry = self._require_registry()
         device_id = await self._device_id_for_call(
             user_id,
@@ -485,31 +578,78 @@ class FileTransferTool(Tool):
                 user_id=user_id,
                 path=parsed.src_path,
             )
-        source: Any | None = None
+            server_tickets.append(ticket)
 
-        async def source_factory() -> Any:
-            nonlocal source
-            source = await workspace.open_transfer_source(ticket)
-            return source
+        transfers = registry.transfers
+        lease = await transfers.acquire_operation(user_id)
+        handed_off = False
+        try:
+            probe = await workspace_fs.probe_directory_source(
+                ticket.target,
+                ticket.relative_path,
+            )
+            if isinstance(probe, ServerFileSourceProbe):
 
-        async def delete_source() -> None:
-            if source is None:
-                raise RuntimeError("transfer source is missing")
-            await workspace.delete_transfer_source(ticket, if_match=source.etag)
+                async def source_factory() -> Any:
+                    source = await workspace.open_transfer_source(ticket)
+                    if source.size != probe.size or source.etag != probe.fingerprint:
+                        close = asyncio.create_task(source.aclose())
+                        await await_future_cancellation_safe(close)
+                        raise _source_changed()
+                    return source
 
-        return await registry.transfers.start_server_to_client(
-            handle=route.handle,
-            route=route,
-            user_id=user_id,
-            src_path=parsed.src_path,
-            dst_path=parsed.dst_path,
-            source_factory=source_factory,
-            mode=parsed.mode,
-            delete_source=delete_source if parsed.mode == "move" else None,
-            src_device="server",
-            dst_device=parsed.openoctopus_dst_device,
-            on_issued=on_issued,
-        )
+                async def delete_source() -> None:
+                    await workspace.delete_transfer_source(
+                        ticket,
+                        if_match=probe.fingerprint,
+                    )
+
+                result = await transfers.start_server_to_client_regular_admitted(
+                    handle=route.handle,
+                    route=route,
+                    operation_lease=lease,
+                    slot_id=new_uuid7(),
+                    user_id=user_id,
+                    src_path=parsed.src_path,
+                    dst_path=parsed.dst_path,
+                    source_factory=source_factory,
+                    total_bytes=probe.size,
+                    mode=parsed.mode,
+                    delete_source=delete_source if parsed.mode == "move" else None,
+                    src_device="server",
+                    dst_device=parsed.openoctopus_dst_device,
+                    on_issued=on_issued,
+                )
+                return _coerce_transfer_outcome(result)
+
+            operation_id = new_uuid7()
+            destination = self._directory_controller(
+                registry,
+                route,
+                user_id=user_id,
+                operation_id=operation_id,
+            )
+            backend = ServerToClientDirectoryBackend(
+                transfer_manager=transfers,
+                operation_lease=lease,
+                workspace_fs=workspace_fs,
+                source=ticket,
+                destination=destination,
+                destination_root=parsed.dst_path,
+                manifest=probe.manifest,
+            )
+            handed_off = True
+            directory_result = await DirectoryTransferCoordinator().run(
+                manifest=probe.manifest,
+                mode=parsed.mode,
+                backend=backend,
+                operation_lease=lease,
+                on_issued=on_issued,
+            )
+            return _directory_outcome(directory_result)
+        finally:
+            if not handed_off:
+                await _close_operation_lease(lease)
 
     async def _client_to_server(
         self,
@@ -517,8 +657,10 @@ class FileTransferTool(Tool):
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
         on_issued: Callable[[], None] | None,
-    ) -> Any:
+        server_tickets: list[TransferPathTicket],
+    ) -> FileTransferOutcome:
         workspace = self._require_workspace()
+        workspace_fs = self._require_fs()
         registry = self._require_registry()
         device_id = await self._device_id_for_call(
             user_id,
@@ -538,62 +680,68 @@ class FileTransferTool(Tool):
                 user_id=user_id,
                 path=parsed.dst_path,
             )
+            server_tickets.append(ticket)
 
-        source_etag: str | None = None
-
-        async def make_sink(begin: TransferBeginFrame) -> Any:
-            nonlocal source_etag
-            if begin.src_path != parsed.src_path or begin.dst_path != parsed.dst_path:
-                raise ValueError("client transfer metadata does not match the request")
-            if begin.total_bytes is None:
-                raise ValueError("client file transfer did not declare its size")
-            source_etag = begin.etag
-            return await workspace.begin_transfer_upload(ticket, size=begin.total_bytes)
-
-        async def commit_sink(
-            sink: Any,
-            _begin: TransferBeginFrame,
-            size: int,
-            digest: str,
-        ) -> bool:
-            return await workspace.commit_transfer_upload(
-                ticket,
-                sink,
-                size=size,
-                sha256=digest,
-            )
-
-        async def delete_source() -> None:
-            if source_etag is None:
-                raise RuntimeError("client source fingerprint is missing")
-            result = await registry.dispatch_tool_on_snapshot(
-                route=route,
-                user_id=user_id,
-                expected_device_name=parsed.openoctopus_src_device,
-                name=INTERNAL_WORKSPACE_ACTION,
-                args={
-                    "operation": "delete_file",
-                    "path": parsed.src_path,
-                    "if_match": source_etag,
-                },
-                max_result_bytes=16 * 1024,
-                timeout_seconds=30,
-            )
-            if getattr(result, "is_error", False):
-                raise RuntimeError("client source deletion failed")
-
-        return await registry.transfers.start_client_to_server(
-            handle=route.handle,
-            route=route,
+        transfers = registry.transfers
+        lease = await transfers.acquire_operation(user_id)
+        operation_id = new_uuid7()
+        source = self._directory_controller(
+            registry,
+            route,
             user_id=user_id,
-            src_path=parsed.src_path,
-            dst_path=parsed.dst_path,
-            sink_factory=make_sink,
-            commit_sink=commit_sink,
-            delete_source=delete_source if parsed.mode == "move" else None,
-            mode=parsed.mode,
-            on_issued=on_issued,
+            operation_id=operation_id,
         )
+        source_owned = False
+        handed_off = False
+        try:
+            source_owned = True
+            probe = await self._probe_client_source(source, parsed.src_path)
+            if isinstance(probe, FileSourceProbe):
+                await source.release_source_probe()
+                source_owned = False
+                result = await self._client_file_to_server(
+                    parsed,
+                    user_id=user_id,
+                    route=route,
+                    ticket=ticket,
+                    probe=probe,
+                    lease=lease,
+                    transfers=transfers,
+                    workspace=workspace,
+                    registry=registry,
+                    on_issued=on_issued,
+                )
+                return _coerce_transfer_outcome(result)
+
+            manifest = await source.retrieve_source_manifest(probe)
+            await source.hold_source_probe()
+            backend = ClientToServerDirectoryBackend(
+                transfer_manager=transfers,
+                operation_lease=lease,
+                workspace_fs=workspace_fs,
+                workspace_service=cast(WorkspaceService, workspace),
+                source=source,
+                source_root=parsed.src_path,
+                destination=ticket,
+                manifest=manifest,
+            )
+            source_owned = False
+            handed_off = True
+            result = await DirectoryTransferCoordinator().run(
+                manifest=manifest,
+                mode=parsed.mode,
+                backend=backend,
+                operation_lease=lease,
+                on_issued=on_issued,
+            )
+            return _directory_outcome(result)
+        finally:
+            try:
+                if source_owned:
+                    await _retire_client_source(source)
+            finally:
+                if not handed_off:
+                    await _close_operation_lease(lease)
 
     async def _client_to_client(
         self,
@@ -602,8 +750,6 @@ class FileTransferTool(Tool):
         device_targets: Mapping[str, UUID] | None,
         on_issued: Callable[[], None] | None,
     ) -> FileTransferOutcome:
-        """Ask one paired client to perform a coordinated local transfer."""
-
         registry = self._require_registry()
         device_id = await self._device_id_for_call(
             user_id,
@@ -617,36 +763,45 @@ class FileTransferTool(Tool):
         )
         if route is None:
             raise DeviceUnavailableError("Device is offline")
-        raw = await registry.dispatch_tool_on_snapshot(
-            route=route,
+        transfers = registry.transfers
+        lease = await transfers.acquire_operation(user_id)
+        controller = self._directory_controller(
+            registry,
+            route,
             user_id=user_id,
-            expected_device_name=parsed.openoctopus_src_device,
-            name=INTERNAL_WORKSPACE_ACTION,
-            args={
-                "operation": "transfer_local",
-                "path": parsed.src_path,
-                "dst_path": parsed.dst_path,
-                "mode": parsed.mode,
-            },
-            max_result_bytes=64 * 1024,
-            timeout_seconds=60.0,
-            on_issued=on_issued,
+            operation_id=new_uuid7(),
         )
-        if raw.is_error:
-            _raise_transfer_client_error(raw.code)
-        if not isinstance(raw.content, str):
-            raise TransferError(ErrorCode.WORKSPACE_STORAGE_ERROR.value)
+        source_owned = False
         try:
-            result = DeviceTransferLocalResult.model_validate_json(raw.content, strict=True)
-        except ValidationError as exc:
-            raise TransferIntegrityError from exc
-        return FileTransferOutcome(
-            kind="file",
-            files_transferred=1,
-            bytes_transferred=result.bytes_transferred,
-            sha256=result.sha256,
-            warnings=tuple(result.warnings),
-        )
+            source_owned = True
+            probe = await self._probe_client_source(controller, parsed.src_path)
+            if isinstance(probe, FileSourceProbe):
+                await controller.release_source_probe()
+                source_owned = False
+                return await self._same_client_file(
+                    parsed,
+                    user_id=user_id,
+                    route=route,
+                    probe=probe,
+                    registry=registry,
+                    on_issued=on_issued,
+                )
+
+            manifest = await controller.retrieve_source_manifest(probe)
+            await controller.release_source_probe()
+            source_owned = False
+            return await self._same_client_directory(
+                parsed,
+                controller=controller,
+                manifest=manifest,
+                on_issued=on_issued,
+            )
+        finally:
+            try:
+                if source_owned:
+                    await _retire_client_source(controller)
+            finally:
+                await _close_operation_lease(lease)
 
     async def _client_to_distinct_client(
         self,
@@ -654,7 +809,7 @@ class FileTransferTool(Tool):
         user_id: UUID,
         device_targets: Mapping[str, UUID] | None,
         on_issued: Callable[[], None] | None,
-    ) -> Any:
+    ) -> FileTransferOutcome:
         registry = self._require_registry()
         source_device_id, destination_device_id = await self._bridge_device_ids_for_call(
             user_id,
@@ -671,33 +826,330 @@ class FileTransferTool(Tool):
         )
         if routes is None:
             raise DeviceUnavailableError("File transfer devices are unavailable")
+        transfers = registry.transfers
+        lease = await transfers.acquire_operation(user_id)
+        operation_id = new_uuid7()
+        source = self._directory_controller(
+            registry,
+            routes.source,
+            user_id=user_id,
+            operation_id=operation_id,
+        )
+        source_owned = False
+        handed_off = False
+        try:
+            source_owned = True
+            probe = await self._probe_client_source(source, parsed.src_path)
+            if isinstance(probe, FileSourceProbe):
+                await source.release_source_probe()
+                source_owned = False
 
-        async def delete_source(source_fingerprint: str) -> None:
+                async def delete_source(source_fingerprint: str) -> None:
+                    if source_fingerprint != probe.fingerprint:
+                        raise TransferIntegrityError(
+                            "Client source fingerprint changed after probe"
+                        )
+                    result = await registry.dispatch_tool_on_snapshot(
+                        route=routes.source,
+                        user_id=user_id,
+                        expected_device_name=parsed.openoctopus_src_device,
+                        name=INTERNAL_WORKSPACE_ACTION,
+                        args={
+                            "operation": "delete_file",
+                            "path": parsed.src_path,
+                            "if_match": probe.fingerprint,
+                        },
+                        max_result_bytes=16 * 1024,
+                        timeout_seconds=BRIDGE_SOURCE_DELETE_TIMEOUT_SECONDS,
+                    )
+                    if getattr(result, "is_error", False):
+                        raise RuntimeError("client source deletion failed")
+
+                result = await transfers.start_client_to_client_regular_admitted(
+                    source_route=routes.source,
+                    destination_route=routes.destination,
+                    operation_lease=lease,
+                    slot_id=new_uuid7(),
+                    user_id=user_id,
+                    src_path=parsed.src_path,
+                    dst_path=parsed.dst_path,
+                    expected_source_size=probe.size,
+                    expected_source_fingerprint=probe.fingerprint,
+                    mode=parsed.mode,
+                    delete_source=delete_source if parsed.mode == "move" else None,
+                    on_issued=on_issued,
+                )
+                return _coerce_transfer_outcome(result)
+
+            manifest = await source.retrieve_source_manifest(probe)
+            await source.hold_source_probe()
+            destination = self._directory_controller(
+                registry,
+                routes.destination,
+                user_id=user_id,
+                operation_id=operation_id,
+            )
+            backend = ClientToClientDirectoryBackend(
+                transfer_manager=transfers,
+                operation_lease=lease,
+                source=source,
+                source_root=parsed.src_path,
+                destination=destination,
+                destination_root=parsed.dst_path,
+                manifest=manifest,
+            )
+            source_owned = False
+            handed_off = True
+            directory_result = await DirectoryTransferCoordinator().run(
+                manifest=manifest,
+                mode=parsed.mode,
+                backend=backend,
+                operation_lease=lease,
+                on_issued=on_issued,
+            )
+            return _directory_outcome(directory_result)
+        finally:
+            try:
+                if source_owned:
+                    await _retire_client_source(source)
+            finally:
+                if not handed_off:
+                    await _close_operation_lease(lease)
+
+    async def _client_file_to_server(
+        self,
+        parsed: FileTransferRequest,
+        *,
+        user_id: UUID,
+        route: DeviceRouteSnapshot,
+        ticket: TransferPathTicket,
+        probe: FileSourceProbe,
+        lease: TransferLease,
+        transfers: TransferManager,
+        workspace: _TransferWorkspace,
+        registry: _TransferRegistry,
+        on_issued: Callable[[], None] | None,
+    ) -> Any:
+        slot_id = new_uuid7()
+
+        async def make_sink(begin: TransferBeginFrame) -> Any:
+            if (
+                begin.id != slot_id
+                or begin.direction != "client_to_server"
+                or begin.purpose != "file_transfer"
+                or begin.src_path != parsed.src_path
+                or begin.dst_path != parsed.dst_path
+                or begin.total_bytes != probe.size
+                or begin.etag != probe.fingerprint
+            ):
+                raise TransferIntegrityError(
+                    "Client transfer metadata changed after source probe"
+                )
+            return await workspace.begin_transfer_upload(ticket, size=probe.size)
+
+        async def commit_sink(
+            sink: Any,
+            _begin: TransferBeginFrame,
+            size: int,
+            digest: str,
+        ) -> bool:
+            return await workspace.commit_transfer_upload(
+                ticket,
+                sink,
+                size=size,
+                sha256=digest,
+            )
+
+        async def delete_source() -> None:
             result = await registry.dispatch_tool_on_snapshot(
-                route=routes.source,
+                route=route,
                 user_id=user_id,
                 expected_device_name=parsed.openoctopus_src_device,
                 name=INTERNAL_WORKSPACE_ACTION,
                 args={
                     "operation": "delete_file",
                     "path": parsed.src_path,
-                    "if_match": source_fingerprint,
+                    "if_match": probe.fingerprint,
                 },
                 max_result_bytes=16 * 1024,
-                timeout_seconds=BRIDGE_SOURCE_DELETE_TIMEOUT_SECONDS,
+                timeout_seconds=30.0,
             )
             if getattr(result, "is_error", False):
                 raise RuntimeError("client source deletion failed")
 
-        return await registry.transfers.start_client_to_client(
-            source_route=routes.source,
-            destination_route=routes.destination,
+        return await transfers.start_client_to_server_regular_admitted(
+            handle=route.handle,
+            route=route,
+            operation_lease=lease,
+            slot_id=slot_id,
             user_id=user_id,
             src_path=parsed.src_path,
             dst_path=parsed.dst_path,
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
             mode=parsed.mode,
             delete_source=delete_source if parsed.mode == "move" else None,
             on_issued=on_issued,
+        )
+
+    async def _same_client_file(
+        self,
+        parsed: FileTransferRequest,
+        *,
+        user_id: UUID,
+        route: DeviceRouteSnapshot,
+        probe: FileSourceProbe,
+        registry: _TransferRegistry,
+        on_issued: Callable[[], None] | None,
+    ) -> FileTransferOutcome:
+        raw = await registry.dispatch_tool_on_snapshot(
+            route=route,
+            user_id=user_id,
+            expected_device_name=parsed.openoctopus_src_device,
+            name=INTERNAL_WORKSPACE_ACTION,
+            args={
+                "operation": "transfer_local",
+                "path": parsed.src_path,
+                "dst_path": parsed.dst_path,
+                "mode": parsed.mode,
+                "if_match": probe.fingerprint,
+            },
+            max_result_bytes=64 * 1024,
+            timeout_seconds=60.0,
+            on_issued=on_issued,
+        )
+        if raw.is_error:
+            _raise_transfer_client_error(raw.code)
+        if not isinstance(raw.content, str):
+            raise TransferError(ErrorCode.WORKSPACE_STORAGE_ERROR.value)
+        try:
+            result = DeviceTransferLocalResult.model_validate_json(raw.content, strict=True)
+        except ValidationError as exc:
+            raise TransferIntegrityError from exc
+        if result.bytes_transferred != probe.size:
+            raise TransferIntegrityError("Local transfer size changed after source probe")
+        return FileTransferOutcome(
+            kind="file",
+            files_transferred=1,
+            bytes_transferred=result.bytes_transferred,
+            sha256=result.sha256,
+            warnings=tuple(result.warnings),
+        )
+
+    async def _same_client_directory(
+        self,
+        parsed: FileTransferRequest,
+        *,
+        controller: DeviceDirectoryJobController,
+        manifest: DirectoryManifest,
+        on_issued: Callable[[], None] | None,
+    ) -> FileTransferOutcome:
+        destination_started = False
+        local_started = False
+        local_issued = False
+        result: FileTransferOutcome | None = None
+        failure: BaseException | None = None
+
+        def mark_local_issued() -> None:
+            nonlocal local_issued
+            local_issued = True
+            if on_issued is not None:
+                on_issued()
+
+        try:
+            destination_started = True
+            await controller.start_destination_preflight(parsed.dst_path, manifest)
+            status = await controller.wait_destination_until(
+                frozenset({"ready", "failed", "outcome_unknown"})
+            )
+            _require_directory_state(status, "ready")
+            local_started = True
+            await controller.start_local_directory(
+                source_path=parsed.src_path,
+                dst_path=parsed.dst_path,
+                mode=parsed.mode,
+                manifest_sha256=manifest.manifest_sha256,
+                on_issued=mark_local_issued,
+            )
+            local = await controller.wait_local_until(
+                frozenset({"succeeded", "failed", "outcome_unknown"})
+            )
+            _require_directory_state(local, "succeeded")
+            terminal = local.terminal_result
+            if terminal is None:
+                raise TransferIntegrityError("Local directory result is missing")
+            result = FileTransferOutcome(
+                kind="directory",
+                files_transferred=terminal.files_transferred,
+                bytes_transferred=terminal.bytes_transferred,
+                sha256=terminal.sha256,
+                warnings=tuple(terminal.warnings),
+            )
+        except BaseException as exc:
+            failure = exc
+
+        cleanup_error = await _settle_same_client_directory(
+            controller,
+            destination_started=destination_started,
+            local_started=local_started,
+            succeeded=result is not None,
+        )
+        if result is not None:
+            if cleanup_error is not None:
+                result = FileTransferOutcome(
+                    kind=result.kind,
+                    files_transferred=result.files_transferred,
+                    bytes_transferred=result.bytes_transferred,
+                    sha256=result.sha256,
+                    warnings=result.warnings + ("transfer_ack_failed",),
+                )
+            return result
+        if failure is not None:
+            mutation_may_have_started = local_issued and not isinstance(
+                failure,
+                DirectoryMutationNotAppliedError,
+            )
+            if cleanup_error is not None and mutation_may_have_started:
+                raise DeviceOutcomeUnknownError(
+                    "Local directory cleanup outcome is unknown"
+                ) from failure
+            raise failure
+        if cleanup_error is not None:
+            raise cleanup_error
+        raise AssertionError("local directory transfer completed without an outcome")
+
+    async def _probe_client_source(
+        self,
+        controller: DeviceDirectoryJobController,
+        path: str,
+    ) -> FileSourceProbe | DirectorySourceProbe:
+        await controller.start_source_probe(path)
+        status = await controller.wait_source_until(
+            frozenset({"succeeded", "ready_retrieval", "failed", "outcome_unknown"})
+        )
+        if status.state == "succeeded" and isinstance(status.probe, FileSourceProbe):
+            return status.probe
+        if status.state == "ready_retrieval" and isinstance(
+            status.probe, DirectorySourceProbe
+        ):
+            return status.probe
+        _raise_directory_status(status)
+        raise AssertionError("unreachable")
+
+    def _directory_controller(
+        self,
+        registry: _TransferRegistry,
+        route: DeviceRouteSnapshot,
+        *,
+        user_id: UUID,
+        operation_id: UUID,
+    ) -> DeviceDirectoryJobController:
+        return DeviceDirectoryJobController(
+            registry=registry,
+            route=route,
+            user_id=user_id,
+            directory_operation_id=operation_id,
+            idle_timeout_seconds=registry.transfers.idle_timeout_seconds,
         )
 
     def _require_workspace(self) -> _TransferWorkspace:
@@ -709,6 +1161,11 @@ class FileTransferTool(Tool):
         if self._engine is None:
             raise RuntimeError("Database engine is not configured")
         return self._engine
+
+    def _require_fs(self) -> WorkspaceFS:
+        if self._fs is None:
+            raise RuntimeError("Workspace filesystem is not configured")
+        return self._fs
 
     async def _device_id_for_call(
         self,
@@ -801,6 +1258,114 @@ class FileTransferTool(Tool):
         return self._devices
 
 
+async def _close_operation_lease(lease: _OperationLease) -> None:
+    close = asyncio.create_task(lease.aclose())
+    await await_future_cancellation_safe(close)
+
+
+async def _retire_client_source(controller: DeviceDirectoryJobController) -> None:
+    async def retire() -> None:
+        try:
+            await controller.cancel_source_probe()
+            await controller.wait_source_until(
+                frozenset({"succeeded", "failed", "outcome_unknown"})
+            )
+        except BaseException:
+            pass
+        try:
+            await controller.release_source_probe()
+        except BaseException:
+            pass
+
+    task = asyncio.create_task(retire())
+    await await_future_cancellation_safe(task)
+
+
+async def _settle_same_client_directory(
+    controller: DeviceDirectoryJobController,
+    *,
+    destination_started: bool,
+    local_started: bool,
+    succeeded: bool,
+) -> BaseException | None:
+    async def settle() -> None:
+        failure: BaseException | None = None
+        if local_started:
+            if not succeeded:
+                try:
+                    await controller.cancel_local_directory()
+                    await controller.wait_local_until(
+                        frozenset({"succeeded", "failed", "outcome_unknown"})
+                    )
+                except BaseException as exc:
+                    failure = exc
+            try:
+                await controller.release_local_directory()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        elif destination_started:
+            try:
+                await controller.cancel_destination()
+                await controller.wait_destination_until(
+                    frozenset({"failed", "outcome_unknown"})
+                )
+            except BaseException as exc:
+                failure = exc
+            try:
+                await controller.release_destination()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+    task = asyncio.create_task(settle())
+    try:
+        await await_future_cancellation_safe(task)
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _directory_outcome(result: DirectoryTransferResult) -> FileTransferOutcome:
+    return FileTransferOutcome(
+        kind="directory",
+        files_transferred=result.files_transferred,
+        bytes_transferred=result.bytes_transferred,
+        sha256=result.sha256,
+        warnings=result.warnings,
+    )
+
+
+def _require_directory_state(status: object, expected: str) -> None:
+    if getattr(status, "state", None) == expected:
+        return
+    _raise_directory_status(status)
+
+
+def _raise_directory_status(status: object) -> None:
+    state = getattr(status, "state", None)
+    if state == "outcome_unknown":
+        raise DeviceOutcomeUnknownError("Client directory outcome is unknown")
+    if state == "failed":
+        error = getattr(status, "terminal_error", None)
+        code = getattr(error, "code", None)
+        if not isinstance(code, str):
+            raise TransferIntegrityError("Client directory failure omitted its error code")
+        if code == ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN.value:
+            raise DeviceOutcomeUnknownError("Client directory outcome is unknown")
+        raise TransferError(code)
+    raise TransferIntegrityError("Client directory status is invalid")
+
+
+def _source_changed() -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_FILE_CHANGED,
+        "Workspace source changed after it was probed",
+    )
+
+
 def _error(code: ErrorCode, message: str) -> ToolResult:
     return ToolResult(content=f"[{code.value}] {message}", is_error=True, code=code)
 
@@ -856,9 +1421,14 @@ def _stable_client_transfer_error(code: str | None) -> ErrorCode | None:
         ErrorCode.WORKSPACE_NOT_FOUND,
         ErrorCode.WORKSPACE_PERMISSION_DENIED,
         ErrorCode.WORKSPACE_SYMLINK_ESCAPE,
+        ErrorCode.WORKSPACE_SOFT_LOCKED,
+        ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+        ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT,
         ErrorCode.WORKSPACE_BLOCKED_PATH,
+        ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE,
         ErrorCode.WORKSPACE_FILE_CHANGED,
         ErrorCode.WORKSPACE_STORAGE_UNAVAILABLE,
+        ErrorCode.WORKSPACE_TRANSFER_BUSY,
         ErrorCode.WORKSPACE_TRANSFER_TIMEOUT,
         ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
         ErrorCode.WORKSPACE_INVALID_REQUEST,

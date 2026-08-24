@@ -1017,11 +1017,13 @@ remain visible and return `tool_device_unreachable` at dispatch.
   operation. Copy does not recreate empty directories, and a source directory
   with no regular files is rejected. Paths are mapped beneath `dst_path` with
   no overwrite or merge semantics.
-- Before a directory targeting a personal Server `skills/` subtree publishes
-  its first destination entry, every mapped `skills/<name>/SKILL.md` is streamed
-  through bounded private staging and validated. Validation failure leaves the
-  destination absent. This is a validation-before-first-commit guarantee, not
-  whole-tree atomic visibility.
+- A regular file targeting personal Server `skills/<name>/SKILL.md` is
+  validated from bounded staging before publish. Before a directory targeting
+  a personal Server `skills/` subtree publishes its first destination entry,
+  every mapped `skills/<name>/SKILL.md` is streamed through the same validation
+  boundary. Validation failure leaves the destination absent. For directories,
+  this is a validation-before-first-commit guarantee, not whole-tree atomic
+  visibility.
 - `move` is copy-all-then-conditional-delete. Copy failure conditionally
   removes only entries created by this operation. If complete cleanup cannot
   be proved, the error is `tool_execution_outcome_unknown`; it is not safe to
@@ -1056,7 +1058,8 @@ while unsupported atomic primitives fail explicitly.
 `tool_device_unreachable` for offline or stale device targets;
 `tool_device_busy` for bounded transfer admission; destination/path policy
 errors such as `workspace_file_changed`; `workspace_directory_too_large` for
-manifest bounds; `workspace_transfer_timeout`,
+manifest bounds; `workspace_invalid_skill_format` for an invalid personal
+Server Skill manifest; `workspace_transfer_timeout`,
 `workspace_transfer_integrity_failed`, and `workspace_storage_unavailable` for
 stream or storage failures; `tool_execution_outcome_unknown` when an issued
 result cannot be established.

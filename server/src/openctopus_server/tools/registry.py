@@ -67,6 +67,7 @@ from openctopus_server.tools.web_fetch import (
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
 from openctopus_server.tools.workspace_files import build_workspace_file_tools
 from openctopus_server.workspace.file_content import DocumentParser
+from openctopus_server.workspace.fs import WorkspaceFS
 from openctopus_server.workspace.service import WorkspaceService
 
 _DEVICE_TOOL_TIMEOUT_SECONDS = 60.0
@@ -466,6 +467,7 @@ def build_py3_registry(
 def build_py4_registry(
     engine: AsyncEngine,
     workspace_service: WorkspaceService,
+    workspace_fs: WorkspaceFS,
     *,
     resolver: Resolver | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -496,6 +498,7 @@ def build_py4_registry(
                 engine,
                 workspace_service,
                 device_registry or get_device_registry(),
+                workspace_fs,
             ),
             _ClientOnlyTool("exec", _EXEC_SCHEMA),
             _ClientOnlyTool("write_stdin", _WRITE_STDIN_SCHEMA),

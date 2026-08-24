@@ -27,6 +27,7 @@ from openctopus_server.devices.workspace import (
 )
 from openctopus_server.directory_contract import DirectoryManifest, canonical_json_bytes
 from openctopus_server.tools.device_directory_jobs import DeviceDirectoryJobController
+from openctopus_server.tools.directory_transfer import DirectoryMutationNotAppliedError
 
 
 def _source_request_digest(path: str) -> str:
@@ -373,9 +374,9 @@ async def test_prepare_loss_with_ready_status_is_stably_not_applied() -> None:
     )
     await controller.start_destination_preflight("destination", manifest)
 
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DirectoryMutationNotAppliedError):
         await controller.prepare_destination()
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DirectoryMutationNotAppliedError):
         await controller.prepare_destination()
 
     assert _operations(registry).count("transfer_directory_prepare") == 1
@@ -438,6 +439,39 @@ async def test_duplicate_progress_does_not_extend_no_progress_deadline() -> None
     assert result.state == "failed"
     assert _operations(registry).count("transfer_source_probe_cancel") == 1
     assert clock.value == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_server_no_progress_cancel_projects_client_cancel_as_timeout() -> None:
+    clock = _Clock()
+    digest = _source_request_digest("source")
+    controller, registry = _controller(
+        [
+            _command("running", digest),
+            _source_status(digest=digest, progress_seq=1),
+            _source_status(digest=digest, progress_seq=1),
+            _command("accepted", digest),
+            _source_status(
+                digest=digest,
+                state="failed",
+                progress_seq=1,
+                terminal_error={
+                    "code": "tool_execution_cancelled",
+                    "message": "cancelled by server",
+                },
+            ),
+        ],
+        idle_timeout_seconds=2.0,
+        clock=clock,
+    )
+    await controller.start_source_probe("source")
+
+    with pytest.raises(TimeoutError, match="made no progress"):
+        await controller.wait_source_until(
+            frozenset({"ready_retrieval", "succeeded", "failed", "outcome_unknown"})
+        )
+
+    assert _operations(registry).count("transfer_source_probe_cancel") == 1
 
 
 @pytest.mark.asyncio
@@ -675,7 +709,7 @@ async def test_local_start_loss_uses_ready_not_started_without_replay() -> None:
     )
     await controller.start_destination_preflight("destination", manifest)
 
-    with pytest.raises(DeviceUnavailableError):
+    with pytest.raises(DirectoryMutationNotAppliedError):
         await controller.start_local_directory(
             source_path="source",
             dst_path="destination",

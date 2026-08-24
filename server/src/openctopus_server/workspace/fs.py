@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
-from collections.abc import AsyncIterator, Callable, Hashable
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -806,6 +806,7 @@ class WorkspaceFS:
         quota_bytes: int,
         mode: str,
         on_issued: Callable[[], None] | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         try:
             async with self._server_transfers.slot(user_id):
@@ -817,6 +818,7 @@ class WorkspaceFS:
                     quota_bytes=quota_bytes,
                     mode=mode,
                     on_issued=on_issued,
+                    validate_staging=validate_staging,
                 )
         except AdmissionTimeoutError as exc:
             raise WorkspaceError(
@@ -846,6 +848,7 @@ class WorkspaceFS:
         expected_source_size: int,
         expected_source_fingerprint: str,
         on_issued: Callable[[], None] | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Transfer one pre-probed file while the caller retains admission."""
 
@@ -859,6 +862,7 @@ class WorkspaceFS:
             on_issued=on_issued,
             expected_source_size=expected_source_size,
             expected_source_fingerprint=expected_source_fingerprint,
+            validate_staging=validate_staging,
         )
 
     async def _transfer_server_to_server(
@@ -873,6 +877,7 @@ class WorkspaceFS:
         on_issued: Callable[[], None] | None,
         expected_source_size: int | None = None,
         expected_source_fingerprint: str | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Stream one server workspace object through a temporary RustFS object."""
         if mode not in {"copy", "move"}:
@@ -908,6 +913,8 @@ class WorkspaceFS:
                 transferred += len(chunk)
                 await sink.write(chunk)
             await sink.finish()
+            if validate_staging is not None:
+                await validate_staging(temporary_object, transferred)
             try:
                 await self.commit_uploaded_object(
                     destination_target,
@@ -923,7 +930,11 @@ class WorkspaceFS:
                 # the source instead of entering the pre-commit abort path.
                 pass
         except BaseException:
-            await sink.abort()
+            cleanup = asyncio.create_task(sink.abort())
+            try:
+                await await_future_cancellation_safe(cleanup)
+            except BaseException:
+                pass
             raise
         finally:
             await source.aclose()

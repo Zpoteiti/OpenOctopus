@@ -42,7 +42,7 @@ from openctopus_server.errors.http import register_error_handler
 from openctopus_server.tools.base import ToolContext
 from openctopus_server.tools.file_transfer import FileTransferTool
 from openctopus_server.tools.registry import ToolRegistry
-from openctopus_server.workspace.fs import WorkspaceFS
+from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
 from openctopus_server.workspace.service import WorkspaceService, get_workspace_service
 
 pytestmark = pytest.mark.skipif(
@@ -248,10 +248,12 @@ async def test_real_file_transfer_and_device_workspace_relay(
 
     fake_rustfs = _TrackingMemoryMinio()
     object_storage = object_storage_for_fake(fake_rustfs, "test", max_connections=2)
-    workspace_service = WorkspaceService(WorkspaceFS(object_storage))
+    workspace_fs = WorkspaceFS(object_storage)
+    workspace_service = WorkspaceService(workspace_fs)
     app = FastAPI()
     app.include_router(api_router)
     app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    app.dependency_overrides[get_workspace_fs] = lambda: workspace_fs
     register_error_handler(app)
     server, server_task, server_url, listener = await _start_server(app)
     client_processes: list[asyncio.subprocess.Process] = []
@@ -326,7 +328,12 @@ async def test_real_file_transfer_and_device_workspace_relay(
 
             server_bytes = (b"server-to-device\x00" * 8192) + b"end"
             fake_rustfs.seed(user_id, "server-source.bin", server_bytes)
-            transfer_tool = FileTransferTool(pg_engine, workspace_service, registry)
+            transfer_tool = FileTransferTool(
+                pg_engine,
+                workspace_service,
+                registry,
+                workspace_fs,
+            )
             context = ToolContext(user_id=user_id, session_id=uuid4())
 
             server_to_client = await transfer_tool.execute(
@@ -621,10 +628,12 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
 
     fake_rustfs = _TrackingMemoryMinio()
     object_storage = object_storage_for_fake(fake_rustfs, "test", max_connections=2)
-    workspace_service = WorkspaceService(WorkspaceFS(object_storage))
+    workspace_fs = WorkspaceFS(object_storage)
+    workspace_service = WorkspaceService(workspace_fs)
     app = FastAPI()
     app.include_router(api_router)
     app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    app.dependency_overrides[get_workspace_fs] = lambda: workspace_fs
     register_error_handler(app)
     server, server_task, server_url, listener = await _start_server(app)
     clients: list[tuple[asyncio.subprocess.Process, str]] = []
@@ -744,7 +753,14 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
             move_bytes = (b"distinct-client-move\xff" * 4096) + b"end"
             (source_workspace / "move-source.bin").write_bytes(move_bytes)
             transfer_registry = ToolRegistry(
-                (FileTransferTool(pg_engine, workspace_service, registry),)
+                (
+                    FileTransferTool(
+                        pg_engine,
+                        workspace_service,
+                        registry,
+                        workspace_fs,
+                    ),
+                )
             )
             move = await transfer_registry.execute(
                 name="file_transfer",

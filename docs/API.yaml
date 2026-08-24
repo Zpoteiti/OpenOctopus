@@ -1251,6 +1251,9 @@ paths:
         '413':
           description: Directory manifest exceeds 10,000 entries or 5 MiB.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: A personal destination SKILL.md is invalid.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: Destination exists, a path/precondition conflicts, a target Device is unreachable, or an issued outcome is unknown.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -2863,19 +2866,61 @@ components:
         mode: { type: string, enum: [copy, move] }
 
     TransferResponse:
-      type: object
-      additionalProperties: false
-      required: [kind, files_transferred, bytes_transferred, sha256, warnings]
+      oneOf:
+        - { $ref: '#/components/schemas/FileTransferResponse' }
+        - { $ref: '#/components/schemas/DirectoryTransferResponse' }
+      discriminator:
+        propertyName: kind
+        mapping:
+          file: '#/components/schemas/FileTransferResponse'
+          directory: '#/components/schemas/DirectoryTransferResponse'
       description: |
         Bounded aggregate result. For `kind=file`, `files_transferred` is 1 and
         `sha256` is the file-content digest. For `kind=directory`, the count is
         1..10000 and `sha256` is the canonical mapped regular-file path/content
         tree digest; it excludes empty directories and filesystem metadata. No
         per-entry result array is returned.
+
+    FileTransferResponse:
+      type: object
+      additionalProperties: false
+      required: [bytes_transferred, sha256, warnings, kind, files_transferred]
       properties:
         kind:
           type: string
-          enum: [file, directory]
+          const: file
+        files_transferred:
+          type: integer
+          const: 1
+        bytes_transferred:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        warnings:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            enum: [transfer_ack_failed, source_delete_failed, source_changed_after_copy, source_cleanup_incomplete]
+          description: |
+            Deduplicated canonical-order non-fatal issues after the complete
+            destination is known finalized. They describe an unconfirmed
+            source ACK or incomplete conditional source cleanup. Inability to
+            prove cleanup of an incomplete destination is instead a 409
+            `tool_execution_outcome_unknown` error, never a success warning.
+
+    DirectoryTransferResponse:
+      type: object
+      additionalProperties: false
+      required: [bytes_transferred, sha256, warnings, kind, files_transferred]
+      properties:
+        kind:
+          type: string
+          const: directory
         files_transferred:
           type: integer
           minimum: 1
@@ -2890,6 +2935,7 @@ components:
         warnings:
           type: array
           maxItems: 8
+          uniqueItems: true
           items:
             type: string
             enum: [transfer_ack_failed, source_delete_failed, source_changed_after_copy, source_cleanup_incomplete]

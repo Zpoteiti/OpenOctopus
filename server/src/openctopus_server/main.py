@@ -196,6 +196,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tool_registry=build_py4_registry(
                     engine,
                     workspace_service,
+                    workspace_fs,
                     web_admission=get_web_fetch_admission(),
                     content_converter=content_converter,
                     device_registry=device_registry,

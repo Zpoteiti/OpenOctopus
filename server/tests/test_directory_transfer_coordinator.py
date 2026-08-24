@@ -16,6 +16,7 @@ from openctopus_server.tools.directory_transfer import (
     DirectoryChildCommittedAfterCancellation,
     DirectoryChildResult,
     DirectoryDestinationFinalizedAfterCancellation,
+    DirectoryMutationNotAppliedError,
     DirectoryTransferCoordinator,
 )
 
@@ -198,6 +199,34 @@ async def test_prepare_failure_after_issue_cleans_destination() -> None:
         )
 
     assert backend.destination_cleanup_calls == 1
+
+
+async def test_prepare_proven_not_applied_preserves_original_without_cleanup() -> None:
+    error = DirectoryMutationNotAppliedError("prepare was not applied")
+
+    @dataclass
+    class NotAppliedPrepareBackend(_Backend):
+        async def prepare_destination(self, mark_issued: object) -> None:
+            callback = mark_issued
+            assert callable(callback)
+            callback()
+            raise error
+
+    backend = NotAppliedPrepareBackend(cleanup_complete=False)
+    lease = _Lease()
+
+    with pytest.raises(DirectoryMutationNotAppliedError) as raised:
+        await DirectoryTransferCoordinator().run(
+            manifest=_manifest(),
+            mode="copy",
+            backend=backend,
+            operation_lease=lease,
+        )
+
+    assert raised.value is error
+    assert backend.destination_cleanup_calls == 0
+    assert backend.release_calls == 1
+    assert lease.close_count == 1
 
 
 async def test_child_failure_cleans_committed_destination_before_reraising() -> None:

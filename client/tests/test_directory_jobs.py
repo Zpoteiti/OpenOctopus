@@ -4,6 +4,7 @@ import asyncio
 import errno
 import hashlib
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -56,10 +57,31 @@ def _fingerprint(path: Path) -> str:
     return opaque_stat_fingerprint((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
 
 
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    cmd = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    completed = subprocess.run(
+        [str(cmd), "/D", "/C", "mklink", "/J", str(link), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise OSError("unable to create a Windows directory junction")
+
+
 def _manager(
     workspace: Path,
     *,
     admission: LocalTransferAdmission | None = None,
+    path_locks: PathLocks | None = None,
     idle_timeout_seconds: float = 5,
     queue_timeout_seconds: float = 1,
     lifecycle_credits: DirectoryLifecycleCredits | None = None,
@@ -68,7 +90,7 @@ def _manager(
     return DirectoryJobManager(
         workspace,
         restrict_to_workspace=True,
-        path_locks=PathLocks(),
+        path_locks=path_locks or PathLocks(),
         admission=admission or LocalTransferAdmission(capacity=2),
         idle_timeout_seconds=idle_timeout_seconds,
         queue_timeout_seconds=queue_timeout_seconds,
@@ -363,11 +385,72 @@ async def test_source_walk_keeps_hidden_noise_zero_byte_and_scan_only_directorie
 
 
 @pytest.mark.asyncio
+async def test_cancelled_destination_release_finishes_reservation_cleanup_and_can_retry(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    try:
+        operation_id, digest, _ = await _prepare_committed_destination(manager, tmp_path)
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_finish",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        await _destination_status(manager, operation_id, digest, {"finalized_held"})
+        record = manager._active[(UUID(operation_id), "destination")]
+        assert record.reservation_held
+
+        await manager._locks._condition.acquire()
+        try:
+            release = asyncio.create_task(
+                _handle(
+                    manager,
+                    {
+                        "operation": "transfer_directory_release",
+                        "directory_operation_id": operation_id,
+                        "expected_digest": digest,
+                    },
+                )
+            )
+            while record.reservation is not None:
+                await asyncio.sleep(0)
+
+            release.cancel()
+            await asyncio.sleep(0)
+            release.cancel()
+            await asyncio.sleep(0)
+            assert release.done() is False
+        finally:
+            manager._locks._condition.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await release
+        assert manager._locks.entry_count == 0
+        assert manager._locks.reservation_count == 0
+
+        retried = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_release",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        assert retried.state == "released"
+        assert manager.active_count == 0
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_source_probe_rejects_empty_tree_and_links(tmp_path: Path) -> None:
     (tmp_path / "empty").mkdir()
     (tmp_path / "linked-target").mkdir()
     (tmp_path / "linked-target" / "file").write_text("x", encoding="utf-8")
-    (tmp_path / "linked").symlink_to(tmp_path / "linked-target", target_is_directory=True)
+    _make_directory_link(tmp_path / "linked", tmp_path / "linked-target")
     manager = _manager(tmp_path)
     try:
         for path, code in (
@@ -452,6 +535,72 @@ async def test_source_hold_authorization_and_conditional_cleanup(tmp_path: Path)
         await manager.aclose()
 
 
+@pytest.mark.asyncio
+async def test_source_probe_path_reservation_conflict_terminalizes_busy(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"data")
+    locks = PathLocks()
+    manager = _manager(tmp_path, path_locks=locks)
+    operation_id = _operation_id()
+    try:
+        async with locks.reserve_subtree("other-operation", str(source)):
+            started = await _handle(
+                manager,
+                {
+                    "operation": "transfer_source_probe_start",
+                    "directory_operation_id": operation_id,
+                    "path": "source",
+                },
+            )
+            status = await _source_status(
+                manager,
+                operation_id,
+                started.expected_digest,
+                {"failed"},
+            )
+            assert status.terminal_error.code == "workspace_transfer_busy"
+            assert manager.active_count == 0
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_source_cleanup_path_reservation_conflict_returns_warning(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"data")
+    locks = PathLocks()
+    manager = _manager(tmp_path, path_locks=locks)
+    operation_id = _operation_id()
+    try:
+        _, digest = await _probe_directory(manager, operation_id, "source")
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_hold",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        async with locks.reserve_subtree("other-operation", str(source)):
+            await _handle(
+                manager,
+                {
+                    "operation": "transfer_source_cleanup",
+                    "directory_operation_id": operation_id,
+                    "expected_digest": digest,
+                },
+            )
+            status = await _source_status(manager, operation_id, digest, {"succeeded"})
+            assert status.terminal_result.cleanup_complete is False
+            assert status.terminal_result.warnings == ["source_cleanup_incomplete"]
+            assert manager.active_count == 0
+            assert (source / "file").read_bytes() == b"data"
+    finally:
+        await manager.aclose()
+
+
 def _small_manifest() -> DirectoryManifest:
     return create_directory_manifest(
         root_identity="source-root",
@@ -460,6 +609,290 @@ def _small_manifest() -> DirectoryManifest:
             DirectoryManifestEntry(relative_path="nested/file", size=4, fingerprint="source"),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "..\\escape",
+        "bad<name",
+        "bad>name",
+        "bad:name",
+        'bad"name',
+        "bad|name",
+        "bad?name",
+        "bad*name",
+        "bad\x01name",
+        "trailing.",
+        "trailing ",
+        "CON",
+        "prn.txt",
+        "AUX.tar.gz",
+        "nul",
+        "CONIN$",
+        "conout$.txt",
+        "COM1.log",
+        "COM1 .log",
+        "com¹.txt",
+        "LPT9",
+        "lpt³.log",
+    ],
+)
+def test_windows_destination_components_reject_unsupported_names(
+    relative_path: str,
+) -> None:
+    with pytest.raises(ToolFailure) as raised:
+        directory_jobs_module._validate_windows_components(relative_path)
+
+    assert raised.value.code == "workspace_invalid_request"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"safe\root",
+        "safe/root",
+        r"C:\safe\root",
+        "C:/safe/root",
+        r"\\server\share\safe\root",
+        "//server/share/safe/root",
+    ],
+)
+def test_windows_caller_path_accepts_drive_unc_and_both_separators(path: str) -> None:
+    directory_jobs_module._validate_windows_caller_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\safe\CON",
+        "C:/safe/trailing.",
+        r"\\server\share\safe\COM1.txt",
+        "//server/share/safe/bad<name",
+        r"C:safe\root",
+        r"\safe\root",
+        r"\\?\C:\safe\root",
+        r"\\.\CON",
+    ],
+)
+def test_windows_caller_path_rejects_invalid_components_and_path_forms(path: str) -> None:
+    with pytest.raises(ToolFailure) as raised:
+        directory_jobs_module._validate_windows_caller_path(path)
+
+    assert raised.value.code == "workspace_invalid_request"
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [r"source\CON", "source/trailing.", r"source\bad<name"],
+)
+@pytest.mark.asyncio
+async def test_windows_source_root_rejects_invalid_component_before_resolve(
+    source_path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "_current_destination_platform", lambda: "windows")
+    if os.name != "nt":
+        source = tmp_path / source_path
+        source.mkdir(parents=True)
+        (source / "file").write_bytes(b"unchanged")
+    before = sorted(
+        (
+            path.relative_to(tmp_path).as_posix(),
+            path.is_dir(),
+            path.read_bytes() if path.is_file() else b"",
+        )
+        for path in tmp_path.rglob("*")
+    )
+    manager = _manager(tmp_path)
+    resolve_calls = 0
+    original_resolve = manager._paths.resolve
+
+    def observed_resolve(*args: Any, **kwargs: Any) -> Path:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(cast(Any, manager._paths), "resolve", observed_resolve)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_start",
+                "directory_operation_id": operation_id,
+                "path": source_path,
+            },
+        )
+        status = await _source_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "ready_retrieval"},
+        )
+
+        assert status.state == "failed"
+        assert status.terminal_error.code == "workspace_invalid_request"
+        assert resolve_calls == 0
+        assert sorted(
+            (
+                path.relative_to(tmp_path).as_posix(),
+                path.is_dir(),
+                path.read_bytes() if path.is_file() else b"",
+            )
+            for path in tmp_path.rglob("*")
+        ) == before
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.parametrize(
+    "destination_path",
+    [r"destination\CON", "destination/trailing.", r"destination\bad<name"],
+)
+@pytest.mark.asyncio
+async def test_windows_destination_root_rejects_invalid_component_before_mutation(
+    destination_path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "_current_destination_platform", lambda: "windows")
+    manager = _manager(tmp_path)
+    resolve_calls = 0
+    original_resolve = manager._paths.resolve
+
+    def observed_resolve(*args: Any, **kwargs: Any) -> Path:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(cast(Any, manager._paths), "resolve", observed_resolve)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": destination_path,
+                "manifest": _small_manifest().model_dump(mode="json"),
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "ready"},
+        )
+
+        assert status.state == "failed"
+        assert status.terminal_error.code == "workspace_invalid_request"
+        assert resolve_calls == 0
+        assert not list(tmp_path.iterdir())
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_windows_destination_preflight_rejects_separator_escape_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "_current_destination_platform", lambda: "windows")
+    manifest = create_directory_manifest(
+        root_identity="source-root",
+        directories=(),
+        entries=(
+            DirectoryManifestEntry(
+                relative_path="..\\outside",
+                size=1,
+                fingerprint="source",
+            ),
+        ),
+    )
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed"},
+        )
+
+        assert status.terminal_error.code == "workspace_invalid_request"
+        assert not (tmp_path / "destination").exists()
+        assert not (tmp_path / "outside").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.parametrize(
+    ("platform", "relative_paths"),
+    [
+        (
+            "macos",
+            (
+                "cafe\N{COMBINING ACUTE ACCENT}.txt",
+                "caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt",
+            ),
+        ),
+        ("windows", ("Name.txt", "name.TXT")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_destination_platform_collision_is_invalid_request(
+    platform: str,
+    relative_paths: tuple[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "_current_destination_platform", lambda: platform)
+    manifest = create_directory_manifest(
+        root_identity="source-root",
+        directories=(),
+        entries=tuple(
+            DirectoryManifestEntry(
+                relative_path=relative_path,
+                size=1,
+                fingerprint=f"source-{index}",
+            )
+            for index, relative_path in enumerate(relative_paths)
+        ),
+    )
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed"},
+        )
+
+        assert status.terminal_error.code == "workspace_invalid_request"
+        assert not list(tmp_path.iterdir())
+    finally:
+        await manager.aclose()
 
 
 async def _prepare_committed_destination(
@@ -1212,7 +1645,10 @@ async def test_local_move_cleans_owned_parents_when_publish_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux native proof")
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform in {"darwin", "win32"}),
+    reason="native exclusive directory rename is unsupported on this platform",
+)
 async def test_local_directory_move_uses_native_no_replace_and_preserves_empty_dirs(
     tmp_path: Path,
 ) -> None:
