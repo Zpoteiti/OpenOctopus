@@ -13,11 +13,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import User, Workspace, WorkspaceMember
 from openctopus_server.devices.registry import DeviceRegistry
+from openctopus_server.directory_contract import (
+    DirectoryManifestDirectory,
+    DirectoryManifestEntry,
+    create_directory_manifest,
+)
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.services import users
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryDestinationPlan,
     DirectoryPage,
     FileMetadata,
     WorkspaceFS,
@@ -25,7 +31,12 @@ from openctopus_server.workspace.fs import (
 )
 from openctopus_server.workspace.resolver import ResolvedWorkspacePath
 from openctopus_server.workspace.search import GrepContentMatch, SearchObject
-from openctopus_server.workspace.service import PatchEdit, ToolReadTicket, WorkspaceService
+from openctopus_server.workspace.service import (
+    PatchEdit,
+    ToolReadTicket,
+    TransferPathTicket,
+    WorkspaceService,
+)
 
 
 @asynccontextmanager
@@ -885,6 +896,430 @@ async def test_repeated_cpu_cancellation_waits_for_worker_thread() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await work
+
+
+async def test_directory_personal_skill_validation_is_sequential_and_skips_other_files() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.personal(user_id)
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024 * 1024,
+    )
+    contents = {
+        "a/SKILL.md": b"---\nname: a\ndescription: first\n---\nbody",
+        "b/SKILL.md": b"---\nname: b\ndescription: second\n---\nbody",
+        "other.txt": b"other",
+    }
+    entries = tuple(
+        DirectoryManifestEntry(
+            relative_path=path,
+            size=len(data),
+            fingerprint=f"etag-{index}",
+        )
+        for index, (path, data) in enumerate(contents.items())
+    )
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(
+            DirectoryManifestDirectory(relative_path="a", identity=None),
+            DirectoryManifestDirectory(relative_path="b", identity=None),
+        ),
+        entries=entries,
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=tuple(f"skills/{path}" for path in contents),
+    )
+    active = 0
+    max_active = 0
+    opened: list[str] = []
+    closed: list[str] = []
+
+    class _Stream:
+        def __init__(self, entry: DirectoryManifestEntry) -> None:
+            nonlocal active, max_active
+            self.size = entry.size
+            self.etag = entry.fingerprint
+            self._path = entry.relative_path
+            self._chunks = [contents[self._path], b""]
+            active += 1
+            max_active = max(max_active, active)
+
+        async def read(self) -> bytes:
+            return self._chunks.pop(0)
+
+        async def aclose(self) -> None:
+            nonlocal active
+            if self._path not in closed:
+                closed.append(self._path)
+                active -= 1
+
+    async def open_source(entry: DirectoryManifestEntry):
+        opened.append(entry.relative_path)
+        return _Stream(entry)
+
+    await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+        destination,
+        manifest,
+        plan,
+        open_source=open_source,
+    )
+
+    expected = ["a/SKILL.md", "b/SKILL.md"]
+    assert opened == expected
+    assert closed == expected
+    assert max_active == 1
+
+
+async def test_directory_skill_validation_rejects_first_invalid_or_drifted_source() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.personal(user_id)
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024,
+    )
+    malformed = b"not a skill"
+    entries = (
+        DirectoryManifestEntry(
+            relative_path="a/SKILL.md",
+            size=len(malformed),
+            fingerprint="etag-a",
+        ),
+        DirectoryManifestEntry(
+            relative_path="b/SKILL.md",
+            size=1,
+            fingerprint="etag-b",
+        ),
+    )
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(
+            DirectoryManifestDirectory(relative_path="a", identity=None),
+            DirectoryManifestDirectory(relative_path="b", identity=None),
+        ),
+        entries=entries,
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=("skills/a/SKILL.md", "skills/b/SKILL.md"),
+    )
+    opened: list[str] = []
+    closed: list[str] = []
+
+    async def open_source(entry: DirectoryManifestEntry):
+        opened.append(entry.relative_path)
+        return SimpleNamespace(
+            size=entry.size,
+            etag=entry.fingerprint,
+            read=AsyncMock(side_effect=[malformed, b""]),
+            aclose=AsyncMock(side_effect=lambda: closed.append(entry.relative_path)),
+        )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+            destination,
+            manifest,
+            plan,
+            open_source=open_source,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    assert opened == ["a/SKILL.md"]
+    assert closed == ["a/SKILL.md"]
+
+    async def open_drifted(entry: DirectoryManifestEntry):
+        return SimpleNamespace(
+            size=entry.size,
+            etag="changed",
+            read=AsyncMock(),
+            aclose=AsyncMock(side_effect=lambda: closed.append("drifted")),
+        )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+            destination,
+            manifest,
+            plan,
+            open_source=open_drifted,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+    assert closed[-1] == "drifted"
+
+
+async def test_directory_skill_validation_does_not_apply_to_shared_workspace() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.shared(uuid4())
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="/shared@00000000/skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024,
+    )
+    content = b"not a skill"
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(DirectoryManifestDirectory(relative_path="bad", identity=None),),
+        entries=(
+            DirectoryManifestEntry(
+                relative_path="bad/SKILL.md",
+                size=len(content),
+                fingerprint="etag",
+            ),
+        ),
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=("skills/bad/SKILL.md",),
+    )
+    open_source = AsyncMock()
+
+    await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+        destination,
+        manifest,
+        plan,
+        open_source=open_source,
+    )
+
+    open_source.assert_not_awaited()
+
+
+async def test_client_directory_skill_selection_is_sequential_and_personal_only() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.personal(user_id)
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024,
+    )
+    entries = (
+        DirectoryManifestEntry(relative_path="a/SKILL.md", size=1, fingerprint="a"),
+        DirectoryManifestEntry(relative_path="other.txt", size=1, fingerprint="other"),
+        DirectoryManifestEntry(relative_path="b/SKILL.md", size=1, fingerprint="b"),
+    )
+    manifest = create_directory_manifest(
+        root_identity="root-v1",
+        directories=(
+            DirectoryManifestDirectory(relative_path="a", identity="dir-a"),
+            DirectoryManifestDirectory(relative_path="b", identity="dir-b"),
+        ),
+        entries=entries,
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=tuple(f"skills/{entry.relative_path}" for entry in manifest.entries),
+    )
+    observed: list[tuple[str, str]] = []
+
+    async def validate_source(entry: DirectoryManifestEntry, path: str) -> None:
+        observed.append((entry.relative_path, path))
+
+    await WorkspaceService(_workspace_fs_mock()).validate_client_directory_skill_manifests(
+        destination,
+        manifest,
+        plan,
+        validate_source=validate_source,
+    )
+
+    assert observed == [
+        ("a/SKILL.md", "skills/a/SKILL.md"),
+        ("b/SKILL.md", "skills/b/SKILL.md"),
+    ]
+
+
+async def test_staged_directory_skill_validation_streams_and_closes() -> None:
+    content = b"---\nname: demo\ndescription: staged\n---\nbody"
+    stream = SimpleNamespace(
+        size=len(content),
+        read=AsyncMock(side_effect=[content[:10], content[10:], b""]),
+        aclose=AsyncMock(),
+    )
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.open_directory_validation_staging.return_value = stream
+    service = WorkspaceService(workspace_fs)
+
+    await service.validate_staged_directory_skill_manifest(
+        "skills/demo/SKILL.md",
+        "_openoctopus-transfers/staged",
+        expected_size=len(content),
+    )
+
+    stream.aclose.assert_awaited_once()
+
+    stream.size = len(content) + 1
+    with pytest.raises(WorkspaceError) as caught:
+        await service.validate_staged_directory_skill_manifest(
+            "skills/demo/SKILL.md",
+            "_openoctopus-transfers/staged",
+            expected_size=len(content),
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED
+
+
+async def test_single_file_transfer_validates_personal_skill_staging_before_commit() -> None:
+    user_id = uuid4()
+    content = b"not a Skill manifest"
+    stream = SimpleNamespace(
+        size=len(content),
+        read=AsyncMock(side_effect=[content, b""]),
+        aclose=AsyncMock(),
+    )
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.open_directory_validation_staging.return_value = stream
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills/demo/SKILL.md",
+        target=WorkspaceTarget.personal(user_id),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    with pytest.raises(WorkspaceError) as caught:
+        await service.commit_transfer_upload(
+            ticket,
+            sink,
+            size=len(content),
+            sha256="0" * 64,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    workspace_fs.commit_uploaded_object.assert_not_awaited()
+    stream.aclose.assert_awaited_once()
+
+
+async def test_single_file_transfer_publishes_valid_personal_skill_staging() -> None:
+    user_id = uuid4()
+    content = b"---\nname: demo\ndescription: valid\n---\nbody"
+    stream = SimpleNamespace(
+        size=len(content),
+        read=AsyncMock(side_effect=[content, b""]),
+        aclose=AsyncMock(),
+    )
+    workspace_fs = _workspace_fs_mock()
+    workspace_fs.open_directory_validation_staging.return_value = stream
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills/demo/SKILL.md",
+        target=WorkspaceTarget.personal(user_id),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    cancelled_after_commit = await service.commit_transfer_upload(
+        ticket,
+        sink,
+        size=len(content),
+        sha256="0" * 64,
+    )
+
+    assert cancelled_after_commit is False
+    workspace_fs.commit_uploaded_object.assert_awaited_once_with(
+        ticket.target,
+        ticket.relative_path,
+        sink.object_name,
+        size=len(content),
+        quota_bytes=ticket.quota_bytes,
+    )
+    stream.aclose.assert_awaited_once()
+
+
+async def test_single_file_transfer_does_not_validate_shared_skill_namespace() -> None:
+    user_id = uuid4()
+    workspace_fs = _workspace_fs_mock()
+    service = WorkspaceService(workspace_fs)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="/shared@12345678/skills/demo/SKILL.md",
+        target=WorkspaceTarget.shared(uuid4()),
+        relative_path="skills/demo/SKILL.md",
+        quota_bytes=1024,
+    )
+    sink = SimpleNamespace(object_name="_openoctopus-transfers/staged")
+
+    await service.commit_transfer_upload(
+        ticket,
+        sink,
+        size=1,
+        sha256="0" * 64,
+    )
+
+    workspace_fs.open_directory_validation_staging.assert_not_awaited()
+    workspace_fs.commit_uploaded_object.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["", "skills", "skills/demo", "skills/demo/SKILL.md"],
+)
+def test_transfer_ticket_changed_invalidates_personal_skills_by_immutable_path(
+    relative_path: str,
+) -> None:
+    user_id = uuid4()
+    cache = Mock()
+    service = WorkspaceService(_workspace_fs_mock(), skills_cache=cache)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="unrelated-display-alias",
+        target=WorkspaceTarget.personal(user_id),
+        relative_path=relative_path,
+        quota_bytes=1024,
+    )
+
+    service.transfer_ticket_changed(ticket)
+
+    cache.invalidate.assert_called_once_with(user_id)
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "relative_path"),
+    [
+        ("shared", "skills/demo/SKILL.md"),
+        ("foreign-personal", "skills/demo/SKILL.md"),
+        ("own-personal", "notes/skills/demo/SKILL.md"),
+    ],
+)
+def test_transfer_ticket_changed_ignores_nonpersonal_skill_namespaces(
+    target_kind: str,
+    relative_path: str,
+) -> None:
+    user_id = uuid4()
+    target = {
+        "shared": WorkspaceTarget.shared(uuid4()),
+        "foreign-personal": WorkspaceTarget.personal(uuid4()),
+        "own-personal": WorkspaceTarget.personal(user_id),
+    }[target_kind]
+    cache = Mock()
+    service = WorkspaceService(_workspace_fs_mock(), skills_cache=cache)
+    ticket = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills/demo/SKILL.md",
+        target=target,
+        relative_path=relative_path,
+        quota_bytes=1024,
+    )
+
+    service.transfer_ticket_changed(ticket)
+
+    cache.invalidate.assert_not_called()
 
 
 async def test_grep_result_cap_resumes_within_the_same_file(pg_engine) -> None:

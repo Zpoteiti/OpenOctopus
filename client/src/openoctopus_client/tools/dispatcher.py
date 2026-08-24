@@ -51,6 +51,11 @@ from openoctopus_client.tools.workspace_rest import (
 )
 from openoctopus_client.tools.workspace_rest import MAX_SCAN_OBJECTS as REST_MAX_SCAN_OBJECTS
 from openoctopus_client.tools.workspace_rest import MAX_TEXT_EDIT_BYTES as REST_MAX_TEXT_EDIT_BYTES
+from openoctopus_client.transfer_admission import (
+    LOCAL_TRANSFER_CAPACITY,
+    LocalTransferAdmission,
+    LocalTransferDrainRegistry,
+)
 
 MAX_READ_CHARS = 128_000
 MAX_TEXT_EDIT_BYTES = 8 * 1024 * 1024
@@ -58,6 +63,7 @@ MAX_GREP_BYTES = 2 * 1024 * 1024
 MAX_SCAN_OBJECTS = 10_000
 MAX_RESPONSE_BYTES = 5_000_000
 MAX_REDIRECTS = 10
+_LOCAL_TRANSFER_CANCEL_GRACE_SECONDS = 0.1
 type FileFingerprint = tuple[int, int, int, int, int, str]
 _NOISE = frozenset(
     {
@@ -148,6 +154,8 @@ class ClientToolDispatcher:
         restrict_to_workspace: bool,
         ssrf_denylist: list[str],
         path_locks: PathLocks | None = None,
+        transfer_admission: LocalTransferAdmission | None = None,
+        transfer_drains: LocalTransferDrainRegistry | None = None,
     ) -> None:
         self._paths = WorkspacePaths(
             workspace,
@@ -156,6 +164,10 @@ class ClientToolDispatcher:
         self._locks = path_locks or PathLocks()
         self._denylist = tuple(ssrf_denylist)
         self._blocking_tasks: set[asyncio.Task[Any]] = set()
+        self._transfer_admission = transfer_admission or LocalTransferAdmission(
+            capacity=LOCAL_TRANSFER_CAPACITY
+        )
+        self._transfer_drains = transfer_drains or LocalTransferDrainRegistry()
 
     def has_pending_blocking(self) -> bool:
         """Whether a local worker thread is still running for this dispatcher."""
@@ -179,6 +191,23 @@ class ClientToolDispatcher:
 
     async def _run_mutation(self, function: Any, *args: Any, **kwargs: Any) -> Any:
         return await _run_mutation(function, *args, tracker=self._blocking_tasks, **kwargs)
+
+    async def _run_transfer_blocking[T](
+        self,
+        abandoned_drains: set[asyncio.Task[None]],
+        function: Callable[..., T],
+        *args: Any,
+        on_abandoned: Callable[[T], Any] | None = None,
+        **kwargs: Any,
+    ) -> T:
+        return await _run_blocking_with_drain(
+            self._blocking_tasks,
+            abandoned_drains,
+            function,
+            *args,
+            on_abandoned=on_abandoned,
+            **kwargs,
+        )
 
     async def _resolve_path(self, path: str, *, directory: bool | None) -> Path:
         return await self._run_blocking(self._paths.resolve, path, directory=directory)
@@ -411,37 +440,84 @@ class ClientToolDispatcher:
             raise ToolFailure(
                 "workspace_invalid_request", "Transfer source and destination must differ"
             )
-        async with self._locks.hold(str(source), str(destination)):
-            source_fd, initial = await self._run_blocking(
+        lease = await self._transfer_admission.acquire()
+        abandoned_drains: set[asyncio.Task[None]] = set()
+        lock_stack = contextlib.AsyncExitStack()
+        source_fd: int | None = None
+        try:
+            await lock_stack.enter_async_context(
+                self._locks.hold(str(source), str(destination))
+            )
+            opened_source = await self._run_transfer_blocking(
+                abandoned_drains,
                 _open_transfer_source,
                 source,
                 action.mode == "move",
+                on_abandoned=_close_transfer_source_result,
             )
+            active_source_fd, initial = opened_source
+            source_fd = active_source_fd
             try:
-                await self._run_blocking(_check_transfer_destination, destination)
-                await self._run_blocking(self._paths.prepare_parent, destination)
-                if not await self._run_blocking(destination.parent.is_dir):
+                if (
+                    action.if_match is not None
+                    and action.if_match != opaque_stat_fingerprint(initial[:4])
+                ):
                     raise ToolFailure(
-                        "tool_not_a_directory", "Destination parent is not a directory"
+                        "workspace_file_changed",
+                        "Source changed before transfer",
+                    )
+                await self._run_transfer_blocking(
+                    abandoned_drains, _check_transfer_destination, destination
+                )
+                await self._run_transfer_blocking(
+                    abandoned_drains, self._paths.prepare_parent, destination
+                )
+                if not await self._run_transfer_blocking(
+                    abandoned_drains, destination.parent.is_dir
+                ):
+                    raise ToolFailure(
+                        "tool_not_a_directory",
+                        "Destination parent is not a directory",
                     )
                 if action.mode == "move":
                     result = await self._move_local(
                         source,
                         destination,
-                        source_fd,
+                        active_source_fd,
                         initial,
+                        abandoned_drains,
                     )
                 else:
                     result = await self._copy_local(
                         source,
                         destination,
-                        source_fd,
+                        active_source_fd,
                         initial,
+                        abandoned_drains,
                     )
                 return _workspace_json(result)
             finally:
-                with contextlib.suppress(OSError):
-                    await self._run_mutation(os.close, source_fd)
+                if not any(not task.done() for task in abandoned_drains):
+                    with contextlib.suppress(OSError):
+                        await self._run_mutation(os.close, active_source_fd)
+                    source_fd = None
+        finally:
+            pending = tuple(task for task in abandoned_drains if not task.done())
+            if pending:
+                cleanup = asyncio.create_task(
+                    _drain_local_transfer_resources(
+                        pending, source_fd, lock_stack
+                    )
+                )
+                self._transfer_drains.adopt(lease, (cleanup,), owner=self)
+            else:
+                try:
+                    if source_fd is not None:
+                        with contextlib.suppress(OSError):
+                            await self._run_mutation(os.close, source_fd)
+                    await lock_stack.aclose()
+                finally:
+                    lease.release()
 
     async def _copy_local(
         self,
@@ -449,9 +525,14 @@ class ClientToolDispatcher:
         destination: Path,
         source_fd: int,
         initial: tuple[int, int, int, int, int],
+        abandoned_drains: set[asyncio.Task[None]],
     ) -> WorkspaceTransferLocalResult:
-        temporary_fd, temporary = await self._run_blocking(
-            _create_transfer_temp, destination.parent, destination.name
+        temporary_fd, temporary = await self._run_transfer_blocking(
+            abandoned_drains,
+            _create_transfer_temp,
+            destination.parent,
+            destination.name,
+            on_abandoned=_discard_transfer_temp_result,
         )
         committed = False
         try:
@@ -462,13 +543,15 @@ class ClientToolDispatcher:
             await self._run_mutation(os.fsync, temporary_fd)
             await self._run_mutation(os.close, temporary_fd)
             temporary_fd = -1
-            if not await self._run_blocking(
-                _source_unchanged, source, source_fd, initial
+            if not await self._run_transfer_blocking(
+                abandoned_drains, _source_unchanged, source, source_fd, initial
             ):
                 raise ToolFailure("workspace_file_changed", "Source changed during transfer")
             await _commit_transfer_no_replace(temporary, destination)
             committed = True
             return WorkspaceTransferLocalResult(
+                kind="file",
+                files_transferred=1,
                 bytes_transferred=bytes_transferred,
                 sha256=digest,
             )
@@ -486,9 +569,12 @@ class ClientToolDispatcher:
         destination: Path,
         source_fd: int,
         initial: tuple[int, int, int, int, int],
+        abandoned_drains: set[asyncio.Task[None]],
     ) -> WorkspaceTransferLocalResult:
         bytes_transferred, digest = await _hash_fd(source_fd)
-        if not await self._run_blocking(_source_unchanged, source, source_fd, initial):
+        if not await self._run_transfer_blocking(
+            abandoned_drains, _source_unchanged, source, source_fd, initial
+        ):
             raise ToolFailure("workspace_file_changed", "Source changed during transfer")
         bytes_transferred, digest = await _run_irreversible_mutation(
             self._blocking_tasks,
@@ -501,6 +587,8 @@ class ClientToolDispatcher:
             digest,
         )
         return WorkspaceTransferLocalResult(
+            kind="file",
+            files_transferred=1,
             bytes_transferred=bytes_transferred,
             sha256=digest,
         )
@@ -1473,6 +1561,74 @@ async def _run_blocking[T](
     return await asyncio.shield(task)
 
 
+async def _run_blocking_with_drain[T](
+    tracker: set[asyncio.Task[Any]],
+    abandoned_drains: set[asyncio.Task[None]],
+    function: Callable[..., T],
+    *args: Any,
+    on_abandoned: Callable[[T], Any] | None = None,
+    **kwargs: Any,
+) -> T:
+    """Transfer blocking work to a runtime drain when its caller is cancelled."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    _track_blocking_task(tracker, task)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The runtime drain now owns this operation; it must not hold the
+        # connection's FIFO tool worker open while the OS syscall finishes.
+        tracker.discard(task)
+        drain = asyncio.create_task(_drain_blocking_result(task, on_abandoned))
+        abandoned_drains.add(drain)
+
+        def finish(completed: asyncio.Task[None]) -> None:
+            abandoned_drains.discard(completed)
+            if not completed.cancelled():
+                with contextlib.suppress(BaseException):
+                    completed.exception()
+
+        drain.add_done_callback(finish)
+        with contextlib.suppress(BaseException):
+            await asyncio.wait(
+                {drain}, timeout=_LOCAL_TRANSFER_CANCEL_GRACE_SECONDS
+            )
+        raise
+
+
+async def _drain_blocking_result[T](
+    task: asyncio.Task[T], on_abandoned: Callable[[T], Any] | None
+) -> None:
+    try:
+        result = await asyncio.shield(task)
+    except BaseException:
+        return
+    if on_abandoned is None:
+        return
+    cleanup = asyncio.create_task(asyncio.to_thread(on_abandoned, result))
+    try:
+        await asyncio.shield(cleanup)
+    except BaseException:
+        if not cleanup.cancelled():
+            with contextlib.suppress(BaseException):
+                cleanup.exception()
+
+
+async def _drain_local_transfer_resources(
+    drains: tuple[asyncio.Task[None], ...],
+    source_fd: int | None,
+    lock_stack: contextlib.AsyncExitStack,
+) -> None:
+    await asyncio.gather(
+        *(asyncio.shield(task) for task in drains),
+        return_exceptions=True,
+    )
+    if source_fd is not None:
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(os.close, source_fd)
+    await lock_stack.aclose()
+
+
 async def _run_mutation(
     function: Any,
     *args: Any,
@@ -1619,6 +1775,20 @@ def _create_transfer_temp(parent: Path, name: str) -> tuple[int, Path]:
             "workspace_storage_unavailable", "Temporary destination unavailable"
         ) from exc
     return descriptor, Path(raw_path)
+
+
+def _close_transfer_source_result(
+    result: tuple[int, tuple[int, int, int, int, int]],
+) -> None:
+    with contextlib.suppress(OSError):
+        os.close(result[0])
+
+
+def _discard_transfer_temp_result(result: tuple[int, Path]) -> None:
+    with contextlib.suppress(OSError):
+        os.close(result[0])
+    with contextlib.suppress(OSError):
+        result[1].unlink()
 
 
 async def _stream_fd(source_fd: int, destination_fd: int) -> tuple[int, str]:

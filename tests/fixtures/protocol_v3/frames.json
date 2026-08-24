@@ -321,6 +321,34 @@
         "type": "transfer_end",
         "id": "0190d5a7-0000-7000-8000-000000000008",
         "ack": true,
+        "ok": true,
+        "code": null,
+        "bytes_sent": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "etag": "destination-fingerprint",
+        "created": true
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": true,
+        "ok": true,
+        "code": null,
+        "bytes_sent": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "etag": "destination-fingerprint",
+        "created": true
+      }
+    },
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "type": "transfer_end",
+        "id": "0190d5a7-0000-7000-8000-000000000008",
+        "ack": true,
         "ok": false,
         "code": "workspace_file_changed",
         "bytes_sent": null,

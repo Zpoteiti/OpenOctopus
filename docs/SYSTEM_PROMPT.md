@@ -118,8 +118,8 @@ To install a new skill into your personal workspace:
 3. Validation runs at write time. If SKILL.md is malformed,
    workspace_fs rejects the write — fix and retry. For folder
    transfers, ALL SKILL.md files under skills/*/SKILL.md in the
-   source tree are pre-validated; if any is malformed the entire
-   transfer is rejected atomically.
+   source tree are pre-validated before the first destination file
+   is committed. If any is malformed, the destination stays absent.
 4. The new skill appears in next turn's Skills section.
 
 To install from a shared workspace, use that workspace's

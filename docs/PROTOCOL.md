@@ -188,7 +188,7 @@ All control frames are **WebSocket text frames** carrying a single JSON object w
 | `register_mcp_ack` | Accept/reject an exact aggregate runtime snapshot | id, revision, digest, per-server results |
 | `tool_call` | Dispatch a tool to the device | id, name, args, max_result_bytes, chat_session_id?, mcp_route? |
 | `config_update` | Push authoritative config/catalog | id, device_name, config_revision, full config, last-good catalog |
-| `transfer_request` | Ask a device to send one regular file | id, purpose, src_path, dst_path? |
+| `transfer_request` | Ask a device to send one regular-file child | id, purpose, src_path, dst_path? |
 | `transfer_begin` | Byte sender opens a slot and declares source/destination metadata | same fields as client frame |
 | `transfer_ready` | Receiver has reserved its destination/consumer | id |
 | `transfer_progress` | Optional progress update | id, bytes_sent |
@@ -490,26 +490,30 @@ stop the Agent loop.
 
 ## 4. File transfer (binary frames)
 
-Python-main implements regular-file `file_transfer` for every install-site
-combination: `server -> server`, `server -> client`, `client -> server`, one
-paired Client to itself, and two distinct Clients owned by the same
-authenticated user. A same-Client transfer is one coordinated local action.
-A distinct-Client transfer is a process-local pure relay between two captured
+Python-main `file_transfer` automatically accepts one regular file or one
+recursive directory for every install-site combination: `server -> server`,
+`server -> client`, `client -> server`, one paired Client to itself, and two
+distinct Clients owned by the same authenticated user. A regular file uses one
+existing slot. A directory is coordinated as a bounded manifest followed by
+sequential regular-file child slots; at most one child is active at a time.
+A distinct-Client child is a process-local pure relay between two captured
 online routes: the Server retains bounded chunks plus verification metadata,
-but creates no Server temporary file, durable byte cache, or RustFS staging
-object. Folder transfer, range, and resume are not supported. Disconnected or
-stale device targets surface `tool_device_unreachable`.
+but creates no durable byte cache or RustFS staging object.
 
-Py8b does not change Protocol v3. A bridge reuses the existing control DTOs,
-binary layout, and one UUIDv7 slot ID on both endpoint routes; there is no
-`bridge` field, second slot ID, capability flag, or version negotiation.
+Py8b/Py8c do not change Protocol v3. A bridge reuses the existing control DTOs,
+binary layout, and one UUIDv7 slot ID on both endpoint routes. Directory control
+uses private workspace actions inside existing `tool_call`/`tool_result`
+frames; there is no public directory frame, binary header change, capability
+bit, second slot ID, or version negotiation. Range and resume are not
+supported. Disconnected or stale Device targets surface
+`tool_device_unreachable`.
 
 ### 4.1 Slot lifecycle
 
 A Protocol v3 transfer has one unambiguous endpoint state sequence:
 
 1. **Requester → sender:** optional `transfer_request` — asks the other side to
-   open one regular-file source.
+   open one regular-file source or one authorized directory child.
 2. **Sender → receiver:** `transfer_begin` — declares the opened source and its
    metadata.
 3. **Receiver → sender:** `transfer_ready` — confirms that the destination or
@@ -526,8 +530,9 @@ can interleave freely. A same-device local copy/move is a tool dispatch and has
 no transfer slot or binary frames.
 
 The server sends `transfer_request` only when it needs bytes from a client. The
-client validates and opens its local regular file, then becomes the byte sender
-by sending `transfer_begin`. For server-to-client transfer and browser upload,
+client validates and opens its local regular file or authorized directory
+child, then becomes the byte sender by sending `transfer_begin`. For
+server-to-client transfer and browser upload,
 the server already owns the source and starts with `transfer_begin`.
 For a distinct-Client bridge, the Server validates the source begin, rewrites
 its route metadata into a `server_to_client` begin for the destination, and
@@ -599,7 +604,10 @@ destination and may carry exactly one destination precondition:
 `if_match` and `if_none_match` are mutually exclusive. The receiver's
 successful ACK always includes `bytes_sent` and `sha256`; a successful
 `workspace_upload` ACK additionally returns the committed destination `etag`
-and whether the destination was `created`:
+and whether the destination was `created`. A successful directory-child
+`file_transfer` ACK also returns committed `etag` and `created=true`, so the
+directory coordinator can perform exact conditional cleanup. The first example
+is a workspace upload; the second is a directory child:
 
 ```jsonc
 {
@@ -611,6 +619,17 @@ and whether the destination was `created`:
   "sha256": "<64-lowercase-hex-digest>",
   "etag": "<opaque-etag>",
   "created": false
+}
+
+{
+  "type": "transfer_end",
+  "id": "0190d5ab-...",
+  "ack": true,
+  "ok": true,
+  "bytes_sent": 42,
+  "sha256": "<64-lowercase-hex-digest>",
+  "etag": "<opaque-etag>",
+  "created": true
 }
 ```
 
@@ -653,7 +672,10 @@ hashes incrementally while streaming and includes the final byte count and
 digest in `transfer_end(ack=false)`. The receiver computes the same values
 while writing and replies with `transfer_end(ack=true, ok=true,
 bytes_sent=<verified size>, sha256=<verified digest>)`. A successful
-`workspace_upload` ACK also includes `etag` and `created` as shown above.
+`workspace_upload` ACK includes `etag` and `created` as shown above. A
+directory-child `file_transfer` ACK includes the same destination metadata and
+requires `created=true`; ordinary single-file `file_transfer` callers do not
+depend on it.
 Failures use `transfer_end(ack=true, ok=false, code="...")`; failed frames do
 not carry size, digest, or destination metadata. On mismatch or cancellation,
 the receiver discards the partial file. Client-to-server writes promote a
@@ -678,8 +700,10 @@ frames for that slot.
 ### 4.5 Device → device
 
 When both device fields name the same paired Client, the Server sends an
-internal workspace action and the Client performs a coordinated local
-regular-file copy or move.
+internal workspace action. Regular files use the existing local copy/move.
+Directories use a generation-bound private job; a qualifying same-Client
+directory move performs one exclusive no-replace native rename and fails if a
+reliable atomic primitive is unavailable or the paths cross volumes.
 
 For two distinct Clients, both Device rows and live routes must belong to the
 authenticated user. The Server atomically captures both ready generations,
@@ -689,24 +713,26 @@ SHA-256 before forwarding the source success terminal. The destination uses
 its ordinary temporary-file and atomic no-replace commit path, so an existing
 destination always rejects and is never overwritten.
 
-`mode="copy"` leaves the source intact. `mode="move"` deletes the source only
-after the destination has committed and its chosen success ACK has been
-delivered to the source. Deletion is conditional on the source fingerprint
-captured by `transfer_begin`; a changed or unavailable source remains in place
-and yields `source_delete_failed`. If destination commit is known but source
-ACK delivery is not confirmed, the result includes `transfer_ack_failed` and
-move also includes `source_delete_failed`; OpenOctopus does not guess, replay,
-or delete the source.
+`mode="copy"` leaves the source intact. `mode="move"` deletes a file source, or
+starts directory source cleanup, only after the complete destination is known
+finalized. Deletion is conditional on captured source fingerprints. A changed
+or unavailable source remains in place and yields a bounded source-cleanup
+warning. If destination commit is known but source ACK delivery is not
+confirmed, the result includes `transfer_ack_failed`; OpenOctopus does not
+guess, replay, or delete an unconfirmed source.
 
 ### 4.6 Caller-facing semantics
 
 The agent's cross-endpoint `file_transfer` tool blocks until the authoritative
 destination result and source-resolution boundary. Same-device local transfers
-return after the Client's coordinated operation. Confirmed destination failure
-surfaces per ADR-031. A committed destination remains a success even if later
-source acknowledgement or conditional deletion fails; those conditions return
-only `transfer_ack_failed` and/or `source_delete_failed` warnings and never
-trigger automatic retry.
+return after the Client's coordinated operation. Success is a bounded aggregate
+of `kind`, file count, total bytes, canonical content digest, and at most eight
+symbolic warnings; it never exposes manifest entries. Confirmed destination
+failure surfaces per ADR-031. If a partial destination cannot be conditionally
+cleaned back to absent, the result is `tool_execution_outcome_unknown` and must
+not be retried automatically. A complete finalized destination remains success
+if later source acknowledgement or conditional source cleanup fails; only that
+post-finalize boundary returns warnings.
 
 The current Py6 `message` tool is web-session only. With `media: [...]` and a
 paired `openoctopus_device`, it writes an online-only device-file reference to
@@ -718,6 +744,67 @@ server destination path and no RustFS write. With `openoctopus_device="server"`,
 the tool authorizes and stats the file through `WorkspaceService` and emits a
 durable workspace-file reference. Third-party channel delivery is outside this
 milestone and has no Py6 wire contract.
+
+### 4.7 Private recursive-directory control
+
+Directory orchestration is not a public or durable job API. The Server sends
+strict private operations through the existing `__workspace_rest__`
+`tool_call` route:
+
+| Role | Private operations |
+|---|---|
+| Source Client | `transfer_source_probe_start`, `transfer_source_probe_status`, `transfer_source_probe_page`, `transfer_source_probe_hold`, `transfer_source_probe_cancel`, `transfer_source_probe_release`, `transfer_directory_authorize_source_child`, `transfer_source_cleanup` |
+| Destination Client | `transfer_directory_preflight`, `transfer_directory_status`, `transfer_directory_prepare`, `transfer_directory_authorize_child`, `transfer_directory_finish`, `transfer_directory_cancel`, `transfer_directory_release` |
+| Same Client | existing `transfer_local`, plus `transfer_local_directory_start`, `transfer_local_directory_status`, `transfer_local_directory_cancel`, `transfer_local_directory_release` |
+
+Each operation is UUIDv7/generation-bound and captures immutable Device route
+and config/path-policy snapshots. Source probe first reports file versus
+directory. A directory manifest is complete before paging: at most 10,000
+entries and 5 MiB encoded, with pages of at most 256 entries/256 KiB. Every
+entry is no-follow validated; links, junctions/reparse points, and special files
+reject the operation. Empty directories are scan-only metadata, are not copied,
+and a tree with no regular files is rejected.
+
+The Server validates the complete manifest before destination preflight. A
+destination progresses through preflight, prepare/reservation, sequential copy,
+exact-tree finalize, and `finalized_held`; copy releases the reservation after
+finalize, while move retains it until source cleanup completes or is abandoned.
+Before every child begins, source and destination issue separate one-shot
+authorizations bound to the exact operation ID, child path/fingerprint, and
+fresh transfer UUID. Loss of either authorization result never triggers begin
+or replay. Destination child ACK metadata supplies the exact identity used for
+conditional cleanup.
+
+Cancellation before finalize enters destination cleanup and returns the
+original error only when absence is proved; otherwise it returns outcome
+unknown. Cancellation after `finalized_held` preserves the destination: copy
+succeeds, and move does not start new source deletion and succeeds with
+`source_cleanup_incomplete`. Private status polling observes monotonic real
+progress and fixed idle leases; duplicate polls do not keep jobs alive. Jobs,
+manifests, reservations, tombstones, and temporary staging are bounded and
+released on terminal acknowledgement/TTL or generation retirement. Client
+process restart does not recover them.
+
+The coordinator, transfer admission, Device routes, and directory state are
+process-local under the current single-ASGI-worker deployment. Graceful Server
+shutdown requests bounded reconciliation. A hard Server restart does not
+replay children or reconstruct jobs and does not treat an old partial
+user-visible destination as safe to delete. Multi-worker/multi-node ownership
+requires a separate routing and distributed-admission design.
+
+Each Client generation admits at most two directory jobs, sharing capacity with
+regular local/slot work; each directory operation has one active child slot.
+Existing 64 KiB chunks, bounded writer/control queues, transfer admission,
+queue timeout, and idle timeout apply. Linux, macOS, and Windows endpoints use
+conservative native no-follow/path/collision checks. Two different Device IDs
+that expose the same physical workspace are unsupported; the Server neither
+discovers nor reconciles that physical overlap.
+
+For a directory mapped into a personal Server `skills/` subtree, each resulting
+`skills/<name>/SKILL.md` is streamed sequentially through bounded private
+staging and validated before the first destination publish. Validation failure
+leaves the destination absent; this does not claim whole-tree atomic visibility
+after copying starts. No complete file or tree is retained in Server memory.
 
 ---
 
@@ -773,6 +860,9 @@ tolerance. Protocol version is independent from the package version.
 - **Streaming `tool_result`** — results are single-frame even if large (subject to the tool's own result cap). Real streaming would require a slot model like transfers; not justified yet.
 - **Multi-server failover** — single server per device. Multi-server coordination is ruled out (ADR-061).
 - **Resume / range support for transfers** — failed transfers restart from byte 0. Resumable transfers require tracking offsets persistently; not worth the complexity at current file sizes.
+- **Public or durable directory jobs** — recursive transfer coordination is
+  private, process-local, generation-bound, and bounded. There is no job REST
+  API, durable manifest, public progress tree, or Server-restart recovery.
 - **Server MCP wire frames** — Server MCP is active in Py8a but is an in-process
   Server route. It deliberately adds no Device frame and does not require
   Protocol v4.
@@ -797,4 +887,5 @@ tolerance. Protocol version is independent from the package version.
 - **ADR-133** — Protocol v3, workspace restriction, Device MCP, last-good
   catalog, validate-before-save, WSS secrets, and no replay.
 - **ADR-134** — Py8b same-owner distinct-Client single-file pure relay over
-  unchanged Protocol v3.
+  unchanged Protocol v3; Py8c applies that slot to sequential recursive
+  directory children without a Protocol v4 surface.

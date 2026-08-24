@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_TRANSFER_WARNING_ORDER = (
+    "transfer_ack_failed",
+    "source_delete_failed",
+    "source_changed_after_copy",
+    "source_cleanup_incomplete",
+)
 
 
 class FileEditRequest(BaseModel):
@@ -88,14 +95,51 @@ class StructuredPatchResponse(BaseModel):
     committed: int
 
 
-class TransferResponse(BaseModel):
+class _TransferResponseFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bytes_transferred: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    warnings: list[Literal["transfer_ack_failed", "source_delete_failed"]] = Field(
-        max_length=8
-    )
+    warnings: list[
+        Literal[
+            "transfer_ack_failed",
+            "source_delete_failed",
+            "source_changed_after_copy",
+            "source_cleanup_incomplete",
+        ]
+    ] = Field(max_length=8, json_schema_extra={"uniqueItems": True})
+
+    @field_validator("warnings")
+    @classmethod
+    def validate_warning_order(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or value != sorted(
+            value,
+            key=_TRANSFER_WARNING_ORDER.index,
+        ):
+            raise ValueError("transfer warnings must be unique and canonically ordered")
+        return value
+
+
+class FileTransferResponse(_TransferResponseFields):
+    kind: Literal["file"]
+    files_transferred: Literal[1]
+
+
+class DirectoryTransferResponse(_TransferResponseFields):
+    kind: Literal["directory"]
+    files_transferred: int = Field(ge=1, le=10_000)
+
+
+type TransferResponse = Annotated[
+    FileTransferResponse | DirectoryTransferResponse,
+    Field(
+        discriminator="kind",
+        description=(
+            "Bounded file or directory aggregate. File responses always report one file; "
+            "directory responses report 1..10000 regular files."
+        ),
+    ),
+]
 
 
 class GrepContextLine(BaseModel):

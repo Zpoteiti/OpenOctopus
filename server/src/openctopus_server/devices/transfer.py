@@ -155,7 +155,32 @@ class TransferSink(Protocol):
 DeleteSource = Callable[[], Awaitable[None]]
 DeleteBridgeSource = Callable[[str], Awaitable[None]]
 SinkFactory = Callable[[TransferBeginFrame], Awaitable[TransferSink]]
-CommitSink = Callable[[TransferSink, TransferBeginFrame, int, str], Awaitable[bool | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class TransferCommitResult:
+    """Coordinator-only metadata returned by a directory child commit."""
+
+    etag: str
+    created: Literal[True] = True
+    cancel_after_commit: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not 1 <= len(self.etag) <= 512
+            or any(
+                character in {'"', "\x00"}
+                or not 0x21 <= ord(character) <= 0x7E
+                for character in self.etag
+            )
+        ):
+            raise ValueError("transfer commit etag is invalid")
+
+
+CommitSink = Callable[
+    [TransferSink, TransferBeginFrame, int, str],
+    Awaitable[bool | TransferCommitResult | None],
+]
 SourceFactory = Callable[[], Awaitable[TransferSource]]
 
 
@@ -183,12 +208,21 @@ class TransferResult:
             raise ValueError("transfer etag is invalid")
 
 
+class TransferCommittedAfterCancellation(asyncio.CancelledError):
+    """An irreversible transfer commit completed before cancellation."""
+
+    def __init__(self, result: TransferResult) -> None:
+        super().__init__()
+        self.result = result
+
+
 @dataclass(slots=True)
 class TransferLease:
     """Idempotent ownership of one global and one per-user transfer slot."""
 
     user_id: UUID
     _release: Callable[[], Awaitable[None]]
+    _owner: object
     _closed: bool = False
 
     async def aclose(self) -> None:
@@ -327,7 +361,7 @@ class FairTransferAdmission:
     def _grant_locked(self, user_id: UUID) -> TransferLease:
         self._active += 1
         self._active_by_user[user_id] = self._active_by_user.get(user_id, 0) + 1
-        return TransferLease(user_id, lambda: self._release(user_id))
+        return TransferLease(user_id, lambda: self._release(user_id), self)
 
     def _drain_locked(self) -> None:
         if not self._round_robin:
@@ -380,7 +414,7 @@ class _TransferSlot:
     direction: TransferDirection
     purpose: TransferPurpose
     state: TransferState
-    lease: TransferLease
+    lease: TransferLease | None
     queue: asyncio.Queue[bytes | None] = field(
         default_factory=lambda: asyncio.Queue(maxsize=TRANSFER_QUEUE_CHUNKS)
     )
@@ -410,6 +444,7 @@ class _TransferSlot:
     fenced: bool = False
     finish_task: asyncio.Task[None] | None = None
     on_issued: Callable[[], None] | None = None
+    directory_child: bool = False
 
 
 @dataclass(slots=True)
@@ -421,9 +456,12 @@ class _BridgeSlot:
     src_path: str
     dst_path: str
     mode: Literal["copy", "move"]
-    lease: TransferLease
+    lease: TransferLease | None
     delete_source: DeleteBridgeSource | None
     on_issued: Callable[[], None] | None
+    expected_source_size: int | None
+    expected_source_fingerprint: str | None
+    directory_child: bool = False
     state: BridgeState = BridgeState.ADMITTED
     queue: asyncio.Queue[bytes | None] = field(
         default_factory=lambda: asyncio.Queue(maxsize=TRANSFER_QUEUE_CHUNKS)
@@ -550,6 +588,29 @@ class TransferManager:
     def slot_ids(self) -> tuple[UUID, ...]:
         return tuple(slot.slot_id for slot in self._slots.values()) + tuple(self._bridges)
 
+    @property
+    def idle_timeout_seconds(self) -> float:
+        """Timeout shared by file slots and private directory controllers."""
+
+        return self._idle_timeout_seconds
+
+    async def acquire_operation(self, user_id: UUID) -> TransferLease:
+        """Acquire one transfer credit owned by a multi-file coordinator."""
+
+        return await self._admission.acquire(user_id)
+
+    def _validate_operation_lease(
+        self,
+        lease: TransferLease,
+        *,
+        user_id: UUID,
+        slot_id: UUID,
+    ) -> None:
+        if lease._owner is not self._admission or lease.user_id != user_id or lease._closed:
+            raise ValueError("transfer operation lease is not active for this user")
+        if slot_id.version != 7:
+            raise ValueError("transfer slot id must be UUIDv7")
+
     def fence_handle(self, handle: object) -> None:
         """Synchronously prevent a retired generation from making more progress."""
 
@@ -618,6 +679,9 @@ class TransferManager:
         src_device: str = "server",
         dst_device: str | None = None,
         on_issued: Callable[[], None] | None = None,
+        _slot_id: UUID | None = None,
+        _operation_lease: TransferLease | None = None,
+        _directory_child: bool = False,
     ) -> TransferResult:
         if mode not in {"copy", "move"}:
             raise ValueError("transfer mode must be copy or move")
@@ -627,7 +691,17 @@ class TransferManager:
             raise ValueError("transfer preconditions are only valid for workspace_upload")
         if if_none_match is False:
             if_none_match = None
-        lease = await self._admission.acquire(user_id)
+        if _operation_lease is None:
+            lease = await self._admission.acquire(user_id)
+        else:
+            if _slot_id is None:
+                raise ValueError("already-admitted transfer requires a slot id")
+            self._validate_operation_lease(
+                _operation_lease,
+                user_id=user_id,
+                slot_id=_slot_id,
+            )
+            lease = None
         slot = await self._new_slot(
             handle=handle,
             route=route,
@@ -641,6 +715,8 @@ class TransferManager:
             delete_source=delete_source,
             mode=mode,
             on_issued=on_issued,
+            slot_id=_slot_id,
+            directory_child=_directory_child,
         )
         try:
             if source_factory is not None:
@@ -686,8 +762,113 @@ class TransferManager:
         try:
             return await asyncio.shield(slot.completion)
         except asyncio.CancelledError:
-            await self._abort(slot, "cancelled", send_frame=True)
+            if slot.state is TransferState.SENDER_ENDED and slot.worker is not None:
+                try:
+                    await await_future_cancellation_safe(slot.worker)
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    await self._abort(slot, "cancelled", send_frame=True)
+                except asyncio.CancelledError:
+                    pass
+            committed = _completed_transfer_result(slot.completion)
+            if committed is not None:
+                raise TransferCommittedAfterCancellation(committed) from None
             raise
+
+    async def start_server_to_client_admitted(
+        self,
+        *,
+        handle: object,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        route: TransferRoute | None = None,
+        user_id: UUID,
+        src_path: str | None,
+        dst_path: str,
+        source: TransferSource | None = None,
+        source_factory: SourceFactory | None = None,
+        total_bytes: int | None = None,
+        sha256: str | None = None,
+        mime: str | None = None,
+        purpose: TransferPurpose = "file_transfer",
+        if_match: str | None = None,
+        if_none_match: bool | None = None,
+        src_device: str = "server",
+        dst_device: str | None = None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> TransferResult:
+        """Run one copy child while the caller retains the operation lease."""
+
+        return await self.start_server_to_client(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            source=source,
+            source_factory=source_factory,
+            total_bytes=total_bytes,
+            sha256=sha256,
+            mime=mime,
+            purpose=purpose,
+            if_match=if_match,
+            if_none_match=if_none_match,
+            mode="copy",
+            src_device=src_device,
+            dst_device=dst_device,
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=True,
+        )
+
+    async def start_server_to_client_regular_admitted(
+        self,
+        *,
+        handle: object,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        route: TransferRoute | None = None,
+        user_id: UUID,
+        src_path: str | None,
+        dst_path: str,
+        source: TransferSource | None = None,
+        source_factory: SourceFactory | None = None,
+        total_bytes: int | None = None,
+        sha256: str | None = None,
+        mime: str | None = None,
+        purpose: TransferPurpose = "file_transfer",
+        mode: str,
+        delete_source: DeleteSource | None,
+        src_device: str = "server",
+        dst_device: str | None = None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> TransferResult:
+        """Run one regular file while the caller retains operation admission."""
+
+        return await self.start_server_to_client(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            source=source,
+            source_factory=source_factory,
+            total_bytes=total_bytes,
+            sha256=sha256,
+            mime=mime,
+            purpose=purpose,
+            mode=mode,
+            delete_source=delete_source,
+            src_device=src_device,
+            dst_device=dst_device,
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=False,
+        )
 
     async def start_client_to_server(
         self,
@@ -703,10 +884,23 @@ class TransferManager:
         purpose: TransferPurpose = "file_transfer",
         mode: str = "copy",
         on_issued: Callable[[], None] | None = None,
+        _slot_id: UUID | None = None,
+        _operation_lease: TransferLease | None = None,
+        _directory_child: bool = False,
     ) -> TransferResult:
         if mode not in {"copy", "move"}:
             raise ValueError("transfer mode must be copy or move")
-        lease = await self._admission.acquire(user_id)
+        if _operation_lease is None:
+            lease = await self._admission.acquire(user_id)
+        else:
+            if _slot_id is None:
+                raise ValueError("already-admitted transfer requires a slot id")
+            self._validate_operation_lease(
+                _operation_lease,
+                user_id=user_id,
+                slot_id=_slot_id,
+            )
+            lease = None
         slot = await self._new_slot(
             handle=handle,
             route=route,
@@ -720,6 +914,8 @@ class TransferManager:
             delete_source=delete_source,
             mode=mode,
             on_issued=on_issued,
+            slot_id=_slot_id,
+            directory_child=_directory_child,
         )
         slot.completion = asyncio.get_running_loop().create_future()
         try:
@@ -739,11 +935,86 @@ class TransferManager:
             slot.route = None
             return await asyncio.shield(slot.completion)
         except asyncio.CancelledError:
-            await self._abort(slot, "cancelled", send_frame=True)
+            try:
+                await self._abort(slot, "cancelled", send_frame=True)
+            except asyncio.CancelledError:
+                pass
+            committed = _completed_transfer_result(slot.completion)
+            if committed is not None:
+                raise TransferCommittedAfterCancellation(committed) from None
             raise
         except BaseException as exc:
             await self._abort(slot, _error_code(exc), send_frame=True)
             raise
+
+    async def start_client_to_server_admitted(
+        self,
+        *,
+        handle: object,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        route: TransferRoute | None = None,
+        user_id: UUID,
+        src_path: str,
+        dst_path: str | None,
+        sink_factory: SinkFactory,
+        commit_sink: CommitSink | None = None,
+        purpose: TransferPurpose = "file_transfer",
+        on_issued: Callable[[], None] | None = None,
+    ) -> TransferResult:
+        """Run one copy child while the caller retains the operation lease."""
+
+        return await self.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            sink_factory=sink_factory,
+            commit_sink=commit_sink,
+            purpose=purpose,
+            mode="copy",
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=True,
+        )
+
+    async def start_client_to_server_regular_admitted(
+        self,
+        *,
+        handle: object,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        route: TransferRoute | None = None,
+        user_id: UUID,
+        src_path: str,
+        dst_path: str | None,
+        sink_factory: SinkFactory,
+        commit_sink: CommitSink | None = None,
+        purpose: TransferPurpose = "file_transfer",
+        mode: str,
+        delete_source: DeleteSource | None,
+        on_issued: Callable[[], None] | None = None,
+    ) -> TransferResult:
+        """Run one regular file while the caller retains operation admission."""
+
+        return await self.start_client_to_server(
+            handle=handle,
+            route=route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            sink_factory=sink_factory,
+            commit_sink=commit_sink,
+            delete_source=delete_source,
+            purpose=purpose,
+            mode=mode,
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=False,
+        )
 
     async def start_client_to_client(
         self,
@@ -756,17 +1027,54 @@ class TransferManager:
         mode: Literal["copy", "move"],
         delete_source: DeleteBridgeSource | None,
         on_issued: Callable[[], None] | None,
+        _slot_id: UUID | None = None,
+        _operation_lease: TransferLease | None = None,
+        _directory_child: bool = False,
+        _expected_source_size: int | None = None,
+        _expected_source_fingerprint: str | None = None,
     ) -> TransferResult:
         """Relay one file directly between two current device generations."""
 
         if mode not in {"copy", "move"}:
             raise ValueError("transfer mode must be copy or move")
+        has_expected_source = (
+            _expected_source_size is not None
+            and _expected_source_fingerprint is not None
+        )
+        if (
+            (_expected_source_size is None) != (_expected_source_fingerprint is None)
+            or (_directory_child and not has_expected_source)
+        ):
+            raise ValueError(
+                "pre-probed bridge source requires expected size and fingerprint"
+            )
+        if _expected_source_size is not None and _expected_source_size < 0:
+            raise ValueError("pre-probed source size is invalid")
+        if _expected_source_fingerprint is not None and (
+            not 1 <= len(_expected_source_fingerprint) <= 512
+            or not _expected_source_fingerprint.isascii()
+            or any(
+                not 0x21 <= ord(character) <= 0x7E
+                for character in _expected_source_fingerprint
+            )
+        ):
+            raise ValueError("pre-probed source fingerprint is invalid")
         source_identity = _handle_identity(source_route.handle)
         destination_identity = _handle_identity(destination_route.handle)
         if source_identity[0] == destination_identity[0]:
             raise ValueError("client bridge requires two distinct devices")
 
-        lease = await self._admission.acquire(user_id)
+        if _operation_lease is None:
+            lease = await self._admission.acquire(user_id)
+        else:
+            if _slot_id is None:
+                raise ValueError("already-admitted transfer requires a slot id")
+            self._validate_operation_lease(
+                _operation_lease,
+                user_id=user_id,
+                slot_id=_slot_id,
+            )
+            lease = None
         bridge: _BridgeSlot | None = None
         try:
             if not await self._bridge_routes_current(
@@ -785,9 +1093,13 @@ class TransferManager:
                 lease=lease,
                 delete_source=delete_source,
                 on_issued=on_issued,
+                slot_id=_slot_id,
+                directory_child=_directory_child,
+                expected_source_size=_expected_source_size,
+                expected_source_fingerprint=_expected_source_fingerprint,
             )
         except BaseException:
-            if bridge is None:
+            if bridge is None and lease is not None:
                 await lease.aclose()
             raise
 
@@ -805,14 +1117,89 @@ class TransferManager:
             return await asyncio.shield(bridge.completion)
         except asyncio.CancelledError:
             if bridge.destination_terminal_issued and bridge.worker is not None:
-                await await_future_cancellation_safe(bridge.worker)
-                raise
-            await self._abort_bridge(
-                bridge,
-                "cancelled",
-                error=TransferError("cancelled"),
-            )
+                try:
+                    await await_future_cancellation_safe(bridge.worker)
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    await self._abort_bridge(
+                        bridge,
+                        "cancelled",
+                        error=TransferError("cancelled"),
+                    )
+                except asyncio.CancelledError:
+                    pass
+            committed = _completed_transfer_result(bridge.completion)
+            if committed is not None:
+                raise TransferCommittedAfterCancellation(committed) from None
             raise
+
+    async def start_client_to_client_admitted(
+        self,
+        *,
+        source_route: TransferRoute,
+        destination_route: TransferRoute,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        user_id: UUID,
+        src_path: str,
+        dst_path: str,
+        expected_source_size: int,
+        expected_source_fingerprint: str,
+        on_issued: Callable[[], None] | None,
+    ) -> TransferResult:
+        """Relay one copy child while the caller retains the operation lease."""
+
+        return await self.start_client_to_client(
+            source_route=source_route,
+            destination_route=destination_route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            mode="copy",
+            delete_source=None,
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=True,
+            _expected_source_size=expected_source_size,
+            _expected_source_fingerprint=expected_source_fingerprint,
+        )
+
+    async def start_client_to_client_regular_admitted(
+        self,
+        *,
+        source_route: TransferRoute,
+        destination_route: TransferRoute,
+        operation_lease: TransferLease,
+        slot_id: UUID,
+        user_id: UUID,
+        src_path: str,
+        dst_path: str,
+        expected_source_size: int,
+        expected_source_fingerprint: str,
+        mode: Literal["copy", "move"],
+        delete_source: DeleteBridgeSource | None,
+        on_issued: Callable[[], None] | None,
+    ) -> TransferResult:
+        """Relay one regular file while the caller retains operation admission."""
+
+        return await self.start_client_to_client(
+            source_route=source_route,
+            destination_route=destination_route,
+            user_id=user_id,
+            src_path=src_path,
+            dst_path=dst_path,
+            mode=mode,
+            delete_source=delete_source,
+            on_issued=on_issued,
+            _slot_id=slot_id,
+            _operation_lease=operation_lease,
+            _directory_child=False,
+            _expected_source_size=expected_source_size,
+            _expected_source_fingerprint=expected_source_fingerprint,
+        )
 
     async def handle_frame(self, handle: object, frame: object) -> None:
         """Route one already-validated client transfer control frame."""
@@ -976,11 +1363,15 @@ class TransferManager:
         src_path: str,
         dst_path: str,
         mode: Literal["copy", "move"],
-        lease: TransferLease,
+        lease: TransferLease | None,
         delete_source: DeleteBridgeSource | None,
         on_issued: Callable[[], None] | None,
+        slot_id: UUID | None = None,
+        directory_child: bool = False,
+        expected_source_size: int | None = None,
+        expected_source_fingerprint: str | None = None,
     ) -> _BridgeSlot:
-        slot_id = new_uuid7()
+        slot_id = slot_id or new_uuid7()
         bridge = _BridgeSlot(
             source_route=source_route,
             destination_route=destination_route,
@@ -992,6 +1383,9 @@ class TransferManager:
             lease=lease,
             delete_source=delete_source,
             on_issued=on_issued,
+            expected_source_size=expected_source_size,
+            expected_source_fingerprint=expected_source_fingerprint,
+            directory_child=directory_child,
         )
         source_device, source_generation = _handle_identity(source_route.handle)
         destination_device, destination_generation = _handle_identity(destination_route.handle)
@@ -1459,9 +1853,14 @@ class TransferManager:
                 await self._finish_bridge_after_timeout_resolution(bridge, destination_ack)
                 return
 
+            source_ack = destination_ack
+            if bridge.directory_child and destination_ack.ok:
+                source_ack = destination_ack.model_copy(
+                    update={"etag": None, "created": None}
+                )
             bridge.source_ack_delivered = await self._send_text(
                 bridge.source_route.handle,
-                destination_ack.model_dump_json(),
+                source_ack.model_dump_json(),
                 route=None,
             )
             if not destination_ack.ok:
@@ -1492,6 +1891,8 @@ class TransferManager:
                 bridge.bytes_received,
                 bridge.digest.hexdigest(),
                 tuple(warnings),
+                etag=destination_ack.etag if bridge.directory_child else None,
+                created=destination_ack.created if bridge.directory_child else None,
             )
             bridge.state = BridgeState.COMPLETED
             await self._complete_bridge_result(bridge, result)
@@ -1734,6 +2135,20 @@ class TransferManager:
         assert bridge.source_begin_future is not None
         if bridge.source_begin_future.done():
             raise TransferProtocolError("duplicate source transfer_begin")
+        if (
+            (
+                bridge.expected_source_size is not None
+                and frame.total_bytes != bridge.expected_source_size
+            )
+            or (
+                bridge.expected_source_fingerprint is not None
+                and frame.etag != bridge.expected_source_fingerprint
+            )
+        ):
+            bridge.source_begin_future.set_exception(
+                TransferError("workspace_file_changed")
+            )
+            return
         bridge.source_begin_future.set_result(frame)
 
     async def _handle_bridge_destination_ready(
@@ -1986,11 +2401,15 @@ class TransferManager:
             raise TransferProtocolError("destination acknowledgement arrived before terminal issue")
         if frame.ok:
             digest = bridge.digest.hexdigest()
+            metadata_mismatched = (
+                frame.etag is None or frame.created is not True
+                if bridge.directory_child
+                else frame.etag is not None or frame.created is not None
+            )
             if (
                 frame.bytes_sent != bridge.bytes_received
                 or frame.sha256 != digest
-                or frame.etag is not None
-                or frame.created is not None
+                or metadata_mismatched
             ):
                 raise TransferProtocolError("destination acknowledgement mismatched bridge bytes")
         async with bridge.lock:
@@ -2216,6 +2635,8 @@ class TransferManager:
                 bridge.bytes_received,
                 bridge.digest.hexdigest(),
                 tuple(warnings),
+                etag=destination_ack.etag if bridge.directory_child else None,
+                created=destination_ack.created if bridge.directory_child else None,
             ),
         )
 
@@ -2296,6 +2717,16 @@ class TransferManager:
                             bridge.bytes_received,
                             bridge.digest.hexdigest(),
                             tuple(warnings),
+                            etag=(
+                                destination_ack.etag
+                                if bridge.directory_child
+                                else None
+                            ),
+                            created=(
+                                destination_ack.created
+                                if bridge.directory_child
+                                else None
+                            ),
                         ),
                         error=None,
                     )
@@ -2508,7 +2939,8 @@ class TransferManager:
                 bridge.queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-        await bridge.lease.aclose()
+        if bridge.lease is not None:
+            await bridge.lease.aclose()
         if bridge.completion is not None and not bridge.completion.done():
             if error is None:
                 assert result is not None
@@ -2770,18 +3202,25 @@ class TransferManager:
                 raise TransferIntegrityError("receiver byte count did not match")
             if ack.sha256 is not None and ack.sha256 != digest:
                 raise TransferIntegrityError("receiver digest did not match")
-            if slot.purpose != "workspace_upload" and (
+            if slot.purpose != "workspace_upload" and not slot.directory_child and (
                 ack.etag is not None or ack.created is not None
             ):
                 raise TransferProtocolError(
                     "transfer metadata is only valid for workspace_upload"
                 )
+            if slot.directory_child and (ack.etag is None or ack.created is not True):
+                raise TransferProtocolError(
+                    "directory child result is missing destination metadata"
+                )
+            include_destination_metadata = (
+                slot.purpose == "workspace_upload" or slot.directory_child
+            )
             slot.committed_result = self._result_for_slot(
                 slot,
                 digest=digest,
                 warnings=(),
-                etag=ack.etag if slot.purpose == "workspace_upload" else None,
-                created=ack.created if slot.purpose == "workspace_upload" else None,
+                etag=ack.etag if include_destination_metadata else None,
+                created=ack.created if include_destination_metadata else None,
             )
             slot.success_ack_delivered = True
             slot.state = TransferState.COMMITTED
@@ -2798,8 +3237,8 @@ class TransferManager:
                 slot,
                 digest=digest,
                 warnings=tuple(warnings),
-                etag=ack.etag if slot.purpose == "workspace_upload" else None,
-                created=ack.created if slot.purpose == "workspace_upload" else None,
+                etag=ack.etag if include_destination_metadata else None,
+                created=ack.created if include_destination_metadata else None,
             )
             slot.committed_result = result
             await self._finish(slot, result)
@@ -2906,19 +3345,25 @@ class TransferManager:
             async with asyncio.timeout(self._idle_timeout_seconds):
                 await slot.sink.finish()
             cancel_after_commit = False
+            destination_etag: str | None = None
+            destination_created: bool | None = None
             if slot.commit_sink is not None:
                 resolution = asyncio.get_running_loop().create_future()
                 slot.commit_resolution = resolution
                 try:
                     async with asyncio.timeout(self._idle_timeout_seconds):
-                        cancel_after_commit = bool(
-                            await slot.commit_sink(
-                                slot.sink,
-                                slot.begin,
-                                slot.bytes_seen,
-                                digest,
-                            )
+                        commit_result = await slot.commit_sink(
+                            slot.sink,
+                            slot.begin,
+                            slot.bytes_seen,
+                            digest,
                         )
+                    if isinstance(commit_result, TransferCommitResult):
+                        destination_etag = commit_result.etag
+                        destination_created = commit_result.created
+                        cancel_after_commit = commit_result.cancel_after_commit
+                    else:
+                        cancel_after_commit = bool(commit_result)
                 except BaseException:
                     resolution.set_result(False)
                     raise
@@ -2926,7 +3371,12 @@ class TransferManager:
                 slot,
                 digest=digest,
                 warnings=(),
-                etag=slot.begin.etag if slot.purpose == "http_relay" else None,
+                etag=(
+                    destination_etag
+                    if slot.directory_child
+                    else slot.begin.etag if slot.purpose == "http_relay" else None
+                ),
+                created=destination_created if slot.directory_child else None,
             )
             if slot.commit_resolution is not None:
                 slot.commit_resolution.set_result(True)
@@ -2968,7 +3418,12 @@ class TransferManager:
                 slot,
                 digest=digest,
                 warnings=tuple(warnings),
-                etag=slot.begin.etag if slot.purpose == "http_relay" else None,
+                etag=(
+                    destination_etag
+                    if slot.directory_child
+                    else slot.begin.etag if slot.purpose == "http_relay" else None
+                ),
+                created=destination_created if slot.directory_child else None,
             )
             slot.state = TransferState.COMMITTED
             await self._finish(slot, result)
@@ -3100,7 +3555,7 @@ class TransferManager:
         handle: object,
         route: TransferRoute | None,
         user_id: UUID,
-        lease: TransferLease,
+        lease: TransferLease | None,
         direction: TransferDirection,
         purpose: TransferPurpose,
         state: TransferState,
@@ -3111,6 +3566,8 @@ class TransferManager:
         source_etag: str | None = None,
         mode: str = "copy",
         on_issued: Callable[[], None] | None = None,
+        slot_id: UUID | None = None,
+        directory_child: bool = False,
     ) -> _TransferSlot:
         try:
             device_id, generation = _handle_identity(handle)
@@ -3120,7 +3577,7 @@ class TransferManager:
                 device_id=device_id,
                 generation=generation,
                 user_id=user_id,
-                slot_id=new_uuid7(),
+                slot_id=slot_id or new_uuid7(),
                 direction=direction,
                 purpose=purpose,
                 state=state,
@@ -3132,6 +3589,7 @@ class TransferManager:
                 sink_factory=sink_factory,
                 mode=mode,
                 on_issued=on_issued,
+                directory_child=directory_child,
             )
             async with self._lock:
                 self._expire_tombstones_locked()
@@ -3141,7 +3599,8 @@ class TransferManager:
                 self._slots[key] = slot
             return slot
         except BaseException:
-            await lease.aclose()
+            if lease is not None:
+                await lease.aclose()
             raise
 
     async def _get_slot(
@@ -3204,6 +3663,11 @@ class TransferManager:
             if etag is None or created is None:
                 raise TransferProtocolError(
                     "workspace_upload result is missing destination metadata"
+                )
+        elif slot.directory_child:
+            if slot.purpose != "file_transfer" or etag is None or created is not True:
+                raise TransferProtocolError(
+                    "directory child result is missing destination metadata"
                 )
         elif slot.purpose == "http_relay":
             if slot.direction != "client_to_server" or created is not None:
@@ -3341,7 +3805,8 @@ class TransferManager:
             except Exception:
                 pass
             slot.sink = None
-        await slot.lease.aclose()
+        if slot.lease is not None:
+            await slot.lease.aclose()
         key = (slot.device_id, slot.generation, slot.slot_id)
         async with self._lock:
             self._slots.pop(key, None)
@@ -3593,6 +4058,17 @@ class TransferError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def _completed_transfer_result(
+    completion: asyncio.Future[TransferResult] | None,
+) -> TransferResult | None:
+    if completion is None or not completion.done() or completion.cancelled():
+        return None
+    try:
+        return completion.result()
+    except BaseException:
+        return None
 
 
 def _handle_identity(handle: object) -> tuple[UUID, int]:

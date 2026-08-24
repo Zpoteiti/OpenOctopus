@@ -20,6 +20,8 @@ from openctopus_server.devices.transfer import (
     TOMBSTONE_MAX_ENTRIES,
     FairTransferAdmission,
     TransferBusyError,
+    TransferCommitResult,
+    TransferCommittedAfterCancellation,
     TransferDisconnectedError,
     TransferError,
     TransferManager,
@@ -2312,3 +2314,627 @@ async def test_tombstone_ignores_only_the_identical_terminal_ack() -> None:
             handle,
             ack.model_copy(update={"bytes_sent": 2}),
         )
+
+
+async def test_already_admitted_child_reuses_outer_lease_and_exact_slot_id() -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> TransferCommitResult:
+        return TransferCommitResult(etag="destination-v1")
+
+    task = asyncio.create_task(
+        manager.start_client_to_server_admitted(
+            handle=handle,
+            user_id=user_id,
+            slot_id=slot_id,
+            operation_lease=lease,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    request = parse_server_frame(transport.text[0][1])
+    assert request.id == slot_id
+    assert admission.active_count == 1
+
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=0,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    digest = hashlib.sha256(b"").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=slot_id,
+            ack=False,
+            ok=True,
+            bytes_sent=0,
+            sha256=digest,
+        ),
+    )
+    assert (await task).sha256 == digest
+    assert admission.active_count == 1
+
+    await lease.aclose()
+    assert admission.active_count == 0
+
+
+async def test_regular_admitted_client_to_server_preserves_move_and_outer_lease() -> None:
+    transport = Transport()
+    manager = _manager(transport, max_concurrency=1)
+    admission = manager._admission
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    deleted: list[None] = []
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    async def delete_source() -> None:
+        deleted.append(None)
+
+    task = asyncio.create_task(
+        manager.start_client_to_server_regular_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            mode="move",
+            delete_source=delete_source,
+        )
+    )
+    await transport.text_event.wait()
+    request = parse_server_frame(transport.text[0][1])
+    assert request.id == slot_id
+    assert admission.active_count == 1
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=0,
+            etag="source-v1",
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    digest = hashlib.sha256(b"").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=slot_id,
+            ack=False,
+            ok=True,
+            bytes_sent=0,
+            sha256=digest,
+        ),
+    )
+
+    result = await task
+    assert result.sha256 == digest
+    assert result.etag is None
+    assert result.created is None
+    assert deleted == [None]
+    assert admission.active_count == 1
+    await lease.aclose()
+    assert admission.active_count == 0
+
+
+async def test_regular_admitted_server_to_client_preserves_move_callback() -> None:
+    transport = Transport()
+    manager = _manager(transport, max_concurrency=1)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    lease = await manager.acquire_operation(user_id)
+    deleted: list[None] = []
+
+    async def delete_source() -> None:
+        deleted.append(None)
+
+    task = asyncio.create_task(
+        manager.start_server_to_client_regular_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            source=Source([], etag="source-v1"),
+            total_bytes=0,
+            mode="move",
+            delete_source=delete_source,
+        )
+    )
+    await transport.text_event.wait()
+    await manager.handle_frame(handle, TransferReadyFrame(id=slot_id))
+    end: TransferEndFrame | None = None
+    while end is None:
+        await asyncio.sleep(0)
+        end = next(
+            (
+                frame
+                for _, payload in transport.text
+                if isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+                and not frame.ack
+            ),
+            None,
+        )
+    await manager.handle_frame(handle, end.model_copy(update={"ack": True}))
+
+    assert (await task).warnings == ()
+    assert deleted == [None]
+    assert manager._admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_regular_admitted_wrapper_validates_uuid_and_active_lease() -> None:
+    transport = Transport()
+    manager = _manager(transport, max_concurrency=1)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    with pytest.raises(ValueError, match="UUIDv7"):
+        await manager.start_client_to_server_regular_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=uuid4(),
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            mode="copy",
+            delete_source=None,
+        )
+    await lease.aclose()
+    with pytest.raises(ValueError, match="not active"):
+        await manager.start_client_to_server_regular_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=new_uuid7(),
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            mode="copy",
+            delete_source=None,
+        )
+
+
+def test_transfer_manager_exposes_directory_control_idle_timeout() -> None:
+    manager = _manager(Transport(), idle_timeout_seconds=12.5)
+
+    assert manager.idle_timeout_seconds == 12.5
+
+
+async def test_cancelled_already_admitted_child_does_not_release_outer_lease() -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    task = asyncio.create_task(
+        manager.start_client_to_server_admitted(
+            handle=handle,
+            user_id=user_id,
+            slot_id=new_uuid7(),
+            operation_lease=lease,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+        )
+    )
+    await transport.text_event.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert manager.active_slots == 0
+    assert admission.active_count == 1
+    await lease.aclose()
+    assert admission.active_count == 0
+
+
+async def test_already_admitted_destination_ack_returns_commit_metadata() -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+    slot_id = new_uuid7()
+    task = asyncio.create_task(
+        manager.start_server_to_client_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            source=Source([b"payload"]),
+            total_bytes=7,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    await manager.handle_frame(handle, TransferReadyFrame(id=slot_id))
+    end: TransferEndFrame | None = None
+    while end is None:
+        await asyncio.sleep(0)
+        end = next(
+            (
+                frame
+                for _, payload in transport.text
+                if isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+                and not frame.ack
+            ),
+            None,
+        )
+    await manager.handle_frame(
+        handle,
+        end.model_copy(
+            update={"ack": True, "etag": "destination-v1", "created": True}
+        ),
+    )
+
+    result = await task
+    assert result.etag == "destination-v1"
+    assert result.created is True
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_already_admitted_server_destination_returns_commit_metadata() -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+    slot_id = new_uuid7()
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> TransferCommitResult:
+        return TransferCommitResult(etag="destination-v1", created=True)
+
+    task = asyncio.create_task(
+        manager.start_client_to_server_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+        )
+    )
+    while not transport.text:
+        await asyncio.sleep(0)
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=0,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    digest = hashlib.sha256(b"").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=slot_id,
+            ack=False,
+            ok=True,
+            bytes_sent=0,
+            sha256=digest,
+        ),
+    )
+
+    result = await task
+    assert result.etag == "destination-v1"
+    assert result.created is True
+    ack = next(
+        frame
+        for _, payload in transport.text
+        if isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+        and frame.ack
+        and frame.ok
+    )
+    assert ack.etag is None
+    assert ack.created is None
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_admitted_client_to_server_reports_commit_after_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+    slot_id = new_uuid7()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_cleanup = manager._cleanup
+
+    async def blocked_cleanup(slot: object, *, skip_worker: bool = False) -> None:
+        if getattr(slot, "committed_result", None) is not None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        await original_cleanup(slot, skip_worker=skip_worker)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(manager, "_cleanup", blocked_cleanup)
+
+    async def make_sink(_: TransferBeginFrame) -> TransferSink:
+        return Sink()
+
+    async def commit_sink(
+        _sink: TransferSink,
+        _begin: TransferBeginFrame,
+        _size: int,
+        _digest: str,
+    ) -> TransferCommitResult:
+        return TransferCommitResult(etag="destination-v1")
+
+    task = asyncio.create_task(
+        manager.start_client_to_server_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            sink_factory=make_sink,
+            commit_sink=commit_sink,
+        )
+    )
+    await transport.text_event.wait()
+    await manager.handle_frame(
+        handle,
+        TransferBeginFrame(
+            id=slot_id,
+            direction="client_to_server",
+            purpose="file_transfer",
+            src_path="source.bin",
+            dst_path="destination.bin",
+            total_bytes=0,
+        ),
+    )
+    await _wait_for_ready(transport, slot_id)
+    digest = hashlib.sha256(b"").hexdigest()
+    await manager.handle_frame(
+        handle,
+        TransferEndFrame(
+            id=slot_id,
+            ack=False,
+            ok=True,
+            bytes_sent=0,
+            sha256=digest,
+        ),
+    )
+    await cleanup_started.wait()
+
+    task.cancel()
+    release_cleanup.set()
+    with pytest.raises(TransferCommittedAfterCancellation) as caught:
+        await task
+
+    assert caught.value.result == TransferResult(
+        bytes_transferred=0,
+        sha256=digest,
+        etag="destination-v1",
+        created=True,
+    )
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_admitted_server_to_client_reports_commit_after_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+    slot_id = new_uuid7()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_cleanup = manager._cleanup
+
+    async def blocked_cleanup(slot: object, *, skip_worker: bool = False) -> None:
+        if getattr(slot, "committed_result", None) is not None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        await original_cleanup(slot, skip_worker=skip_worker)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(manager, "_cleanup", blocked_cleanup)
+    task = asyncio.create_task(
+        manager.start_server_to_client_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            source=Source([b"payload"]),
+            total_bytes=7,
+        )
+    )
+    await transport.text_event.wait()
+    await manager.handle_frame(handle, TransferReadyFrame(id=slot_id))
+    end: TransferEndFrame | None = None
+    while end is None:
+        await asyncio.sleep(0)
+        end = next(
+            (
+                frame
+                for _, payload in transport.text
+                if isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+                and not frame.ack
+            ),
+            None,
+        )
+    await manager.handle_frame(
+        handle,
+        end.model_copy(
+            update={"ack": True, "etag": "destination-v1", "created": True}
+        ),
+    )
+    await cleanup_started.wait()
+
+    task.cancel()
+    release_cleanup.set()
+    with pytest.raises(TransferCommittedAfterCancellation) as caught:
+        await task
+
+    assert caught.value.result.etag == "destination-v1"
+    assert caught.value.result.created is True
+    assert caught.value.result.warnings == ()
+    assert admission.active_count == 1
+    await lease.aclose()
+
+
+async def test_server_sender_cancellation_after_success_end_reconciles_original_ack() -> None:
+    transport = Transport()
+    admission = FairTransferAdmission(
+        max_concurrency=1,
+        max_concurrency_per_user=1,
+        queue_timeout_seconds=0.05,
+    )
+    manager = TransferManager(transport, admission=admission)
+    handle = Handle(uuid4(), 1)
+    user_id = uuid4()
+    lease = await manager.acquire_operation(user_id)
+    slot_id = new_uuid7()
+    task = asyncio.create_task(
+        manager.start_server_to_client_admitted(
+            handle=handle,
+            operation_lease=lease,
+            slot_id=slot_id,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            source=Source([b"payload"]),
+            total_bytes=7,
+        )
+    )
+    await transport.text_event.wait()
+    await manager.handle_frame(handle, TransferReadyFrame(id=slot_id))
+    success_end: TransferEndFrame | None = None
+    while success_end is None:
+        await asyncio.sleep(0)
+        success_end = next(
+            (
+                frame
+                for _, payload in transport.text
+                if isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+                and not frame.ack
+                and frame.ok
+            ),
+            None,
+        )
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not any(
+        isinstance(frame := parse_server_frame(payload), TransferEndFrame)
+        and not frame.ack
+        and not frame.ok
+        for _, payload in transport.text
+    )
+
+    acknowledgement = success_end.model_copy(
+        update={"ack": True, "etag": "destination-v1", "created": True}
+    )
+    await manager.handle_frame(handle, acknowledgement)
+    with pytest.raises(TransferCommittedAfterCancellation) as caught:
+        await task
+
+    assert caught.value.result.etag == "destination-v1"
+    assert caught.value.result.created is True
+    await manager.handle_frame(handle, acknowledgement)
+    assert admission.active_count == 1
+    await lease.aclose()

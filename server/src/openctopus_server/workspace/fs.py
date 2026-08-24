@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,14 +13,34 @@ from uuid import UUID
 
 from fastapi import Depends
 
-from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
+from openctopus_server.admission import AdmissionLease, AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.config import get_settings
+from openctopus_server.directory_contract import (
+    MAX_DIRECTORY_ENTRIES as MAX_TRANSFER_DIRECTORY_ENTRIES,
+)
+from openctopus_server.directory_contract import (
+    MAX_DIRECTORY_INTEGER,
+    MAX_DIRECTORY_MANIFEST_BYTES,
+    DirectoryContractError,
+    DirectoryManifest,
+    DirectoryManifestDirectory,
+    DirectoryManifestEntry,
+    canonical_json_bytes,
+    create_directory_manifest,
+    destination_collision_keys,
+    directory_manifest_sha256,
+)
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.workspace.locks import KeyedLockManager
+from openctopus_server.workspace.locks import (
+    KeyedLockManager,
+    SubtreeLease,
+    SubtreeLeaseManager,
+)
 from openctopus_server.workspace.search import MAX_SCAN_OBJECTS, NOISE_DIRECTORIES, SearchObject
 from openctopus_server.workspace.storage import (
+    TRANSFER_TEMP_PREFIX,
     DirectoryObject,
     ObjectMetadata,
     ObjectStorage,
@@ -44,6 +64,10 @@ class FileMetadata:
 
 class UploadCommittedAfterCancellation(asyncio.CancelledError):
     """The destination was published before caller cancellation took effect."""
+
+    def __init__(self, metadata: FileMetadata | None = None) -> None:
+        super().__init__()
+        self.metadata = metadata
 
 
 @dataclass(frozen=True)
@@ -82,6 +106,79 @@ class WorkspaceTarget:
         return cls(kind="shared", id=workspace_id)
 
 
+@dataclass(frozen=True, slots=True)
+class ServerFileSourceProbe:
+    size: int
+    fingerprint: str
+    kind: Literal["file"] = "file"
+
+
+@dataclass(frozen=True, slots=True)
+class ServerDirectorySourceProbe:
+    manifest: DirectoryManifest
+    kind: Literal["directory"] = "directory"
+
+
+type ServerSourceProbe = ServerFileSourceProbe | ServerDirectorySourceProbe
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryDestinationPlan:
+    target: WorkspaceTarget
+    destination_root: str
+    manifest_sha256: str
+    mapped_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryCommittedFile:
+    relative_path: str
+    size: int
+    etag: str
+
+
+@dataclass(eq=False, slots=True)
+class _DirectoryQuotaRecord:
+    target: WorkspaceTarget
+    owner: Hashable
+    quota_bytes: int
+    remaining_bytes: int
+
+
+class DirectoryQuotaReservation:
+    """One idempotently released aggregate directory quota reservation."""
+
+    def __init__(self, workspace_fs: WorkspaceFS, record: _DirectoryQuotaRecord) -> None:
+        self._workspace_fs = workspace_fs
+        self._record = record
+        self._release_task: asyncio.Task[None] | None = None
+
+    @property
+    def target(self) -> WorkspaceTarget:
+        return self._record.target
+
+    @property
+    def owner(self) -> Hashable:
+        return self._record.owner
+
+    @property
+    def quota_bytes(self) -> int:
+        return self._record.quota_bytes
+
+    @property
+    def remaining_bytes(self) -> int:
+        return self._record.remaining_bytes
+
+    async def release(self) -> None:
+        task = self._release_task
+        if task is None:
+            task = asyncio.create_task(
+                self._workspace_fs._release_directory_quota_reservation(self._record)
+            )
+            self._release_task = task
+        await await_future_cancellation_safe(task)
+
+
 class WorkspaceFS:
     """Quota-aware coordination for already-authorized workspace identities."""
 
@@ -113,11 +210,473 @@ class WorkspaceFS:
         )
         self._transfer_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._mutation_locks = KeyedLockManager()
+        self._subtree_leases = SubtreeLeaseManager()
+        self._directory_quota_reservations: dict[
+            tuple[WorkspaceTarget, Hashable], _DirectoryQuotaRecord
+        ] = {}
         self._retired_targets: set[WorkspaceTarget] = set()
 
     @property
     def mutation_lock_count(self) -> int:
         return self._mutation_locks.entry_count
+
+    @property
+    def directory_quota_reservation_count(self) -> int:
+        return len(self._directory_quota_reservations)
+
+    async def acquire_subtree_lease(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        owner: Hashable,
+        wait: bool = True,
+    ) -> SubtreeLease:
+        """Reserve one canonical workspace subtree for a long-lived operation."""
+        _, prefix = _subtree_scope(target, relative_path)
+        lease = await self._subtree_leases.acquire(
+            target=target,
+            prefix=prefix,
+            owner=owner,
+            wait=wait,
+        )
+        try:
+            self._ensure_active(target)
+        except BaseException:
+            await lease.release()
+            raise
+        return lease
+
+    @asynccontextmanager
+    async def _hold_mutations(
+        self,
+        scopes: tuple[tuple[WorkspaceTarget, tuple[str, ...]], ...],
+        *,
+        owner: Hashable | None = None,
+    ) -> AsyncIterator[None]:
+        lease_owner = object() if owner is None else owner
+        ordered = sorted(
+            set(scopes),
+            key=lambda scope: (
+                scope[0].kind,
+                scope[0].id.int,
+                len(scope[1]),
+                scope[1],
+            ),
+        )
+        leases: list[SubtreeLease] = []
+        try:
+            for target, prefix in ordered:
+                leases.append(
+                    await self._subtree_leases.acquire(
+                        target=target,
+                        prefix=prefix,
+                        owner=lease_owner,
+                    )
+                )
+            async with self._mutation_locks.hold_many(
+                tuple(target for target, _ in ordered)
+            ):
+                yield
+        finally:
+            cleanup = asyncio.create_task(_release_subtree_leases(tuple(reversed(leases))))
+            await await_future_cancellation_safe(cleanup)
+
+    async def probe_directory_source(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+    ) -> ServerSourceProbe:
+        """Probe exact object and prefix independently before selecting file or directory."""
+        self._ensure_active(target)
+        if relative_path:
+            object_name = _object_key(target, relative_path)
+            exact = await _stat_optional(self._storage, object_name)
+            prefix = f"{object_name}/"
+        else:
+            exact = None
+            prefix = _workspace_prefix(target)
+        prefix_page = await self._storage.list_page(prefix, limit=1)
+        has_prefix = bool(prefix_page.items)
+        if exact is not None and has_prefix:
+            raise _workspace_storage_shape_error()
+        if exact is not None:
+            return ServerFileSourceProbe(size=exact.size, fingerprint=exact.etag)
+        if not has_prefix:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_NOT_FOUND,
+                "Workspace source was not found",
+            )
+        return ServerDirectorySourceProbe(
+            manifest=await self._scan_server_directory_manifest(prefix)
+        )
+
+    async def _scan_server_directory_manifest(self, prefix: str) -> DirectoryManifest:
+        entries: list[DirectoryManifestEntry] = []
+        directory_paths: set[str] = set()
+        entry_paths: set[str] = set()
+        total_bytes = 0
+        try:
+            async for objects in _metadata_pages(self._storage, prefix):
+                for item in objects:
+                    if not item.object_name.startswith(prefix):
+                        raise _workspace_storage_shape_error()
+                    relative_path = item.object_name.removeprefix(prefix)
+                    entry = DirectoryManifestEntry(
+                        relative_path=relative_path,
+                        size=item.size,
+                        fingerprint=item.etag,
+                    )
+                    if entry.relative_path in entry_paths:
+                        raise _workspace_storage_shape_error()
+                    entry_paths.add(entry.relative_path)
+                    entries.append(entry)
+                    components = entry.relative_path.split("/")
+                    directory_paths.update(
+                        "/".join(components[:end]) for end in range(1, len(components))
+                    )
+                    total_bytes += entry.size
+                    if (
+                        len(entries) + len(directory_paths) > MAX_TRANSFER_DIRECTORY_ENTRIES
+                        or total_bytes > MAX_DIRECTORY_INTEGER
+                    ):
+                        raise _workspace_directory_too_large()
+        except WorkspaceError:
+            raise
+        except (DirectoryContractError, ValueError) as exc:
+            raise _workspace_storage_shape_error() from exc
+
+        if not entries:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace source directory changed while it was scanned",
+            )
+        try:
+            directories = tuple(
+                DirectoryManifestDirectory(relative_path=path, identity=None)
+                for path in sorted(directory_paths, key=lambda value: value.encode("utf-8"))
+            )
+            sorted_entries = tuple(
+                sorted(entries, key=lambda item: item.relative_path.encode("utf-8"))
+            )
+            digest = directory_manifest_sha256(None, directories, sorted_entries)
+            encoded = canonical_json_bytes(
+                {
+                    "version": 1,
+                    "root_identity": None,
+                    "scanned_entries": len(directories) + len(sorted_entries),
+                    "total_bytes": total_bytes,
+                    "directories": directories,
+                    "entries": sorted_entries,
+                    "manifest_sha256": digest,
+                }
+            )
+            if len(encoded) > MAX_DIRECTORY_MANIFEST_BYTES:
+                raise _workspace_directory_too_large()
+            return create_directory_manifest(
+                root_identity=None,
+                directories=directories,
+                entries=sorted_entries,
+            )
+        except WorkspaceError:
+            raise
+        except (DirectoryContractError, ValueError) as exc:
+            raise _workspace_storage_shape_error() from exc
+
+    async def preflight_directory_destination(
+        self,
+        target: WorkspaceTarget,
+        destination_root: str,
+        manifest: DirectoryManifest,
+        *,
+        on_progress: Callable[[], None] | None = None,
+    ) -> DirectoryDestinationPlan:
+        self._ensure_active(target)
+        root_object_name = _object_key(target, destination_root)
+        try:
+            destination_collision_keys(manifest, platform="linux")
+        except DirectoryContractError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory destination paths conflict",
+            ) from exc
+        mapped_paths = tuple(
+            _join_relative_path(destination_root, entry.relative_path)
+            for entry in manifest.entries
+        )
+        _report_progress(on_progress)
+        if any(len(path) > 4096 for path in mapped_paths):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory destination path is too long",
+            )
+        for path in mapped_paths:
+            _object_key(target, path)
+
+        for parent in _parent_object_names(_workspace_prefix(target), root_object_name):
+            if await _stat_optional(self._storage, parent) is not None:
+                raise WorkspaceError(
+                    ErrorCode.TOOL_NOT_A_DIRECTORY,
+                    "A workspace path parent is a file",
+                )
+            _report_progress(on_progress)
+        exact = await _stat_optional(self._storage, root_object_name)
+        _report_progress(on_progress)
+        prefix_page = await self._storage.list_page(f"{root_object_name}/", limit=1)
+        _report_progress(on_progress)
+        has_prefix = bool(prefix_page.items)
+        if exact is not None and has_prefix:
+            raise _workspace_storage_shape_error()
+        if exact is not None or has_prefix:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace destination root already exists",
+            )
+        return DirectoryDestinationPlan(
+            target=target,
+            destination_root=destination_root,
+            manifest_sha256=manifest.manifest_sha256,
+            mapped_paths=mapped_paths,
+        )
+
+    async def reserve_directory_quota(
+        self,
+        target: WorkspaceTarget,
+        *,
+        owner: Hashable,
+        total_bytes: int,
+        quota_bytes: int,
+        on_progress: Callable[[], None] | None = None,
+    ) -> DirectoryQuotaReservation:
+        if total_bytes < 0:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory size must not be negative",
+            )
+        record: _DirectoryQuotaRecord | None = None
+        try:
+            async with self._mutation_locks.hold(target):
+                self._ensure_active(target)
+                key = (target, owner)
+                if key in self._directory_quota_reservations:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_INVALID_REQUEST,
+                        "Directory quota reservation already exists",
+                    )
+                usage = await self._authoritative_usage(target, on_progress=on_progress)
+                reserved = self._reserved_directory_bytes(target)
+                _validate_projected_quota(
+                    usage=usage,
+                    reserved=reserved,
+                    operation_bytes=total_bytes,
+                    quota_bytes=quota_bytes,
+                )
+                record = _DirectoryQuotaRecord(
+                    target=target,
+                    owner=owner,
+                    quota_bytes=quota_bytes,
+                    remaining_bytes=total_bytes,
+                )
+                self._directory_quota_reservations[key] = record
+            return DirectoryQuotaReservation(self, record)
+        except BaseException:
+            if record is not None:
+                cleanup = asyncio.create_task(self._release_directory_quota_reservation(record))
+                await await_future_cancellation_safe(cleanup)
+            raise
+
+    async def begin_directory_child_upload(
+        self,
+        reservation: DirectoryQuotaReservation,
+        relative_path: str,
+        *,
+        size: int,
+    ) -> tuple[ObjectUpload, str]:
+        if size < 0:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Transfer size must not be negative",
+            )
+        async with self._hold_mutations(
+            (_subtree_scope(reservation.target, relative_path),),
+            owner=reservation.owner,
+        ):
+            record = self._active_directory_quota_record(reservation)
+            if size > record.remaining_bytes:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                    "Directory child exceeds its remaining quota reservation",
+                )
+            self._ensure_active(record.target)
+            await self._ensure_destination_absent(record.target, relative_path)
+        temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
+        return self._storage.begin_upload(temporary_object, length=size), temporary_object
+
+    def begin_directory_validation_staging(self, *, size: int) -> tuple[ObjectUpload, str]:
+        """Create one bounded private object used only for pre-publish validation."""
+
+        if not 0 <= size <= MAX_DIRECTORY_INTEGER:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory validation size is invalid",
+            )
+        object_name = f"{TRANSFER_TEMP_PREFIX}{secrets.token_hex(16)}"
+        return self._storage.begin_upload(object_name, length=size), object_name
+
+    async def open_directory_validation_staging(self, object_name: str) -> ObjectStream:
+        _validate_private_transfer_object(object_name)
+        return await self._storage.open_stream(object_name)
+
+    async def delete_directory_validation_staging(self, object_name: str) -> None:
+        _validate_private_transfer_object(object_name)
+        await self._storage.delete(object_name)
+
+    async def commit_directory_child_upload(
+        self,
+        reservation: DirectoryQuotaReservation,
+        relative_path: str,
+        temporary_object: str,
+        *,
+        size: int,
+        on_issued: Callable[[], None] | None = None,
+    ) -> FileMetadata:
+        return await self.commit_uploaded_object(
+            reservation.target,
+            relative_path,
+            temporary_object,
+            size=size,
+            quota_bytes=reservation.quota_bytes,
+            on_issued=on_issued,
+            subtree_owner=reservation.owner,
+            quota_reservation=reservation,
+        )
+
+    async def conditional_delete_file(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        expected_etag: str,
+        subtree_owner: Hashable | None = None,
+    ) -> Literal["deleted", "missing", "mismatch"]:
+        object_name = _object_key(target, relative_path)
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
+            self._ensure_active(target)
+            existing = await _stat_optional(self._storage, object_name)
+            if existing is None:
+                prefix_page = await self._storage.list_page(f"{object_name}/", limit=1)
+                return "mismatch" if prefix_page.items else "missing"
+            if existing.etag != expected_etag:
+                return "mismatch"
+            await self._storage.delete(object_name)
+            return "deleted"
+
+    async def verify_directory_destination(
+        self,
+        plan: DirectoryDestinationPlan,
+        committed: tuple[DirectoryCommittedFile, ...],
+        *,
+        owner: Hashable,
+        on_progress: Callable[[], None] | None = None,
+    ) -> None:
+        """Verify the destination prefix contains exactly the committed objects."""
+        if tuple(item.relative_path for item in committed) != plan.mapped_paths:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                "Directory destination records do not match their transfer plan",
+            )
+        expected = {
+            _object_key(plan.target, item.relative_path): (item.size, item.etag)
+            for item in committed
+        }
+        root_object_name = _object_key(plan.target, plan.destination_root)
+        async with self._hold_mutations(
+            (_subtree_scope(plan.target, plan.destination_root),),
+            owner=owner,
+        ):
+            self._ensure_active(plan.target)
+            if await _stat_optional(self._storage, root_object_name) is not None:
+                raise _workspace_directory_finalize_error()
+            _report_progress(on_progress)
+            actual: dict[str, tuple[int, str]] = {}
+            prefix = f"{root_object_name}/"
+            async for objects in _metadata_pages(self._storage, prefix):
+                for item in objects:
+                    if not item.object_name.startswith(prefix) or item.object_name in actual:
+                        raise _workspace_storage_shape_error()
+                    actual[item.object_name] = (item.size, item.etag)
+                _report_progress(on_progress)
+            if actual != expected:
+                raise _workspace_directory_finalize_error()
+
+    async def directory_root_is_absent(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        owner: Hashable,
+    ) -> bool:
+        """Return whether neither an exact object nor any prefix child exists."""
+        if relative_path:
+            object_name = _object_key(target, relative_path)
+            prefix = f"{object_name}/"
+        else:
+            object_name = None
+            prefix = _workspace_prefix(target)
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=owner,
+        ):
+            self._ensure_active(target)
+            if (
+                object_name is not None
+                and await _stat_optional(self._storage, object_name) is not None
+            ):
+                return False
+            return not bool((await self._storage.list_page(prefix, limit=1)).items)
+
+    async def _authoritative_usage(
+        self,
+        target: WorkspaceTarget,
+        *,
+        on_progress: Callable[[], None] | None = None,
+    ) -> int:
+        usage = 0
+        async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
+            usage += sum(item.size for item in objects)
+            _report_progress(on_progress)
+        return usage
+
+    def _reserved_directory_bytes(self, target: WorkspaceTarget) -> int:
+        return sum(
+            record.remaining_bytes
+            for record in self._directory_quota_reservations.values()
+            if record.target == target
+        )
+
+    def _active_directory_quota_record(
+        self,
+        reservation: DirectoryQuotaReservation,
+    ) -> _DirectoryQuotaRecord:
+        record = reservation._record
+        if self._directory_quota_reservations.get((record.target, record.owner)) is not record:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory quota reservation is no longer active",
+            )
+        return record
+
+    async def _release_directory_quota_reservation(
+        self,
+        record: _DirectoryQuotaRecord,
+    ) -> None:
+        async with self._mutation_locks.hold(record.target):
+            key = (record.target, record.owner)
+            if self._directory_quota_reservations.get(key) is record:
+                self._directory_quota_reservations.pop(key)
 
     async def stat(self, target: WorkspaceTarget, relative_path: str) -> FileMetadata:
         metadata = await self._storage.stat(_object_key(target, relative_path))
@@ -229,9 +788,10 @@ class WorkspaceFS:
                 ErrorCode.WORKSPACE_INVALID_REQUEST,
                 "Transfer size must not be negative",
             )
-        self._ensure_active(target)
-        await self._ensure_destination_absent(target, relative_path)
-        await self._ensure_transfer_quota(target, size=size, quota_bytes=quota_bytes)
+        async with self._mutation_locks.hold(target):
+            self._ensure_active(target)
+            await self._ensure_destination_absent(target, relative_path)
+            await self._ensure_transfer_quota(target, size=size, quota_bytes=quota_bytes)
         temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
         return self._storage.begin_upload(temporary_object, length=size), temporary_object
 
@@ -246,6 +806,7 @@ class WorkspaceFS:
         quota_bytes: int,
         mode: str,
         on_issued: Callable[[], None] | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         try:
             async with self._server_transfers.slot(user_id):
@@ -257,12 +818,52 @@ class WorkspaceFS:
                     quota_bytes=quota_bytes,
                     mode=mode,
                     on_issued=on_issued,
+                    validate_staging=validate_staging,
                 )
         except AdmissionTimeoutError as exc:
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_TRANSFER_BUSY,
                 "Workspace transfer capacity is busy; retry later",
             ) from exc
+
+    async def acquire_server_transfer_operation(self, user_id: UUID) -> AdmissionLease:
+        """Acquire one transferable Server workspace transfer operation lease."""
+        try:
+            return await self._server_transfers.acquire(user_id)
+        except AdmissionTimeoutError as exc:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_TRANSFER_BUSY,
+                "Workspace transfer capacity is busy; retry later",
+            ) from exc
+
+    async def transfer_server_to_server_admitted(
+        self,
+        source_target: WorkspaceTarget,
+        source_path: str,
+        destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
+        quota_bytes: int,
+        mode: str,
+        expected_source_size: int,
+        expected_source_fingerprint: str,
+        on_issued: Callable[[], None] | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        """Transfer one pre-probed file while the caller retains admission."""
+
+        return await self._transfer_server_to_server(
+            source_target,
+            source_path,
+            destination_target,
+            destination_path,
+            quota_bytes=quota_bytes,
+            mode=mode,
+            on_issued=on_issued,
+            expected_source_size=expected_source_size,
+            expected_source_fingerprint=expected_source_fingerprint,
+            validate_staging=validate_staging,
+        )
 
     async def _transfer_server_to_server(
         self,
@@ -274,11 +875,26 @@ class WorkspaceFS:
         quota_bytes: int,
         mode: str,
         on_issued: Callable[[], None] | None,
+        expected_source_size: int | None = None,
+        expected_source_fingerprint: str | None = None,
+        validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Stream one server workspace object through a temporary RustFS object."""
         if mode not in {"copy", "move"}:
             raise WorkspaceError(ErrorCode.WORKSPACE_INVALID_REQUEST, "Transfer mode is invalid")
         source = await self.open_stream(source_target, source_path)
+        if (
+            expected_source_size is not None
+            and (
+                source.size != expected_source_size
+                or source.etag != expected_source_fingerprint
+            )
+        ):
+            await source.aclose()
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_FILE_CHANGED,
+                "Workspace source changed after it was probed",
+            )
         try:
             sink, temporary_object = await self.begin_transfer_upload(
                 destination_target,
@@ -297,6 +913,8 @@ class WorkspaceFS:
                 transferred += len(chunk)
                 await sink.write(chunk)
             await sink.finish()
+            if validate_staging is not None:
+                await validate_staging(temporary_object, transferred)
             try:
                 await self.commit_uploaded_object(
                     destination_target,
@@ -312,7 +930,11 @@ class WorkspaceFS:
                 # the source instead of entering the pre-commit abort path.
                 pass
         except BaseException:
-            await sink.abort()
+            cleanup = asyncio.create_task(sink.abort())
+            try:
+                await await_future_cancellation_safe(cleanup)
+            except BaseException:
+                pass
             raise
         finally:
             await source.aclose()
@@ -373,24 +995,13 @@ class WorkspaceFS:
         size: int,
         quota_bytes: int,
     ) -> None:
-        usage = 0
-        async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
-            usage += sum(item.size for item in objects)
-        if usage > quota_bytes:
-            raise WorkspaceError(
-                ErrorCode.WORKSPACE_SOFT_LOCKED,
-                "Workspace is over quota; delete files before writing",
-            )
-        if size * 5 > quota_bytes * 4:
-            raise WorkspaceError(
-                ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
-                "Workspace operation exceeds the single-operation size limit",
-            )
-        if usage + size > quota_bytes:
-            raise WorkspaceError(
-                ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
-                "Workspace quota would be exceeded",
-            )
+        usage = await self._authoritative_usage(target)
+        _validate_projected_quota(
+            usage=usage,
+            reserved=self._reserved_directory_bytes(target),
+            operation_bytes=size,
+            quota_bytes=quota_bytes,
+        )
 
     @asynccontextmanager
     async def collect_upload(
@@ -583,6 +1194,7 @@ class WorkspaceFS:
         quota_bytes: int,
         if_match: str | None = None,
         if_none_match: bool = False,
+        subtree_owner: Hashable | None = None,
     ) -> FileMetadata:
         async with self.materialization_slot():
             return await self._write(
@@ -592,6 +1204,7 @@ class WorkspaceFS:
                 quota_bytes=quota_bytes,
                 if_match=if_match,
                 if_none_match=if_none_match,
+                subtree_owner=subtree_owner,
             )
 
     async def write_collected_upload(
@@ -603,6 +1216,7 @@ class WorkspaceFS:
         quota_bytes: int,
         if_match: str | None = None,
         if_none_match: bool = False,
+        subtree_owner: Hashable | None = None,
     ) -> FileMetadata:
         return await self._write(
             target,
@@ -611,6 +1225,7 @@ class WorkspaceFS:
             quota_bytes=quota_bytes,
             if_match=if_match,
             if_none_match=if_none_match,
+            subtree_owner=subtree_owner,
         )
 
     async def commit_uploaded_object(
@@ -622,13 +1237,31 @@ class WorkspaceFS:
         size: int,
         quota_bytes: int,
         on_issued: Callable[[], None] | None = None,
+        subtree_owner: Hashable | None = None,
+        quota_reservation: DirectoryQuotaReservation | None = None,
     ) -> FileMetadata:
         """Atomically publish a completed RustFS upload under a mutation lock."""
         if size < 0:
             raise ValueError("uploaded object size must be non-negative")
         object_name = _object_key(target, relative_path)
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
+            reservation_record = None
+            if quota_reservation is not None:
+                reservation_record = self._active_directory_quota_record(quota_reservation)
+                if (
+                    reservation_record.target != target
+                    or reservation_record.owner != subtree_owner
+                    or reservation_record.quota_bytes != quota_bytes
+                    or size > reservation_record.remaining_bytes
+                ):
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                        "Directory child does not match its quota reservation",
+                    )
             usage = 0
             existing = None
             parent_names = set(_parent_object_names(_workspace_prefix(target), object_name))
@@ -664,12 +1297,16 @@ class WorkspaceFS:
                     ErrorCode.WORKSPACE_SOFT_LOCKED,
                     "Workspace is over quota; delete files before writing",
                 )
-            if size * 5 > quota_bytes * 4:
+            reserved = self._reserved_directory_bytes(target)
+            if reservation_record is None and size * 5 > quota_bytes * 4:
                 raise WorkspaceError(
                     ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
                     "Workspace operation exceeds the single-operation size limit",
                 )
-            if usage + size > quota_bytes:
+            projected_usage = usage + reserved
+            if reservation_record is None:
+                projected_usage += size
+            if projected_usage > quota_bytes:
                 raise WorkspaceError(
                     ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
                     "Workspace quota would be exceeded",
@@ -684,12 +1321,14 @@ class WorkspaceFS:
                 )
             )
             uploaded, cancelled = await _await_irreversible_result(publish)
+            if reservation_record is not None:
+                reservation_record.remaining_bytes -= size
             cleanup = asyncio.create_task(self._delete_transfer_temporary(temporary_object))
             self._transfer_cleanup_tasks.add(cleanup)
             cleanup.add_done_callback(self._transfer_cleanup_tasks.discard)
             metadata = FileMetadata(size=size, etag=uploaded.etag, created=True)
             if cancelled:
-                raise UploadCommittedAfterCancellation
+                raise UploadCommittedAfterCancellation(metadata)
             return metadata
 
     async def _write(
@@ -701,9 +1340,13 @@ class WorkspaceFS:
         quota_bytes: int,
         if_match: str | None,
         if_none_match: bool,
+        subtree_owner: Hashable | None,
     ) -> FileMetadata:
         object_name = _object_key(target, relative_path)
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
             return await self._write_locked(
                 target,
@@ -723,6 +1366,7 @@ class WorkspaceFS:
         *,
         quota_bytes: int,
         if_match: str | None = None,
+        subtree_owner: Hashable | None = None,
     ) -> FileMetadata:
         async with self.materialization_slot():
             return await self.edit_materialized(
@@ -731,6 +1375,7 @@ class WorkspaceFS:
                 transform,
                 quota_bytes=quota_bytes,
                 if_match=if_match,
+                subtree_owner=subtree_owner,
             )
 
     async def edit_materialized(
@@ -741,9 +1386,13 @@ class WorkspaceFS:
         *,
         quota_bytes: int,
         if_match: str | None = None,
+        subtree_owner: Hashable | None = None,
     ) -> FileMetadata:
         object_name = _object_key(target, relative_path)
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
             metadata = await self._storage.stat(object_name)
             if if_match is not None and metadata.etag != if_match:
@@ -780,9 +1429,13 @@ class WorkspaceFS:
         *,
         quota_bytes: int,
         if_match: str | None = None,
+        subtree_owner: Hashable | None = None,
     ) -> FileMetadata:
         object_name = _object_key(target, relative_path)
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
             metadata = None
             current_data = None
@@ -878,7 +1531,13 @@ class WorkspaceFS:
             )
 
         replaced_size = existing.size if existing is not None else 0
-        if usage - replaced_size + len(data) > quota_bytes:
+        if (
+            usage
+            + self._reserved_directory_bytes(target)
+            - replaced_size
+            + len(data)
+            > quota_bytes
+        ):
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
                 "Workspace quota would be exceeded",
@@ -897,9 +1556,13 @@ class WorkspaceFS:
         relative_path: str,
         *,
         if_match: str | None = None,
+        subtree_owner: Hashable | None = None,
     ) -> None:
         object_name = _object_key(target, relative_path)
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
             try:
                 existing = await self._storage.stat(object_name)
@@ -923,10 +1586,19 @@ class WorkspaceFS:
                 )
             await self._storage.delete(object_name)
 
-    async def delete_folder(self, target: WorkspaceTarget, relative_path: str) -> None:
+    async def delete_folder(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        subtree_owner: Hashable | None = None,
+    ) -> None:
         object_name = _object_key(target, relative_path)
         folder_prefix = f"{object_name}/"
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(
+            (_subtree_scope(target, relative_path),),
+            owner=subtree_owner,
+        ):
             self._ensure_active(target)
             try:
                 await self._storage.stat(object_name)
@@ -949,6 +1621,7 @@ class WorkspaceFS:
         edits: tuple[FileTransform, ...],
         *,
         dry_run: bool,
+        subtree_owner: Hashable | None = None,
     ) -> tuple[FileMetadata, ...]:
         if not 1 <= len(edits) <= 20:
             raise WorkspaceError(
@@ -956,21 +1629,26 @@ class WorkspaceFS:
                 "Workspace patch must contain between 1 and 20 edits",
             )
         async with self.materialization_slot():
-            return await self.apply_transforms_admitted(edits, dry_run=dry_run)
+            return await self.apply_transforms_admitted(
+                edits,
+                dry_run=dry_run,
+                subtree_owner=subtree_owner,
+            )
 
     async def apply_transforms_admitted(
         self,
         edits: tuple[FileTransform, ...],
         *,
         dry_run: bool,
+        subtree_owner: Hashable | None = None,
     ) -> tuple[FileMetadata, ...]:
         if not 1 <= len(edits) <= 20:
             raise WorkspaceError(
                 ErrorCode.WORKSPACE_INVALID_REQUEST,
                 "Workspace patch must contain between 1 and 20 edits",
             )
-        targets = tuple(edit.target for edit in edits)
-        async with self._mutation_locks.hold_many(targets):
+        scopes = tuple(_subtree_scope(edit.target, edit.relative_path) for edit in edits)
+        async with self._hold_mutations(scopes, owner=subtree_owner):
             return await self._apply_transforms_locked(edits, dry_run=dry_run)
 
     async def _apply_transforms_locked(
@@ -1029,7 +1707,7 @@ class WorkspaceFS:
                     "Workspace is over quota; delete files before writing",
                 )
             metadata_by_target[target] = metadata
-            usage_by_target[target] = usage
+            usage_by_target[target] = usage + self._reserved_directory_bytes(target)
 
         staged: dict[tuple[WorkspaceTarget, str], bytes | None] = {}
         prepared: list[tuple[FileTransform, str, bytes, FileMetadata]] = []
@@ -1112,23 +1790,23 @@ class WorkspaceFS:
 
     async def purge_workspace(self, target: WorkspaceTarget) -> None:
         """Idempotently remove every object for an already-authorized lifecycle event."""
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(((target, ()),)):
             self._retired_targets.add(target)
             await _delete_prefix(self._storage, _workspace_prefix(target))
 
     async def retire_workspace(self, target: WorkspaceTarget) -> None:
         """Fence mutations before committing durable lifecycle deletion state."""
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(((target, ()),)):
             self._retired_targets.add(target)
 
     async def reactivate_workspace(self, target: WorkspaceTarget) -> None:
         """Undo retirement when the corresponding database deletion rolls back."""
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(((target, ()),)):
             self._retired_targets.discard(target)
 
     async def forget_workspace(self, target: WorkspaceTarget) -> None:
         """Release a completed deletion tombstone after its durable job commits."""
-        async with self._mutation_locks.hold(target):
+        async with self._hold_mutations(((target, ()),)):
             self._retired_targets.discard(target)
 
     def _ensure_active(self, target: WorkspaceTarget) -> None:
@@ -1145,6 +1823,93 @@ class WorkspaceFS:
             # Startup recovery removes leftovers. The published destination is
             # already verified and must remain successful after cleanup errors.
             pass
+
+
+async def _release_subtree_leases(leases: tuple[SubtreeLease, ...]) -> None:
+    for lease in leases:
+        await lease.release()
+
+
+def _validate_private_transfer_object(object_name: str) -> None:
+    suffix = object_name.removeprefix(TRANSFER_TEMP_PREFIX)
+    if (
+        not object_name.startswith(TRANSFER_TEMP_PREFIX)
+        or len(suffix) != 32
+        or any(character not in "0123456789abcdef" for character in suffix)
+    ):
+        raise ValueError("private transfer temporary object is invalid")
+
+
+def _subtree_scope(
+    target: WorkspaceTarget,
+    relative_path: str,
+) -> tuple[WorkspaceTarget, tuple[str, ...]]:
+    if not relative_path:
+        return target, ()
+    object_name = _object_key(target, relative_path)
+    relative_object_name = object_name.removeprefix(_workspace_prefix(target))
+    return target, tuple(relative_object_name.split("/"))
+
+
+async def _stat_optional(
+    storage: ObjectStorage,
+    object_name: str,
+) -> ObjectMetadata | None:
+    try:
+        return await storage.stat(object_name)
+    except WorkspaceError as exc:
+        if exc.code is ErrorCode.WORKSPACE_NOT_FOUND:
+            return None
+        raise
+
+
+def _join_relative_path(root: str, relative_path: str) -> str:
+    return f"{root}/{relative_path}"
+
+
+def _workspace_storage_shape_error() -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_STORAGE_ERROR,
+        "Workspace object storage contains an invalid file/prefix shape",
+    )
+
+
+def _workspace_directory_too_large() -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE,
+        "Workspace directory exceeds the recursive transfer limit",
+    )
+
+
+def _workspace_directory_finalize_error() -> WorkspaceError:
+    return WorkspaceError(
+        ErrorCode.WORKSPACE_FILE_CHANGED,
+        "Workspace destination directory changed before finalization",
+    )
+
+
+def _validate_projected_quota(
+    *,
+    usage: int,
+    reserved: int,
+    operation_bytes: int,
+    quota_bytes: int,
+) -> None:
+    if usage > quota_bytes:
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_SOFT_LOCKED,
+            "Workspace is over quota; delete files before writing",
+        )
+    if operation_bytes * 5 > quota_bytes * 4:
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+            "Workspace operation exceeds the single-operation size limit",
+        )
+    if usage + reserved + operation_bytes > quota_bytes:
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+            "Workspace quota would be exceeded",
+        )
 
 
 async def _run_transform(transform: Callable[[bytes], bytes], current: bytes) -> bytes:
@@ -1175,6 +1940,11 @@ async def _run_optional_transform(
 ) -> bytes:
     worker = asyncio.create_task(asyncio.to_thread(transform, current))
     return await await_future_cancellation_safe(worker)
+
+
+def _report_progress(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 async def _metadata_pages(

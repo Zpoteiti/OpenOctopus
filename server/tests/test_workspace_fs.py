@@ -1,21 +1,32 @@
 import asyncio
+import hashlib
 import io
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
-from uuid import uuid4
+from unittest.mock import AsyncMock, Mock
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 from storage_http import object_storage_for_fake
 
+from openctopus_server.directory_contract import (
+    DirectoryManifestDirectory,
+    DirectoryManifestEntry,
+    create_directory_manifest,
+)
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryCommittedFile,
+    DirectoryDestinationPlan,
+    FileMetadata,
     FileTransform,
+    ServerDirectorySourceProbe,
+    ServerFileSourceProbe,
     UploadCommittedAfterCancellation,
     WorkspaceFS,
     WorkspaceTarget,
@@ -77,6 +88,30 @@ async def test_upload_collection_does_not_take_an_agent_materialization_slot() -
     await upload
 
 
+async def test_private_directory_validation_staging_has_bounded_lifecycle() -> None:
+    storage = AsyncMock()
+    sink = object()
+    stream = object()
+    storage.begin_upload = Mock(return_value=sink)
+    storage.open_stream.return_value = stream
+    workspace_fs = WorkspaceFS(storage)
+
+    actual_sink, object_name = workspace_fs.begin_directory_validation_staging(size=7)
+    assert actual_sink is sink
+    assert object_name.startswith("_openoctopus-transfers/")
+    storage.begin_upload.assert_called_once_with(object_name, length=7)
+
+    assert await workspace_fs.open_directory_validation_staging(object_name) is stream
+    storage.open_stream.assert_awaited_once_with(object_name)
+    await workspace_fs.delete_directory_validation_staging(object_name)
+    storage.delete.assert_awaited_once_with(object_name)
+
+    with pytest.raises(ValueError, match="private transfer temporary"):
+        await workspace_fs.open_directory_validation_staging(
+            "personal/user/skills/example/SKILL.md"
+        )
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _truncate_tables() -> None:
     """These unit tests do not need the suite's PostgreSQL cleanup fixture."""
@@ -132,7 +167,7 @@ class _MemoryMinio:
         with self._guard:
             self.list_calls += 1
             self.list_prefixes.append(prefix)
-            objects = list(self._objects.items())
+            objects = sorted(self._objects.items())
         return iter(
             _Object(key, len(content), etag)
             for key, (content, etag) in objects
@@ -175,9 +210,11 @@ class _MemoryMinio:
         length: int,
         *,
         num_parallel_uploads: int,
+        part_size: int | None = None,
     ) -> SimpleNamespace:
         del bucket
         assert num_parallel_uploads == 1
+        assert part_size is None or part_size == 5 * 1024 * 1024
         content = data.read(length)
         with self._guard:
             self.put_calls += 1
@@ -194,6 +231,25 @@ class _MemoryMinio:
             del self._objects[object_name]
             self.removed_names.append(object_name)
 
+    def copy_object(
+        self,
+        bucket: str,
+        object_name: str,
+        source: object,
+    ) -> SimpleNamespace:
+        del bucket
+        source_name = getattr(source, "object_name", None)
+        if not isinstance(source_name, str):
+            raise AssertionError("fake copy source is missing object_name")
+        with self._guard:
+            stored = self._objects.get(source_name)
+            if stored is None:
+                raise _S3Error("NoSuchKey")
+            self._revision += 1
+            etag = f"revision-{self._revision}"
+            self._objects[object_name] = (stored[0], etag)
+        return SimpleNamespace(etag=etag)
+
 
 class _FailingSecondPutMinio(_MemoryMinio):
     def put_object(
@@ -204,6 +260,7 @@ class _FailingSecondPutMinio(_MemoryMinio):
         length: int,
         *,
         num_parallel_uploads: int,
+        part_size: int | None = None,
     ) -> SimpleNamespace:
         if self.put_calls == 1:
             raise _S3Error("InternalError")
@@ -213,6 +270,7 @@ class _FailingSecondPutMinio(_MemoryMinio):
             data,
             length,
             num_parallel_uploads=num_parallel_uploads,
+            part_size=part_size,
         )
 
 
@@ -255,6 +313,7 @@ class _BlockingPutMinio(_MemoryMinio):
         length: int,
         *,
         num_parallel_uploads: int,
+        part_size: int | None = None,
     ) -> SimpleNamespace:
         with self._guard:
             self.active_puts += 1
@@ -268,6 +327,7 @@ class _BlockingPutMinio(_MemoryMinio):
                 data,
                 length,
                 num_parallel_uploads=num_parallel_uploads,
+                part_size=part_size,
             )
         finally:
             with self._guard:
@@ -377,6 +437,7 @@ class _CapacityMinio(_MemoryMinio):
         length: int,
         *,
         num_parallel_uploads: int,
+        part_size: int | None = None,
     ) -> SimpleNamespace:
         self._enter_operation()
         try:
@@ -386,6 +447,7 @@ class _CapacityMinio(_MemoryMinio):
                 data,
                 length,
                 num_parallel_uploads=num_parallel_uploads,
+                part_size=part_size,
             )
         finally:
             self._leave_operation()
@@ -451,6 +513,612 @@ async def test_same_workspace_mutations_serialize_and_idle_lock_is_evicted() -> 
 
     assert client.max_active_puts == 1
     assert fs.mutation_lock_count == 0
+
+
+async def test_subtree_lease_blocks_overlap_but_not_sibling_or_other_target() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    other_target = WorkspaceTarget.personal(uuid4())
+    lease = await fs.acquire_subtree_lease(
+        target,
+        "reserved",
+        owner="directory-operation",
+    )
+
+    overlapping = asyncio.create_task(
+        fs.write(target, "reserved/file.txt", b"blocked", quota_bytes=100)
+    )
+    await _wait_for(lambda: fs._subtree_leases.pending_count == 1)
+
+    sibling = asyncio.create_task(
+        fs.write(target, "sibling/file.txt", b"sibling", quota_bytes=100)
+    )
+    other = asyncio.create_task(
+        fs.write(other_target, "reserved/file.txt", b"other", quota_bytes=100)
+    )
+    await asyncio.wait_for(asyncio.gather(sibling, other), timeout=1)
+
+    assert not overlapping.done()
+    await lease.release()
+    await asyncio.wait_for(overlapping, timeout=1)
+
+    assert await fs.read(target, "sibling/file.txt") == b"sibling"
+    assert await fs.read(other_target, "reserved/file.txt") == b"other"
+    assert await fs.read(target, "reserved/file.txt") == b"blocked"
+
+
+async def test_subtree_owner_mutation_bypasses_its_queued_non_owner() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    owner = "directory-operation"
+    lease = await fs.acquire_subtree_lease(target, "reserved", owner=owner)
+
+    ordinary = asyncio.create_task(
+        fs.write(target, "reserved/ordinary.txt", b"ordinary", quota_bytes=100)
+    )
+    await _wait_for(lambda: fs._subtree_leases.pending_count == 1)
+
+    await asyncio.wait_for(
+        fs.write(
+            target,
+            "reserved/owned.txt",
+            b"owned",
+            quota_bytes=100,
+            subtree_owner=owner,
+        ),
+        timeout=1,
+    )
+
+    assert not ordinary.done()
+    await lease.release()
+    await asyncio.wait_for(ordinary, timeout=1)
+
+
+async def test_cancelled_multi_target_mutation_releases_partially_acquired_subtrees() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    first_target = WorkspaceTarget.personal(UUID(int=1))
+    second_target = WorkspaceTarget.personal(UUID(int=2))
+    blocker = await fs.acquire_subtree_lease(
+        second_target,
+        "reserved",
+        owner="directory-operation",
+    )
+    operation = asyncio.create_task(
+        fs.apply_transforms_admitted(
+            (
+                FileTransform(first_target, "free/file.txt", 100, lambda _: b"first"),
+                FileTransform(second_target, "reserved/file.txt", 100, lambda _: b"second"),
+            ),
+            dry_run=False,
+        )
+    )
+    await _wait_for(
+        lambda: fs._subtree_leases.active_count == 2
+        and fs._subtree_leases.pending_count == 1
+    )
+
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+
+    assert fs._subtree_leases.active_count == 1
+    assert fs._subtree_leases.pending_count == 0
+    await asyncio.wait_for(
+        fs.write(first_target, "free/file.txt", b"available", quota_bytes=100),
+        timeout=1,
+    )
+    await blocker.release()
+    assert fs._subtree_leases.active_count == 0
+
+
+async def test_inactive_target_rejects_subtree_lease_without_ghost() -> None:
+    fs = _fs(_MemoryMinio())
+    target = WorkspaceTarget.personal(uuid4())
+    await fs.retire_workspace(target)
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.acquire_subtree_lease(target, "reserved", owner="directory-operation")
+
+    assert caught.value.code is ErrorCode.WORKSPACE_NOT_FOUND
+    assert fs._subtree_leases.active_count == 0
+    assert fs._subtree_leases.pending_count == 0
+
+
+async def test_server_source_probe_distinguishes_file_directory_missing_and_invalid_shape() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    prefix = f"users/{target.id}/"
+    client._objects[f"{prefix}file.txt"] = (b"file", "file-etag")
+
+    file_probe = await fs.probe_directory_source(target, "file.txt")
+
+    assert file_probe == ServerFileSourceProbe(size=4, fingerprint="file-etag")
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.probe_directory_source(target, "missing")
+    assert caught.value.code is ErrorCode.WORKSPACE_NOT_FOUND
+
+    client._objects[f"{prefix}tree"] = (b"exact", "exact-etag")
+    client._objects[f"{prefix}tree/child.txt"] = (b"child", "child-etag")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.probe_directory_source(target, "tree")
+    assert caught.value.code is ErrorCode.WORKSPACE_STORAGE_ERROR
+
+
+async def test_server_directory_manifest_pages_exact_prefix_without_noise_filter() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    object_prefix = f"users/{target.id}/tree/"
+    seeded = {
+        ".git/config": b"git",
+        "node_modules/pkg/index.js": b"js",
+        "plain.txt": b"plain",
+    }
+    seeded.update({f"bulk/{index:04d}.txt": b"x" for index in range(1001)})
+    for index, (relative_path, data) in enumerate(seeded.items()):
+        client._objects[f"{object_prefix}{relative_path}"] = (data, f"etag-{index}")
+
+    probe = await fs.probe_directory_source(target, "tree")
+
+    assert isinstance(probe, ServerDirectorySourceProbe)
+    manifest = probe.manifest
+    assert manifest.root_identity is None
+    assert {item.relative_path for item in manifest.directories} >= {
+        ".git",
+        "node_modules",
+        "node_modules/pkg",
+        "bulk",
+    }
+    assert {item.relative_path for item in manifest.entries} >= {
+        ".git/config",
+        "node_modules/pkg/index.js",
+        "plain.txt",
+    }
+    assert all(item.identity is None for item in manifest.directories)
+    assert client.list_calls >= 3
+    assert all(prefix == object_prefix for prefix in client.list_prefixes)
+
+
+async def test_server_directory_probe_supports_authorized_workspace_root() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    client._objects[f"users/{target.id}/root.txt"] = (b"root", "root-etag")
+
+    probe = await fs.probe_directory_source(target, "")
+
+    assert isinstance(probe, ServerDirectorySourceProbe)
+    assert probe.manifest.entries == (
+        DirectoryManifestEntry(
+            relative_path="root.txt",
+            size=4,
+            fingerprint="root-etag",
+        ),
+    )
+    assert not await fs.directory_root_is_absent(target, "", owner="operation")
+
+    client._objects.clear()
+
+    assert await fs.directory_root_is_absent(target, "", owner="operation")
+
+
+async def test_server_destination_plan_maps_files_only_and_checks_root_shape() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(
+            DirectoryManifestDirectory(relative_path="empty", identity=None),
+            DirectoryManifestDirectory(relative_path="lib", identity=None),
+        ),
+        entries=(
+            DirectoryManifestEntry(relative_path="lib/a.py", size=1, fingerprint="a"),
+            DirectoryManifestEntry(relative_path="README.md", size=2, fingerprint="b"),
+        ),
+    )
+
+    plan = await fs.preflight_directory_destination(target, "backup", manifest)
+
+    assert plan.destination_root == "backup"
+    assert plan.mapped_paths == ("backup/README.md", "backup/lib/a.py")
+    object_prefix = f"users/{target.id}/"
+
+    client._objects[f"{object_prefix}backup"] = (b"file", "root-etag")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.preflight_directory_destination(target, "backup", manifest)
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+    client._objects.pop(f"{object_prefix}backup")
+    client._objects[f"{object_prefix}backup/existing.txt"] = (b"existing", "child-etag")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.preflight_directory_destination(target, "backup", manifest)
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+    client._objects[f"{object_prefix}backup"] = (b"file", "root-etag")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.preflight_directory_destination(target, "backup", manifest)
+    assert caught.value.code is ErrorCode.WORKSPACE_STORAGE_ERROR
+
+
+async def test_server_directory_phases_report_only_completed_storage_progress() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(),
+        entries=(DirectoryManifestEntry(relative_path="file.txt", size=1, fingerprint="source"),),
+    )
+    progress: list[str] = []
+
+    plan = await fs.preflight_directory_destination(
+        target,
+        "backup",
+        manifest,
+        on_progress=lambda: progress.append("preflight"),
+    )
+    reservation = await fs.reserve_directory_quota(
+        target,
+        owner="operation",
+        total_bytes=1,
+        quota_bytes=10,
+        on_progress=lambda: progress.append("quota"),
+    )
+    client._objects[f"users/{target.id}/backup/file.txt"] = (b"x", "destination")
+    await fs.verify_directory_destination(
+        plan,
+        (DirectoryCommittedFile("backup/file.txt", 1, "destination"),),
+        owner="operation",
+        on_progress=lambda: progress.append("verify"),
+    )
+
+    assert progress.count("preflight") >= 3
+    assert progress.count("quota") == 1
+    assert progress.count("verify") >= 2
+    await reservation.release()
+
+
+async def test_server_destination_plan_rejects_file_parent_and_oversized_mapping() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(),
+        entries=(DirectoryManifestEntry(relative_path="file.txt", size=1, fingerprint="a"),),
+    )
+    client._objects[f"users/{target.id}/parent"] = (b"file", "parent-etag")
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.preflight_directory_destination(target, "parent/backup", manifest)
+    assert caught.value.code is ErrorCode.TOOL_NOT_A_DIRECTORY
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.preflight_directory_destination(target, "x" * 4090, manifest)
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_REQUEST
+
+
+async def test_directory_quota_reservation_fences_writes_and_child_commit_consumes_bytes() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    owner = "directory-operation"
+    subtree = await fs.acquire_subtree_lease(target, "reserved", owner=owner)
+    reservation = await fs.reserve_directory_quota(
+        target,
+        owner=owner,
+        total_bytes=6,
+        quota_bytes=10,
+    )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.write(target, "ordinary.txt", b"12345", quota_bytes=10)
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.reserve_directory_quota(
+            target,
+            owner="second-operation",
+            total_bytes=5,
+            quota_bytes=10,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    sink, temporary_object = await fs.begin_directory_child_upload(
+        reservation,
+        "reserved/a.bin",
+        size=4,
+    )
+    await sink.write(b"data")
+    await sink.finish()
+    committed = await fs.commit_directory_child_upload(
+        reservation,
+        "reserved/a.bin",
+        temporary_object,
+        size=4,
+    )
+
+    assert committed.created is True
+    assert committed.etag
+    assert reservation.remaining_bytes == 2
+    await fs.write(target, "ordinary.txt", b"1234", quota_bytes=10)
+
+    await reservation.release()
+    await reservation.release()
+    await subtree.release()
+    assert fs.directory_quota_reservation_count == 0
+
+
+async def test_active_directory_reservation_fences_upload_patch_and_single_file_transfer() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    source_target = WorkspaceTarget.personal(uuid4())
+    destination_target = WorkspaceTarget.personal(uuid4())
+    client._objects[f"users/{source_target.id}/source.bin"] = (b"12345", "source-etag")
+    reservation = await fs.reserve_directory_quota(
+        destination_target,
+        owner="directory-operation",
+        total_bytes=6,
+        quota_bytes=10,
+    )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.begin_transfer_upload(
+            destination_target,
+            "upload.bin",
+            size=5,
+            quota_bytes=10,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    temporary = "_openoctopus-transfers/ordinary"
+    sink = fs._storage.begin_upload(temporary, length=5)
+    await sink.write(b"12345")
+    await sink.finish()
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.commit_uploaded_object(
+            destination_target,
+            "commit.bin",
+            temporary,
+            size=5,
+            quota_bytes=10,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.apply_transforms_admitted(
+            (
+                FileTransform(
+                    destination_target,
+                    "patch.bin",
+                    10,
+                    lambda _: b"12345",
+                ),
+            ),
+            dry_run=False,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.transfer_server_to_server(
+            source_target,
+            "source.bin",
+            destination_target,
+            "copied.bin",
+            user_id=uuid4(),
+            quota_bytes=10,
+            mode="copy",
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_QUOTA_EXCEEDED
+
+    await reservation.release()
+
+
+async def test_directory_child_temp_uses_existing_restart_recovery_prefix() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    reservation = await fs.reserve_directory_quota(
+        target,
+        owner="directory-operation",
+        total_bytes=2,
+        quota_bytes=10,
+    )
+    sink, temporary_object = await fs.begin_directory_child_upload(
+        reservation,
+        "reserved/file.bin",
+        size=2,
+    )
+    await sink.write(b"xx")
+    await sink.finish()
+
+    removed = await fs._storage.recover_transfer_uploads()
+
+    assert removed == 1
+    assert temporary_object not in client._objects
+    await reservation.release()
+
+
+async def test_conditional_cleanup_deletes_only_matching_etag() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    written = await fs.write(target, "tree/file.txt", b"data", quota_bytes=100)
+
+    assert (
+        await fs.conditional_delete_file(
+            target,
+            "tree/file.txt",
+            expected_etag="different",
+        )
+        == "mismatch"
+    )
+    assert await fs.read(target, "tree/file.txt") == b"data"
+    assert (
+        await fs.conditional_delete_file(
+            target,
+            "tree/file.txt",
+            expected_etag=written.etag,
+        )
+        == "deleted"
+    )
+    assert (
+        await fs.conditional_delete_file(
+            target,
+            "tree/file.txt",
+            expected_etag=written.etag,
+        )
+        == "missing"
+    )
+
+
+async def test_directory_destination_verification_requires_exact_paths_and_etags() -> None:
+    client = _MemoryMinio()
+    fs = _fs(client)
+    target = WorkspaceTarget.personal(uuid4())
+    prefix = f"users/{target.id}/backup/"
+    client._objects[f"{prefix}a.txt"] = (b"a", "etag-a")
+    client._objects[f"{prefix}nested/b.txt"] = (b"bb", "etag-b")
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="backup",
+        manifest_sha256="0" * 64,
+        mapped_paths=("backup/a.txt", "backup/nested/b.txt"),
+    )
+    committed = (
+        DirectoryCommittedFile("backup/a.txt", 1, "etag-a"),
+        DirectoryCommittedFile("backup/nested/b.txt", 2, "etag-b"),
+    )
+
+    await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert not await fs.directory_root_is_absent(
+        target,
+        "backup",
+        owner="operation",
+    )
+
+    client._objects[f"{prefix}extra.txt"] = (b"extra", "etag-extra")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+    client._objects.pop(f"{prefix}extra.txt")
+    client._objects[f"{prefix}a.txt"] = (b"a", "changed")
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.verify_directory_destination(plan, committed, owner="operation")
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+
+
+async def test_server_transfer_operation_lease_is_transferable_and_busy_is_stable() -> None:
+    storage = AsyncMock()
+    storage.max_connections = 2
+    fs = WorkspaceFS(
+        storage,
+        server_transfer_max_concurrency_per_user=1,
+        server_transfer_queue_timeout_seconds=0.01,
+    )
+    first = await fs.acquire_server_transfer_operation(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.acquire_server_transfer_operation(uuid4())
+    assert caught.value.code is ErrorCode.WORKSPACE_TRANSFER_BUSY
+
+    await first.aclose()
+    replacement = await fs.acquire_server_transfer_operation(uuid4())
+    await replacement.aclose()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "write",
+        "write_collected_upload",
+        "commit_uploaded_object",
+        "edit_materialized",
+        "edit_optional_materialized",
+        "delete_file",
+        "delete_folder",
+        "apply_transforms_admitted",
+        "purge_workspace",
+        "retire_workspace",
+        "reactivate_workspace",
+        "forget_workspace",
+    ],
+)
+async def test_every_workspace_mutation_participates_in_subtree_leases(
+    mutation: str,
+) -> None:
+    fs = WorkspaceFS(AsyncMock())
+    target = WorkspaceTarget.personal(uuid4())
+    lease = await fs.acquire_subtree_lease(target, "reserved", owner="directory-operation")
+
+    operation: Awaitable[object]
+    if mutation == "write":
+        operation = fs.write(target, "reserved/file.txt", b"data", quota_bytes=100)
+    elif mutation == "write_collected_upload":
+        operation = fs.write_collected_upload(
+            target,
+            "reserved/file.txt",
+            b"data",
+            quota_bytes=100,
+        )
+    elif mutation == "commit_uploaded_object":
+        operation = fs.commit_uploaded_object(
+            target,
+            "reserved/file.txt",
+            "temporary-object",
+            size=4,
+            quota_bytes=100,
+        )
+    elif mutation == "edit_materialized":
+        operation = fs.edit_materialized(
+            target,
+            "reserved/file.txt",
+            lambda data: data,
+            quota_bytes=100,
+        )
+    elif mutation == "edit_optional_materialized":
+        operation = fs.edit_optional_materialized(
+            target,
+            "reserved/file.txt",
+            lambda data: data or b"data",
+            quota_bytes=100,
+        )
+    elif mutation == "delete_file":
+        operation = fs.delete_file(target, "reserved/file.txt")
+    elif mutation == "delete_folder":
+        operation = fs.delete_folder(target, "reserved/folder")
+    elif mutation == "apply_transforms_admitted":
+        operation = fs.apply_transforms_admitted(
+            (FileTransform(target, "reserved/file.txt", 100, lambda _: b"data"),),
+            dry_run=False,
+        )
+    elif mutation == "purge_workspace":
+        operation = fs.purge_workspace(target)
+    elif mutation == "retire_workspace":
+        operation = fs.retire_workspace(target)
+    elif mutation == "reactivate_workspace":
+        operation = fs.reactivate_workspace(target)
+    elif mutation == "forget_workspace":
+        operation = fs.forget_workspace(target)
+    else:
+        raise AssertionError(f"Unhandled mutation: {mutation}")
+
+    task = asyncio.ensure_future(operation)
+    await _wait_for(lambda: fs._subtree_leases.pending_count == 1)
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert fs._subtree_leases.pending_count == 0
+    await lease.release()
 
 
 async def test_multi_file_transform_validates_every_edit_before_first_write() -> None:
@@ -995,6 +1663,166 @@ async def test_server_move_uses_open_source_etag_for_conditional_delete(
     commit.assert_awaited_once()
 
 
+async def test_server_regular_admitted_transfer_reuses_outer_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        def __init__(self) -> None:
+            self.read_count = 0
+
+        async def read(self) -> bytes:
+            self.read_count += 1
+            return b"payload" if self.read_count == 1 else b""
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        async def write(self, chunk: bytes) -> None:
+            assert chunk == b"payload"
+
+        async def finish(self) -> None:
+            pass
+
+        async def abort(self) -> None:
+            pass
+
+    fs = WorkspaceFS(AsyncMock())
+    source = Source()
+    sink = Sink()
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", AsyncMock(return_value=(sink, "temp")))
+    monkeypatch.setattr(fs, "commit_uploaded_object", AsyncMock())
+    monkeypatch.setattr(
+        fs._server_transfers,
+        "acquire",
+        AsyncMock(side_effect=AssertionError("admitted transfer reacquired capacity")),
+    )
+    target = WorkspaceTarget.personal(uuid4())
+
+    transferred, digest, warnings = await fs.transfer_server_to_server_admitted(
+        target,
+        "source.txt",
+        target,
+        "destination.txt",
+        quota_bytes=100,
+        mode="copy",
+        expected_source_size=7,
+        expected_source_fingerprint="source-v1",
+    )
+
+    assert transferred == 7
+    assert digest == hashlib.sha256(b"payload").hexdigest()
+    assert warnings == ()
+
+
+async def test_server_regular_admitted_transfer_validates_staging_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Source:
+        size = 7
+        etag = "source-v1"
+
+        def __init__(self) -> None:
+            self._read = False
+
+        async def read(self) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            return b"payload"
+
+        async def aclose(self) -> None:
+            pass
+
+    class Sink:
+        object_name = "temp"
+
+        async def write(self, _chunk: bytes) -> None:
+            pass
+
+        async def finish(self) -> None:
+            events.append("finish")
+
+        async def abort(self) -> None:
+            events.append("abort")
+
+    async def validate_staging(object_name: str, size: int) -> None:
+        assert object_name == "temp"
+        assert size == 7
+        events.append("validate")
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT,
+            "invalid Skill manifest",
+        )
+
+    fs = WorkspaceFS(AsyncMock())
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=Source()))
+    monkeypatch.setattr(
+        fs,
+        "begin_transfer_upload",
+        AsyncMock(return_value=(Sink(), "temp")),
+    )
+    commit = AsyncMock()
+    monkeypatch.setattr(fs, "commit_uploaded_object", commit)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.transfer_server_to_server_admitted(
+            target,
+            "source.txt",
+            target,
+            "skills/demo/SKILL.md",
+            quota_bytes=100,
+            mode="copy",
+            expected_source_size=7,
+            expected_source_fingerprint="source-v1",
+            validate_staging=validate_staging,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    assert events == ["finish", "validate", "abort"]
+    commit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("expected_size", "expected_fingerprint"),
+    [(8, "source-v1"), (7, "source-v2")],
+)
+async def test_server_regular_admitted_transfer_fences_source_before_destination_begin(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_size: int,
+    expected_fingerprint: str,
+) -> None:
+    source = AsyncMock(size=7, etag="source-v1")
+    fs = WorkspaceFS(AsyncMock())
+    begin = AsyncMock(side_effect=AssertionError("destination began before source fence"))
+    monkeypatch.setattr(fs, "open_stream", AsyncMock(return_value=source))
+    monkeypatch.setattr(fs, "begin_transfer_upload", begin)
+    target = WorkspaceTarget.personal(uuid4())
+
+    with pytest.raises(WorkspaceError) as caught:
+        await fs.transfer_server_to_server_admitted(
+            target,
+            "source.txt",
+            target,
+            "destination.txt",
+            quota_bytes=100,
+            mode="copy",
+            expected_source_size=expected_size,
+            expected_source_fingerprint=expected_fingerprint,
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+    begin.assert_not_awaited()
+    source.aclose.assert_awaited_once()
+
+
 async def test_server_move_finishes_after_publish_observes_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1169,8 +1997,13 @@ async def test_uploaded_object_publish_propagates_cancellation_after_true_result
 
     assert task.done() is False
     release_publish.set()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(UploadCommittedAfterCancellation) as caught:
         await task
+    assert caught.value.metadata == FileMetadata(
+        size=1,
+        etag="destination-etag",
+        created=True,
+    )
     storage.promote_if_absent.assert_awaited_once()
 
 

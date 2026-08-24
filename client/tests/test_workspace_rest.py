@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import threading
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,7 +17,11 @@ import openoctopus_client.transfer as transfer_module
 from openoctopus_client.tools import ClientToolDispatcher
 from openoctopus_client.tools.common import ToolFailure, ToolOutput
 from openoctopus_client.tools.locks import PathLocks
-from openoctopus_client.tools.workspace_rest import INTERNAL_WORKSPACE_ACTION
+from openoctopus_client.tools.workspace_rest import INTERNAL_WORKSPACE_ACTION, FileSourceProbe
+from openoctopus_client.transfer_admission import (
+    LocalTransferAdmission,
+    LocalTransferDrainRegistry,
+)
 
 
 class _RecordingLocks(PathLocks):
@@ -24,9 +29,11 @@ class _RecordingLocks(PathLocks):
         super().__init__()
         self.reservations: list[tuple[str, ...]] = []
 
-    def hold(self, *paths: str):  # type: ignore[no-untyped-def]
+    def hold(  # type: ignore[no-untyped-def]
+        self, *paths: str, owner: Hashable | None = None
+    ):
         self.reservations.append(paths)
-        return super().hold(*paths)
+        return super().hold(*paths, owner=owner)
 
 
 def _run(dispatcher: ClientToolDispatcher, **args: object) -> ToolOutput:
@@ -56,6 +63,12 @@ def _make_directory_link(link: Path, target: Path) -> None:
     )
     if completed.returncode != 0:
         raise OSError("unable to create a Windows directory junction")
+
+
+@pytest.mark.parametrize("fingerprint", ["line\nbreak", "non-ascii-é", "delete-\x7f"])
+def test_file_source_probe_rejects_non_visible_ascii_fingerprint(fingerprint: str) -> None:
+    with pytest.raises(ValueError, match="visible ASCII"):
+        FileSourceProbe(size=1, fingerprint=fingerprint)
 
 
 def test_workspace_rest_returns_machine_results_and_etag_guard(tmp_path: Path) -> None:
@@ -251,6 +264,8 @@ def test_workspace_rest_local_copy_and_move_return_digest_without_overwrite(
     assert copied.is_error is False
     result = _json(copied)
     assert result == {
+        "kind": "file",
+        "files_transferred": 1,
         "bytes_transferred": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "warnings": [],
@@ -277,6 +292,217 @@ def test_workspace_rest_local_copy_and_move_return_digest_without_overwrite(
     )
     assert conflict.code == "workspace_file_changed"
     assert (tmp_path / "moved.bin").read_bytes() == payload
+
+
+def test_workspace_rest_local_transfer_honors_source_if_match(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
+    fingerprint = dispatcher_module._stat_fingerprint(source)
+    assert fingerprint is not None
+
+    matched = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="matched.bin",
+        mode="copy",
+        if_match=fingerprint,
+    )
+    stale = _run(
+        dispatcher,
+        operation="transfer_local",
+        path="source.bin",
+        dst_path="missing-parent/stale.bin",
+        mode="copy",
+        if_match="stale",
+    )
+
+    assert matched.is_error is False
+    assert (tmp_path / "matched.bin").read_bytes() == b"payload"
+    assert stale.code == "workspace_file_changed"
+    assert (tmp_path / "missing-parent").exists() is False
+
+
+def test_workspace_rest_local_transfer_waits_for_shared_runtime_capacity(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        (tmp_path / "source.bin").write_bytes(b"payload")
+        admission = LocalTransferAdmission(capacity=2)
+        drains = LocalTransferDrainRegistry()
+        first = admission.try_acquire()
+        second = admission.try_acquire()
+        assert first is not None and second is not None
+        dispatcher = ClientToolDispatcher(
+            tmp_path,
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+            transfer_admission=admission,
+            transfer_drains=drains,
+        )
+
+        task = asyncio.create_task(
+            dispatcher.execute(
+                "__workspace_rest__",
+                {
+                    "operation": "transfer_local",
+                    "path": "source.bin",
+                    "dst_path": "copy.bin",
+                    "mode": "copy",
+                },
+            )
+        )
+        while admission.waiting_count != 1:
+            await asyncio.sleep(0)
+        assert task.done() is False
+
+        first.release()
+        result = await asyncio.wait_for(task, timeout=1)
+        assert result.is_error is False
+        assert admission.active_count == 1
+        second.release()
+        assert admission.active_count == 0
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_local_transfer_hands_late_open_and_slot_to_runtime_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    original_open = dispatcher_module._open_transfer_source
+    started = threading.Event()
+    release = threading.Event()
+    opened: list[tuple[int, tuple[int, int, int, int, int]]] = []
+
+    def delayed_open(
+        path: Path, delete_access: bool = False
+    ) -> tuple[int, tuple[int, int, int, int, int]]:
+        result = original_open(path, delete_access)
+        opened.append(result)
+        started.set()
+        release.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(dispatcher_module, "_open_transfer_source", delayed_open)
+
+    async def exercise() -> None:
+        admission = LocalTransferAdmission(capacity=1)
+        drains = LocalTransferDrainRegistry()
+        dispatcher = ClientToolDispatcher(
+            tmp_path,
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+            transfer_admission=admission,
+            transfer_drains=drains,
+        )
+        task = asyncio.create_task(
+            dispatcher.execute(
+                "__workspace_rest__",
+                {
+                    "operation": "transfer_local",
+                    "path": "source.bin",
+                    "dst_path": "copy.bin",
+                    "mode": "copy",
+                },
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert admission.active_count == 1
+        assert admission.try_acquire() is None
+        assert dispatcher.has_pending_blocking() is False
+        assert dispatcher._locks.reservation_count == 2
+
+        release.set()
+        assert await drains.wait(timeout_seconds=1)
+        assert admission.active_count == 0
+        assert dispatcher._locks.reservation_count == 0
+        with pytest.raises(OSError):
+            os.fstat(opened[0][0])
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+
+
+def test_cancelled_local_transfer_retains_fd_lock_and_slot_until_check_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    original_unchanged = dispatcher_module._source_unchanged
+    started = threading.Event()
+    release = threading.Event()
+    descriptor: list[int] = []
+
+    def delayed_unchanged(
+        path: Path, source_fd: int, initial: tuple[int, int, int, int, int]
+    ) -> bool:
+        descriptor.append(source_fd)
+        started.set()
+        release.wait(timeout=2)
+        return original_unchanged(path, source_fd, initial)
+
+    monkeypatch.setattr(dispatcher_module, "_source_unchanged", delayed_unchanged)
+
+    async def transfer(dispatcher: ClientToolDispatcher) -> ToolOutput:
+        return await dispatcher.execute(
+            "__workspace_rest__",
+            {
+                "operation": "transfer_local",
+                "path": "source.bin",
+                "dst_path": "copy.bin",
+                "mode": "copy",
+            },
+        )
+
+    async def exercise() -> None:
+        admission = LocalTransferAdmission(capacity=2)
+        drains = LocalTransferDrainRegistry()
+        dispatcher = ClientToolDispatcher(
+            tmp_path,
+            restrict_to_workspace=True,
+            ssrf_denylist=[],
+            transfer_admission=admission,
+            transfer_drains=drains,
+        )
+        first = asyncio.create_task(transfer(dispatcher))
+        assert await asyncio.to_thread(started.wait, 1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first, timeout=1)
+
+        assert os.fstat(descriptor[0]).st_size == len(b"payload")
+        assert dispatcher._locks.reservation_count == 2
+        assert admission.active_count == 1
+
+        second = asyncio.create_task(transfer(dispatcher))
+        while admission.active_count != 2:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        assert second.done() is False
+        assert dispatcher._locks.reservation_count == 2
+
+        release.set()
+        result = await asyncio.wait_for(second, timeout=1)
+        assert result.is_error is False
+        assert await drains.wait(timeout_seconds=1)
+        assert admission.active_count == 0
+        assert dispatcher._locks.reservation_count == 0
+        with pytest.raises(OSError):
+            os.fstat(descriptor[0])
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
 
 
 def test_workspace_rest_local_transfer_rejects_same_path_links_and_special_files(

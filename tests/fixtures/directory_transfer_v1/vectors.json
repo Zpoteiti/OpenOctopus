@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "manifest_vectors": [
+    {
+      "name": "filesystem-identities",
+      "manifest": {
+        "version": 1,
+        "root_identity": "root-device-inode",
+        "scanned_entries": 6,
+        "total_bytes": 9,
+        "directories": [
+          {
+            "relative_path": ".git",
+            "identity": "dir-git"
+          },
+          {
+            "relative_path": "café",
+            "identity": "d"
+          },
+          {
+            "relative_path": "中文",
+            "identity": "directory-zh-identity"
+          }
+        ],
+        "entries": [
+          {
+            "relative_path": ".git/config",
+            "size": 3,
+            "fingerprint": "x"
+          },
+          {
+            "relative_path": "café/.env",
+            "size": 0,
+            "fingerprint": "fingerprint-medium"
+          },
+          {
+            "relative_path": "中文/数据.txt",
+            "size": 6,
+            "fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        ],
+        "manifest_sha256": "c7703e92f36f6aabd4eba17a4ac6f4c43d932983384a5ccb4593beeb81bfe0eb"
+      },
+      "canonical_bytes": 611,
+      "canonical_sha256": "71a03693685039b98d60c02cabfaf673f006cc9f83f8f32079a1759de823d961"
+    },
+    {
+      "name": "object-prefix-null-identities",
+      "manifest": {
+        "version": 1,
+        "root_identity": null,
+        "scanned_entries": 6,
+        "total_bytes": 9,
+        "directories": [
+          {
+            "relative_path": ".git",
+            "identity": null
+          },
+          {
+            "relative_path": "café",
+            "identity": null
+          },
+          {
+            "relative_path": "中文",
+            "identity": null
+          }
+        ],
+        "entries": [
+          {
+            "relative_path": ".git/config",
+            "size": 3,
+            "fingerprint": "x"
+          },
+          {
+            "relative_path": "café/.env",
+            "size": 0,
+            "fingerprint": "fingerprint-medium"
+          },
+          {
+            "relative_path": "中文/数据.txt",
+            "size": 6,
+            "fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        ],
+        "manifest_sha256": "96cccbbfd6fa9b08db2c1c862c11cb0cbee7d2aee02cc7f0adfb5ec39f75e453"
+      },
+      "canonical_bytes": 573,
+      "canonical_sha256": "c5a277ed2db462bc89831ee709fc11ca2ae1f5392d72529aa97938961cf2d51d"
+    }
+  ],
+  "content_vector": {
+    "entries": [
+      {
+        "relative_path": ".git/config",
+        "size": 3,
+        "sha256": "9a881b9b9f23849475296a8cd768ea1965bc3152df7118e60c145975af6aa58a"
+      },
+      {
+        "relative_path": "café/.env",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "relative_path": "中文/数据.txt",
+        "size": 6,
+        "sha256": "5440f7424f2865bf2bee49b320121bd059e9838e8fb920835c1f8d20f61cf78e"
+      }
+    ],
+    "sha256": "bae78fd07db02a2da0ee7bbc238d9765273cd59b9c11bfb4d1d6358fd4abf1da"
+  }
+}

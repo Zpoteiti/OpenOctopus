@@ -1219,17 +1219,20 @@ paths:
 
   /api/workspace/transfer:
     description: |
-      Workspace file transfer route. Mirrors the `file_transfer` tool args,
-      accepts one regular file between any two same-owner install sites, and
-      supports a coordinated local copy/move when both Client names are equal.
-      A distinct-Client transfer is a bounded pure relay between two online
-      Device routes: the Server verifies and forwards bytes without creating a
-      temporary file, durable cache, or RustFS staging object. Destination
-      overwrite is always rejected. Streamed moves delete the source
-      conditionally only after the destination commit and source ACK boundary.
+      Workspace transfer route. Mirrors the `file_transfer` tool args and
+      automatically accepts one regular file or one recursive directory
+      across Server→Server, Server→Client, Client→Server, same-Client, and
+      distinct same-owner Client topologies. A same-Client directory move
+      uses an exclusive no-replace native rename when the platform can provide
+      it; other directory paths copy one manifest file at a time. A
+      distinct-Client transfer is a bounded pure relay between two captured
+      online Device routes: the Server verifies and forwards bytes without a
+      durable byte cache or RustFS staging object. Destination overwrite and
+      merge are always rejected. Streamed moves delete the source
+      conditionally only after the complete destination is finalized.
     post:
       tags: [Workspace Files]
-      summary: Copy or move one regular file between same-owner install sites
+      summary: Copy or move one file or recursive directory between same-owner install sites
       requestBody:
         required: true
         content:
@@ -1244,6 +1247,12 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '408':
           description: Transfer made no progress before the idle timeout.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413':
+          description: Directory manifest exceeds 10,000 entries or 5 MiB.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: A personal destination SKILL.md is invalid.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: Destination exists, a path/precondition conflicts, a target Device is unreachable, or an issued outcome is unknown.
@@ -2825,10 +2834,14 @@ components:
         Mirrors the `file_transfer` tool's args. Every server/paired-Device
         combination is valid, including two distinct paired Clients owned by
         the authenticated user. Client endpoints must be online when the
-        transfer starts. Both paths identify one regular file; recursive folder
-        transfer remains unsupported. The reserved `openoctopus_` prefix on the
-        two device fields matches the agent-visible tool schema. Existing
-        destinations are rejected without overwrite.
+        transfer starts. The source may be one regular file or one directory;
+        source kind is detected automatically and a directory is recursive.
+        Links, reparse points, and special files reject the operation. Empty
+        source directories are rejected, and copied directories do not recreate
+        empty subdirectories. The reserved `openoctopus_` prefix on the two
+        device fields matches the agent-visible tool schema. Existing
+        destination roots are rejected without overwrite or merge. There are
+        deliberately no `recursive` or `overwrite` fields.
       properties:
         openoctopus_src_device:
           type: string
@@ -2853,10 +2866,32 @@ components:
         mode: { type: string, enum: [copy, move] }
 
     TransferResponse:
+      oneOf:
+        - { $ref: '#/components/schemas/FileTransferResponse' }
+        - { $ref: '#/components/schemas/DirectoryTransferResponse' }
+      discriminator:
+        propertyName: kind
+        mapping:
+          file: '#/components/schemas/FileTransferResponse'
+          directory: '#/components/schemas/DirectoryTransferResponse'
+      description: |
+        Bounded aggregate result. For `kind=file`, `files_transferred` is 1 and
+        `sha256` is the file-content digest. For `kind=directory`, the count is
+        1..10000 and `sha256` is the canonical mapped regular-file path/content
+        tree digest; it excludes empty directories and filesystem metadata. No
+        per-entry result array is returned.
+
+    FileTransferResponse:
       type: object
       additionalProperties: false
-      required: [bytes_transferred, sha256, warnings]
+      required: [bytes_transferred, sha256, warnings, kind, files_transferred]
       properties:
+        kind:
+          type: string
+          const: file
+        files_transferred:
+          type: integer
+          const: 1
         bytes_transferred:
           type: integer
           format: int64
@@ -2867,13 +2902,49 @@ components:
         warnings:
           type: array
           maxItems: 8
+          uniqueItems: true
           items:
             type: string
-            enum: [transfer_ack_failed, source_delete_failed]
+            enum: [transfer_ack_failed, source_delete_failed, source_changed_after_copy, source_cleanup_incomplete]
           description: |
-            Non-fatal post-commit issues. `transfer_ack_failed` means the
-            destination committed but source ACK delivery was not confirmed;
-            `source_delete_failed` means a move left the source in place.
+            Deduplicated canonical-order non-fatal issues after the complete
+            destination is known finalized. They describe an unconfirmed
+            source ACK or incomplete conditional source cleanup. Inability to
+            prove cleanup of an incomplete destination is instead a 409
+            `tool_execution_outcome_unknown` error, never a success warning.
+
+    DirectoryTransferResponse:
+      type: object
+      additionalProperties: false
+      required: [bytes_transferred, sha256, warnings, kind, files_transferred]
+      properties:
+        kind:
+          type: string
+          const: directory
+        files_transferred:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        bytes_transferred:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        warnings:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            enum: [transfer_ack_failed, source_delete_failed, source_changed_after_copy, source_cleanup_incomplete]
+          description: |
+            Deduplicated canonical-order non-fatal issues after the complete
+            destination is known finalized. They describe an unconfirmed
+            source ACK or incomplete conditional source cleanup. Inability to
+            prove cleanup of an incomplete destination is instead a 409
+            `tool_execution_outcome_unknown` error, never a success warning.
 
     FileMutation:
       type: object

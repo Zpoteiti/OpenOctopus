@@ -50,8 +50,10 @@ from openctopus_server.devices.workspace import (
 from openctopus_server.dto.error import ErrorResponse
 from openctopus_server.dto.workspace_file import (
     DirectoryEntryPage,
+    DirectoryTransferResponse,
     FileEditRequest,
     FileMutationResponse,
+    FileTransferResponse,
     GrepResultPage,
     StructuredPatchRequest,
     StructuredPatchResponse,
@@ -60,6 +62,7 @@ from openctopus_server.dto.workspace_file import (
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.tools.file_transfer import FileTransferRequest, FileTransferTool
+from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
 from openctopus_server.workspace.search import GrepContentMatch, GrepCount
 from openctopus_server.workspace.service import PatchEdit, WorkspaceService, get_workspace_service
 
@@ -922,6 +925,14 @@ async def grep_workspace_files(
             "model": ErrorResponse,
             "description": "The transfer conflicts or a target device is unavailable.",
         },
+        413: {
+            "model": ErrorResponse,
+            "description": "The source directory exceeds the transfer manifest limits.",
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "A personal destination SKILL.md is invalid.",
+        },
         429: {
             "model": ErrorResponse,
             "description": "Transfer capacity is busy; retry after the indicated delay.",
@@ -947,17 +958,28 @@ async def transfer_workspace_file(
     user: User = Depends(get_current_user),
     engine: AsyncEngine = Depends(get_engine),
     service: WorkspaceService = Depends(get_workspace_service),
+    workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
     registry: DeviceRegistry = Depends(get_device_registry),
     settings: Settings = Depends(get_settings),
 ) -> TransferResponse:
-    """Run the shared single-file transfer machine for a REST caller."""
+    """Run the shared file-or-directory transfer machine for a REST caller."""
 
-    tool = FileTransferTool(engine, service, registry)
+    tool = FileTransferTool(engine, service, registry, workspace_fs)
     try:
         outcome = await tool.transfer(body, user_id=user.id)
     except Exception as exc:
         _raise_device_transfer(exc, settings)
-    return TransferResponse(
+    if outcome.kind == "file":
+        return FileTransferResponse(
+            kind="file",
+            files_transferred=1,
+            bytes_transferred=outcome.bytes_transferred,
+            sha256=outcome.sha256,
+            warnings=list(outcome.warnings),
+        )
+    return DirectoryTransferResponse(
+        kind="directory",
+        files_transferred=outcome.files_transferred,
         bytes_transferred=outcome.bytes_transferred,
         sha256=outcome.sha256,
         warnings=list(outcome.warnings),

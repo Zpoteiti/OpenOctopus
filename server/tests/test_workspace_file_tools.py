@@ -14,6 +14,7 @@ from openctopus_server.tools.workspace_files import (
     WORKSPACE_FILE_TOOL_TIMEOUT_SECONDS,
     build_workspace_file_tools,
 )
+from openctopus_server.workspace.fs import WorkspaceFS
 from openctopus_server.workspace.service import WorkspaceService
 
 EXPECTED_TOOL_NAMES = [
@@ -307,7 +308,11 @@ async def test_notebook_edit_rejects_non_notebook_paths() -> None:
 
 
 def test_py4_registry_includes_message_and_ten_workspace_tools(pg_engine) -> None:
-    registry = build_py4_registry(pg_engine, Mock(spec=WorkspaceService))
+    registry = build_py4_registry(
+        pg_engine,
+        Mock(spec=WorkspaceService),
+        Mock(spec=WorkspaceFS),
+    )
 
     assert [schema["name"] for schema in registry.get_tool_schemas()] == [
         "web_fetch",

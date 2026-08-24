@@ -251,7 +251,11 @@ def _install_runtime(
     runtime = ChatRuntime(
         engine,
         provider_factory=lambda config: provider,
-        tool_registry=build_py4_registry(engine, workspace_service),
+        tool_registry=build_py4_registry(
+            engine,
+            workspace_service,
+            Mock(spec=WorkspaceFS),
+        ),
         workspace_service=workspace_service,
     )
     test_app.state.chat_runtime = runtime

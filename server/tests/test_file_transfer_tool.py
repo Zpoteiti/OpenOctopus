@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -14,13 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 import openctopus_server.tools.file_transfer as file_transfer_module
 from openctopus_server.db.models import Device, User
-from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
+from openctopus_server.devices.protocol import TransferBeginFrame
 from openctopus_server.devices.registry import (
     BridgeRoutePair,
     ConnectionHandle,
     DeviceRouteSnapshot,
 )
 from openctopus_server.devices.transfer import TransferError, TransferUnavailableError
+from openctopus_server.devices.workspace import FileSourceProbe
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext
 from openctopus_server.tools.file_transfer import (
@@ -38,7 +38,7 @@ def _ctx() -> ToolContext:
 
 
 def test_file_transfer_schema_marks_both_device_fields() -> None:
-    schema = ToolRegistry((FileTransferTool(None, None, None),)).get_tool_schemas()[0]
+    schema = ToolRegistry((FileTransferTool(None, None, None, None),)).get_tool_schemas()[0]
 
     assert schema["name"] == "file_transfer"
     properties = schema["input_schema"]["properties"]
@@ -54,6 +54,44 @@ def test_file_transfer_schema_marks_both_device_fields() -> None:
         "openoctopus_dst_device",
         "dst_path",
     ]
+    assert "regular file or directory tree" in schema["description"]
+
+
+def test_file_transfer_outcome_validates_kind_count_and_normalizes_warnings() -> None:
+    outcome = FileTransferOutcome(
+        kind="directory",
+        files_transferred=3,
+        bytes_transferred=12,
+        sha256="a" * 64,
+        warnings=(
+            "source_cleanup_incomplete",
+            "transfer_ack_failed",
+            "source_changed_after_copy",
+            "transfer_ack_failed",
+        ),
+    )
+
+    assert outcome.warnings == (
+        "transfer_ack_failed",
+        "source_changed_after_copy",
+        "source_cleanup_incomplete",
+    )
+
+    with pytest.raises(ValueError):
+        FileTransferOutcome(
+            kind="file",
+            files_transferred=2,
+            bytes_transferred=12,
+            sha256="a" * 64,
+        )
+
+    with pytest.raises(ValueError):
+        FileTransferOutcome(
+            kind="directory",
+            files_transferred=0,
+            bytes_transferred=0,
+            sha256="a" * 64,
+        )
 
 
 @pytest.mark.parametrize(
@@ -70,7 +108,7 @@ def test_file_transfer_schema_accepts_every_install_site_combination(
     source: str,
     destination: str,
 ) -> None:
-    schema = ToolRegistry((FileTransferTool(None, None, None),)).get_tool_schemas(
+    schema = ToolRegistry((FileTransferTool(None, None, None, None),)).get_tool_schemas(
         device_names=["laptop", "phone"]
     )[0]["input_schema"]
 
@@ -106,8 +144,13 @@ async def test_distinct_clients_resolve_once_then_dispatch_one_bridge(
         lookup_session=session,
     )
     workspace = _NoIoWorkspace()
-    tool = FileTransferTool(object(), workspace, registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), workspace, registry, None)  # type: ignore[arg-type]
     monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
+    monkeypatch.setattr(
+        file_transfer_module,
+        "DeviceDirectoryJobController",
+        _FileProbeController,
+    )
 
     result = await tool.execute(
         {
@@ -124,6 +167,7 @@ async def test_distinct_clients_resolve_once_then_dispatch_one_bridge(
     )
 
     assert result.is_error is False
+    assert "file, 1 file" in str(result.content)
     assert "12 bytes" in str(result.content)
     assert session.execute_calls == 1
     assert session.closed is True
@@ -158,8 +202,13 @@ async def test_distinct_client_move_uses_source_snapshot_conditional_delete(
         lookup_session=session,
         source_fingerprint="source-v1",
     )
-    tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), None, registry, None)  # type: ignore[arg-type]
     monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
+    monkeypatch.setattr(
+        file_transfer_module,
+        "DeviceDirectoryJobController",
+        _FileProbeController,
+    )
 
     outcome = await tool.transfer(
         FileTransferRequest(
@@ -199,7 +248,7 @@ async def test_distinct_client_turn_snapshot_name_reuse_fails_before_registry(
         [("laptop", uuid4()), ("phone", captured_destination_id)]
     )
     registry = _NoIoRegistry()
-    tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), None, registry, None)  # type: ignore[arg-type]
     monkeypatch.setattr(file_transfer_module, "AsyncSession", lambda *_args, **_kwargs: session)
 
     result = await tool.execute(
@@ -276,7 +325,7 @@ async def test_distinct_client_db_lookup_is_scoped_to_one_owner(
         )
         await db.commit()
 
-    tool = FileTransferTool(pg_engine, None, _NoIoRegistry())
+    tool = FileTransferTool(pg_engine, None, _NoIoRegistry(), None)
     assert await tool._bridge_device_ids_for_call(
         owner.id,
         "laptop",
@@ -298,7 +347,12 @@ async def test_same_client_dispatches_one_private_local_action_without_transfer_
 ) -> None:
     device_id = uuid4()
     registry = _SameClientRegistry()
-    tool = FileTransferTool(object(), None, registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), None, registry, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        file_transfer_module,
+        "DeviceDirectoryJobController",
+        _FileProbeController,
+    )
 
     async def resolve(_: UUID, name: str, _expected: UUID | None = None) -> UUID:
         assert name == "laptop"
@@ -327,6 +381,7 @@ async def test_same_client_dispatches_one_private_local_action_without_transfer_
                 "path": "a.txt",
                 "dst_path": "b.txt",
                 "mode": "move",
+                "if_match": "source-v1",
             },
             "laptop",
         )
@@ -334,9 +389,19 @@ async def test_same_client_dispatches_one_private_local_action_without_transfer_
 
 
 @pytest.mark.asyncio
-async def test_server_to_server_uses_workspace_transfer_without_device_registry() -> None:
-    workspace = _Workspace()
-    tool = FileTransferTool(None, workspace, None)
+async def test_server_to_server_uses_workspace_transfer_without_device_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = uuid4()
+    workspace = _Workspace(user_id)
+    workspace_fs = _ServerFS()
+    tool = FileTransferTool(
+        object(),  # type: ignore[arg-type]
+        workspace,  # type: ignore[arg-type]
+        None,
+        workspace_fs,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(file_transfer_module, "AsyncSession", _AuthorizationSession)
 
     result = await tool.execute(
         {
@@ -346,12 +411,13 @@ async def test_server_to_server_uses_workspace_transfer_without_device_registry(
             "dst_path": "b.txt",
             "mode": "move",
         },
-        _ctx(),
+        ToolContext(user_id=user_id, session_id=uuid4()),
     )
 
     assert result.is_error is False
     assert "12 bytes" in str(result.content)
-    assert workspace.calls == [("a.txt", "b.txt", "move")]
+    assert workspace_fs.calls == [("a.txt", "b.txt", "move")]
+    assert workspace.calls == [("b.txt", "temp", "validate")]
 
 
 @pytest.mark.asyncio
@@ -362,7 +428,12 @@ async def test_client_to_server_move_uses_private_conditional_source_delete(
     device_id = uuid4()
     workspace = _DestinationWorkspace(user_id)
     registry = _ClientToServerRegistry()
-    tool = FileTransferTool(object(), workspace, registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), workspace, registry, object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        file_transfer_module,
+        "DeviceDirectoryJobController",
+        _FileProbeController,
+    )
 
     async def resolve(_: UUID, name: str, _expected: UUID | None = None) -> UUID:
         assert name == "laptop"
@@ -411,6 +482,11 @@ async def test_client_to_server_move_uses_private_conditional_source_delete(
     [
         ErrorCode.WORKSPACE_NOT_FOUND,
         ErrorCode.WORKSPACE_FILE_CHANGED,
+        ErrorCode.WORKSPACE_SOFT_LOCKED,
+        ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+        ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT,
+        ErrorCode.WORKSPACE_DIRECTORY_TOO_LARGE,
+        ErrorCode.WORKSPACE_TRANSFER_BUSY,
         ErrorCode.TOOL_PATH_OUTSIDE_WORKSPACE,
         ErrorCode.TOOL_DEVICE_BUSY,
         ErrorCode.TOOL_DEVICE_UNREACHABLE,
@@ -421,7 +497,7 @@ async def test_remote_transfer_preserves_stable_workspace_errors(
     monkeypatch: pytest.MonkeyPatch,
     code: ErrorCode,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
     monkeypatch.setattr(
         tool,
         "transfer",
@@ -446,7 +522,7 @@ async def test_remote_transfer_preserves_stable_workspace_errors(
 async def test_remote_transfer_maps_unknown_error_to_storage_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
     monkeypatch.setattr(
         tool,
         "transfer",
@@ -471,7 +547,7 @@ async def test_remote_transfer_maps_unknown_error_to_storage_error(
 async def test_preissue_transfer_fence_maps_to_device_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
     monkeypatch.setattr(
         tool,
         "transfer",
@@ -496,7 +572,7 @@ async def test_preissue_transfer_fence_maps_to_device_unreachable(
 async def test_registry_leaves_file_transfer_unissued_during_tool_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
     entered = asyncio.Event()
     issued = asyncio.Event()
     mark_issued = issued.set
@@ -536,7 +612,7 @@ async def test_registry_leaves_file_transfer_unissued_during_tool_preflight(
 async def test_native_transfer_timeout_maps_to_stable_timeout_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool = FileTransferTool(None, None, None)
+    tool = FileTransferTool(None, None, None, None)
     monkeypatch.setattr(tool, "transfer", AsyncMock(side_effect=TimeoutError))
 
     result = await tool.execute(
@@ -553,13 +629,35 @@ async def test_native_transfer_timeout_maps_to_stable_timeout_error(
     assert result.code is ErrorCode.WORKSPACE_TRANSFER_TIMEOUT
 
 
+@pytest.mark.parametrize(
+    "tool",
+    [
+        FileTransferTool(None, object(), None, object()),  # type: ignore[arg-type]
+        FileTransferTool(object(), object(), None, object()),  # type: ignore[arg-type]
+    ],
+)
+@pytest.mark.asyncio
+async def test_transfer_requires_engine_and_client_registry(tool: FileTransferTool) -> None:
+    result = await tool.execute(
+        {
+            "openoctopus_src_device": "server",
+            "src_path": "a.txt",
+            "openoctopus_dst_device": "laptop",
+            "dst_path": "b.txt",
+        },
+        _ctx(),
+    )
+
+    assert result.code is ErrorCode.TOOL_INVALID_ARGS
+
+
 @pytest.mark.asyncio
 async def test_intrinsic_device_transfer_rejects_a_reused_provider_turn_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_device_id = uuid4()
     registry = _NoIoRegistry()
-    tool = FileTransferTool(object(), _NoIoWorkspace(), registry)  # type: ignore[arg-type]
+    tool = FileTransferTool(object(), _NoIoWorkspace(), registry, object())  # type: ignore[arg-type]
 
     async def resolve(
         _user_id: UUID,
@@ -592,29 +690,118 @@ async def test_intrinsic_device_transfer_rejects_a_reused_provider_turn_name(
     assert registry.calls == []
 
 
-@dataclass
 class _Workspace:
-    calls: list[tuple[str, str, str]] | None = None
+    def __init__(self, user_id: UUID) -> None:
+        target = WorkspaceTarget.personal(user_id)
+        self.source = TransferPathTicket(user_id, "a.txt", target, "a.txt", 100)
+        self.destination = TransferPathTicket(user_id, "b.txt", target, "b.txt", 100)
+        self.calls: list[tuple[str, str, str]] = []
 
-    def __post_init__(self) -> None:
-        self.calls = []
-
-    async def transfer_server_to_server(
+    async def authorize_transfer_source(
         self,
         db: object,
         *,
         user_id: UUID,
-        src_path: str,
-        dst_path: str,
+        path: str,
+    ) -> TransferPathTicket:
+        del db
+        assert user_id == self.source.user_id
+        assert path == "a.txt"
+        return self.source
+
+    async def authorize_transfer_destination(
+        self,
+        db: object,
+        *,
+        user_id: UUID,
+        path: str,
+    ) -> TransferPathTicket:
+        del db
+        assert user_id == self.destination.user_id
+        assert path == "b.txt"
+        return self.destination
+
+    def transfer_ticket_changed(self, _ticket: TransferPathTicket) -> None:
+        pass
+
+    async def validate_transfer_skill_staging(
+        self,
+        ticket: TransferPathTicket,
+        object_name: str,
+        *,
+        expected_size: int,
+    ) -> None:
+        assert ticket is self.destination
+        assert object_name == "temp"
+        assert expected_size == 12
+        self.calls.append((ticket.relative_path, object_name, "validate"))
+
+
+class _ServerFS:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def acquire_server_transfer_operation(self, _user_id: UUID) -> object:
+        return _TestLease()
+
+    async def probe_directory_source(
+        self,
+        _target: WorkspaceTarget,
+        _relative_path: str,
+    ) -> object:
+        return file_transfer_module.ServerFileSourceProbe(12, "source-v1")
+
+    async def transfer_server_to_server_admitted(
+        self,
+        _source_target: WorkspaceTarget,
+        source_path: str,
+        _destination_target: WorkspaceTarget,
+        destination_path: str,
+        *,
         mode: str,
-        on_issued: Callable[[], None] | None = None,
-    ) -> Any:
-        del db, user_id
-        if on_issued is not None:
-            on_issued()
-        assert self.calls is not None
-        self.calls.append((src_path, dst_path, mode))
-        return _TransferResult(12, "a" * 64, ())
+        **_kwargs: object,
+    ) -> tuple[int, str, tuple[str, ...]]:
+        assert source_path == "a.txt"
+        assert destination_path == "b.txt"
+        assert mode == "move"
+        validate_staging = _kwargs["validate_staging"]
+        assert callable(validate_staging)
+        await validate_staging("temp", 12)
+        self.calls.append((source_path, destination_path, mode))
+        return 12, "a" * 64, ()
+
+
+class _AuthorizationSession:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *_args: object) -> None:
+        pass
+
+
+class _TestLease:
+    async def aclose(self) -> None:
+        pass
+
+
+class _FileProbeController:
+    def __init__(self, **_kwargs: object) -> None:
+        pass
+
+    async def start_source_probe(self, _path: str) -> None:
+        pass
+
+    async def wait_source_until(self, _states: frozenset[str]) -> object:
+        return SimpleNamespace(
+            state="succeeded",
+            probe=FileSourceProbe(size=12, fingerprint="source-v1"),
+        )
+
+    async def release_source_probe(self) -> None:
+        pass
 
 
 class _NoIoWorkspace:
@@ -643,6 +830,8 @@ class _BridgeLookupSession:
 
 
 class _DistinctClientRegistry:
+    idle_timeout_seconds = 30.0
+
     def __init__(
         self,
         *,
@@ -671,6 +860,9 @@ class _DistinctClientRegistry:
         self.delete_call: dict[str, object] | None = None
         self.transfers = self
 
+    async def acquire_operation(self, _user_id: UUID) -> _TestLease:
+        return _TestLease()
+
     async def get_bridge_route_pair(
         self,
         *,
@@ -688,11 +880,18 @@ class _DistinctClientRegistry:
         assert destination_device_name == "phone"
         return self.routes
 
-    async def start_client_to_client(self, **kwargs: object) -> _TransferResult:
+    async def start_client_to_client_regular_admitted(
+        self,
+        **kwargs: object,
+    ) -> _TransferResult:
         call = dict(kwargs)
         on_issued = call.pop("on_issued")
         if callable(on_issued):
             on_issued()
+        call.pop("operation_lease")
+        call.pop("slot_id")
+        assert call.pop("expected_source_size") == 12
+        assert call.pop("expected_source_fingerprint") == "source-v1"
         delete_source = call.get("delete_source")
         if self.source_fingerprint is not None:
             assert callable(delete_source)
@@ -706,9 +905,14 @@ class _DistinctClientRegistry:
 
 
 class _SameClientRegistry:
+    idle_timeout_seconds = 30.0
+
     def __init__(self) -> None:
         self.calls: list[tuple[object, str, dict[str, object], str]] = []
-        self.transfers = object()
+        self.transfers = self
+
+    async def acquire_operation(self, _user_id: UUID) -> _TestLease:
+        return _TestLease()
 
     async def get_route_snapshot(
         self,
@@ -742,7 +946,10 @@ class _SameClientRegistry:
         return SimpleNamespace(
             is_error=False,
             code=None,
-            content='{"bytes_transferred":12,"sha256":"%s","warnings":[]}' % ("a" * 64),
+            content=(
+                '{"kind":"file","files_transferred":1,'
+                '"bytes_transferred":12,"sha256":"%s","warnings":[]}' % ("a" * 64)
+            ),
         )
 
 
@@ -769,15 +976,23 @@ class _DestinationWorkspace:
 
     async def begin_transfer_upload(self, ticket: TransferPathTicket, *, size: int) -> object:
         assert ticket is self.ticket
-        assert size == 7
+        assert size == 12
         return object()
+
+    def transfer_ticket_changed(self, _ticket: TransferPathTicket) -> None:
+        pass
 
 
 class _ClientToServerRegistry:
+    idle_timeout_seconds = 30.0
+
     def __init__(self) -> None:
         self.transfers = self
         self.delete_call: tuple[UUID, str, dict[str, object]] | None = None
         self.route: DeviceRouteSnapshot | None = None
+
+    async def acquire_operation(self, _user_id: UUID) -> _TestLease:
+        return _TestLease()
 
     async def get_route_snapshot(
         self,
@@ -790,17 +1005,20 @@ class _ClientToServerRegistry:
         assert expected_device_name == "laptop"
         return DeviceRouteSnapshot(ConnectionHandle(device_id, 1), 0)
 
-    async def start_client_to_server(self, **kwargs: object) -> _TransferResult:
+    async def start_client_to_server_regular_admitted(
+        self,
+        **kwargs: object,
+    ) -> _TransferResult:
         route = kwargs.get("route")
         assert isinstance(route, DeviceRouteSnapshot)
         self.route = route
         begin = TransferBeginFrame(
-            id=new_uuid7(),
+            id=kwargs["slot_id"],  # type: ignore[arg-type]
             direction="client_to_server",
             purpose="file_transfer",
             src_path="source.txt",
             dst_path="destination.txt",
-            total_bytes=7,
+            total_bytes=12,
             etag="source-v1",
         )
         sink_factory = kwargs["sink_factory"]
@@ -809,7 +1027,7 @@ class _ClientToServerRegistry:
         delete_source = kwargs["delete_source"]
         assert callable(delete_source)
         await delete_source()
-        return _TransferResult(7, "a" * 64, ())
+        return _TransferResult(12, "a" * 64, ())
 
     async def dispatch_tool_on_snapshot(
         self,

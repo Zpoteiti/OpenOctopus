@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -12,6 +12,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.directory_contract import DirectoryManifest, DirectoryManifestEntry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.workspace.file_content import (
@@ -21,6 +22,7 @@ from openctopus_server.workspace.file_content import (
 )
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryDestinationPlan,
     DirectoryEntry,
     DirectoryPage,
     FileMetadata,
@@ -54,6 +56,7 @@ from openctopus_server.workspace.skills import (
     is_skill_manifest,
     is_under_skills,
     validate_skill_manifest,
+    validate_skill_manifest_stream,
 )
 from openctopus_server.workspace.storage import ObjectStream, ObjectUpload, StoredObject
 from openctopus_server.workspace.text_edit import apply_text_edit
@@ -800,6 +803,143 @@ class WorkspaceService:
             quota_bytes=resolved.quota_bytes,
         )
 
+    async def validate_directory_skill_manifests(
+        self,
+        destination: TransferPathTicket,
+        manifest: DirectoryManifest,
+        plan: DirectoryDestinationPlan,
+        *,
+        open_source: Callable[[DirectoryManifestEntry], Awaitable[ObjectStream]],
+    ) -> None:
+        """Validate personal destination Skills sequentially before the first commit."""
+        for entry, mapped_path in _directory_skill_entries(
+            destination,
+            manifest,
+            plan,
+        ):
+            source = await open_source(entry)
+            try:
+                if source.size != entry.size or source.etag != entry.fingerprint:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_FILE_CHANGED,
+                        "Workspace source changed after its directory manifest was created",
+                    )
+                transferred = 0
+
+                async def chunks() -> AsyncIterator[bytes]:
+                    nonlocal transferred
+                    while chunk := await source.read():
+                        transferred += len(chunk)
+                        if transferred > entry.size:
+                            raise WorkspaceError(
+                                ErrorCode.WORKSPACE_FILE_CHANGED,
+                                "Workspace source changed during Skill validation",
+                            )
+                        yield chunk
+
+                await validate_skill_manifest_stream(mapped_path, chunks())
+                if transferred != entry.size:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_FILE_CHANGED,
+                        "Workspace source changed during Skill validation",
+                    )
+            finally:
+                cleanup = asyncio.create_task(source.aclose())
+                await await_future_cancellation_safe(cleanup)
+
+    async def validate_client_directory_skill_manifests(
+        self,
+        destination: TransferPathTicket,
+        manifest: DirectoryManifest,
+        plan: DirectoryDestinationPlan,
+        *,
+        validate_source: Callable[[DirectoryManifestEntry, str], Awaitable[None]],
+    ) -> None:
+        """Validate selected Client source entries sequentially before publish."""
+
+        for entry, mapped_path in _directory_skill_entries(
+            destination,
+            manifest,
+            plan,
+        ):
+            await validate_source(entry, mapped_path)
+
+    async def validate_staged_directory_skill_manifest(
+        self,
+        mapped_path: str,
+        object_name: str,
+        *,
+        expected_size: int,
+    ) -> None:
+        if not is_skill_manifest(mapped_path):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory validation target is not a Skill manifest",
+            )
+        stream = await self._fs.open_directory_validation_staging(object_name)
+        try:
+            if stream.size != expected_size:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                    "Staged Skill size mismatched its manifest",
+                )
+            transferred = 0
+
+            async def chunks() -> AsyncIterator[bytes]:
+                nonlocal transferred
+                while chunk := await stream.read():
+                    transferred += len(chunk)
+                    if transferred > expected_size:
+                        raise WorkspaceError(
+                            ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                            "Staged Skill exceeded its manifest size",
+                        )
+                    yield chunk
+
+            await validate_skill_manifest_stream(mapped_path, chunks())
+            if transferred != expected_size:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                    "Staged Skill size mismatched its manifest",
+                )
+        finally:
+            cleanup = asyncio.create_task(stream.aclose())
+            await await_future_cancellation_safe(cleanup)
+
+    async def validate_transfer_skill_staging(
+        self,
+        destination: TransferPathTicket,
+        object_name: str,
+        *,
+        expected_size: int,
+    ) -> None:
+        """Validate a staged personal Skill before a single-file publish."""
+
+        if (
+            destination.target != WorkspaceTarget.personal(destination.user_id)
+            or not is_skill_manifest(destination.relative_path)
+        ):
+            return
+        await self.validate_staged_directory_skill_manifest(
+            destination.relative_path,
+            object_name,
+            expected_size=expected_size,
+        )
+
+    def directory_transfer_committed(self, destination: TransferPathTicket) -> None:
+        """Invalidate personal Skill discovery after an exact directory finalize."""
+
+        self.transfer_ticket_changed(destination)
+
+    def transfer_ticket_changed(self, ticket: TransferPathTicket) -> None:
+        """Invalidate Skills affected through one immutable authorized target."""
+
+        if ticket.target != WorkspaceTarget.personal(ticket.user_id):
+            return
+        parts = PurePosixPath(ticket.relative_path).parts
+        if not parts or parts[0] == "skills":
+            self._skills_cache.invalidate(ticket.user_id)
+
     async def open_transfer_source(self, ticket: TransferPathTicket) -> ObjectStream:
         return await self._fs.open_stream(ticket.target, ticket.relative_path)
 
@@ -842,6 +982,11 @@ class WorkspaceService:
     ) -> bool:
         del sha256
         try:
+            await self.validate_transfer_skill_staging(
+                ticket,
+                sink.object_name,
+                expected_size=size,
+            )
             try:
                 await self._fs.commit_uploaded_object(
                     ticket.target,
@@ -877,6 +1022,14 @@ class WorkspaceService:
         # while the transfer streams through object storage or waits for the
         # source-delete cleanup.
         await db.close()
+
+        async def validate_staging(object_name: str, size: int) -> None:
+            await self.validate_transfer_skill_staging(
+                destination,
+                object_name,
+                expected_size=size,
+            )
+
         try:
             transferred, digest, warnings = await self._fs.transfer_server_to_server(
                 source.target,
@@ -887,6 +1040,7 @@ class WorkspaceService:
                 quota_bytes=destination.quota_bytes,
                 mode=mode,
                 on_issued=on_issued,
+                validate_staging=validate_staging,
             )
             return WorkspaceTransferResult(transferred, digest, warnings)
         finally:
@@ -1223,6 +1377,30 @@ def _personal_relative_path(path: str, user_id: UUID) -> str:
     if not path.startswith("/"):
         return path
     return path.removeprefix(f"/{user_id}/") if path.startswith(f"/{user_id}/") else ""
+
+
+def _directory_skill_entries(
+    destination: TransferPathTicket,
+    manifest: DirectoryManifest,
+    plan: DirectoryDestinationPlan,
+) -> tuple[tuple[DirectoryManifestEntry, str], ...]:
+    if destination.target.kind != "personal" or destination.target.id != destination.user_id:
+        return ()
+    if (
+        plan.target != destination.target
+        or plan.destination_root != destination.relative_path
+        or plan.manifest_sha256 != manifest.manifest_sha256
+        or len(plan.mapped_paths) != len(manifest.entries)
+    ):
+        raise WorkspaceError(
+            ErrorCode.WORKSPACE_INVALID_REQUEST,
+            "Directory destination plan does not match its manifest",
+        )
+    return tuple(
+        (entry, mapped_path)
+        for entry, mapped_path in zip(manifest.entries, plan.mapped_paths, strict=True)
+        if is_skill_manifest(mapped_path)
+    )
 
 
 async def _run_cpu[T](function: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:

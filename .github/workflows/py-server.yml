@@ -7,6 +7,7 @@ on:
       - "server/**"
       - "client/**"
       - "docs/API.yaml"
+      - "tests/fixtures/directory_transfer_v1/**"
       - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/py-server.yml"
   pull_request:
@@ -15,6 +16,7 @@ on:
       - "server/**"
       - "client/**"
       - "docs/API.yaml"
+      - "tests/fixtures/directory_transfer_v1/**"
       - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/py-server.yml"
 
@@ -129,4 +131,5 @@ jobs:
           PY6_REAL_E2E: "1"
           PY7_REAL_E2E: "1"
           PY8A_REAL_E2E: "1"
+          PY8C_REAL_E2E: "1"
         run: pytest -v
