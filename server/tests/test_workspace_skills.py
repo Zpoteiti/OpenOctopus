@@ -15,6 +15,7 @@ from openctopus_server.workspace.skills import (
     parse_skill_manifest,
     parse_skill_manifest_header,
     validate_skill_manifest,
+    validate_skill_manifest_stream,
 )
 
 
@@ -155,6 +156,44 @@ def test_validate_conditional_stream_rejects_invalid_utf8() -> None:
     with pytest.raises(WorkspaceError) as exc_info:
         validate_skill_manifest("skills/reviewer/SKILL.md", content)
 
+    assert exc_info.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+
+
+async def test_async_skill_validator_streams_large_conditional_body() -> None:
+    prefix = b"---\nname: reviewer\ndescription: x\n---\n"
+    yielded = 0
+
+    async def chunks():
+        nonlocal yielded
+        for chunk in (prefix[:7], prefix[7:], b"x" * (128 * 1024), "正文".encode()):
+            yielded += 1
+            yield chunk
+
+    await validate_skill_manifest_stream("skills/reviewer/SKILL.md", chunks())
+
+    assert yielded == 4
+
+
+async def test_async_skill_validator_rejects_invalid_utf8_and_oversized_always_on() -> None:
+    async def invalid_utf8():
+        yield b"---\nname: reviewer\ndescription: x\n---\nbody\xff"
+
+    with pytest.raises(WorkspaceError) as exc_info:
+        await validate_skill_manifest_stream(
+            "skills/reviewer/SKILL.md",
+            invalid_utf8(),
+        )
+    assert exc_info.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+
+    async def oversized_always_on():
+        yield b"---\nname: reviewer\ndescription: x\nalways_on: true\n---\n"
+        yield b"x" * ALWAYS_ON_MAX_BYTES
+
+    with pytest.raises(WorkspaceError) as exc_info:
+        await validate_skill_manifest_stream(
+            "skills/reviewer/SKILL.md",
+            oversized_always_on(),
+        )
     assert exc_info.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
 
 

@@ -13,11 +13,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import User, Workspace, WorkspaceMember
 from openctopus_server.devices.registry import DeviceRegistry
+from openctopus_server.directory_contract import (
+    DirectoryManifestDirectory,
+    DirectoryManifestEntry,
+    create_directory_manifest,
+)
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.services import users
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryDestinationPlan,
     DirectoryPage,
     FileMetadata,
     WorkspaceFS,
@@ -25,7 +31,12 @@ from openctopus_server.workspace.fs import (
 )
 from openctopus_server.workspace.resolver import ResolvedWorkspacePath
 from openctopus_server.workspace.search import GrepContentMatch, SearchObject
-from openctopus_server.workspace.service import PatchEdit, ToolReadTicket, WorkspaceService
+from openctopus_server.workspace.service import (
+    PatchEdit,
+    ToolReadTicket,
+    TransferPathTicket,
+    WorkspaceService,
+)
 
 
 @asynccontextmanager
@@ -885,6 +896,203 @@ async def test_repeated_cpu_cancellation_waits_for_worker_thread() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await work
+
+
+async def test_directory_personal_skill_validation_is_sequential_and_skips_other_files() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.personal(user_id)
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024 * 1024,
+    )
+    contents = {
+        "a/SKILL.md": b"---\nname: a\ndescription: first\n---\nbody",
+        "b/SKILL.md": b"---\nname: b\ndescription: second\n---\nbody",
+        "other.txt": b"other",
+    }
+    entries = tuple(
+        DirectoryManifestEntry(
+            relative_path=path,
+            size=len(data),
+            fingerprint=f"etag-{index}",
+        )
+        for index, (path, data) in enumerate(contents.items())
+    )
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(
+            DirectoryManifestDirectory(relative_path="a", identity=None),
+            DirectoryManifestDirectory(relative_path="b", identity=None),
+        ),
+        entries=entries,
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=tuple(f"skills/{path}" for path in contents),
+    )
+    active = 0
+    max_active = 0
+    opened: list[str] = []
+    closed: list[str] = []
+
+    class _Stream:
+        def __init__(self, entry: DirectoryManifestEntry) -> None:
+            nonlocal active, max_active
+            self.size = entry.size
+            self.etag = entry.fingerprint
+            self._path = entry.relative_path
+            self._chunks = [contents[self._path], b""]
+            active += 1
+            max_active = max(max_active, active)
+
+        async def read(self) -> bytes:
+            return self._chunks.pop(0)
+
+        async def aclose(self) -> None:
+            nonlocal active
+            if self._path not in closed:
+                closed.append(self._path)
+                active -= 1
+
+    async def open_source(entry: DirectoryManifestEntry):
+        opened.append(entry.relative_path)
+        return _Stream(entry)
+
+    await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+        destination,
+        manifest,
+        plan,
+        open_source=open_source,
+    )
+
+    expected = ["a/SKILL.md", "b/SKILL.md"]
+    assert opened == expected
+    assert closed == expected
+    assert max_active == 1
+
+
+async def test_directory_skill_validation_rejects_first_invalid_or_drifted_source() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.personal(user_id)
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024,
+    )
+    malformed = b"not a skill"
+    entries = (
+        DirectoryManifestEntry(
+            relative_path="a/SKILL.md",
+            size=len(malformed),
+            fingerprint="etag-a",
+        ),
+        DirectoryManifestEntry(
+            relative_path="b/SKILL.md",
+            size=1,
+            fingerprint="etag-b",
+        ),
+    )
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(
+            DirectoryManifestDirectory(relative_path="a", identity=None),
+            DirectoryManifestDirectory(relative_path="b", identity=None),
+        ),
+        entries=entries,
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=("skills/a/SKILL.md", "skills/b/SKILL.md"),
+    )
+    opened: list[str] = []
+    closed: list[str] = []
+
+    async def open_source(entry: DirectoryManifestEntry):
+        opened.append(entry.relative_path)
+        return SimpleNamespace(
+            size=entry.size,
+            etag=entry.fingerprint,
+            read=AsyncMock(side_effect=[malformed, b""]),
+            aclose=AsyncMock(side_effect=lambda: closed.append(entry.relative_path)),
+        )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+            destination,
+            manifest,
+            plan,
+            open_source=open_source,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    assert opened == ["a/SKILL.md"]
+    assert closed == ["a/SKILL.md"]
+
+    async def open_drifted(entry: DirectoryManifestEntry):
+        return SimpleNamespace(
+            size=entry.size,
+            etag="changed",
+            read=AsyncMock(),
+            aclose=AsyncMock(side_effect=lambda: closed.append("drifted")),
+        )
+
+    with pytest.raises(WorkspaceError) as caught:
+        await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+            destination,
+            manifest,
+            plan,
+            open_source=open_drifted,
+        )
+    assert caught.value.code is ErrorCode.WORKSPACE_FILE_CHANGED
+    assert closed[-1] == "drifted"
+
+
+async def test_directory_skill_validation_does_not_apply_to_shared_workspace() -> None:
+    user_id = uuid4()
+    target = WorkspaceTarget.shared(uuid4())
+    destination = TransferPathTicket(
+        user_id=user_id,
+        display_path="/shared@00000000/skills",
+        target=target,
+        relative_path="skills",
+        quota_bytes=1024,
+    )
+    content = b"not a skill"
+    manifest = create_directory_manifest(
+        root_identity=None,
+        directories=(DirectoryManifestDirectory(relative_path="bad", identity=None),),
+        entries=(
+            DirectoryManifestEntry(
+                relative_path="bad/SKILL.md",
+                size=len(content),
+                fingerprint="etag",
+            ),
+        ),
+    )
+    plan = DirectoryDestinationPlan(
+        target=target,
+        destination_root="skills",
+        manifest_sha256=manifest.manifest_sha256,
+        mapped_paths=("skills/bad/SKILL.md",),
+    )
+    open_source = AsyncMock()
+
+    await WorkspaceService(_workspace_fs_mock()).validate_directory_skill_manifests(
+        destination,
+        manifest,
+        plan,
+        open_source=open_source,
+    )
+
+    open_source.assert_not_awaited()
 
 
 async def test_grep_result_cap_resumes_within_the_same_file(pg_engine) -> None:

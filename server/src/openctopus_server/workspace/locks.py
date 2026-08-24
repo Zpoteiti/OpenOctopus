@@ -54,3 +54,131 @@ class KeyedLockManager:
             for key in ordered:
                 await stack.enter_async_context(self.hold(key))
             yield
+
+
+class SubtreeLeaseBusyError(RuntimeError):
+    """The requested subtree overlaps a lease owned by another operation."""
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class _SubtreeReservation:
+    target: Hashable
+    prefix: tuple[str, ...]
+    owner: Hashable
+
+
+class SubtreeLease:
+    """An explicitly released, operation-owned subtree reservation."""
+
+    def __init__(
+        self,
+        manager: SubtreeLeaseManager,
+        reservation: _SubtreeReservation,
+    ) -> None:
+        self._manager = manager
+        self._reservation = reservation
+        self._release_task: asyncio.Task[None] | None = None
+
+    async def release(self) -> None:
+        task = self._release_task
+        if task is None:
+            task = asyncio.create_task(self._manager._release(self._reservation))
+            self._release_task = task
+        await await_future_cancellation_safe(task)
+
+
+class SubtreeLeaseManager:
+    """Owner-aware leases for canonical prefixes within immutable targets."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._pending: list[_SubtreeReservation] = []
+        self._active: list[_SubtreeReservation] = []
+
+    @property
+    def active_count(self) -> int:
+        return len(self._active)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    async def acquire(
+        self,
+        *,
+        target: Hashable,
+        prefix: tuple[str, ...],
+        owner: Hashable,
+        wait: bool = True,
+    ) -> SubtreeLease:
+        _validate_canonical_prefix(prefix)
+        reservation = _SubtreeReservation(target=target, prefix=prefix, owner=owner)
+        await self._condition.acquire()
+        try:
+            self._pending.append(reservation)
+            try:
+                if not wait and self._blocked(reservation):
+                    raise SubtreeLeaseBusyError
+                while self._blocked(reservation):
+                    await self._condition.wait()
+            except BaseException:
+                self._pending.remove(reservation)
+                self._condition.notify_all()
+                raise
+
+            self._pending.remove(reservation)
+            self._active.append(reservation)
+        finally:
+            self._condition.release()
+
+        return SubtreeLease(self, reservation)
+
+    def _blocked(self, reservation: _SubtreeReservation) -> bool:
+        overlapping_active = [
+            active for active in self._active if _subtree_reservations_overlap(reservation, active)
+        ]
+        if any(active.owner != reservation.owner for active in overlapping_active):
+            return True
+
+        owner_covers_request = any(
+            active.owner == reservation.owner
+            and _prefix_contains(active.prefix, reservation.prefix)
+            for active in overlapping_active
+        )
+        if owner_covers_request:
+            return False
+
+        index = self._pending.index(reservation)
+        return any(
+            _subtree_reservations_overlap(reservation, earlier)
+            for earlier in self._pending[:index]
+        )
+
+    async def _release(self, reservation: _SubtreeReservation) -> None:
+        async with self._condition:
+            if reservation not in self._active:
+                return
+            self._active.remove(reservation)
+            self._condition.notify_all()
+
+
+def _subtree_reservations_overlap(
+    first: _SubtreeReservation,
+    second: _SubtreeReservation,
+) -> bool:
+    return first.target == second.target and (
+        _prefix_contains(first.prefix, second.prefix)
+        or _prefix_contains(second.prefix, first.prefix)
+    )
+
+
+def _prefix_contains(ancestor: tuple[str, ...], descendant: tuple[str, ...]) -> bool:
+    return len(ancestor) <= len(descendant) and descendant[: len(ancestor)] == ancestor
+
+
+def _validate_canonical_prefix(prefix: tuple[str, ...]) -> None:
+    if any(
+        component in {"", ".", ".."} or "/" in component or "\x00" in component
+        for component in prefix
+    ):
+        raise ValueError("Subtree prefix must contain canonical path components")

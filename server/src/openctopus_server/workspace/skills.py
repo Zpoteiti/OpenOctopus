@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -82,6 +82,46 @@ def validate_skill_manifest(path: str, content: bytes) -> None:
         decoder.decode(b"", final=True)
     except UnicodeDecodeError as exc:
         raise _invalid_skill() from exc
+
+
+async def validate_skill_manifest_stream(
+    path: str,
+    chunks: AsyncIterator[bytes],
+) -> None:
+    """Validate one SKILL.md while retaining only bounded frontmatter/body bytes."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    prefix = bytearray()
+    always_on_content = bytearray()
+    header: SkillInfo | None = None
+    total_bytes = 0
+    try:
+        async for chunk in chunks:
+            total_bytes += len(chunk)
+            decoder.decode(chunk)
+
+            if len(prefix) < MAX_SKILL_FRONTMATTER_PREFIX_BYTES:
+                remaining = MAX_SKILL_FRONTMATTER_PREFIX_BYTES - len(prefix)
+                prefix.extend(chunk[:remaining])
+            if header is None and b"\n---\n" in prefix[4:]:
+                header = parse_skill_manifest_header(path, bytes(prefix))
+                if not header.always_on:
+                    always_on_content.clear()
+
+            if header is None or header.always_on:
+                remaining = ALWAYS_ON_MAX_BYTES + 1 - len(always_on_content)
+                if remaining > 0:
+                    always_on_content.extend(chunk[:remaining])
+            if header is not None and header.always_on and total_bytes > ALWAYS_ON_MAX_BYTES:
+                raise _invalid_skill()
+
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError as exc:
+        raise _invalid_skill() from exc
+
+    if header is None:
+        header = parse_skill_manifest_header(path, bytes(prefix))
+    if header.always_on:
+        validate_skill_manifest(path, bytes(always_on_content))
 
 
 def _parse_header(path: str, content: bytes) -> tuple[SkillInfo, int]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -12,6 +12,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.directory_contract import DirectoryManifest, DirectoryManifestEntry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
 from openctopus_server.workspace.file_content import (
@@ -21,6 +22,7 @@ from openctopus_server.workspace.file_content import (
 )
 from openctopus_server.workspace.fs import (
     MAX_EDIT_BYTES,
+    DirectoryDestinationPlan,
     DirectoryEntry,
     DirectoryPage,
     FileMetadata,
@@ -54,6 +56,7 @@ from openctopus_server.workspace.skills import (
     is_skill_manifest,
     is_under_skills,
     validate_skill_manifest,
+    validate_skill_manifest_stream,
 )
 from openctopus_server.workspace.storage import ObjectStream, ObjectUpload, StoredObject
 from openctopus_server.workspace.text_edit import apply_text_edit
@@ -799,6 +802,65 @@ class WorkspaceService:
             relative_path=resolved.relative_path,
             quota_bytes=resolved.quota_bytes,
         )
+
+    async def validate_directory_skill_manifests(
+        self,
+        destination: TransferPathTicket,
+        manifest: DirectoryManifest,
+        plan: DirectoryDestinationPlan,
+        *,
+        open_source: Callable[[DirectoryManifestEntry], Awaitable[ObjectStream]],
+    ) -> None:
+        """Validate personal destination Skills sequentially before the first commit."""
+        if destination.target.kind != "personal" or destination.target.id != destination.user_id:
+            return
+        if (
+            plan.target != destination.target
+            or plan.destination_root != destination.relative_path
+            or plan.manifest_sha256 != manifest.manifest_sha256
+            or len(plan.mapped_paths) != len(manifest.entries)
+        ):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Directory destination plan does not match its manifest",
+            )
+
+        for entry, mapped_path in zip(
+            manifest.entries,
+            plan.mapped_paths,
+            strict=True,
+        ):
+            if not is_skill_manifest(mapped_path):
+                continue
+            source = await open_source(entry)
+            try:
+                if source.size != entry.size or source.etag != entry.fingerprint:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_FILE_CHANGED,
+                        "Workspace source changed after its directory manifest was created",
+                    )
+                transferred = 0
+
+                async def chunks() -> AsyncIterator[bytes]:
+                    nonlocal transferred
+                    while chunk := await source.read():
+                        transferred += len(chunk)
+                        if transferred > entry.size:
+                            raise WorkspaceError(
+                                ErrorCode.WORKSPACE_FILE_CHANGED,
+                                "Workspace source changed during Skill validation",
+                            )
+                        yield chunk
+
+                await validate_skill_manifest_stream(mapped_path, chunks())
+                if transferred != entry.size:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_FILE_CHANGED,
+                        "Workspace source changed during Skill validation",
+                    )
+            finally:
+                cleanup = asyncio.create_task(source.aclose())
+                await await_future_cancellation_safe(cleanup)
 
     async def open_transfer_source(self, ticket: TransferPathTicket) -> ObjectStream:
         return await self._fs.open_stream(ticket.target, ticket.relative_path)
