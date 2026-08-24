@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
+import sys
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -20,7 +23,10 @@ from openoctopus_client.tools.directory_contract import (
     DirectoryManifestEntry,
     create_directory_manifest,
 )
-from openoctopus_client.tools.directory_jobs import DirectoryJobManager
+from openoctopus_client.tools.directory_jobs import (
+    DirectoryJobManager,
+    DirectoryLifecycleCredits,
+)
 from openoctopus_client.tools.fingerprints import opaque_stat_fingerprint
 from openoctopus_client.tools.locks import PathLocks
 from openoctopus_client.tools.workspace_rest import (
@@ -56,6 +62,8 @@ def _manager(
     admission: LocalTransferAdmission | None = None,
     idle_timeout_seconds: float = 5,
     queue_timeout_seconds: float = 1,
+    lifecycle_credits: DirectoryLifecycleCredits | None = None,
+    terminal_ttl_seconds: float = 60,
 ) -> DirectoryJobManager:
     return DirectoryJobManager(
         workspace,
@@ -64,8 +72,15 @@ def _manager(
         admission=admission or LocalTransferAdmission(capacity=2),
         idle_timeout_seconds=idle_timeout_seconds,
         queue_timeout_seconds=queue_timeout_seconds,
-        terminal_ttl_seconds=60,
+        terminal_ttl_seconds=terminal_ttl_seconds,
+        lifecycle_credits=lifecycle_credits,
     )
+
+
+async def _handle(manager: DirectoryJobManager, raw_action: object) -> Any:
+    """Keep dynamic action/result narrowing local to this black-box test module."""
+
+    return await manager.handle(raw_action)
 
 
 async def _source_status(
@@ -75,12 +90,13 @@ async def _source_status(
     states: set[str],
 ) -> Any:
     for _ in range(200):
-        status = await manager.handle(
+        status = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_status",
                 "directory_operation_id": operation_id,
                 "expected_digest": expected_digest,
-            }
+            },
         )
         expected_digest = status.expected_digest
         if status.state in states:
@@ -99,12 +115,13 @@ async def _destination_status(
 ) -> Any:
     operation = "transfer_local_directory_status" if local else "transfer_directory_status"
     for _ in range(300):
-        status = await manager.handle(
+        status = await _handle(
+            manager,
             {
                 "operation": operation,
                 "directory_operation_id": operation_id,
                 "expected_digest": expected_digest,
-            }
+            },
         )
         expected_digest = status.expected_digest
         if status.state in states:
@@ -118,12 +135,13 @@ async def _probe_directory(
     operation_id: str,
     path: str,
 ) -> tuple[DirectoryManifest, str]:
-    started = await manager.handle(
+    started = await _handle(
+        manager,
         {
             "operation": "transfer_source_probe_start",
             "directory_operation_id": operation_id,
             "path": path,
-        }
+        },
     )
     status = await _source_status(
         manager,
@@ -138,13 +156,14 @@ async def _probe_directory(
     entries: list[DirectoryManifestEntry] = []
     offset = 0
     while True:
-        page = await manager.handle(
+        page = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_page",
                 "directory_operation_id": operation_id,
                 "expected_digest": status.expected_digest,
                 "offset": offset,
-            }
+            },
         )
         for item in page.items:
             if item.kind == "directory":
@@ -321,20 +340,22 @@ async def test_source_walk_keeps_hidden_noise_zero_byte_and_scan_only_directorie
             (".git/config", 0),
             ("node_modules/pkg/index.js", 6),
         ]
-        held = await manager.handle(
+        held = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_hold",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         assert held.state == "held"
-        released = await manager.handle(
+        released = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         assert released.state == "released"
     finally:
@@ -354,12 +375,13 @@ async def test_source_probe_rejects_empty_tree_and_links(tmp_path: Path) -> None
             ("linked", "workspace_symlink_escape"),
         ):
             operation_id = _operation_id()
-            started = await manager.handle(
+            started = await _handle(
+                manager,
                 {
                     "operation": "transfer_source_probe_start",
                     "directory_operation_id": operation_id,
                     "path": path,
-                }
+                },
             )
             status = await _source_status(
                 manager, operation_id, started.expected_digest, {"failed"}
@@ -379,16 +401,18 @@ async def test_source_hold_authorization_and_conditional_cleanup(tmp_path: Path)
     operation_id = _operation_id()
     try:
         manifest, digest = await _probe_directory(manager, operation_id, "source")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_hold",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         entry = manifest.entries[0]
         transfer_uuid = _operation_id()
-        accepted = await manager.handle(
+        accepted = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_source_child",
                 "directory_operation_id": operation_id,
@@ -396,7 +420,7 @@ async def test_source_hold_authorization_and_conditional_cleanup(tmp_path: Path)
                 "transfer_uuid": transfer_uuid,
                 "relative_path": entry.relative_path,
                 "fingerprint": entry.fingerprint,
-            }
+            },
         )
         assert accepted.state == "accepted"
         grant = await manager.consume_source_authorization(
@@ -406,12 +430,13 @@ async def test_source_hold_authorization_and_conditional_cleanup(tmp_path: Path)
         await manager.complete_source_authorization(UUID(transfer_uuid), success=True)
 
         (source / "b").write_bytes(b"changed")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_cleanup",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         status = await _source_status(
             manager, operation_id, digest, {"succeeded", "outcome_unknown"}
@@ -437,19 +462,72 @@ def _small_manifest() -> DirectoryManifest:
     )
 
 
+async def _prepare_committed_destination(
+    manager: DirectoryJobManager,
+    workspace: Path,
+) -> tuple[str, str, Path]:
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    started = await _handle(
+        manager,
+        {
+            "operation": "transfer_directory_preflight",
+            "directory_operation_id": operation_id,
+            "dst_path": "destination",
+            "manifest": manifest.model_dump(mode="json"),
+        },
+    )
+    await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+    await _handle(
+        manager,
+        {
+            "operation": "transfer_directory_prepare",
+            "directory_operation_id": operation_id,
+            "expected_digest": started.expected_digest,
+        },
+    )
+    await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+    destination = workspace / "destination" / "nested" / "file"
+    transfer_uuid = _operation_id()
+    await _handle(
+        manager,
+        {
+            "operation": "transfer_directory_authorize_child",
+            "directory_operation_id": operation_id,
+            "expected_digest": started.expected_digest,
+            "transfer_uuid": transfer_uuid,
+            "relative_path": "nested/file",
+        },
+    )
+    grant = await manager.consume_destination_authorization(UUID(transfer_uuid))
+    assert grant.destination_path == destination
+    assert grant.expected_size == 4
+    destination.write_bytes(b"data")
+    await manager.record_destination_commit(
+        UUID(operation_id),
+        UUID(transfer_uuid),
+        relative_path="nested/file",
+        destination_fingerprint=_fingerprint(destination),
+        verified_size=4,
+        verified_sha256=_sha(b"data"),
+    )
+    return operation_id, started.expected_digest, destination
+
+
 @pytest.mark.asyncio
 async def test_destination_prepare_authorize_finish_and_release(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manifest = _small_manifest()
     operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_preflight",
                 "directory_operation_id": operation_id,
                 "dst_path": "destination",
                 "manifest": manifest.model_dump(mode="json"),
-            }
+            },
         )
         status = await _destination_status(
             manager, operation_id, started.expected_digest, {"ready", "failed"}
@@ -457,31 +535,37 @@ async def test_destination_prepare_authorize_finish_and_release(tmp_path: Path) 
         assert status.state == "ready"
         assert not (tmp_path / "destination").exists()
 
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_prepare",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         status = await _destination_status(
             manager, operation_id, started.expected_digest, {"reserved", "failed"}
         )
         assert status.state == "reserved"
         destination = tmp_path / "destination" / "nested" / "file"
-        destination.parent.mkdir()
 
         transfer_uuid = _operation_id()
-        await manager.handle(
+        destination_record = manager._active[(UUID(operation_id), "destination")]
+        assert destination_record.manifest is not None and destination_record.entries_by_path
+        saved_manifest = destination_record.manifest
+        destination_record.manifest = saved_manifest.model_copy(update={"entries": ()})
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_child",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
                 "transfer_uuid": transfer_uuid,
                 "relative_path": "nested/file",
-            }
+            },
         )
-        grant = await manager.consume_destination_authorization(UUID(transfer_uuid), destination)
+        destination_record.manifest = saved_manifest
+        grant = await manager.consume_destination_authorization(UUID(transfer_uuid))
         assert grant.relative_path == "nested/file"
         destination.write_bytes(b"data")
         await manager.record_destination_commit(
@@ -493,12 +577,13 @@ async def test_destination_prepare_authorize_finish_and_release(tmp_path: Path) 
             verified_sha256=_sha(b"data"),
         )
 
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_finish",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         status = await _destination_status(
             manager,
@@ -515,15 +600,97 @@ async def test_destination_prepare_authorize_finish_and_release(tmp_path: Path) 
             + bytes.fromhex(_sha(b"data"))
         )
 
-        released = await manager.handle(
+        destination_record = manager._active[(UUID(operation_id), "destination")]
+        assert destination_record.reservation_held
+        await manager.request_close(preserve_finalized=True, final=False)
+        assert not destination_record.reservation_held
+        assert await manager.wait_for_drain(timeout_seconds=0.1)
+        assert destination.read_bytes() == b"data"
+
+        released = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         assert released.state == "released"
         assert destination.read_bytes() == b"data"
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["delete_root", "replace_root", "delete_parent"])
+async def test_destination_child_parent_validation_rejects_identity_races(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    transfer_uuid = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_authorize_child",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+                "transfer_uuid": transfer_uuid,
+                "relative_path": "nested/file",
+            },
+        )
+        await manager.consume_destination_authorization(UUID(transfer_uuid))
+
+        root = tmp_path / "destination"
+        parent = root / "nested"
+        if race == "delete_parent":
+            parent.rmdir()
+        else:
+            parent.rmdir()
+            root.rmdir()
+            if race == "replace_root":
+                root.mkdir()
+
+        with pytest.raises(ToolFailure) as raised:
+            manager.validate_destination_child_parent(UUID(transfer_uuid))
+        assert raised.value.code == "workspace_file_changed"
+        await manager.complete_destination_authorization(UUID(transfer_uuid), success=False)
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_cancel",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "outcome_unknown"},
+        )
     finally:
         await manager.aclose()
 
@@ -534,35 +701,267 @@ async def test_destination_cancel_conditionally_removes_owned_tree(tmp_path: Pat
     manifest = _small_manifest()
     operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_preflight",
                 "directory_operation_id": operation_id,
                 "dst_path": "destination",
                 "manifest": manifest.model_dump(mode="json"),
-            }
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_prepare",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_cancel",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         status = await _destination_status(
             manager, operation_id, started.expected_digest, {"failed", "outcome_unknown"}
         )
         assert status.state == "failed"
         assert not (tmp_path / "destination").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_destination_prepare_never_claims_or_deletes_an_externally_raced_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_claim = directory_jobs_module._claim_destination_root
+
+    def race_parent(
+        record: Any,
+        destination: Path,
+    ) -> None:
+        original_claim(record, destination)
+        (destination / "nested").mkdir()
+
+    monkeypatch.setattr(directory_jobs_module, "_claim_destination_root", race_parent)
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "outcome_unknown"},
+        )
+        assert status.state == "outcome_unknown"
+        assert (tmp_path / "destination" / "nested").is_dir()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_destination_prepare_retains_ambiguous_mkdir_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_identity = directory_jobs_module._directory_identity
+
+    def fail_root_identity(path: Path) -> str:
+        if path.name == "destination":
+            raise OSError("injected identity failure")
+        return original_identity(path)
+
+    monkeypatch.setattr(directory_jobs_module, "_directory_identity", fail_root_identity)
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "created/destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "outcome_unknown"},
+        )
+        assert status.state == "outcome_unknown"
+        assert status.cleanup_complete is False
+        assert (tmp_path / "created" / "destination").is_dir()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="symlink replacement proof is POSIX-specific")
+async def test_destination_cleanup_treats_owned_directory_link_replacement_as_incomplete(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        replaced = tmp_path / "destination" / "nested"
+        replaced.rmdir()
+        replaced.symlink_to(outside, target_is_directory=True)
+
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_cancel",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "outcome_unknown"},
+        )
+        assert status.state == "outcome_unknown"
+        assert status.cleanup_complete is False
+        assert replaced.is_symlink()
+        assert outside.is_dir()
+        assert manager._locks.reservation_count == 0
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cross_site_prepare_omits_scan_only_empty_directories(tmp_path: Path) -> None:
+    manifest = create_directory_manifest(
+        root_identity="source-root",
+        directories=(
+            DirectoryManifestDirectory(relative_path="empty", identity="empty-id"),
+            DirectoryManifestDirectory(relative_path="nested", identity="nested-id"),
+        ),
+        entries=(
+            DirectoryManifestEntry(relative_path="nested/file", size=4, fingerprint="source"),
+        ),
+    )
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        assert (tmp_path / "destination" / "nested").is_dir()
+        assert not (tmp_path / "destination" / "empty").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_file_phases_do_not_exceed_manifest_file_count(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    manifest = _small_manifest()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        record = manager._active[(UUID(operation_id), "destination")]
+        initial_seq = record.progress_seq
+        record.bump(files=1, phase="copying")
+        record.bump(files=1, phase="revalidating")
+        record.bump(files=1, phase="cleanup")
+        status = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        assert status.files_processed == len(manifest.entries)
+        assert status.progress_seq == initial_seq + 3
     finally:
         await manager.aclose()
 
@@ -574,20 +973,22 @@ async def _prepare_local_job(
     destination_path: str,
 ) -> tuple[DirectoryManifest, str, str]:
     manifest, source_digest = await _probe_directory(manager, operation_id, source_path)
-    await manager.handle(
+    await _handle(
+        manager,
         {
             "operation": "transfer_source_probe_release",
             "directory_operation_id": operation_id,
             "expected_digest": source_digest,
-        }
+        },
     )
-    preflight = await manager.handle(
+    preflight = await _handle(
+        manager,
         {
             "operation": "transfer_directory_preflight",
             "directory_operation_id": operation_id,
             "dst_path": destination_path,
             "manifest": manifest.model_dump(mode="json"),
-        }
+        },
     )
     await _destination_status(manager, operation_id, preflight.expected_digest, {"ready"})
     return manifest, source_digest, preflight.expected_digest
@@ -608,7 +1009,8 @@ async def test_local_directory_copy_is_recursive_atomic_per_file_and_omits_empty
         manifest, _, destination_digest = await _prepare_local_job(
             manager, operation_id, "source", "copied"
         )
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_start",
                 "directory_operation_id": operation_id,
@@ -617,7 +1019,7 @@ async def test_local_directory_copy_is_recursive_atomic_per_file_and_omits_empty
                 "dst_path": "copied",
                 "mode": "copy",
                 "manifest_sha256": manifest.manifest_sha256,
-            }
+            },
         )
         status = await _destination_status(
             manager,
@@ -647,7 +1049,7 @@ async def test_local_copy_does_not_delete_a_competing_destination(
     (source / "file").write_bytes(b"payload")
     manager = _manager(tmp_path)
     operation_id = _operation_id()
-    original_link = directory_jobs_module.os.link
+    original_link = cast(Any, directory_jobs_module).os.link
 
     def competing_link(
         source_path: Path,
@@ -662,12 +1064,13 @@ async def test_local_copy_does_not_delete_a_competing_destination(
             follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(directory_jobs_module.os, "link", competing_link)
+    monkeypatch.setattr(cast(Any, directory_jobs_module).os, "link", competing_link)
     try:
         manifest, _, destination_digest = await _prepare_local_job(
             manager, operation_id, "source", "copied"
         )
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_start",
                 "directory_operation_id": operation_id,
@@ -676,7 +1079,7 @@ async def test_local_copy_does_not_delete_a_competing_destination(
                 "dst_path": "copied",
                 "mode": "copy",
                 "manifest_sha256": manifest.manifest_sha256,
-            }
+            },
         )
         status = await _destination_status(
             manager,
@@ -710,7 +1113,8 @@ async def test_local_copy_cleans_its_published_link_when_parent_fsync_fails(
         manifest, _, destination_digest = await _prepare_local_job(
             manager, operation_id, "source", "copied"
         )
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_start",
                 "directory_operation_id": operation_id,
@@ -719,7 +1123,7 @@ async def test_local_copy_cleans_its_published_link_when_parent_fsync_fails(
                 "dst_path": "copied",
                 "mode": "copy",
                 "manifest_sha256": manifest.manifest_sha256,
-            }
+            },
         )
         status = await _destination_status(
             manager,
@@ -734,8 +1138,81 @@ async def test_local_copy_cleans_its_published_link_when_parent_fsync_fails(
         await manager.aclose()
 
 
+def test_directory_fsync_is_a_noop_when_windows_cannot_open_directories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cast(Any, directory_jobs_module).os, "name", "nt")
+
+    def unexpected_open(*_args: Any, **_kwargs: Any) -> int:
+        raise AssertionError("Windows directory fsync must not call os.open")
+
+    monkeypatch.setattr(cast(Any, directory_jobs_module).os, "open", unexpected_open)
+    directory_jobs_module._fsync_directory(Path("unused"))
+
+
+def test_directory_fsync_propagates_real_posix_io_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX fsync error proof")
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError(errno.EIO, "injected directory I/O failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    with pytest.raises(OSError) as raised:
+        directory_jobs_module._fsync_directory(tmp_path)
+    assert raised.value.errno == errno.EIO
+
+
 @pytest.mark.asyncio
-@pytest.mark.skipif(not os.sys.platform.startswith("linux"), reason="Linux native proof")
+async def test_local_move_cleans_owned_parents_when_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"payload")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+
+    def fail_publish(_source: Path, _destination: Path) -> None:
+        raise ToolFailure("workspace_storage_unavailable", "injected publish failure")
+
+    monkeypatch.setattr(directory_jobs_module, "_rename_directory_no_replace", fail_publish)
+    try:
+        manifest, _, destination_digest = await _prepare_local_job(
+            manager, operation_id, "source", "created/parent/moved"
+        )
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_start",
+                "directory_operation_id": operation_id,
+                "expected_digest": destination_digest,
+                "source_path": "source",
+                "dst_path": "created/parent/moved",
+                "mode": "move",
+                "manifest_sha256": manifest.manifest_sha256,
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            destination_digest,
+            {"failed", "outcome_unknown"},
+            local=True,
+        )
+        assert status.state == "failed"
+        assert not (tmp_path / "created").exists()
+        assert source.is_dir()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux native proof")
 async def test_local_directory_move_uses_native_no_replace_and_preserves_empty_dirs(
     tmp_path: Path,
 ) -> None:
@@ -748,7 +1225,8 @@ async def test_local_directory_move_uses_native_no_replace_and_preserves_empty_d
         manifest, _, destination_digest = await _prepare_local_job(
             manager, operation_id, "source", "moved"
         )
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_start",
                 "directory_operation_id": operation_id,
@@ -757,7 +1235,7 @@ async def test_local_directory_move_uses_native_no_replace_and_preserves_empty_d
                 "dst_path": "moved",
                 "mode": "move",
                 "manifest_sha256": manifest.manifest_sha256,
-            }
+            },
         )
         status = await _destination_status(
             manager,
@@ -788,7 +1266,8 @@ async def test_local_cancel_stops_forward_work_but_not_cleanup(tmp_path: Path) -
         )
         blocker = admission.try_acquire()
         assert blocker is not None
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_start",
                 "directory_operation_id": operation_id,
@@ -797,14 +1276,15 @@ async def test_local_cancel_stops_forward_work_but_not_cleanup(tmp_path: Path) -
                 "dst_path": "destination",
                 "mode": "copy",
                 "manifest_sha256": manifest.manifest_sha256,
-            }
+            },
         )
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_local_directory_cancel",
                 "directory_operation_id": operation_id,
                 "expected_digest": destination_digest,
-            }
+            },
         )
         record = manager._active[(UUID(operation_id), "destination")]
         assert record.stop_forward_work.is_set()
@@ -834,28 +1314,31 @@ async def test_wrong_digest_is_rejected_and_release_is_idempotent(tmp_path: Path
         manifest, digest = await _probe_directory(manager, operation_id, "source")
         assert manifest.entries
         with pytest.raises(ToolFailure) as raised:
-            await manager.handle(
+            await _handle(
+                manager,
                 {
                     "operation": "transfer_source_probe_release",
                     "directory_operation_id": operation_id,
                     "expected_digest": "0" * 64,
-                }
+                },
             )
         assert raised.value.code == "workspace_transfer_integrity_failed"
 
-        first = await manager.handle(
+        first = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
-        second = await manager.handle(
+        second = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         assert first.model_dump() == second.model_dump()
         assert manager.active_count == 0
@@ -872,12 +1355,13 @@ async def test_source_authorization_is_one_shot_and_expires_on_release(tmp_path:
     operation_id = _operation_id()
     try:
         manifest, digest = await _probe_directory(manager, operation_id, "source")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_hold",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         transfer_uuid = _operation_id()
         action = {
@@ -888,8 +1372,8 @@ async def test_source_authorization_is_one_shot_and_expires_on_release(tmp_path:
             "relative_path": "file",
             "fingerprint": manifest.entries[0].fingerprint,
         }
-        assert (await manager.handle(action)).state == "accepted"
-        assert (await manager.handle(action)).state == "accepted"
+        assert (await _handle(manager, action)).state == "accepted"
+        assert (await _handle(manager, action)).state == "accepted"
         with pytest.raises(ToolFailure):
             await manager.consume_source_authorization(UUID(transfer_uuid), source / "wrong")
         with pytest.raises(ToolFailure):
@@ -897,18 +1381,86 @@ async def test_source_authorization_is_one_shot_and_expires_on_release(tmp_path:
 
         second_uuid = _operation_id()
         action["transfer_uuid"] = second_uuid
-        await manager.handle(action)
+        await _handle(manager, action)
         await manager.consume_source_authorization(UUID(second_uuid), source / "file")
         await manager.complete_source_authorization(UUID(second_uuid), success=False)
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         with pytest.raises(ToolFailure):
             await manager.consume_source_authorization(UUID(second_uuid), source / "file")
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_source_child_uuid_is_tombstoned_and_success_counts_each_path_once(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    file = source / "file"
+    file.write_bytes(b"x")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    try:
+        manifest, digest = await _probe_directory(manager, operation_id, "source")
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_hold",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        initial_status = await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        source_record = manager._active[(UUID(operation_id), "source")]
+        assert source_record.manifest is not None and source_record.entries_by_path
+        source_record.manifest = source_record.manifest.model_copy(update={"entries": ()})
+        first_uuid = _operation_id()
+        action = {
+            "operation": "transfer_directory_authorize_source_child",
+            "directory_operation_id": operation_id,
+            "expected_digest": digest,
+            "transfer_uuid": first_uuid,
+            "relative_path": "file",
+            "fingerprint": manifest.entries[0].fingerprint,
+        }
+        await _handle(manager, action)
+        await manager.consume_source_authorization(UUID(first_uuid), file)
+        await manager.complete_source_authorization(UUID(first_uuid), success=True)
+
+        with pytest.raises(ToolFailure) as reused:
+            await _handle(manager, action)
+        assert reused.value.code == "workspace_transfer_integrity_failed"
+        assert manager.claims_source_transfer(UUID(first_uuid))
+
+        second_uuid = _operation_id()
+        action["transfer_uuid"] = second_uuid
+        await _handle(manager, action)
+        await manager.consume_source_authorization(UUID(second_uuid), file)
+        await manager.complete_source_authorization(UUID(second_uuid), success=True)
+        status = await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        assert status.files_processed == initial_status.files_processed
     finally:
         await manager.aclose()
 
@@ -925,26 +1477,237 @@ async def test_directory_job_active_capacity_rejects_third_before_work(tmp_path:
     manager = _manager(tmp_path, admission=admission)
     try:
         for name in ("one", "two"):
-            await manager.handle(
+            await _handle(
+                manager,
                 {
                     "operation": "transfer_source_probe_start",
                     "directory_operation_id": _operation_id(),
                     "path": name,
-                }
+                },
             )
         with pytest.raises(ToolFailure) as raised:
-            await manager.handle(
+            await _handle(
+                manager,
                 {
                     "operation": "transfer_source_probe_start",
                     "directory_operation_id": _operation_id(),
                     "path": "three",
-                }
+                },
             )
         assert raised.value.code == "workspace_transfer_busy"
         assert manager.active_count == 2
     finally:
         blocker.release()
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_capacity_is_shared_across_retired_and_current_managers(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file").write_bytes(b"x")
+    credits = DirectoryLifecycleCredits(capacity=1)
+    first = _manager(tmp_path, lifecycle_credits=credits)
+    second = _manager(tmp_path, lifecycle_credits=credits)
+    try:
+        await first.handle(
+            {
+                "operation": "transfer_source_probe_start",
+                "directory_operation_id": _operation_id(),
+                "path": "source",
+            }
+        )
+        with pytest.raises(ToolFailure) as raised:
+            await second.handle(
+                {
+                    "operation": "transfer_source_probe_start",
+                    "directory_operation_id": _operation_id(),
+                    "path": "source",
+                }
+            )
+        assert raised.value.code == "workspace_transfer_busy"
+        assert credits.active_count == 1
+    finally:
+        await first.aclose()
+        await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_config_retire_keeps_janitor_until_lifecycle_tombstones_expire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.02)
+    source = tmp_path / "file"
+    source.write_bytes(b"x")
+    manager = _manager(tmp_path, terminal_ttl_seconds=0.02)
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_start",
+                "directory_operation_id": operation_id,
+                "path": "file",
+            },
+        )
+        await _source_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"succeeded"},
+        )
+        await manager.request_close(preserve_finalized=True, final=False)
+        assert await manager.wait_for_lifecycle_empty(timeout_seconds=1)
+        assert manager.lifecycle_count == 0
+    finally:
+        await manager.aclose(final=True)
+
+
+@pytest.mark.asyncio
+async def test_retired_manager_reconciles_exact_starts_and_rejects_new_work(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "file"
+    source.write_bytes(b"x")
+    source_manager = _manager(tmp_path)
+    source_operation_id = _operation_id()
+    source_action = {
+        "operation": "transfer_source_probe_start",
+        "directory_operation_id": source_operation_id,
+        "path": "file",
+    }
+    try:
+        started = await _handle(source_manager, source_action)
+        await _source_status(
+            source_manager,
+            source_operation_id,
+            started.expected_digest,
+            {"succeeded"},
+        )
+        await source_manager.request_close(final=False)
+        retried = await _handle(source_manager, source_action)
+        assert retried.state == "succeeded"
+        with pytest.raises(ToolFailure) as new_source:
+            await _handle(
+                source_manager,
+                {
+                    **source_action,
+                    "directory_operation_id": _operation_id(),
+                },
+            )
+        assert new_source.value.code == "tool_device_unreachable"
+    finally:
+        await source_manager.aclose(final=True)
+
+    destination_manager = _manager(tmp_path)
+    destination_operation_id = _operation_id()
+    manifest = _small_manifest()
+    preflight_action = {
+        "operation": "transfer_directory_preflight",
+        "directory_operation_id": destination_operation_id,
+        "dst_path": "destination",
+        "manifest": manifest.model_dump(mode="json"),
+    }
+    try:
+        preflight = await _handle(destination_manager, preflight_action)
+        await _destination_status(
+            destination_manager,
+            destination_operation_id,
+            preflight.expected_digest,
+            {"ready"},
+        )
+        await destination_manager.request_close(final=False)
+        retried = await _handle(destination_manager, preflight_action)
+        local = await _handle(
+            destination_manager,
+            {
+                "operation": "transfer_local_directory_status",
+                "directory_operation_id": destination_operation_id,
+                "expected_digest": preflight.expected_digest,
+            },
+        )
+        assert retried.state == "ready"
+        assert local.state == "ready_not_started"
+        with pytest.raises(ToolFailure) as retired_local_start:
+            await _handle(
+                destination_manager,
+                {
+                    "operation": "transfer_local_directory_start",
+                    "directory_operation_id": destination_operation_id,
+                    "expected_digest": preflight.expected_digest,
+                    "source_path": "source",
+                    "dst_path": "destination",
+                    "mode": "copy",
+                    "manifest_sha256": manifest.manifest_sha256,
+                },
+            )
+        assert retired_local_start.value.code == "tool_device_unreachable"
+        with pytest.raises(ToolFailure) as new_destination:
+            await _handle(
+                destination_manager,
+                {
+                    **preflight_action,
+                    "directory_operation_id": _operation_id(),
+                },
+            )
+        assert new_destination.value.code == "tool_device_unreachable"
+    finally:
+        await destination_manager.aclose(final=True)
+
+
+@pytest.mark.asyncio
+async def test_retired_manager_allows_prepare_and_finish_result_retries(
+    tmp_path: Path,
+) -> None:
+    prepare_manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    prepare_operation_id = _operation_id()
+    try:
+        preflight = await _handle(
+            prepare_manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": prepare_operation_id,
+                "dst_path": "prepared",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(
+            prepare_manager, prepare_operation_id, preflight.expected_digest, {"ready"}
+        )
+        prepare_action = {
+            "operation": "transfer_directory_prepare",
+            "directory_operation_id": prepare_operation_id,
+            "expected_digest": preflight.expected_digest,
+        }
+        await _handle(prepare_manager, prepare_action)
+        await _destination_status(
+            prepare_manager, prepare_operation_id, preflight.expected_digest, {"reserved"}
+        )
+        prepare_manager._closed = True
+        assert (await _handle(prepare_manager, prepare_action)).state == "accepted"
+    finally:
+        await prepare_manager.aclose(final=True)
+
+    finish_manager = _manager(tmp_path)
+    try:
+        operation_id, digest, _destination = await _prepare_committed_destination(
+            finish_manager, tmp_path
+        )
+        finish_action = {
+            "operation": "transfer_directory_finish",
+            "directory_operation_id": operation_id,
+            "expected_digest": digest,
+        }
+        await _handle(finish_manager, finish_action)
+        await _destination_status(finish_manager, operation_id, digest, {"finalized_held"})
+        await finish_manager.request_close(preserve_finalized=True, final=False)
+        assert (await _handle(finish_manager, finish_action)).state == "accepted"
+    finally:
+        await finish_manager.aclose(final=True)
 
 
 @pytest.mark.asyncio
@@ -956,12 +1719,13 @@ async def test_source_probe_rejects_special_file(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_start",
                 "directory_operation_id": operation_id,
                 "path": "source",
-            }
+            },
         )
         status = await _source_status(manager, operation_id, started.expected_digest, {"failed"})
         assert status.terminal_error.code == "workspace_blocked_path"
@@ -978,12 +1742,13 @@ async def test_manifest_page_retry_is_stable_and_page_skip_is_rejected(tmp_path:
     manager = _manager(tmp_path)
     operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_start",
                 "directory_operation_id": operation_id,
                 "path": "source",
-            }
+            },
         )
         status = await _source_status(
             manager,
@@ -998,13 +1763,13 @@ async def test_manifest_page_retry_is_stable_and_page_skip_is_rejected(tmp_path:
             "offset": 256,
         }
         with pytest.raises(ToolFailure):
-            await manager.handle(page_action)
+            await _handle(manager, page_action)
         page_action["offset"] = 0
-        first = await manager.handle(page_action)
-        retry = await manager.handle(page_action)
+        first = await _handle(manager, page_action)
+        retry = await _handle(manager, page_action)
         assert first.model_dump() == retry.model_dump()
         page_action["offset"] = 256
-        final = await manager.handle(page_action)
+        final = await _handle(manager, page_action)
         assert final.next_offset is None
     finally:
         await manager.aclose()
@@ -1021,15 +1786,17 @@ async def test_consumed_source_authorization_blocks_next_child_cleanup_and_relea
     operation_id = _operation_id()
     try:
         manifest, digest = await _probe_directory(manager, operation_id, "source")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_hold",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         transfer_uuid = _operation_id()
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_source_child",
                 "directory_operation_id": operation_id,
@@ -1037,22 +1804,24 @@ async def test_consumed_source_authorization_blocks_next_child_cleanup_and_relea
                 "transfer_uuid": transfer_uuid,
                 "relative_path": "file",
                 "fingerprint": manifest.entries[0].fingerprint,
-            }
+            },
         )
         await manager.consume_source_authorization(UUID(transfer_uuid), source / "file")
 
         for operation in ("transfer_source_cleanup", "transfer_source_probe_release"):
             with pytest.raises(ToolFailure) as raised:
-                await manager.handle(
+                await _handle(
+                    manager,
                     {
                         "operation": operation,
                         "directory_operation_id": operation_id,
                         "expected_digest": digest,
-                    }
+                    },
                 )
             assert raised.value.code == "workspace_transfer_busy"
         with pytest.raises(ToolFailure) as raised:
-            await manager.handle(
+            await _handle(
+                manager,
                 {
                     "operation": "transfer_directory_authorize_source_child",
                     "directory_operation_id": operation_id,
@@ -1060,17 +1829,20 @@ async def test_consumed_source_authorization_blocks_next_child_cleanup_and_relea
                     "transfer_uuid": _operation_id(),
                     "relative_path": "file",
                     "fingerprint": manifest.entries[0].fingerprint,
-                }
+                },
             )
         assert raised.value.code == "workspace_transfer_busy"
 
+        assert await manager.aclose(grace_seconds=0.01) is False
         await manager.complete_source_authorization(UUID(transfer_uuid), success=True)
-        released = await manager.handle(
+        assert await manager.wait_for_drain(timeout_seconds=1)
+        released = await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_release",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         assert released.state == "released"
     finally:
@@ -1088,15 +1860,17 @@ async def test_unconsumed_authorization_and_ready_job_expire_in_background(
     operation_id = _operation_id()
     try:
         manifest, digest = await _probe_directory(manager, operation_id, "source")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_source_probe_hold",
                 "directory_operation_id": operation_id,
                 "expected_digest": digest,
-            }
+            },
         )
         transfer_uuid = _operation_id()
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_source_child",
                 "directory_operation_id": operation_id,
@@ -1104,7 +1878,7 @@ async def test_unconsumed_authorization_and_ready_job_expire_in_background(
                 "transfer_uuid": transfer_uuid,
                 "relative_path": "file",
                 "fingerprint": manifest.entries[0].fingerprint,
-            }
+            },
         )
         await asyncio.sleep(0.12)
         with pytest.raises(ToolFailure):
@@ -1134,12 +1908,13 @@ async def test_manager_close_is_bounded_and_exposes_drain_tasks(
 
     monkeypatch.setattr(directory_jobs_module, "_scan_source_path", blocked_scan)
     manager = _manager(tmp_path)
-    await manager.handle(
+    await _handle(
+        manager,
         {
             "operation": "transfer_source_probe_start",
             "directory_operation_id": _operation_id(),
             "path": "source",
-        }
+        },
     )
     assert await asyncio.to_thread(entered.wait, 1)
     started = asyncio.get_running_loop().time()
@@ -1157,36 +1932,39 @@ async def test_finalize_failure_reuses_current_capacity_for_cleanup(tmp_path: Pa
     manifest = _small_manifest()
     operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_preflight",
                 "directory_operation_id": operation_id,
                 "dst_path": "destination",
                 "manifest": manifest.model_dump(mode="json"),
-            }
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_prepare",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
         destination = tmp_path / "destination" / "nested" / "file"
-        destination.parent.mkdir()
         transfer_uuid = _operation_id()
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_child",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
                 "transfer_uuid": transfer_uuid,
                 "relative_path": "nested/file",
-            }
+            },
         )
-        await manager.consume_destination_authorization(UUID(transfer_uuid), destination)
+        grant = await manager.consume_destination_authorization(UUID(transfer_uuid))
+        assert grant.destination_path == destination
         destination.write_bytes(b"data")
         await manager.record_destination_commit(
             UUID(operation_id),
@@ -1197,12 +1975,13 @@ async def test_finalize_failure_reuses_current_capacity_for_cleanup(tmp_path: Pa
             verified_sha256=_sha(b"data"),
         )
         (tmp_path / "destination" / "extra").write_bytes(b"race")
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_finish",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
         status = await asyncio.wait_for(
             _destination_status(
@@ -1220,51 +1999,408 @@ async def test_finalize_failure_reuses_current_capacity_for_cleanup(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_destination_cancel_clears_consumed_authorization(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cleanup_complete", [True, False])
+async def test_finalize_timeout_cleanup_preserves_cause_only_when_complete(
+    tmp_path: Path,
+    cleanup_complete: bool,
+) -> None:
+    class TimeoutThenAdmission:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.delegate = LocalTransferAdmission(capacity=1)
+
+        async def acquire(self, *, timeout_seconds: float) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError
+            return await self.delegate.acquire(timeout_seconds=timeout_seconds)
+
     manager = _manager(tmp_path)
-    manifest = _small_manifest()
-    operation_id = _operation_id()
     try:
-        started = await manager.handle(
+        operation_id, digest, _destination = await _prepare_committed_destination(manager, tmp_path)
+        if not cleanup_complete:
+            (tmp_path / "destination" / "external").write_bytes(b"race")
+        manager._admission = TimeoutThenAdmission()  # type: ignore[assignment]
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_finish",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        status = await _destination_status(
+            manager,
+            operation_id,
+            digest,
+            {"failed", "outcome_unknown"},
+        )
+        if cleanup_complete:
+            assert status.state == "failed"
+            assert status.cleanup_complete is True
+            assert status.terminal_error.code == "workspace_transfer_timeout"
+            assert not (tmp_path / "destination").exists()
+        else:
+            assert status.state == "outcome_unknown"
+            assert status.cleanup_complete is False
+            assert status.terminal_error.code == "tool_execution_outcome_unknown"
+            assert (tmp_path / "destination" / "external").is_file()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_reserved_destination_cleanup_preserves_timeout_error(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, idle_timeout_seconds=0.05)
+    operation_id = _operation_id()
+    manifest = _small_manifest()
+    try:
+        started = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_preflight",
                 "directory_operation_id": operation_id,
                 "dst_path": "destination",
                 "manifest": manifest.model_dump(mode="json"),
-            }
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_prepare",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        status = await _destination_status(
+            manager,
+            operation_id,
+            started.expected_digest,
+            {"failed", "outcome_unknown"},
+        )
+        assert status.state == "failed"
+        assert status.cleanup_complete is True
+        assert status.terminal_error.code == "workspace_transfer_timeout"
+        assert not (tmp_path / "destination").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ready_not_started_local_cancel_then_release_frees_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(directory_jobs_module, "TOMBSTONE_TTL_SECONDS", 0.02)
+    credits = DirectoryLifecycleCredits(capacity=1)
+    manager = _manager(
+        tmp_path,
+        lifecycle_credits=credits,
+        terminal_ttl_seconds=0.02,
+    )
+    operation_id = _operation_id()
+    manifest = _small_manifest()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        ready = await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        assert ready.state == "ready_not_started"
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_cancel",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        cancelled = await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        assert cancelled.state == "failed"
+        assert cancelled.terminal_error.code == "tool_execution_cancelled"
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_local_directory_release",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
+        )
+        assert manager.active_count == 0
+        assert await manager.wait_for_lifecycle_empty(timeout_seconds=1)
+        assert credits.active_count == 0
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        ("cancel", "tool_execution_cancelled"),
+        ("idle", "workspace_transfer_timeout"),
+    ],
+)
+async def test_destination_terminal_action_waits_for_consumed_child(
+    tmp_path: Path,
+    cause: str,
+    expected_code: str,
+) -> None:
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
         transfer_uuid = _operation_id()
-        await manager.handle(
+        await _handle(
+            manager,
             {
                 "operation": "transfer_directory_authorize_child",
                 "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
                 "transfer_uuid": transfer_uuid,
                 "relative_path": "nested/file",
-            }
+            },
         )
-        await manager.consume_destination_authorization(
-            UUID(transfer_uuid), tmp_path / "destination" / "nested" / "file"
+        await manager.consume_destination_authorization(UUID(transfer_uuid))
+        if cause == "cancel":
+            await _handle(
+                manager,
+                {
+                    "operation": "transfer_directory_cancel",
+                    "directory_operation_id": operation_id,
+                    "expected_digest": started.expected_digest,
+                },
+            )
+        else:
+            record = manager._active[(UUID(operation_id), "destination")]
+            record.last_progress_at = time.monotonic() - manager._idle_timeout - 1
+            await manager._expire_idle_jobs()
+
+        in_flight = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": started.expected_digest,
+            },
         )
-        await manager.handle(
+        assert in_flight.state == "copying"
+        assert manager._consumed_destination
+        assert (tmp_path / "destination").is_dir()
+
+        await manager.complete_destination_authorization(UUID(transfer_uuid), success=False)
+        terminal = await _destination_status(
+            manager, operation_id, started.expected_digest, {"failed", "outcome_unknown"}
+        )
+        assert terminal.state == "failed"
+        assert terminal.terminal_error.code == expected_code
+        assert not manager._consumed_destination
+        assert not (tmp_path / "destination").exists()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        ("cancel", "tool_execution_cancelled"),
+        ("idle", "workspace_transfer_timeout"),
+    ],
+)
+async def test_source_terminal_action_waits_for_consumed_child(
+    tmp_path: Path,
+    cause: str,
+    expected_code: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    child = source / "file"
+    child.write_bytes(b"data")
+    manager = _manager(tmp_path)
+    operation_id = _operation_id()
+    try:
+        manifest, digest = await _probe_directory(manager, operation_id, "source")
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_hold",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        transfer_uuid = _operation_id()
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_authorize_source_child",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+                "transfer_uuid": transfer_uuid,
+                "relative_path": "file",
+                "fingerprint": manifest.entries[0].fingerprint,
+            },
+        )
+        await manager.consume_source_authorization(UUID(transfer_uuid), child)
+
+        if cause == "cancel":
+            await _handle(
+                manager,
+                {
+                    "operation": "transfer_source_probe_cancel",
+                    "directory_operation_id": operation_id,
+                    "expected_digest": digest,
+                },
+            )
+        else:
+            record = manager._active[(UUID(operation_id), "source")]
+            record.last_progress_at = time.monotonic() - manager._idle_timeout - 1
+            await manager._expire_idle_jobs()
+
+        in_flight = await _handle(
+            manager,
+            {
+                "operation": "transfer_source_probe_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        assert in_flight.state == "held"
+        assert manager._consumed_source
+
+        await manager.complete_source_authorization(UUID(transfer_uuid), success=False)
+        terminal = await _source_status(manager, operation_id, digest, {"failed"})
+        assert terminal.terminal_error.code == expected_code
+        assert not manager._consumed_source
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_late_destination_cancel_preserves_finalized_tree_and_result(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    try:
+        operation_id, digest, destination = await _prepare_committed_destination(manager, tmp_path)
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_finish",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        finalized = await _destination_status(manager, operation_id, digest, {"finalized_held"})
+
+        cancelled = await _handle(
+            manager,
             {
                 "operation": "transfer_directory_cancel",
                 "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+        after_cancel = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_status",
+                "directory_operation_id": operation_id,
+                "expected_digest": digest,
+            },
+        )
+
+        assert cancelled.state == "accepted"
+        assert after_cancel.state == "finalized_held"
+        assert after_cancel.terminal_result == finalized.terminal_result
+        assert destination.read_bytes() == b"data"
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_destination_child_uuid_cannot_be_reauthorized(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manifest = _small_manifest()
+    operation_id = _operation_id()
+    try:
+        started = await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_preflight",
+                "directory_operation_id": operation_id,
+                "dst_path": "destination",
+                "manifest": manifest.model_dump(mode="json"),
+            },
+        )
+        await _destination_status(manager, operation_id, started.expected_digest, {"ready"})
+        await _handle(
+            manager,
+            {
+                "operation": "transfer_directory_prepare",
+                "directory_operation_id": operation_id,
                 "expected_digest": started.expected_digest,
-            }
+            },
         )
-        await _destination_status(
-            manager, operation_id, started.expected_digest, {"failed", "outcome_unknown"}
-        )
-        assert not manager._consumed_destination
+        await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        destination = tmp_path / "destination" / "nested" / "file"
+        transfer_uuid = _operation_id()
+        action = {
+            "operation": "transfer_directory_authorize_child",
+            "directory_operation_id": operation_id,
+            "expected_digest": started.expected_digest,
+            "transfer_uuid": transfer_uuid,
+            "relative_path": "nested/file",
+        }
+        await _handle(manager, action)
+        grant = await manager.consume_destination_authorization(UUID(transfer_uuid))
+        assert grant.destination_path == destination
+        await manager.complete_destination_authorization(UUID(transfer_uuid), success=False)
+
+        with pytest.raises(ToolFailure) as reused:
+            await _handle(manager, action)
+        assert reused.value.code == "workspace_transfer_integrity_failed"
+        assert manager.claims_destination_transfer(UUID(transfer_uuid))
     finally:
         await manager.aclose()

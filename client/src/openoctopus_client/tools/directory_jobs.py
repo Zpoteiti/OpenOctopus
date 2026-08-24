@@ -78,6 +78,11 @@ MAX_ACTIVE_DIRECTORY_JOBS = 2
 DIRECTORY_LIFECYCLE_MAX_ENTRIES = TOMBSTONE_MAX_ENTRIES
 DIRECTORY_TERMINAL_TTL_SECONDS = TOMBSTONE_TTL_SECONDS
 DIRECTORY_IO_CHUNK_BYTES = 64 * 1024
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("EINVAL", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+    if hasattr(errno, name)
+)
 
 type JobRole = Literal["source", "destination"]
 type JobKey = tuple[UUID, JobRole]
@@ -90,6 +95,32 @@ class _ForwardWorkCancelledError(Exception):
 
 class _CleanupCancelledError(Exception):
     pass
+
+
+class DirectoryLifecycleCredits:
+    """Runtime-wide credits held from job start through its final tombstone."""
+
+    def __init__(self, *, capacity: int = DIRECTORY_LIFECYCLE_MAX_ENTRIES) -> None:
+        if capacity < 1:
+            raise ValueError("directory lifecycle capacity is invalid")
+        self._capacity = capacity
+        self._held: set[tuple[object, JobKey]] = set()
+
+    @property
+    def active_count(self) -> int:
+        return len(self._held)
+
+    def try_acquire(self, owner: object, key: JobKey) -> bool:
+        token = (owner, key)
+        if token in self._held:
+            return True
+        if len(self._held) >= self._capacity:
+            return False
+        self._held.add(token)
+        return True
+
+    def release(self, owner: object, key: JobKey) -> None:
+        self._held.discard((owner, key))
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +138,7 @@ class DestinationChildAuthorization:
     transfer_uuid: UUID
     destination_path: Path
     relative_path: str
+    expected_size: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +146,7 @@ class _Authorization:
     transfer_uuid: UUID
     relative_path: str
     fingerprint: str | None = None
+    expected_size: int | None = None
     expires_at: float = 0.0
 
 
@@ -150,6 +183,7 @@ class _JobRecord:
     source_path: Path | None = None
     destination_path: Path | None = None
     manifest: DirectoryManifest | None = None
+    entries_by_path: dict[str, DirectoryManifestEntry] = field(default_factory=dict)
     pages: tuple[DirectoryManifestPage, ...] = ()
     probe: FileSourceProbe | DirectorySourceProbe | None = None
     progress_seq: int = 0
@@ -159,6 +193,8 @@ class _JobRecord:
     phase: str = "waiting"
     terminal_result: WorkspaceTransferDirectoryResult | DirectoryCleanupResult | None = None
     terminal_error: DirectoryStableError | None = None
+    deferred_terminal_error: DirectoryStableError | None = None
+    cleanup_terminal_error: DirectoryStableError | None = None
     stop_forward_work: threading.Event = field(default_factory=threading.Event)
     stop_cleanup: threading.Event = field(default_factory=threading.Event)
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -169,12 +205,14 @@ class _JobRecord:
     last_progress_at: float = field(default_factory=time.monotonic)
     source_authorization: _Authorization | None = None
     destination_authorization: _Authorization | None = None
+    active_destination_bytes: int = 0
     local_mode: Literal["copy", "move"] | None = None
     reservation: AbstractAsyncContextManager[None] | None = None
     reservation_held: bool = False
     root_claimed: bool = False
     created_directories: dict[Path, str] = field(default_factory=dict)
     committed: dict[str, _CommittedDestination] = field(default_factory=dict)
+    completed_source_paths: set[str] = field(default_factory=set)
 
     def bump(
         self,
@@ -186,7 +224,10 @@ class _JobRecord:
     ) -> None:
         with self.sync_lock:
             self.entries_processed += entries
-            self.files_processed += files
+            file_limit = (
+                len(self.entries_by_path) if self.manifest is not None else MAX_DIRECTORY_ENTRIES
+            )
+            self.files_processed = min(file_limit, self.files_processed + files)
             self.bytes_processed += byte_count
             if phase is not None:
                 self.phase = phase
@@ -208,6 +249,7 @@ class _TerminalRecord:
     expected_digest: str
     snapshot: SourceDirectoryJobStatus | DestinationDirectoryJobStatus | LocalDirectoryJobStatus
     expires_at: float
+    local_snapshot: LocalDirectoryJobStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +261,7 @@ class _Tombstone:
     )
     released: bool
     expires_at: float
+    local_snapshot: LocalDirectoryJobStatus | None = None
 
 
 class DirectoryJobManager:
@@ -233,8 +276,10 @@ class DirectoryJobManager:
         admission: LocalTransferAdmission,
         idle_timeout_seconds: float,
         queue_timeout_seconds: float,
+        generation: int = 0,
         terminal_ttl_seconds: float = DIRECTORY_TERMINAL_TTL_SECONDS,
         lifecycle_capacity: int = DIRECTORY_LIFECYCLE_MAX_ENTRIES,
+        lifecycle_credits: DirectoryLifecycleCredits | None = None,
     ) -> None:
         if idle_timeout_seconds <= 0 or queue_timeout_seconds < 0:
             raise ValueError("directory timeout values are invalid")
@@ -248,8 +293,15 @@ class DirectoryJobManager:
         self._admission = admission
         self._idle_timeout = idle_timeout_seconds
         self._queue_timeout = queue_timeout_seconds
+        self._generation = generation
         self._terminal_ttl = terminal_ttl_seconds
         self._lifecycle_capacity = lifecycle_capacity
+        self._lifecycle_credits = lifecycle_credits or DirectoryLifecycleCredits(
+            capacity=lifecycle_capacity
+        )
+        self._credit_owner = object()
+        self._credited_keys: set[JobKey] = set()
+        self._lifecycle_changed = asyncio.Event()
         self._active: dict[JobKey, _JobRecord] = {}
         self._retained: dict[JobKey, _TerminalRecord] = {}
         self._tombstones: dict[JobKey, _Tombstone] = {}
@@ -257,6 +309,8 @@ class DirectoryJobManager:
         self._consumed_source: dict[UUID, tuple[_JobRecord, _Authorization]] = {}
         self._destination_authorizations: dict[UUID, tuple[_JobRecord, _Authorization]] = {}
         self._consumed_destination: dict[UUID, tuple[_JobRecord, _Authorization]] = {}
+        self._expired_source: dict[UUID, float] = {}
+        self._expired_destination: dict[UUID, float] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_stop = asyncio.Event()
@@ -265,6 +319,10 @@ class DirectoryJobManager:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+    @property
+    def generation(self) -> int:
+        return self._generation
 
     @property
     def retained_count(self) -> int:
@@ -281,17 +339,38 @@ class DirectoryJobManager:
         return tuple(task for task in self._tasks if not task.done())
 
     def start_background_cleanup(self) -> None:
-        if self._closed or (self._cleanup_task is not None and not self._cleanup_task.done()):
+        if self._cleanup_stop.is_set() or (
+            self._cleanup_task is not None and not self._cleanup_task.done()
+        ):
             return
         self._cleanup_task = asyncio.create_task(self._background_cleanup())
 
     async def handle(self, raw_action: object) -> BaseModel:
-        if self._closed:
-            raise ToolFailure("tool_device_unreachable", "Directory manager is closed")
+        action = parse_directory_action(raw_action)
         self.start_background_cleanup()
         self._purge_expired()
-        action = parse_directory_action(raw_action)
         return await self._dispatch(action)
+
+    def owns_operation(self, operation_id: UUID, role: JobRole) -> bool:
+        self._purge_expired()
+        key = (operation_id, role)
+        return key in self._active or key in self._retained or key in self._tombstones
+
+    def claims_source_transfer(self, transfer_uuid: UUID) -> bool:
+        self._purge_expired()
+        return (
+            transfer_uuid in self._source_authorizations
+            or transfer_uuid in self._consumed_source
+            or transfer_uuid in self._expired_source
+        )
+
+    def claims_destination_transfer(self, transfer_uuid: UUID) -> bool:
+        self._purge_expired()
+        return (
+            transfer_uuid in self._destination_authorizations
+            or transfer_uuid in self._consumed_destination
+            or transfer_uuid in self._expired_destination
+        )
 
     async def _dispatch(self, action: DirectoryWorkspaceAction) -> BaseModel:
         if isinstance(action, TransferSourceProbeStartAction):
@@ -350,7 +429,9 @@ class DirectoryJobManager:
         existing = self._existing_start((operation_id, "source"), request_digest)
         if existing is not None:
             return existing
-        self._ensure_start_capacity()
+        self._ensure_forward_work_available()
+        key: JobKey = (operation_id, "source")
+        self._ensure_start_capacity(key)
         record = _JobRecord(
             operation_id=operation_id,
             role="source",
@@ -359,7 +440,7 @@ class DirectoryJobManager:
             state="scanning",
             source_value=action.path,
         )
-        self._active[(operation_id, "source")] = record
+        self._active[key] = record
         self._spawn(record, self._run_source_scan(record))
         return DirectoryCommandResult(state="running", expected_digest=request_digest)
 
@@ -384,6 +465,9 @@ class DirectoryJobManager:
                 await self._terminalize(record, state="succeeded")
                 return
             record.manifest = scanned.manifest
+            record.entries_by_path = {
+                entry.relative_path: entry for entry in scanned.manifest.entries
+            }
             record.pages = scanned.pages
             record.expected_digest = scanned.manifest.manifest_sha256
             record.set_state("ready_retrieval")
@@ -479,11 +563,15 @@ class DirectoryJobManager:
             )
         self._validate_exact_digest(record, action.expected_digest)
         record.stop_forward_work.set()
+        cancelled_error = _stable_error("tool_execution_cancelled", "Directory probe was cancelled")
+        if self._source_child_consumed(record):
+            self._remember_deferred_error(record, cancelled_error)
+            return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
         if record.task is None or record.task.done():
             await self._terminalize(
                 record,
                 state="failed",
-                error=_stable_error("tool_execution_cancelled", "Directory probe was cancelled"),
+                error=cancelled_error,
             )
         return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
 
@@ -495,14 +583,7 @@ class DirectoryJobManager:
         )
         if record.state != "held" or record.manifest is None:
             raise ToolFailure("workspace_invalid_request", "Source manifest is not held")
-        expected = next(
-            (
-                item
-                for item in record.manifest.entries
-                if item.relative_path == action.relative_path
-            ),
-            None,
-        )
+        expected = record.entries_by_path.get(action.relative_path)
         if expected is None or expected.fingerprint != action.fingerprint:
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Source child authorization is invalid"
@@ -519,10 +600,15 @@ class DirectoryJobManager:
                     state="accepted", expected_digest=record.expected_digest
                 )
             raise ToolFailure("workspace_transfer_busy", "Another source child is authorized")
-        if authorization.transfer_uuid in self._source_authorizations:
+        if (
+            authorization.transfer_uuid in self._source_authorizations
+            or authorization.transfer_uuid in self._consumed_source
+            or authorization.transfer_uuid in self._expired_source
+        ):
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Transfer UUID is already authorized"
             )
+        self._ensure_forward_work_available()
         record.source_authorization = authorization
         self._source_authorizations[authorization.transfer_uuid] = (record, authorization)
         record.last_progress_at = time.monotonic()
@@ -531,6 +617,10 @@ class DirectoryJobManager:
     async def consume_source_authorization(
         self, transfer_uuid: UUID, source_path: Path
     ) -> SourceChildAuthorization:
+        if transfer_uuid in self._expired_source:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Source child authorization expired"
+            )
         found = self._source_authorizations.pop(transfer_uuid, None)
         if found is None:
             raise ToolFailure(
@@ -539,6 +629,7 @@ class DirectoryJobManager:
         record, authorization = found
         if authorization.expires_at <= time.monotonic():
             record.source_authorization = None
+            self._remember_expired_authorization(transfer_uuid, source=True)
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Source child authorization expired"
             )
@@ -546,6 +637,7 @@ class DirectoryJobManager:
         expected_path = record.source_path.joinpath(*authorization.relative_path.split("/"))
         if source_path != expected_path:
             record.source_authorization = None
+            self._remember_expired_authorization(transfer_uuid, source=True)
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Authorized source path does not match"
             )
@@ -579,8 +671,27 @@ class DirectoryJobManager:
         record, authorization = found
         if record.source_authorization == authorization:
             record.source_authorization = None
+        self._remember_expired_authorization(transfer_uuid, source=True)
         if success:
-            record.bump(files=1)
+            if authorization.relative_path not in record.completed_source_paths:
+                record.completed_source_paths.add(authorization.relative_path)
+                record.bump(files=1)
+            else:
+                record.bump()
+        else:
+            record.bump()
+        deferred_error = record.deferred_terminal_error
+        if (deferred_error is not None or self._closed) and self._active.get(
+            (record.operation_id, "source")
+        ) is record:
+            await self._terminalize(
+                record,
+                state="failed",
+                error=deferred_error
+                or _stable_error(
+                    "tool_execution_cancelled", "Directory source manager was retired"
+                ),
+            )
 
     async def _source_cleanup(self, action: TransferSourceCleanupAction) -> DirectoryCommandResult:
         record = self._require_active(
@@ -645,7 +756,9 @@ class DirectoryJobManager:
         existing = self._existing_start((operation_id, "destination"), request_digest)
         if existing is not None:
             return existing
-        self._ensure_start_capacity()
+        self._ensure_forward_work_available()
+        key: JobKey = (operation_id, "destination")
+        self._ensure_start_capacity(key)
         record = _JobRecord(
             operation_id=operation_id,
             role="destination",
@@ -654,8 +767,9 @@ class DirectoryJobManager:
             state="preflighting",
             destination_value=action.dst_path,
             manifest=action.manifest,
+            entries_by_path={entry.relative_path: entry for entry in action.manifest.entries},
         )
-        self._active[(operation_id, "destination")] = record
+        self._active[key] = record
         self._spawn(record, self._run_destination_preflight(record))
         return DirectoryCommandResult(state="running", expected_digest=request_digest)
 
@@ -722,7 +836,7 @@ class DirectoryJobManager:
             if isinstance(action, TransferDirectoryStatusAction):
                 self._observe_outer_progress(record, action.outer_progress_seq)
             return self._local_snapshot(record) if local else self._destination_snapshot(record)
-        terminal = self._terminal_snapshot(key, action.expected_digest)
+        terminal = self._terminal_snapshot(key, action.expected_digest, local=local)
         if local and isinstance(terminal, LocalDirectoryJobStatus):
             return terminal
         if not local and isinstance(terminal, DestinationDirectoryJobStatus):
@@ -739,6 +853,7 @@ class DirectoryJobManager:
             return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
         if record.state != "ready" or record.destination_path is None:
             raise ToolFailure("workspace_invalid_request", "Destination is not ready")
+        self._ensure_forward_work_available()
         record.set_state("preparing", phase="preparing")
         self._spawn(record, self._run_destination_prepare(record))
         return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
@@ -748,17 +863,21 @@ class DirectoryJobManager:
         try:
             lease = await self._admission.acquire(timeout_seconds=self._queue_timeout)
             _check_forward(record.stop_forward_work)
-            assert record.destination_path is not None
+            assert record.destination_path is not None and record.manifest is not None
             await self._enter_reservation(record, record.destination_path)
-            created = await asyncio.to_thread(
-                _claim_destination_root,
+            await asyncio.to_thread(
+                _claim_destination_tree,
+                record,
                 record.destination_path,
-                record.stop_forward_work,
-                record.bump,
+                record.manifest,
             )
-            record.created_directories.update(created)
-            record.root_claimed = True
             if record.stop_forward_work.is_set():
+                self._remember_cleanup_error(
+                    record,
+                    _stable_error(
+                        "tool_execution_cancelled", "Directory destination job was cancelled"
+                    ),
+                )
                 await self._run_destination_cleanup(record, lease_already_held=True)
                 return
             record.set_state("reserved")
@@ -769,10 +888,6 @@ class DirectoryJobManager:
                 error=_stable_error("workspace_transfer_busy", "Transfer capacity is busy"),
             )
         except (_ForwardWorkCancelledError, ToolFailure, PathLockBusyError, OSError) as exc:
-            if record.root_claimed or record.created_directories:
-                await self._run_destination_cleanup(record, lease_already_held=True)
-                return
-            await self._exit_reservation(record)
             error = (
                 _tool_error(exc)
                 if isinstance(exc, ToolFailure)
@@ -786,6 +901,13 @@ class DirectoryJobManager:
                     "workspace_storage_unavailable", "Destination could not be reserved"
                 )
             )
+            if isinstance(exc, _ForwardWorkCancelledError) and record.cleanup_terminal_error:
+                error = record.cleanup_terminal_error
+            if record.root_claimed or record.created_directories:
+                self._remember_cleanup_error(record, error)
+                await self._run_destination_cleanup(record, lease_already_held=True)
+                return
+            await self._exit_reservation(record)
             await self._terminalize(record, state="failed", error=error)
         finally:
             if lease is not None:
@@ -799,14 +921,15 @@ class DirectoryJobManager:
         )
         if record.state not in {"reserved", "copying"} or record.manifest is None:
             raise ToolFailure("workspace_invalid_request", "Destination is not reserved")
-        expected_paths = {item.relative_path for item in record.manifest.entries}
-        if action.relative_path not in expected_paths or action.relative_path in record.committed:
+        expected = record.entries_by_path.get(action.relative_path)
+        if expected is None or action.relative_path in record.committed:
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Destination child is not expected"
             )
         authorization = _Authorization(
             transfer_uuid=UUID(action.transfer_uuid),
             relative_path=action.relative_path,
+            expected_size=expected.size,
             expires_at=time.monotonic() + self._idle_timeout,
         )
         if record.destination_authorization is not None:
@@ -818,18 +941,24 @@ class DirectoryJobManager:
         if (
             authorization.transfer_uuid in self._destination_authorizations
             or authorization.transfer_uuid in self._consumed_destination
+            or authorization.transfer_uuid in self._expired_destination
         ):
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Transfer UUID is already authorized"
             )
+        self._ensure_forward_work_available()
         record.destination_authorization = authorization
         self._destination_authorizations[authorization.transfer_uuid] = (record, authorization)
         record.set_state("copying")
         return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
 
     async def consume_destination_authorization(
-        self, transfer_uuid: UUID, destination_path: Path
+        self, transfer_uuid: UUID
     ) -> DestinationChildAuthorization:
+        if transfer_uuid in self._expired_destination:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Destination child authorization expired"
+            )
         found = self._destination_authorizations.pop(transfer_uuid, None)
         if found is None:
             raise ToolFailure(
@@ -838,23 +967,78 @@ class DirectoryJobManager:
         record, authorization = found
         if authorization.expires_at <= time.monotonic():
             record.destination_authorization = None
+            self._remember_expired_authorization(transfer_uuid, source=False)
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Destination child authorization expired"
             )
         assert record.destination_path is not None
-        expected_path = record.destination_path.joinpath(*authorization.relative_path.split("/"))
-        if destination_path != expected_path:
-            record.destination_authorization = None
-            raise ToolFailure(
-                "workspace_transfer_integrity_failed", "Authorized destination path does not match"
-            )
+        assert authorization.expected_size is not None
+        destination_path = record.destination_path.joinpath(*authorization.relative_path.split("/"))
         self._consumed_destination[transfer_uuid] = (record, authorization)
         return DestinationChildAuthorization(
             directory_operation_id=record.operation_id,
             transfer_uuid=transfer_uuid,
             destination_path=destination_path,
             relative_path=authorization.relative_path,
+            expected_size=authorization.expected_size,
         )
+
+    def validate_destination_child_parent(self, transfer_uuid: UUID) -> None:
+        found = self._consumed_destination.get(transfer_uuid)
+        if found is None:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Destination child is not in flight"
+            )
+        record, authorization = found
+        if record.destination_path is None:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Destination child path is unavailable"
+            )
+        destination = record.destination_path.joinpath(*authorization.relative_path.split("/"))
+        parents = (
+            record.destination_path,
+            *_derived_parents(record.destination_path, destination),
+        )
+        for parent in parents:
+            expected_identity = record.created_directories.get(parent)
+            if not expected_identity:
+                raise ToolFailure("workspace_file_changed", "Destination parent changed")
+            try:
+                current_identity = _directory_identity(parent)
+            except (OSError, ToolFailure) as exc:
+                raise ToolFailure("workspace_file_changed", "Destination parent changed") from exc
+            if current_identity != expected_identity:
+                raise ToolFailure("workspace_file_changed", "Destination parent changed")
+
+    async def report_destination_child_progress(
+        self, transfer_uuid: UUID, *, byte_count: int = 0
+    ) -> None:
+        found = self._consumed_destination.get(transfer_uuid)
+        if found is None or byte_count < 0:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Destination child is not in flight"
+            )
+        record, _ = found
+        record.active_destination_bytes += byte_count
+        record.bump(byte_count=byte_count)
+
+    async def complete_destination_authorization(
+        self, transfer_uuid: UUID, *, success: bool
+    ) -> None:
+        if success:
+            raise ValueError("Successful destination children require commit metadata")
+        found = self._consumed_destination.pop(transfer_uuid, None)
+        if found is None:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Destination child is not in flight"
+            )
+        record, authorization = found
+        if record.destination_authorization == authorization:
+            record.destination_authorization = None
+        self._remember_expired_authorization(transfer_uuid, source=False)
+        record.active_destination_bytes = 0
+        record.bump()
+        await self._resume_destination_after_child(record)
 
     async def record_destination_commit(
         self,
@@ -872,34 +1056,65 @@ class DirectoryJobManager:
                 "workspace_transfer_integrity_failed", "Destination commit is not authorized"
             )
         record, authorization = found
+        try:
+            if (
+                record.operation_id != directory_operation_id
+                or authorization.relative_path != relative_path
+            ):
+                raise ToolFailure(
+                    "workspace_transfer_integrity_failed",
+                    "Destination commit does not match authorization",
+                )
+            assert record.manifest is not None and record.destination_path is not None
+            expected = record.entries_by_path.get(relative_path)
+            if expected is None:
+                raise ToolFailure(
+                    "workspace_transfer_integrity_failed",
+                    "Destination commit does not match manifest",
+                )
+            if verified_size != expected.size or not _is_sha256(verified_sha256):
+                raise ToolFailure(
+                    "workspace_transfer_integrity_failed", "Destination commit metadata is invalid"
+                )
+            if record.active_destination_bytes > verified_size:
+                raise ToolFailure(
+                    "workspace_transfer_integrity_failed",
+                    "Destination progress exceeds commit size",
+                )
+        except BaseException:
+            if record.destination_authorization == authorization:
+                record.destination_authorization = None
+            record.active_destination_bytes = 0
+            self._remember_expired_authorization(transfer_uuid, source=False)
+            raise
         record.destination_authorization = None
-        if (
-            record.operation_id != directory_operation_id
-            or authorization.relative_path != relative_path
-        ):
-            raise ToolFailure(
-                "workspace_transfer_integrity_failed",
-                "Destination commit does not match authorization",
-            )
-        assert record.manifest is not None and record.destination_path is not None
-        expected = next(
-            item for item in record.manifest.entries if item.relative_path == relative_path
-        )
-        if verified_size != expected.size or not _is_sha256(verified_sha256):
-            raise ToolFailure(
-                "workspace_transfer_integrity_failed", "Destination commit metadata is invalid"
-            )
-        destination = record.destination_path.joinpath(*relative_path.split("/"))
-        for parent in _derived_parents(record.destination_path, destination):
-            if parent.is_dir():
-                record.created_directories.setdefault(parent, _directory_identity(parent))
         record.committed[relative_path] = _CommittedDestination(
             relative_path=relative_path,
             destination_fingerprint=destination_fingerprint,
             verified_size=verified_size,
             verified_sha256=verified_sha256,
         )
-        record.bump(files=1, byte_count=verified_size, phase="copying")
+        remaining_bytes = verified_size - record.active_destination_bytes
+        record.active_destination_bytes = 0
+        self._remember_expired_authorization(transfer_uuid, source=False)
+        record.bump(files=1, byte_count=remaining_bytes, phase="copying")
+        await self._resume_destination_after_child(record)
+
+    async def _resume_destination_after_child(self, record: _JobRecord) -> None:
+        if self._active.get((record.operation_id, "destination")) is not record:
+            return
+        error = record.cleanup_terminal_error
+        if error is None and not self._closed:
+            return
+        if record.root_claimed or record.created_directories or record.committed:
+            if record.task is None or record.task.done():
+                self._spawn(record, self._run_destination_cleanup(record))
+            return
+        await self._terminalize(
+            record,
+            state="failed",
+            error=error or _stable_error("tool_execution_cancelled", "Directory manager closed"),
+        )
 
     async def _destination_finish(
         self, action: TransferDirectoryFinishAction
@@ -909,6 +1124,7 @@ class DirectoryJobManager:
         )
         if record.state in {"finalizing", "finalized_held"}:
             return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
+        self._ensure_forward_work_available()
         if record.state not in {"reserved", "copying"} or record.manifest is None:
             raise ToolFailure("workspace_invalid_request", "Destination is not ready to finalize")
         if record.destination_authorization is not None:
@@ -938,15 +1154,30 @@ class DirectoryJobManager:
             record.terminal_result = _aggregate_result(record.committed.values())
             record.set_state("finalized_held")
         except TimeoutError:
-            await self._terminalize(
+            self._remember_cleanup_error(
                 record,
-                state="outcome_unknown",
-                error=_stable_error(
-                    "tool_execution_outcome_unknown", "Destination finalize capacity timed out"
+                _stable_error(
+                    "workspace_transfer_timeout", "Destination finalize capacity timed out"
                 ),
             )
-            await self._exit_reservation(record)
-        except (_ForwardWorkCancelledError, ToolFailure, OSError):
+            await self._run_destination_cleanup(record)
+        except (_ForwardWorkCancelledError, ToolFailure, OSError) as exc:
+            if isinstance(exc, ToolFailure):
+                self._remember_cleanup_error(record, _tool_error(exc))
+            elif isinstance(exc, OSError):
+                self._remember_cleanup_error(
+                    record,
+                    _stable_error(
+                        "workspace_storage_unavailable", "Destination verification failed"
+                    ),
+                )
+            else:
+                self._remember_cleanup_error(
+                    record,
+                    _stable_error(
+                        "tool_execution_cancelled", "Directory destination job was cancelled"
+                    ),
+                )
             record.stop_forward_work.set()
             await self._run_destination_cleanup(record, lease_already_held=True)
         finally:
@@ -967,7 +1198,23 @@ class DirectoryJobManager:
                 state="accepted", expected_digest=terminal.expected_digest
             )
         self._validate_exact_digest(record, expected_digest)
+        if record.state == "finalized_held":
+            return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
         record.stop_forward_work.set()
+        cancelled_error = _stable_error(
+            "tool_execution_cancelled", "Directory destination job was cancelled"
+        )
+        self._remember_cleanup_error(record, cancelled_error)
+        if self._destination_child_consumed(record):
+            return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
+        if local and record.local_mode is None and record.state == "ready":
+            await self._terminalize(
+                record,
+                state="failed",
+                error=cancelled_error,
+                local=True,
+            )
+            return DirectoryCommandResult(state="accepted", expected_digest=record.expected_digest)
         if local:
             record.set_state("cancelling", phase="cleanup")
         elif record.state not in {"preflighting", "preparing", "finalizing", "cleaning"}:
@@ -977,9 +1224,7 @@ class DirectoryJobManager:
                 await self._terminalize(
                     record,
                     state="failed",
-                    error=_stable_error(
-                        "tool_execution_cancelled", "Directory destination job was cancelled"
-                    ),
+                    error=cancelled_error,
                 )
                 return DirectoryCommandResult(
                     state="accepted", expected_digest=record.expected_digest
@@ -1002,7 +1247,7 @@ class DirectoryJobManager:
                 record.stop_cleanup,
             )
             await self._exit_reservation(record)
-            error = _stable_error(
+            error = record.cleanup_terminal_error or _stable_error(
                 "tool_execution_cancelled", "Directory destination job was cancelled"
             )
             await self._terminalize(
@@ -1049,6 +1294,7 @@ class DirectoryJobManager:
             raise ToolFailure(
                 "workspace_transfer_integrity_failed", "Local directory start parameters changed"
             )
+        self._ensure_forward_work_available()
         if (
             record.state != "ready"
             or record.manifest is None
@@ -1140,7 +1386,7 @@ class DirectoryJobManager:
 
     async def _cleanup_local_after_error(self, record: _JobRecord) -> bool:
         complete = True
-        if record.root_claimed or record.committed:
+        if record.root_claimed or record.created_directories or record.committed:
             record.set_state("cancelling", phase="cleanup")
             try:
                 complete = await asyncio.to_thread(
@@ -1258,17 +1504,38 @@ class DirectoryJobManager:
             raise ToolFailure("workspace_invalid_request", "Directory job was already released")
         return None
 
-    def _ensure_start_capacity(self) -> None:
+    def _ensure_start_capacity(self, key: JobKey) -> None:
         if len(self._active) >= MAX_ACTIVE_DIRECTORY_JOBS:
             raise ToolFailure("workspace_transfer_busy", "Directory job capacity is busy")
-        if self.lifecycle_count >= self._lifecycle_capacity:
+        self._purge_expired()
+        if not self._lifecycle_credits.try_acquire(self._credit_owner, key):
             raise ToolFailure("workspace_transfer_busy", "Directory lifecycle capacity is full")
+        self._credited_keys.add(key)
+        self._lifecycle_changed.set()
+
+    def _ensure_forward_work_available(self) -> None:
+        if self._closed:
+            raise ToolFailure("tool_device_unreachable", "Directory manager is retired")
+
+    def _release_lifecycle_credit(self, key: JobKey) -> None:
+        if key not in self._credited_keys:
+            return
+        self._credited_keys.remove(key)
+        self._lifecycle_credits.release(self._credit_owner, key)
+        self._lifecycle_changed.set()
 
     def _require_active(
         self, operation_id: UUID, role: JobRole, expected_digest: str
     ) -> _JobRecord:
         record = self._active.get((operation_id, role))
         if record is None:
+            if self._closed:
+                key = (operation_id, role)
+                lifecycle = self._retained.get(key) or self._tombstones.get(key)
+                if lifecycle is not None:
+                    if expected_digest != lifecycle.expected_digest:
+                        self._integrity_error()
+                    raise ToolFailure("tool_device_unreachable", "Directory manager is retired")
             raise ToolFailure("workspace_not_found", "Directory job was not found")
         self._validate_exact_digest(record, expected_digest)
         return record
@@ -1293,6 +1560,32 @@ class DirectoryJobManager:
     def _integrity_error() -> None:
         raise ToolFailure(
             "workspace_transfer_integrity_failed", "Directory job digest does not match"
+        )
+
+    @staticmethod
+    def _remember_cleanup_error(
+        record: _JobRecord,
+        error: DirectoryStableError,
+    ) -> None:
+        if record.cleanup_terminal_error is None:
+            record.cleanup_terminal_error = error
+
+    @staticmethod
+    def _remember_deferred_error(
+        record: _JobRecord,
+        error: DirectoryStableError,
+    ) -> None:
+        if record.deferred_terminal_error is None:
+            record.deferred_terminal_error = error
+
+    def _source_child_consumed(self, record: _JobRecord) -> bool:
+        authorization = record.source_authorization
+        return authorization is not None and authorization.transfer_uuid in self._consumed_source
+
+    def _destination_child_consumed(self, record: _JobRecord) -> bool:
+        authorization = record.destination_authorization
+        return (
+            authorization is not None and authorization.transfer_uuid in self._consumed_destination
         )
 
     def _observe_outer_progress(self, record: _JobRecord, value: int | None) -> None:
@@ -1333,7 +1626,11 @@ class DirectoryJobManager:
 
     def _local_snapshot(self, record: _JobRecord) -> LocalDirectoryJobStatus:
         with record.sync_lock:
-            state = "ready_not_started" if record.local_mode is None else record.state
+            state = (
+                "ready_not_started"
+                if record.local_mode is None and record.state == "ready"
+                else record.state
+            )
             return LocalDirectoryJobStatus(
                 state=cast(Any, state),
                 phase=cast(Any, record.phase),
@@ -1380,41 +1677,68 @@ class DirectoryJobManager:
             expires_at=time.monotonic() + self._terminal_ttl,
         )
 
+    def _retain_ready_destination(self, record: _JobRecord) -> None:
+        key: JobKey = (record.operation_id, "destination")
+        destination_snapshot = self._destination_snapshot(record)
+        local_snapshot = self._local_snapshot(record)
+        self._remove_active_record(record)
+        self._retained[key] = _TerminalRecord(
+            request_digest=record.request_digest,
+            expected_digest=record.expected_digest,
+            snapshot=destination_snapshot,
+            expires_at=time.monotonic() + self._terminal_ttl,
+            local_snapshot=local_snapshot,
+        )
+
     def _remove_active_record(self, record: _JobRecord) -> None:
         self._active.pop((record.operation_id, record.role), None)
         if record.source_authorization is not None:
             self._source_authorizations.pop(record.source_authorization.transfer_uuid, None)
             self._consumed_source.pop(record.source_authorization.transfer_uuid, None)
+            self._remember_expired_authorization(
+                record.source_authorization.transfer_uuid, source=True
+            )
         if record.destination_authorization is not None:
             self._destination_authorizations.pop(
                 record.destination_authorization.transfer_uuid, None
             )
             self._consumed_destination.pop(record.destination_authorization.transfer_uuid, None)
-        for authorization_map in (
-            self._source_authorizations,
-            self._consumed_source,
-            self._destination_authorizations,
-            self._consumed_destination,
+            self._remember_expired_authorization(
+                record.destination_authorization.transfer_uuid, source=False
+            )
+        for authorization_map, source in (
+            (self._source_authorizations, True),
+            (self._consumed_source, True),
+            (self._destination_authorizations, False),
+            (self._consumed_destination, False),
         ):
             for transfer_uuid, (owner, _) in tuple(authorization_map.items()):
                 if owner is record:
                     authorization_map.pop(transfer_uuid, None)
+                    self._remember_expired_authorization(transfer_uuid, source=source)
         record.manifest = None
+        record.entries_by_path.clear()
         record.pages = ()
         record.committed.clear()
         record.created_directories.clear()
 
     def _terminal_snapshot(
-        self, key: JobKey, expected_digest: str
+        self, key: JobKey, expected_digest: str, *, local: bool = False
     ) -> SourceDirectoryJobStatus | DestinationDirectoryJobStatus | LocalDirectoryJobStatus | None:
         terminal = self._retained.get(key)
         if terminal is not None:
             self._validate_terminal_digest(terminal, expected_digest)
-            return terminal.snapshot
+            return (
+                terminal.local_snapshot if local and terminal.local_snapshot else terminal.snapshot
+            )
         tombstone = self._tombstones.get(key)
         if tombstone is not None:
             self._validate_tombstone_digest(tombstone, expected_digest)
-            return tombstone.snapshot
+            return (
+                tombstone.local_snapshot
+                if local and tombstone.local_snapshot
+                else tombstone.snapshot
+            )
         return None
 
     def _spawn(self, record: _JobRecord, coroutine: Any) -> None:
@@ -1457,6 +1781,9 @@ class DirectoryJobManager:
                 authorizations.pop(transfer_uuid, None)
                 if getattr(record, attribute) == authorization:
                     setattr(record, attribute, None)
+                self._remember_expired_authorization(
+                    transfer_uuid, source=attribute == "source_authorization"
+                )
 
     async def _expire_idle_jobs(self) -> None:
         now = time.monotonic()
@@ -1465,13 +1792,14 @@ class DirectoryJobManager:
                 continue
             if record.role == "source":
                 if record.state in {"ready_retrieval", "held"}:
-                    await self._terminalize(
-                        record,
-                        state="failed",
-                        error=_stable_error(
-                            "workspace_transfer_timeout", "Directory source job expired"
-                        ),
+                    error = _stable_error(
+                        "workspace_transfer_timeout", "Directory source job expired"
                     )
+                    record.stop_forward_work.set()
+                    if self._source_child_consumed(record):
+                        self._remember_deferred_error(record, error)
+                    else:
+                        await self._terminalize(record, state="failed", error=error)
                 elif record.state == "scanning":
                     record.stop_forward_work.set()
                 elif record.state == "source_cleanup":
@@ -1498,10 +1826,25 @@ class DirectoryJobManager:
                     expires_at=now + TOMBSTONE_TTL_SECONDS,
                 )
             elif record.state in {"reserved", "copying"}:
+                self._remember_cleanup_error(
+                    record,
+                    _stable_error(
+                        "workspace_transfer_timeout", "Directory destination job expired"
+                    ),
+                )
                 record.stop_forward_work.set()
-                if record.task is None or record.task.done():
+                if not self._destination_child_consumed(record) and (
+                    record.task is None or record.task.done()
+                ):
                     self._spawn(record, self._run_destination_cleanup(record))
             elif record.state in {"preflighting", "preparing", "finalizing", "running"}:
+                if record.state in {"preparing", "finalizing"}:
+                    self._remember_cleanup_error(
+                        record,
+                        _stable_error(
+                            "workspace_transfer_timeout", "Directory destination job expired"
+                        ),
+                    )
                 record.stop_forward_work.set()
             elif record.state in {"cleaning", "cancelling"}:
                 record.stop_cleanup.set()
@@ -1518,18 +1861,57 @@ class DirectoryJobManager:
                 snapshot=terminal.snapshot,
                 released=False,
                 expires_at=now + TOMBSTONE_TTL_SECONDS,
+                local_snapshot=terminal.local_snapshot,
             )
         for key, tombstone in tuple(self._tombstones.items()):
             if tombstone.expires_at <= now:
                 self._tombstones.pop(key, None)
+                self._release_lifecycle_credit(key)
 
-    async def request_close(self) -> None:
-        if self._closed:
-            return
+        for authorizations in (self._expired_source, self._expired_destination):
+            for transfer_uuid, expires_at in tuple(authorizations.items()):
+                if expires_at <= now:
+                    authorizations.pop(transfer_uuid, None)
+
+    def _remember_expired_authorization(self, transfer_uuid: UUID, *, source: bool) -> None:
+        authorizations = self._expired_source if source else self._expired_destination
+        if len(authorizations) >= self._lifecycle_capacity:
+            authorizations.pop(next(iter(authorizations)))
+        authorizations[transfer_uuid] = time.monotonic() + TOMBSTONE_TTL_SECONDS
+
+    async def request_close(
+        self,
+        *,
+        preserve_finalized: bool = False,
+        final: bool = True,
+    ) -> None:
         self._closed = True
-        self._cleanup_stop.set()
+        if final:
+            self._cleanup_stop.set()
         for record in tuple(self._active.values()):
             record.stop_forward_work.set()
+            self._expire_record_unconsumed_authorizations(record)
+            if self._record_has_consumed_child(record):
+                continue
+            if (
+                not final
+                and record.role == "destination"
+                and record.state == "ready"
+                and record.local_mode is None
+            ):
+                await self._exit_reservation(record)
+                self._retain_ready_destination(record)
+                continue
+            if record.state == "finalized_held":
+                await self._exit_reservation(record)
+                continue
+            if record.role == "destination":
+                self._remember_cleanup_error(
+                    record,
+                    _stable_error(
+                        "tool_execution_cancelled", "Directory destination job was cancelled"
+                    ),
+                )
             if record.root_claimed:
                 record.stop_cleanup.clear()
                 if record.task is None or record.task.done():
@@ -1543,21 +1925,97 @@ class DirectoryJobManager:
                     local=record.local_mode is not None,
                 )
 
+    def _expire_record_unconsumed_authorizations(self, record: _JobRecord) -> None:
+        for authorizations, attribute, source in (
+            (self._source_authorizations, "source_authorization", True),
+            (self._destination_authorizations, "destination_authorization", False),
+        ):
+            authorization = getattr(record, attribute)
+            if authorization is None or authorization.transfer_uuid not in authorizations:
+                continue
+            authorizations.pop(authorization.transfer_uuid, None)
+            setattr(record, attribute, None)
+            self._remember_expired_authorization(authorization.transfer_uuid, source=source)
+
+    def _record_has_consumed_child(self, record: _JobRecord) -> bool:
+        return any(
+            owner is record
+            for authorizations in (self._consumed_source, self._consumed_destination)
+            for owner, _ in authorizations.values()
+        )
+
     async def wait_for_drain(self, *, timeout_seconds: float | None) -> bool:
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("drain timeout must be non-negative")
-        pending = {task for task in self._tasks if not task.done()}
-        if not pending:
-            return True
-        _, unfinished = await asyncio.wait(pending, timeout=timeout_seconds)
-        return not unfinished
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
+        while True:
+            pending = {task for task in self._tasks if not task.done()}
+            if not pending and not self._consumed_source and not self._consumed_destination:
+                return True
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            if remaining == 0:
+                return False
+            wait_slice = 0.01 if remaining is None else min(0.01, remaining)
+            if pending:
+                await asyncio.wait(pending, timeout=wait_slice)
+            else:
+                await asyncio.sleep(wait_slice)
 
-    async def aclose(self, *, grace_seconds: float = 0.1) -> bool:
-        await self.request_close()
+    async def wait_for_lifecycle_empty(self, *, timeout_seconds: float | None) -> bool:
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("lifecycle timeout must be non-negative")
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
+        while True:
+            self._purge_expired()
+            if self.lifecycle_count == 0:
+                return True
+            self._lifecycle_changed.clear()
+            self._purge_expired()
+            if self.lifecycle_count == 0:
+                return True
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            if remaining == 0:
+                return False
+            try:
+                await asyncio.wait_for(self._lifecycle_changed.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
+
+    def discard_lifecycle(self) -> None:
+        if (
+            any(not task.done() for task in self._tasks)
+            or self._consumed_source
+            or self._consumed_destination
+        ):
+            raise RuntimeError("directory manager still has in-flight work")
+        for key in tuple(self._credited_keys):
+            self._release_lifecycle_credit(key)
+        self._active.clear()
+        self._retained.clear()
+        self._tombstones.clear()
+        self._source_authorizations.clear()
+        self._destination_authorizations.clear()
+        self._expired_source.clear()
+        self._expired_destination.clear()
+
+    async def aclose(
+        self,
+        *,
+        grace_seconds: float = 0.1,
+        preserve_finalized: bool = False,
+        final: bool = True,
+    ) -> bool:
+        await self.request_close(preserve_finalized=preserve_finalized, final=final)
         quiescent = await self.wait_for_drain(timeout_seconds=grace_seconds)
         if quiescent:
             for record in tuple(self._active.values()):
+                if record.state == "finalized_held" and preserve_finalized:
+                    continue
                 await self._exit_reservation(record)
+        if final and self._cleanup_task is not None:
+            await self._cleanup_task
         return quiescent
 
 
@@ -1570,6 +2028,7 @@ def _same_authorization(first: _Authorization, second: _Authorization) -> bool:
         first.transfer_uuid == second.transfer_uuid
         and first.relative_path == second.relative_path
         and first.fingerprint == second.fingerprint
+        and first.expected_size == second.expected_size
     )
 
 
@@ -1878,12 +2337,8 @@ def _reject_overlap(source: Path, destination: Path, platform: DestinationPlatfo
         raise ToolFailure("workspace_invalid_request", "Directory source and destination overlap")
 
 
-def _claim_destination_root(
-    destination: Path,
-    stop: threading.Event,
-    progress: Callable[..., None],
-) -> dict[Path, str]:
-    _check_forward(stop)
+def _claim_destination_root(record: _JobRecord, destination: Path) -> None:
+    _check_forward(record.stop_forward_work)
     if _lstat_optional(destination) is not None:
         raise ToolFailure("workspace_file_changed", "Destination root already exists")
     missing: list[Path] = []
@@ -1894,23 +2349,51 @@ def _claim_destination_root(
     current_info = current.stat(follow_symlinks=False)
     if _is_link_or_reparse(current_info) or not stat.S_ISDIR(current_info.st_mode):
         raise ToolFailure("workspace_symlink_escape", "Destination ancestor is not a directory")
-    created: dict[Path, str] = {}
     for parent in reversed(missing):
-        _check_forward(stop)
+        _check_forward(record.stop_forward_work)
         try:
             parent.mkdir()
         except FileExistsError as exc:
             raise ToolFailure("workspace_file_changed", "Destination ancestor changed") from exc
-        created[parent] = _directory_identity(parent)
-        progress(phase="preparing")
-    _check_forward(stop)
+        record.created_directories[parent] = ""
+        record.created_directories[parent] = _directory_identity(parent)
+        record.bump(phase="preparing")
+    _check_forward(record.stop_forward_work)
     try:
         destination.mkdir()
     except FileExistsError as exc:
         raise ToolFailure("workspace_file_changed", "Destination root already exists") from exc
-    created[destination] = _directory_identity(destination)
-    progress(phase="preparing")
-    return created
+    record.root_claimed = True
+    record.created_directories[destination] = ""
+    record.created_directories[destination] = _directory_identity(destination)
+    record.bump(phase="preparing")
+
+
+def _claim_destination_tree(
+    record: _JobRecord,
+    destination: Path,
+    manifest: DirectoryManifest,
+) -> None:
+    _claim_destination_root(record, destination)
+    relative_directories = {
+        "/".join(parts[:end])
+        for entry in manifest.entries
+        for parts in (entry.relative_path.split("/"),)
+        for end in range(1, len(parts))
+    }
+    for relative_path in sorted(
+        relative_directories,
+        key=lambda value: (len(value.split("/")), value.encode("utf-8")),
+    ):
+        _check_forward(record.stop_forward_work)
+        path = destination.joinpath(*relative_path.split("/"))
+        try:
+            path.mkdir()
+        except FileExistsError as exc:
+            raise ToolFailure("workspace_file_changed", "Destination parent changed") from exc
+        record.created_directories[path] = ""
+        record.created_directories[path] = _directory_identity(path)
+        record.bump(phase="preparing")
 
 
 def _derived_parents(root: Path, child: Path) -> tuple[Path, ...]:
@@ -2029,9 +2512,7 @@ def _execute_local_copy(
 ) -> WorkspaceTransferDirectoryResult:
     scanned = _scan_directory(source, record.stop_forward_work, record.bump, hash_contents=False)
     _require_matching_manifest(scanned.manifest, expected_manifest)
-    created = _claim_destination_root(destination, record.stop_forward_work, record.bump)
-    record.created_directories.update(created)
-    record.root_claimed = True
+    _claim_destination_root(record, destination)
     for entry in expected_manifest.entries:
         _check_forward(record.stop_forward_work)
         source_file = source.joinpath(*entry.relative_path.split("/"))
@@ -2068,6 +2549,7 @@ def _create_owned_directory(record: _JobRecord, path: Path) -> None:
         path.mkdir()
     except FileExistsError as exc:
         raise ToolFailure("workspace_file_changed", "Destination parent changed") from exc
+    record.created_directories[path] = ""
     record.created_directories[path] = _directory_identity(path)
     record.bump(phase="copying")
 
@@ -2187,12 +2669,12 @@ def _execute_local_move(
     record.bump(phase="revalidating")
     second = _scan_directory(source, record.stop_forward_work, record.bump, hash_contents=False)
     _require_matching_manifest(second.manifest, expected_manifest)
-    created = _prepare_destination_parents(destination, record.stop_forward_work, record.bump)
-    record.created_directories.update(created)
+    _prepare_destination_parents(record, destination)
     _check_forward(record.stop_forward_work)
     record.bump(phase="renaming")
     _rename_directory_no_replace(source, destination)
     record.root_claimed = True
+    record.created_directories[destination] = ""
     record.created_directories[destination] = _directory_identity(destination)
     entries = tuple(
         _CommittedDestination(
@@ -2206,12 +2688,8 @@ def _execute_local_move(
     return _aggregate_result(entries)
 
 
-def _prepare_destination_parents(
-    destination: Path,
-    stop: threading.Event,
-    progress: Callable[..., None],
-) -> dict[Path, str]:
-    _check_forward(stop)
+def _prepare_destination_parents(record: _JobRecord, destination: Path) -> None:
+    _check_forward(record.stop_forward_work)
     if _lstat_optional(destination) is not None:
         raise ToolFailure("workspace_file_changed", "Destination root already exists")
     missing: list[Path] = []
@@ -2222,13 +2700,12 @@ def _prepare_destination_parents(
     info = current.stat(follow_symlinks=False)
     if _is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
         raise ToolFailure("workspace_symlink_escape", "Destination ancestor is invalid")
-    created: dict[Path, str] = {}
     for parent in reversed(missing):
-        _check_forward(stop)
+        _check_forward(record.stop_forward_work)
         parent.mkdir()
-        created[parent] = _directory_identity(parent)
-        progress(phase="preparing")
-    return created
+        record.created_directories[parent] = ""
+        record.created_directories[parent] = _directory_identity(parent)
+        record.bump(phase="preparing")
 
 
 def _rename_directory_no_replace(source: Path, destination: Path) -> None:
@@ -2353,7 +2830,7 @@ def _cleanup_destination(record: _JobRecord, stop: threading.Event) -> bool:
                 continue
             path.rmdir()
             record.bump(phase="cleanup")
-        except OSError:
+        except (OSError, ToolFailure):
             complete = False
     if record.root_claimed and _lstat_optional(record.destination_path) is not None:
         complete = False
@@ -2432,9 +2909,20 @@ def _lstat_optional(path: Path) -> os.stat_result | None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
-    descriptor = os.open(path, flags)
     try:
-        os.fsync(descriptor)
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
     finally:
         os.close(descriptor)

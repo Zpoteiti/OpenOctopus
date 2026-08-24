@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import os
 import secrets
 import stat
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from openoctopus_client.protocol import (
@@ -26,7 +27,7 @@ from openoctopus_client.protocol import (
 )
 from openoctopus_client.tools.common import ToolFailure
 from openoctopus_client.tools.fingerprints import opaque_stat_fingerprint
-from openoctopus_client.tools.locks import PathLocks
+from openoctopus_client.tools.locks import PathLockBusyError, PathLocks
 from openoctopus_client.tools.paths import WorkspacePaths
 from openoctopus_client.transfer_admission import (
     LOCAL_TRANSFER_CAPACITY,
@@ -67,6 +68,62 @@ class TransferOperationError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class _SourceChildAuthorization(Protocol):
+    directory_operation_id: UUID
+    relative_path: str
+    fingerprint: str
+
+
+class _DestinationChildAuthorization(Protocol):
+    directory_operation_id: UUID
+    relative_path: str
+    destination_path: Path
+    expected_size: int
+
+
+class DirectoryTransferHooks(Protocol):
+    def claims_source_transfer(self, transfer_uuid: UUID) -> bool: ...
+
+    def claims_destination_transfer(self, transfer_uuid: UUID) -> bool: ...
+
+    async def consume_source_authorization(
+        self, transfer_uuid: UUID, source_path: Path
+    ) -> _SourceChildAuthorization: ...
+
+    async def report_source_child_progress(
+        self, transfer_uuid: UUID, *, byte_count: int = 0
+    ) -> None: ...
+
+    async def complete_source_authorization(
+        self, transfer_uuid: UUID, *, success: bool
+    ) -> None: ...
+
+    async def consume_destination_authorization(
+        self, transfer_uuid: UUID
+    ) -> _DestinationChildAuthorization: ...
+
+    def validate_destination_child_parent(self, transfer_uuid: UUID) -> None: ...
+
+    async def report_destination_child_progress(
+        self, transfer_uuid: UUID, *, byte_count: int = 0
+    ) -> None: ...
+
+    async def complete_destination_authorization(
+        self, transfer_uuid: UUID, *, success: bool
+    ) -> None: ...
+
+    async def record_destination_commit(
+        self,
+        directory_operation_id: UUID,
+        transfer_uuid: UUID,
+        *,
+        relative_path: str,
+        destination_fingerprint: str,
+        verified_size: int,
+        verified_sha256: str,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -161,6 +218,11 @@ class _Slot:
     lease: LocalTransferLease | None = None
     abandoned_drains: set[asyncio.Task[None]] = field(default_factory=set)
     cleanup_task: asyncio.Task[None] | None = None
+    directory_manager: DirectoryTransferHooks | None = None
+    directory_source: _SourceChildAuthorization | None = None
+    directory_destination: _DestinationChildAuthorization | None = None
+    directory_success: bool = False
+    directory_completion_reported: bool = False
 
 
 class TransferManager:
@@ -182,6 +244,7 @@ class TransferManager:
         path_locks: PathLocks | None = None,
         admission: LocalTransferAdmission | None = None,
         drain_registry: LocalTransferDrainRegistry | None = None,
+        directory_managers: Callable[[], Iterable[DirectoryTransferHooks]] | None = None,
         idle_timeout_seconds: float = TRANSFER_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         if isinstance(workspace, TransferConfigSnapshot):
@@ -196,10 +259,9 @@ class TransferManager:
         self._snapshot = snapshot
         self._writer = writer
         self._locks = path_locks or PathLocks()
-        self._admission = admission or LocalTransferAdmission(
-            capacity=MAX_ACTIVE_TRANSFER_SLOTS
-        )
+        self._admission = admission or LocalTransferAdmission(capacity=MAX_ACTIVE_TRANSFER_SLOTS)
         self._drains = drain_registry or LocalTransferDrainRegistry()
+        self._directory_managers = directory_managers or (lambda: ())
         self._idle_timeout = max(0.1, idle_timeout_seconds)
         self._slots: dict[UUID, _Slot] = {}
         self._tasks: set[asyncio.Task[None]] = set()
@@ -295,8 +357,7 @@ class TransferManager:
                 and tombstone.receiver_ready
                 and chunk
                 and tombstone.declared_bytes is not None
-                and tombstone.binary_bytes_seen + len(chunk)
-                <= tombstone.declared_bytes
+                and tombstone.binary_bytes_seen + len(chunk) <= tombstone.declared_bytes
             ):
                 self._tombstones[slot_id] = replace(
                     tombstone,
@@ -380,9 +441,7 @@ class TransferManager:
         if self._tasks:
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
         if self._blocking_tasks:
-            await asyncio.wait(
-                tuple(self._blocking_tasks), timeout=_TO_THREAD_CANCEL_GRACE_SECONDS
-            )
+            await asyncio.wait(tuple(self._blocking_tasks), timeout=_TO_THREAD_CANCEL_GRACE_SECONDS)
         for slot in list(self._slots.values()):
             await self._cleanup_slot(slot)
         if overflow is not None:
@@ -396,6 +455,9 @@ class TransferManager:
         request: TransferRequest,
         snapshot: TransferConfigSnapshot,
     ) -> None:
+        directory_manager = self._claim_directory_manager(request.id, source=True)
+        if self._reject_reused_directory_slot(request.id, directory_manager):
+            return
         self._ensure_new_slot(request.id)
         lease = self._admission.try_acquire()
         if lease is None:
@@ -409,6 +471,7 @@ class TransferManager:
             state="REQUESTED",
             request=request,
             lease=lease,
+            directory_manager=directory_manager,
         )
         self._slots[request.id] = slot
         slot.task = self._spawn(self._send_requested(slot))
@@ -418,9 +481,12 @@ class TransferManager:
         begin: TransferBegin,
         snapshot: TransferConfigSnapshot,
     ) -> None:
-        self._ensure_new_slot(begin.id)
         if begin.direction != "server_to_client":
             raise TransferProtocolError("Client cannot receive a client_to_server begin")
+        directory_manager = self._claim_directory_manager(begin.id, source=False)
+        if self._reject_reused_directory_slot(begin.id, directory_manager):
+            return
+        self._ensure_new_slot(begin.id)
         lease = self._admission.try_acquire()
         if lease is None:
             self._send_terminal_rejection(begin.id, "tool_device_busy")
@@ -434,6 +500,7 @@ class TransferManager:
             begin=begin,
             inbound=asyncio.Queue(maxsize=TRANSFER_CHUNKS_PER_SLOT),
             lease=lease,
+            directory_manager=directory_manager,
         )
         self._slots[begin.id] = slot
         slot.task = self._spawn(self._prepare_receiver(slot))
@@ -484,9 +551,7 @@ class TransferManager:
                 and tombstone.local_failure_end == end
             ):
                 if not tombstone.crossing_failure_ack_sent:
-                    self._enqueue_critical(
-                        encode_frame(end.model_copy(update={"ack": True}))
-                    )
+                    self._enqueue_critical(encode_frame(end.model_copy(update={"ack": True})))
                     self._tombstones[end.id] = replace(
                         tombstone,
                         crossing_failure_ack_sent=True,
@@ -513,16 +578,9 @@ class TransferManager:
                     )
                 return
             raise TransferProtocolError("transfer_end arrived for an unknown transfer")
-        if (
-            not end.ack
-            and not end.ok
-            and slot.state == "ABORTED"
-            and slot.local_failure_end == end
-        ):
+        if not end.ack and not end.ok and slot.state == "ABORTED" and slot.local_failure_end == end:
             if not slot.crossing_failure_ack_sent:
-                self._enqueue_critical(
-                    encode_frame(end.model_copy(update={"ack": True}))
-                )
+                self._enqueue_critical(encode_frame(end.model_copy(update={"ack": True})))
                 slot.crossing_failure_ack_sent = True
             return
         if (
@@ -571,11 +629,7 @@ class TransferManager:
             if receiver_overflow is not None:
                 raise receiver_overflow
             return
-        if (
-            slot.role == "receiver"
-            and slot.state in {"BEGUN", "READY", "STREAMING"}
-            and not end.ok
-        ):
+        if slot.role == "receiver" and slot.state in {"BEGUN", "READY", "STREAMING"} and not end.ok:
             slot.remote_end = end
             slot.remote_failure_end = end
             slot.state = "ABORTED"
@@ -625,6 +679,43 @@ class TransferManager:
             raise TransferProtocolError("Transfer slot ID is already active")
         if slot_id in self._tombstones:
             raise TransferProtocolError("Transfer slot ID was already closed")
+
+    def _claim_directory_manager(
+        self, transfer_uuid: UUID, *, source: bool
+    ) -> DirectoryTransferHooks | None:
+        matches = [
+            manager
+            for manager in self._directory_managers()
+            if (
+                manager.claims_source_transfer(transfer_uuid)
+                if source
+                else manager.claims_destination_transfer(transfer_uuid)
+            )
+        ]
+        if len(matches) > 1:
+            raise TransferProtocolError("Directory child authorization is ambiguous")
+        return matches[0] if matches else None
+
+    def _reject_reused_directory_slot(
+        self,
+        transfer_uuid: UUID,
+        manager: DirectoryTransferHooks | None,
+    ) -> bool:
+        if manager is None or (
+            transfer_uuid not in self._slots and transfer_uuid not in self._tombstones
+        ):
+            return False
+        self._enqueue_critical(
+            encode_frame(
+                TransferEnd(
+                    id=transfer_uuid,
+                    ack=False,
+                    ok=False,
+                    code="workspace_transfer_integrity_failed",
+                )
+            )
+        )
+        return True
 
     def _require_slot(self, slot_id: UUID) -> _Slot:
         slot = self._slots.get(slot_id)
@@ -702,12 +793,29 @@ class TransferManager:
                 "workspace_invalid_request", "Transfer destination is missing"
             )
         try:
+            if slot.directory_manager is not None:
+                slot.directory_destination = (
+                    await slot.directory_manager.consume_destination_authorization(slot.slot_id)
+                )
+                if begin.total_bytes != slot.directory_destination.expected_size:
+                    raise TransferOperationError(
+                        "workspace_transfer_integrity_failed",
+                        "Transfer size does not match directory manifest",
+                    )
             paths, destination = await self._run_filesystem(
                 slot,
                 _resolve_destination,
                 slot.snapshot,
                 begin.dst_path,
             )
+            if (
+                slot.directory_destination is not None
+                and destination != slot.directory_destination.destination_path
+            ):
+                raise TransferOperationError(
+                    "workspace_transfer_integrity_failed",
+                    "Authorized destination path does not match",
+                )
         except ToolFailure as exc:
             raise TransferOperationError(exc.code, exc.args[0] if exc.args else exc.code) from exc
         except OSError as exc:
@@ -716,10 +824,30 @@ class TransferManager:
             ) from exc
         stack = contextlib.AsyncExitStack()
         slot.lock_stack = stack
-        await stack.enter_async_context(self._locks.hold(str(destination)))
+        try:
+            await stack.enter_async_context(
+                self._locks.hold(
+                    str(destination),
+                    owner=(
+                        slot.directory_destination.directory_operation_id
+                        if slot.directory_destination is not None
+                        else None
+                    ),
+                )
+            )
+        except PathLockBusyError as exc:
+            raise TransferOperationError(
+                "workspace_transfer_busy", "Destination subtree is reserved"
+            ) from exc
         slot.destination = destination
         slot.destination_paths = paths
         try:
+            if slot.directory_manager is not None:
+                await self._run_filesystem(
+                    slot,
+                    slot.directory_manager.validate_destination_child_parent,
+                    slot.slot_id,
+                )
             reservation = await self._run_filesystem(
                 slot,
                 _prepare_destination,
@@ -728,6 +856,7 @@ class TransferManager:
                 slot.purpose,
                 begin.if_match,
                 begin.if_none_match,
+                slot.directory_destination is None,
                 on_abandoned=_discard_destination_reservation,
             )
             slot.destination_initial_fingerprint = reservation.initial_fingerprint
@@ -798,6 +927,10 @@ class TransferManager:
                     await self._run_filesystem(slot, file_handle.write, chunk)
                     slot.received_bytes += len(chunk)
                     slot.received_digest.update(chunk)
+                    if slot.directory_manager is not None:
+                        await slot.directory_manager.report_destination_child_progress(
+                            slot.slot_id, byte_count=len(chunk)
+                        )
                     slot.state = "STREAMING"
                     idle_deadline = asyncio.get_running_loop().time() + self._idle_timeout
                 slot.inbound.task_done()
@@ -870,17 +1003,32 @@ class TransferManager:
                     "workspace_file_changed", "Destination parent changed during transfer"
                 )
             if not await self._run_filesystem(
-                slot,
-                _temporary_unchanged, slot.temporary, slot.temporary_identity
+                slot, _temporary_unchanged, slot.temporary, slot.temporary_identity
             ):
                 raise TransferOperationError(
                     "workspace_file_changed", "Temporary destination changed during transfer"
                 )
             current_fingerprint = await self._run_filesystem(
-                slot,
-                _stat_fingerprint, slot.destination
+                slot, _stat_fingerprint, slot.destination
             )
-            if slot.purpose == "workspace_upload":
+            if slot.directory_destination is not None:
+                if current_fingerprint is not None:
+                    raise TransferOperationError(
+                        "workspace_file_changed", "Destination changed during transfer"
+                    )
+                committed_etag = await self._commit_directory_destination_cancellation_safe(
+                    slot, digest
+                )
+                self._enqueue_end(
+                    slot,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=slot.received_bytes,
+                    sha256=digest,
+                    etag=committed_etag,
+                    created=True,
+                )
+            elif slot.purpose == "workspace_upload":
                 if current_fingerprint != slot.destination_initial_fingerprint:
                     raise TransferOperationError(
                         "workspace_file_changed", "Destination changed during transfer"
@@ -892,24 +1040,10 @@ class TransferManager:
                     slot.destination,
                     slot.temporary_identity,
                 )
-            else:
-                if current_fingerprint is not None:
-                    raise TransferOperationError(
-                        "workspace_file_changed", "Destination changed during transfer"
-                    )
-                await self._run_filesystem(
-                    slot,
-                    _commit_no_replace,
-                    slot.temporary,
-                    slot.destination,
-                    slot.temporary_identity,
-                )
-            slot.temporary = None
-            slot.state = "COMMITTED"
-            if slot.purpose == "workspace_upload":
+                slot.temporary = None
+                slot.state = "COMMITTED"
                 committed_etag = await self._run_filesystem(
-                    slot,
-                    _stat_fingerprint, slot.destination
+                    slot, _stat_fingerprint, slot.destination
                 )
                 if committed_etag is None or slot.destination_created is None:
                     raise TransferOperationError(
@@ -925,6 +1059,19 @@ class TransferManager:
                     created=slot.destination_created,
                 )
             else:
+                if current_fingerprint is not None:
+                    raise TransferOperationError(
+                        "workspace_file_changed", "Destination changed during transfer"
+                    )
+                await self._run_filesystem(
+                    slot,
+                    _commit_no_replace,
+                    slot.temporary,
+                    slot.destination,
+                    slot.temporary_identity,
+                )
+                slot.temporary = None
+                slot.state = "COMMITTED"
                 self._enqueue_end(
                     slot,
                     ack=True,
@@ -959,6 +1106,56 @@ class TransferManager:
                 slot.destination_handle = None
             await self._cleanup_slot(slot)
 
+    async def _commit_directory_destination_cancellation_safe(
+        self,
+        slot: _Slot,
+        digest: str,
+    ) -> str:
+        commit = asyncio.create_task(self._commit_directory_destination(slot, digest))
+        cancelled = False
+        while True:
+            try:
+                committed_etag = await asyncio.shield(commit)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            except BaseException:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+            if cancelled:
+                raise asyncio.CancelledError
+            return committed_etag
+
+    async def _commit_directory_destination(self, slot: _Slot, digest: str) -> str:
+        assert slot.temporary is not None and slot.destination is not None
+        assert slot.directory_destination is not None and slot.directory_manager is not None
+        await self._run_filesystem(
+            slot,
+            _commit_directory_no_replace,
+            slot.temporary,
+            slot.destination,
+            slot.temporary_identity,
+        )
+        slot.temporary = None
+        slot.state = "COMMITTED"
+        if slot.temporary_identity is None or slot.destination_created is not True:
+            raise TransferOperationError(
+                "workspace_storage_unavailable", "Committed destination is unavailable"
+            )
+        committed_etag = _fingerprint_from_identity(slot.temporary_identity)
+        await slot.directory_manager.record_destination_commit(
+            slot.directory_destination.directory_operation_id,
+            slot.slot_id,
+            relative_path=slot.directory_destination.relative_path,
+            destination_fingerprint=committed_etag,
+            verified_size=slot.received_bytes,
+            verified_sha256=digest,
+        )
+        slot.directory_success = True
+        slot.directory_completion_reported = True
+        return committed_etag
+
     async def _await_rejection_ack(self, slot: _Slot) -> None:
         try:
             await asyncio.wait_for(slot.sender_ack.wait(), self._idle_timeout)
@@ -979,11 +1176,31 @@ class TransferManager:
                     slot.snapshot,
                     request.src_path,
                 )
+                if slot.directory_manager is not None:
+                    slot.directory_source = (
+                        await slot.directory_manager.consume_source_authorization(
+                            slot.slot_id, source
+                        )
+                    )
             except ToolFailure as exc:
                 raise TransferOperationError(exc.code, "Source path is unavailable") from exc
             source_lock = contextlib.AsyncExitStack()
             slot.lock_stack = source_lock
-            await source_lock.enter_async_context(self._locks.hold(str(source)))
+            try:
+                await source_lock.enter_async_context(
+                    self._locks.hold(
+                        str(source),
+                        owner=(
+                            slot.directory_source.directory_operation_id
+                            if slot.directory_source is not None
+                            else None
+                        ),
+                    )
+                )
+            except PathLockBusyError as exc:
+                raise TransferOperationError(
+                    "workspace_transfer_busy", "Source subtree is reserved"
+                ) from exc
             fd, initial = await self._run_filesystem(
                 slot,
                 _open_source,
@@ -993,6 +1210,13 @@ class TransferManager:
             slot.source_fd = fd
             slot.source_path = source
             slot.source_identity = initial
+            if (
+                slot.directory_source is not None
+                and _fingerprint_from_identity(initial) != slot.directory_source.fingerprint
+            ):
+                raise TransferOperationError(
+                    "workspace_file_changed", "Source changed after directory manifest"
+                )
             self._writer.register_binary_lane(slot.slot_id)
             slot.state = "BEGUN"
             self._enqueue_critical(
@@ -1018,18 +1242,18 @@ class TransferManager:
             hasher = hashlib.sha256()
             bytes_sent = 0
             while True:
-                chunk = await self._run_filesystem(
-                    slot, os.read, fd, TRANSFER_CHUNK_BYTES
-                )
+                chunk = await self._run_filesystem(slot, os.read, fd, TRANSFER_CHUNK_BYTES)
                 if not chunk:
                     break
                 hasher.update(chunk)
                 bytes_sent += len(chunk)
+                if slot.directory_manager is not None:
+                    await slot.directory_manager.report_source_child_progress(
+                        slot.slot_id, byte_count=len(chunk)
+                    )
                 await self._writer.wait_enqueue_binary(slot.slot_id, chunk)
             await self._writer.drain_binary(slot.slot_id)
-            if not await self._run_filesystem(
-                slot, _source_unchanged, source, fd, initial
-            ):
+            if not await self._run_filesystem(slot, _source_unchanged, source, fd, initial):
                 raise TransferOperationError(
                     "workspace_file_changed", "Source changed during transfer"
                 )
@@ -1056,16 +1280,17 @@ class TransferManager:
                     "workspace_transfer_integrity_failed", "Receiver acknowledgement mismatched"
                 )
             slot.final_end = remote_end
+            slot.directory_success = True
             await self._finish_slot(slot)
         except asyncio.CancelledError:
             raise
         except TransferOperationError as exc:
-            had_begun = slot.source_fd is not None or slot.state != "REQUESTED"
+            had_begun = slot.state != "REQUESTED"
             slot.state = "ABORTED"
             self._enqueue_end(slot, ok=False, code=exc.code, ack=False)
             await self._wait_for_failure_ack(slot, had_begun=had_begun)
         except (OSError, TimeoutError, WriterOverflowError) as exc:
-            had_begun = slot.source_fd is not None or slot.state != "REQUESTED"
+            had_begun = slot.state != "REQUESTED"
             slot.state = "ABORTED"
             code = (
                 "workspace_transfer_timeout"
@@ -1075,7 +1300,7 @@ class TransferManager:
             self._enqueue_end(slot, ok=False, code=code, ack=False)
             await self._wait_for_failure_ack(slot, had_begun=had_begun)
         except Exception as exc:
-            had_begun = slot.source_fd is not None or slot.state != "REQUESTED"
+            had_begun = slot.state != "REQUESTED"
             slot.state = "ABORTED"
             raw_code: object = getattr(exc, "code", None)
             code = (
@@ -1180,9 +1405,47 @@ class TransferManager:
             return
         try:
             await self._cleanup_slot_resources(slot)
+            await self._complete_directory_child(slot)
         finally:
             if lease is not None:
                 lease.release()
+
+    @staticmethod
+    async def _complete_directory_child(slot: _Slot) -> None:
+        manager = slot.directory_manager
+        if manager is None or slot.directory_completion_reported:
+            return
+        if slot.directory_source is not None:
+            completion = asyncio.create_task(
+                manager.complete_source_authorization(slot.slot_id, success=slot.directory_success)
+            )
+        elif slot.directory_destination is not None:
+            completion = asyncio.create_task(
+                manager.complete_destination_authorization(slot.slot_id, success=False)
+            )
+        else:
+            return
+        slot.directory_completion_reported = True
+        cancelled = False
+        try:
+            while True:
+                try:
+                    await asyncio.shield(completion)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if completion.done():
+                        break
+            if not completion.cancelled():
+                with contextlib.suppress(Exception):
+                    completion.result()
+        except Exception:
+            pass
+        finally:
+            if not completion.done():
+                completion.add_done_callback(_consume_thread_result)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _drain_slot_resources(
         self,
@@ -1194,6 +1457,7 @@ class TransferManager:
             return_exceptions=True,
         )
         await self._cleanup_slot_resources(slot)
+        await self._complete_directory_child(slot)
 
     @staticmethod
     async def _cleanup_slot_resources(slot: _Slot) -> None:
@@ -1246,17 +1510,23 @@ class TransferManager:
             sender_success_end=(
                 sender_success_end
                 if sender_success_end is not None
-                else existing.sender_success_end if existing is not None else None
+                else existing.sender_success_end
+                if existing is not None
+                else None
             ),
             local_failure_end=(
                 local_failure_end
                 if local_failure_end is not None
-                else existing.local_failure_end if existing is not None else None
+                else existing.local_failure_end
+                if existing is not None
+                else None
             ),
             remote_failure_end=(
                 remote_failure_end
                 if remote_failure_end is not None
-                else existing.remote_failure_end if existing is not None else None
+                else existing.remote_failure_end
+                if existing is not None
+                else None
             ),
             crossing_failure_ack_sent=(
                 crossing_failure_ack_sent
@@ -1267,7 +1537,9 @@ class TransferManager:
             declared_bytes=(
                 declared_bytes
                 if declared_bytes is not None
-                else existing.declared_bytes if existing is not None else None
+                else existing.declared_bytes
+                if existing is not None
+                else None
             ),
             binary_bytes_seen=max(
                 binary_bytes_seen,
@@ -1360,10 +1632,7 @@ class TransferManager:
             and not terminal.ack
             and (
                 terminal == success
-                or (
-                    not terminal.ok
-                    and terminal.code == "workspace_transfer_timeout"
-                )
+                or (not terminal.ok and terminal.code == "workspace_transfer_timeout")
             )
         )
         if not awaiting_success_resolution:
@@ -1391,6 +1660,7 @@ def _prepare_destination(
     purpose: str,
     if_match: str | None,
     if_none_match: bool | None,
+    create_parents: bool = True,
 ) -> _DestinationReservation:
     initial_fingerprint = _stat_fingerprint(destination)
     if purpose == "workspace_upload":
@@ -1399,21 +1669,42 @@ def _prepare_destination(
                 "workspace_file_changed", "Destination does not match If-Match"
             )
         if if_none_match is True and initial_fingerprint is not None:
-            raise TransferOperationError(
-                "workspace_file_changed", "Destination already exists"
-            )
+            raise TransferOperationError("workspace_file_changed", "Destination already exists")
     elif initial_fingerprint is not None:
         # Ordinary file_transfer remains create-without-overwrite.
         raise TransferOperationError("workspace_file_changed", "Destination already exists")
-    paths.prepare_parent(destination)
-    if not destination.parent.is_dir():
+    if create_parents:
+        paths.prepare_parent(destination)
+    try:
+        parent_info = destination.parent.stat(follow_symlinks=False)
+    except (FileNotFoundError, NotADirectoryError) as exc:
         raise TransferOperationError(
-            "tool_not_a_directory", "Destination parent is not a directory"
+            "workspace_file_changed", "Destination parent changed"
+        ) from exc
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or bool(
+            getattr(parent_info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
         )
+        or not stat.S_ISDIR(parent_info.st_mode)
+    ):
+        raise TransferOperationError(
+            "workspace_file_changed" if not create_parents else "tool_not_a_directory",
+            "Destination parent changed"
+            if not create_parents
+            else "Destination parent is not a directory",
+        )
+    try:
+        temporary = _create_temp(destination.parent, destination.name)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise TransferOperationError(
+            "workspace_file_changed", "Destination parent changed"
+        ) from exc
     return _DestinationReservation(
         initial_fingerprint=initial_fingerprint,
         created=initial_fingerprint is None,
-        temporary=_create_temp(destination.parent, destination.name),
+        temporary=temporary,
     )
 
 
@@ -1510,9 +1801,7 @@ def _open_temp(path: Path) -> tuple[Any, tuple[int, int, int, int, int]]:
                 os.close(fd)
 
 
-def _temporary_unchanged(
-    path: Path, expected: tuple[int, int, int, int, int] | None
-) -> bool:
+def _temporary_unchanged(path: Path, expected: tuple[int, int, int, int, int] | None) -> bool:
     if expected is None:
         return False
     try:
@@ -1538,10 +1827,7 @@ def _identity_after_close(
     try:
         path_before_info = os.lstat(path)
         path_before = _identity(path_before_info)
-        if (
-            not stat.S_ISREG(path_before_info.st_mode)
-            or path_before[:3] != open_identity[:3]
-        ):
+        if not stat.S_ISREG(path_before_info.st_mode) or path_before[:3] != open_identity[:3]:
             raise TransferOperationError(
                 "workspace_file_changed", "Temporary destination changed during transfer"
             )
@@ -1549,10 +1835,7 @@ def _identity_after_close(
         fd = os.open(path, flags)
         handle_before_info = os.fstat(fd)
         handle_before = _identity(handle_before_info)
-        if (
-            not stat.S_ISREG(handle_before_info.st_mode)
-            or handle_before[:4] != path_before[:4]
-        ):
+        if not stat.S_ISREG(handle_before_info.st_mode) or handle_before[:4] != path_before[:4]:
             raise TransferOperationError(
                 "workspace_file_changed", "Temporary destination changed during transfer"
             )
@@ -1616,6 +1899,65 @@ def _commit_no_replace(
         _fsync_parent(destination.parent)
 
 
+def _commit_directory_no_replace(
+    temporary: Path,
+    destination: Path,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+) -> None:
+    if not _temporary_unchanged(temporary, expected_identity):
+        raise TransferOperationError(
+            "workspace_file_changed", "Temporary destination changed during transfer"
+        )
+    assert expected_identity is not None
+    try:
+        os.link(temporary, destination, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise TransferOperationError(
+            "workspace_file_changed", "Destination already exists"
+        ) from exc
+
+    linked_identity = expected_identity[:2]
+    try:
+        temporary_info = os.lstat(temporary)
+        destination_info = os.lstat(destination)
+        if (
+            not stat.S_ISREG(temporary_info.st_mode)
+            or not stat.S_ISREG(destination_info.st_mode)
+            or (temporary_info.st_dev, temporary_info.st_ino) != linked_identity
+            or (destination_info.st_dev, destination_info.st_ino) != linked_identity
+        ):
+            raise TransferOperationError(
+                "workspace_file_changed", "Published destination changed during transfer"
+            )
+        temporary.unlink()
+        _fsync_parent_strict(destination.parent)
+    except BaseException:
+        if _unlink_regular_if_identity(destination, linked_identity):
+            with contextlib.suppress(OSError):
+                _fsync_parent_strict(destination.parent)
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
+def _unlink_regular_if_identity(destination: Path, expected_identity: tuple[int, int]) -> bool:
+    try:
+        info = os.lstat(destination)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != expected_identity:
+        return False
+    try:
+        destination.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return not _lexists(destination)
+
+
 def _commit_replace(
     temporary: Path,
     destination: Path,
@@ -1651,6 +1993,32 @@ def _fsync_parent(parent: Path) -> None:
         if fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def _fsync_parent_strict(parent: Path) -> None:
+    if os.name == "nt":
+        return
+    unsupported = {
+        getattr(errno, name)
+        for name in ("EINVAL", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+        if hasattr(errno, name)
+    }
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(parent, os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)))
+        except OSError as exc:
+            if exc.errno in unsupported:
+                return
+            raise
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _open_source(path: Path) -> tuple[int, tuple[int, int, int, int, int]]:
@@ -1761,9 +2129,7 @@ async def _to_thread_safely(
         task.add_done_callback(_consume_thread_result)
     else:
         tracker.add(task)
-        task.add_done_callback(
-            lambda completed: _finish_tracked_thread(completed, tracker)
-        )
+        task.add_done_callback(lambda completed: _finish_tracked_thread(completed, tracker))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -1780,9 +2146,7 @@ async def _to_thread_safely(
             drain.add_done_callback(_consume_thread_result)
         else:
             tracker.add(drain)
-            drain.add_done_callback(
-                lambda completed: _finish_tracked_thread(completed, tracker)
-            )
+            drain.add_done_callback(lambda completed: _finish_tracked_thread(completed, tracker))
         with contextlib.suppress(BaseException):
             await asyncio.wait({drain}, timeout=_TO_THREAD_CANCEL_GRACE_SECONDS)
         raise

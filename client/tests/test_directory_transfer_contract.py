@@ -182,7 +182,7 @@ def test_manifest_entry_count_exact_boundary() -> None:
 
 
 def _manifest_payload_of_exact_size(target: int) -> dict[str, Any]:
-    entries = [
+    entries: list[dict[str, Any]] = [
         {
             "relative_path": f"{index:04d}-" + "p" * (4096 - 5),
             "size": 0,

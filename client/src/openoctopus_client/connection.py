@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
+from pydantic import ValidationError
 from websockets.asyncio.client import connect
 
 from openoctopus_client import __version__
@@ -54,10 +55,21 @@ from openoctopus_client.protocol import (
     encode_frame,
 )
 from openoctopus_client.tools import ClientToolDispatcher, ToolOutput
+from openoctopus_client.tools.common import ToolFailure
+from openoctopus_client.tools.directory_jobs import (
+    DirectoryJobManager,
+    DirectoryLifecycleCredits,
+)
 from openoctopus_client.tools.exec import ExecManager, ExecToolDispatcher
 from openoctopus_client.tools.locks import PathLocks
+from openoctopus_client.tools.workspace_rest import (
+    DIRECTORY_WORKSPACE_OPERATIONS,
+    INTERNAL_WORKSPACE_ACTION,
+)
 from openoctopus_client.transfer import (
     MAX_ACTIVE_TRANSFER_SLOTS,
+    TRANSFER_IDLE_TIMEOUT_SECONDS,
+    DirectoryTransferHooks,
     TransferConfigSnapshot,
     TransferManager,
 )
@@ -70,10 +82,23 @@ from openoctopus_client.writer import SerializedWriter, TextWebSocket, WriterOve
 LOGGER = logging.getLogger(__name__)
 _TOOL_QUEUE_MAX = 64
 _TOOL_QUEUE_BYTES_MAX = 32 * 1024 * 1024
+_DIRECTORY_CONTROL_QUEUE_MAX = 8
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _SHUTDOWN_WATCHDOG_SECONDS = 15.0
 _HELLO_ACK_TIMEOUT_SECONDS = 10.0
 _RETRYABLE_CLOSE_CODES = frozenset({1000, 1001, 1006, 1013, 4408})
+_SOURCE_DIRECTORY_OPERATIONS = frozenset(
+    {
+        "transfer_source_probe_start",
+        "transfer_source_probe_status",
+        "transfer_source_probe_page",
+        "transfer_source_probe_hold",
+        "transfer_source_probe_cancel",
+        "transfer_source_probe_release",
+        "transfer_directory_authorize_source_child",
+        "transfer_source_cleanup",
+    }
+)
 
 
 class ClosableWebSocket(TextWebSocket, Protocol):
@@ -291,9 +316,7 @@ class _ToolWorker:
                         )
                         result = await asyncio.shield(invocation)
                     else:
-                        result = await self._runtime._run_tool(
-                            request.call, request.dispatcher
-                        )
+                        result = await self._runtime._run_tool(request.call, request.dispatcher)
                     self._writer.enqueue_normal(encode_frame(result))
                     await _wait_for_dispatcher_blocking(request.dispatcher)
                 finally:
@@ -306,6 +329,69 @@ class _ToolWorker:
             if not self._failed.done():
                 self._failed.set_exception(exc)
             raise
+
+
+@dataclass(frozen=True)
+class _QueuedDirectoryCall:
+    call: ToolCall
+    manager: DirectoryJobManager
+
+
+class _DirectoryControlWorker:
+    """Run bounded directory lifecycle controls independently of ordinary tools."""
+
+    def __init__(self, runtime: ClientRuntime, writer: SerializedWriter) -> None:
+        self._runtime = runtime
+        self._writer = writer
+        self._queue: asyncio.Queue[_QueuedDirectoryCall] = asyncio.Queue(
+            maxsize=_DIRECTORY_CONTROL_QUEUE_MAX
+        )
+        self._failed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._task = asyncio.create_task(self._run())
+
+    @property
+    def failed(self) -> asyncio.Future[None]:
+        return self._failed
+
+    def enqueue(self, call: ToolCall, manager: DirectoryJobManager) -> bool:
+        if self._queue.full():
+            return False
+        self._queue.put_nowait(_QueuedDirectoryCall(call=call, manager=manager))
+        return True
+
+    async def stop(self) -> None:
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                request = await self._queue.get()
+                try:
+                    result = await self._runtime._run_directory_tool(request.call, request.manager)
+                    self._writer.enqueue_normal(encode_frame(result))
+                finally:
+                    self._queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if not self._failed.done():
+                self._failed.set_exception(exc)
+            raise
+
+
+def _is_directory_tool_call(call: ToolCall) -> bool:
+    operation = call.args.get("operation")
+    return (
+        call.mcp_route is None
+        and call.name == INTERNAL_WORKSPACE_ACTION
+        and isinstance(operation, str)
+        and operation in DIRECTORY_WORKSPACE_OPERATIONS
+    )
 
 
 class ReconnectDisposition(Enum):
@@ -338,9 +424,7 @@ class ClientRuntime:
         self._hello_factory = hello_factory or self._new_hello
         self._random_value = random_value
         self._path_locks = PathLocks()
-        self._local_transfer_admission = LocalTransferAdmission(
-            capacity=MAX_ACTIVE_TRANSFER_SLOTS
-        )
+        self._local_transfer_admission = LocalTransferAdmission(capacity=MAX_ACTIVE_TRANSFER_SLOTS)
         self._local_transfer_drains = LocalTransferDrainRegistry()
         self._shell_inventory = shell_inventory or discover_shells()
         self._exec_sessions: _RuntimeExecManager = exec_session_manager or ExecSessionManager()
@@ -364,6 +448,10 @@ class ClientRuntime:
         self._device_name: str | None = None
         self._tools: ToolDispatcher | None = None
         self._transfer_manager: TransferManager | None = None
+        self._directory_lifecycle_credits = DirectoryLifecycleCredits()
+        self._directory_manager: DirectoryJobManager | None = None
+        self._retired_directory_managers: set[DirectoryJobManager] = set()
+        self._directory_retirement_tasks: dict[DirectoryJobManager, asyncio.Task[None]] = {}
         self._config_tasks: set[asyncio.Task[Any]] = set()
         self._config_generation = 0
         self._hard_exit = hard_exit
@@ -516,6 +604,10 @@ class ClientRuntime:
         writer_task = asyncio.create_task(writer.run(websocket))
         worker = _ToolWorker(self, writer)
         worker_failure_task = asyncio.create_task(_wait_for_worker_failure(worker.failed))
+        directory_worker = _DirectoryControlWorker(self, writer)
+        directory_worker_failure_task = asyncio.create_task(
+            _wait_for_worker_failure(directory_worker.failed)
+        )
         transfer_manager: TransferManager | None = None
         transfer_failure_task: asyncio.Task[str | bytes | None] | None = None
         config_update_tasks: list[asyncio.Task[_PreparedConfig]] = []
@@ -524,9 +616,7 @@ class ClientRuntime:
         config_ack_deadline: float | None = None
         config_bound_transfer_tasks: list[asyncio.Task[None]] = []
         validation_tasks: dict[asyncio.Task[ConfigValidateResult | None], UUID] = {}
-        suppressed_validation_tasks: set[
-            asyncio.Task[ConfigValidateResult | None]
-        ] = set()
+        suppressed_validation_tasks: set[asyncio.Task[ConfigValidateResult | None]] = set()
         mcp_control_tasks: dict[asyncio.Task[None], UUID] = {}
         registration_signal_task: asyncio.Task[bool] | None = None
         registration_deadline: float | None = None
@@ -572,6 +662,7 @@ class ClientRuntime:
                 wait_set: set[asyncio.Task[object]] = {
                     receive_task,
                     worker_failure_task,
+                    directory_worker_failure_task,
                     writer_task,
                     stopping_task,
                 }
@@ -641,6 +732,13 @@ class ClientRuntime:
                     except asyncio.CancelledError:
                         pass
                     worker_failure_task.result()
+                if directory_worker_failure_task in done:
+                    receive_task.cancel()
+                    try:
+                        await receive_task
+                    except asyncio.CancelledError:
+                        pass
+                    directory_worker_failure_task.result()
                 if transfer_failure_task is not None and transfer_failure_task in done:
                     receive_task.cancel()
                     try:
@@ -656,10 +754,7 @@ class ClientRuntime:
                 for validation_task in completed_validations:
                     result = validation_task.result()
                     validation_tasks.pop(validation_task)
-                    if (
-                        result is not None
-                        and validation_task not in suppressed_validation_tasks
-                    ):
+                    if result is not None and validation_task not in suppressed_validation_tasks:
                         writer.enqueue_normal(encode_frame(result))
                     suppressed_validation_tasks.discard(validation_task)
                 if registration_signal_task is not None and registration_signal_task in done:
@@ -737,6 +832,12 @@ class ClientRuntime:
                     ):
                         raise ProtocolError("Expected matching config applied acknowledgement")
                     assert self._active_config is not None
+                    directory_manager = self._new_directory_manager(
+                        Path(self._active_config.workspace_path),
+                        self._active_config,
+                        generation=config_generation,
+                    )
+                    self._directory_manager = directory_manager
                     transfer_manager = TransferManager(
                         TransferConfigSnapshot.from_values(
                             Path(self._active_config.workspace_path),
@@ -748,6 +849,10 @@ class ClientRuntime:
                         path_locks=self._path_locks,
                         admission=self._local_transfer_admission,
                         drain_registry=self._local_transfer_drains,
+                        directory_managers=lambda: cast(
+                            tuple[DirectoryTransferHooks, ...],
+                            self._directory_managers_for_generation(config_generation),
+                        ),
                     )
                     self._transfer_manager = transfer_manager
                     transfer_failure_task = asyncio.create_task(
@@ -837,6 +942,15 @@ class ClientRuntime:
                         raise ProtocolError("Tool call arrived before device configuration")
                     if config_update_tasks and frame.name in EXEC_TOOL_NAMES:
                         writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
+                        continue
+                    if _is_directory_tool_call(frame):
+                        manager = self._directory_manager_for_call(
+                            frame,
+                            generation=config_generation,
+                            allow_new=not config_update_tasks,
+                        )
+                        if manager is None or not directory_worker.enqueue(frame, manager):
+                            writer.enqueue_normal(encode_frame(self._busy_tool_result(frame)))
                         continue
                     dispatcher: ToolDispatcher = (
                         self._mcp_dispatcher if frame.mcp_route is not None else self._tools
@@ -943,6 +1057,10 @@ class ClientRuntime:
             worker_failure_task.cancel()
             with contextlib.suppress(BaseException):
                 await worker_failure_task
+            directory_worker_failure_task.cancel()
+            with contextlib.suppress(BaseException):
+                await directory_worker_failure_task
+            await directory_worker.stop()
             if transfer_failure_task is not None:
                 transfer_failure_task.cancel()
                 with contextlib.suppress(BaseException):
@@ -975,6 +1093,7 @@ class ClientRuntime:
                     self._local_transfer_drains.retain(
                         transfer_shutdown_task, owner=transfer_manager
                     )
+            await self._retire_directory_generation(config_generation)
             worker_stopped = await worker.stop(
                 timeout=_SHUTDOWN_GRACE_SECONDS if shutdown_requested else None
             )
@@ -1003,6 +1122,119 @@ class ClientRuntime:
             transfer_admission=self._local_transfer_admission,
             transfer_drains=self._local_transfer_drains,
         )
+
+    def _new_directory_manager(
+        self, workspace: Path, config: DeviceConfig, *, generation: int
+    ) -> DirectoryJobManager:
+        return DirectoryJobManager(
+            workspace,
+            restrict_to_workspace=config.restrict_to_workspace,
+            path_locks=self._path_locks,
+            admission=self._local_transfer_admission,
+            idle_timeout_seconds=TRANSFER_IDLE_TIMEOUT_SECONDS,
+            queue_timeout_seconds=TRANSFER_IDLE_TIMEOUT_SECONDS,
+            generation=generation,
+            lifecycle_credits=self._directory_lifecycle_credits,
+        )
+
+    def _directory_managers_for_generation(
+        self, generation: int
+    ) -> tuple[DirectoryJobManager, ...]:
+        values: list[DirectoryJobManager] = []
+        current = self._directory_manager
+        if current is not None and current.generation == generation:
+            values.append(current)
+        values.extend(
+            manager
+            for manager in self._retired_directory_managers
+            if manager.generation == generation and manager is not current
+        )
+        return tuple(values)
+
+    def _directory_manager_for_call(
+        self, call: ToolCall, *, generation: int, allow_new: bool
+    ) -> DirectoryJobManager | None:
+        managers = self._directory_managers_for_generation(generation)
+        current = self._directory_manager
+        operation = call.args.get("operation")
+        operation_id_value = call.args.get("directory_operation_id")
+        if isinstance(operation_id_value, str):
+            with contextlib.suppress(ValueError):
+                operation_id = UUID(operation_id_value)
+                role: Literal["source", "destination"] = (
+                    "source" if operation in _SOURCE_DIRECTORY_OPERATIONS else "destination"
+                )
+                owners = [
+                    manager for manager in managers if manager.owns_operation(operation_id, role)
+                ]
+                if len(owners) > 1:
+                    raise ProtocolError("Directory operation ownership is ambiguous")
+                if owners:
+                    return owners[0]
+        if allow_new and current is not None and current.generation == generation:
+            return current
+        return None
+
+    async def _retire_directory_manager(
+        self,
+        manager: DirectoryJobManager,
+        *,
+        preserve_finalized: bool,
+        drop_when_drained: bool,
+    ) -> None:
+        if self._directory_manager is manager:
+            self._directory_manager = None
+        self._retired_directory_managers.add(manager)
+        previous_retirement = self._directory_retirement_tasks.pop(manager, None)
+        if previous_retirement is not None:
+            previous_retirement.cancel()
+            await asyncio.gather(previous_retirement, return_exceptions=True)
+        quiescent = await manager.aclose(
+            grace_seconds=0.1,
+            preserve_finalized=preserve_finalized,
+            final=drop_when_drained,
+        )
+        if drop_when_drained and quiescent:
+            manager.discard_lifecycle()
+            self._retired_directory_managers.discard(manager)
+            return
+        if not quiescent and not drop_when_drained:
+            drain = asyncio.create_task(manager.wait_for_drain(timeout_seconds=None))
+            self._local_transfer_drains.retain(drain, owner=manager)
+
+        async def finish_retirement() -> None:
+            if drop_when_drained:
+                if not quiescent:
+                    await manager.wait_for_drain(timeout_seconds=None)
+                manager.discard_lifecycle()
+            else:
+                await manager.wait_for_lifecycle_empty(timeout_seconds=None)
+                await manager.aclose(
+                    grace_seconds=0,
+                    preserve_finalized=True,
+                    final=True,
+                )
+            self._retired_directory_managers.discard(manager)
+
+        task = asyncio.create_task(finish_retirement())
+        self._directory_retirement_tasks[manager] = task
+        if drop_when_drained:
+            self._local_transfer_drains.retain(task, owner=manager)
+
+        def retired(completed: asyncio.Task[None]) -> None:
+            if self._directory_retirement_tasks.get(manager) is completed:
+                self._directory_retirement_tasks.pop(manager, None)
+            _consume_task_result(completed)
+
+        task.add_done_callback(retired)
+
+    async def _retire_directory_generation(self, generation: int) -> None:
+        for manager in self._directory_managers_for_generation(generation):
+            await self._retire_directory_manager(
+                manager,
+                preserve_finalized=False,
+                drop_when_drained=True,
+            )
 
     def _new_hello(self) -> Hello:
         system = platform.system().lower()
@@ -1090,6 +1322,19 @@ class ClientRuntime:
                 expected_generation=generation,
             )
             self._activate_prepared_config(prepared)
+            previous_directory_manager = self._directory_manager
+            replacement_directory_manager = self._new_directory_manager(
+                prepared.workspace,
+                prepared.config,
+                generation=generation,
+            )
+            self._directory_manager = replacement_directory_manager
+            if previous_directory_manager is not None:
+                await self._retire_directory_manager(
+                    previous_directory_manager,
+                    preserve_finalized=True,
+                    drop_when_drained=False,
+                )
             if transfer_manager is not None:
                 transfer_manager.update_config(_transfer_snapshot(prepared))
             return prepared
@@ -1263,6 +1508,35 @@ class ClientRuntime:
             if not callable(execute):
                 raise ProtocolError("Tool dispatcher is unavailable")
             output = await execute(call.name, call.args)
+        return self._result_with_credit(call, output)
+
+    async def _run_directory_tool(self, call: ToolCall, manager: DirectoryJobManager) -> ToolResult:
+        try:
+            result = await manager.handle(call.args)
+            output = ToolOutput(result.model_dump_json())
+        except ToolFailure as exc:
+            output = ToolOutput(
+                content=f"[{exc.code}] {exc.message}",
+                is_error=True,
+                code=exc.code,
+            )
+        except ValidationError:
+            output = ToolOutput(
+                content="[tool_invalid_args] Directory action arguments are invalid",
+                is_error=True,
+                code="tool_invalid_args",
+            )
+        except OSError as exc:
+            code = (
+                "workspace_permission_denied"
+                if exc.errno in {getattr(os, "EACCES", 13), getattr(os, "EPERM", 1)}
+                else "workspace_storage_unavailable"
+            )
+            output = ToolOutput(
+                content=f"[{code}] Directory filesystem operation failed",
+                is_error=True,
+                code=code,
+            )
         return self._result_with_credit(call, output)
 
     def _start_mcp_tool(

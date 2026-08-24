@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -9,7 +10,8 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -26,6 +28,9 @@ from openoctopus_client.protocol import (
     encode_binary_chunk,
     new_uuid7,
 )
+from openoctopus_client.tools.common import ToolFailure
+from openoctopus_client.tools.fingerprints import opaque_stat_fingerprint
+from openoctopus_client.tools.locks import PathLocks
 from openoctopus_client.tools.paths import WorkspacePaths
 from openoctopus_client.transfer import (
     TOMBSTONE_MAX_ENTRIES,
@@ -56,6 +61,8 @@ async def _manager(
     *,
     admission: LocalTransferAdmission | None = None,
     drains: LocalTransferDrainRegistry | None = None,
+    path_locks: PathLocks | None = None,
+    directory_managers: Any = None,
 ) -> tuple[TransferManager, SerializedWriter, Socket, asyncio.Task[None]]:
     socket = Socket()
     writer = SerializedWriter()
@@ -64,8 +71,10 @@ async def _manager(
         TransferManager(
             workspace,
             writer,
+            path_locks=path_locks,
             admission=admission,
             drain_registry=drains,
+            directory_managers=directory_managers,
         ),
         writer,
         socket,
@@ -138,6 +147,121 @@ def _make_directory_link(link: Path, target: Path) -> None:
     )
     if completed.returncode != 0:
         raise OSError("unable to create a Windows directory junction")
+
+
+def _fingerprint(path: Path) -> str:
+    info = path.stat(follow_symlinks=False)
+    return opaque_stat_fingerprint((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+
+
+class _DirectoryTransferHooks:
+    def __init__(
+        self,
+        *,
+        source_id: UUID | None = None,
+        destination_id: UUID | None = None,
+        source_path: Path | None = None,
+        destination_path: Path | None = None,
+        expected_size: int | None = None,
+        fingerprint: str | None = None,
+        commit_started: asyncio.Event | None = None,
+        release_commit: asyncio.Event | None = None,
+    ) -> None:
+        self.operation_id = new_uuid7()
+        self.source_id = source_id
+        self.destination_id = destination_id
+        self.source_path = source_path
+        self.destination_path = destination_path
+        self.expected_size = expected_size
+        self.fingerprint = fingerprint
+        self.commit_started = commit_started
+        self.release_commit = release_commit
+        self.source_progress: list[int] = []
+        self.destination_progress: list[int] = []
+        self.source_terminal: list[bool] = []
+        self.destination_terminal: list[bool] = []
+        self.source_completed = asyncio.Event()
+        self.destination_completed = asyncio.Event()
+        self.commits: list[dict[str, object]] = []
+
+    def claims_source_transfer(self, transfer_uuid: UUID) -> bool:
+        return transfer_uuid == self.source_id
+
+    def claims_destination_transfer(self, transfer_uuid: UUID) -> bool:
+        return transfer_uuid == self.destination_id
+
+    async def consume_source_authorization(self, transfer_uuid: UUID, source_path: Path) -> object:
+        if transfer_uuid != self.source_id or source_path != self.source_path:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed", "Source child authorization mismatched"
+            )
+        assert self.fingerprint is not None
+        return SimpleNamespace(
+            directory_operation_id=self.operation_id,
+            transfer_uuid=transfer_uuid,
+            source_path=source_path,
+            relative_path=source_path.name,
+            fingerprint=self.fingerprint,
+        )
+
+    async def report_source_child_progress(
+        self, transfer_uuid: UUID, *, byte_count: int = 0
+    ) -> None:
+        assert transfer_uuid == self.source_id
+        self.source_progress.append(byte_count)
+
+    async def complete_source_authorization(self, transfer_uuid: UUID, *, success: bool) -> None:
+        assert transfer_uuid == self.source_id
+        self.source_terminal.append(success)
+        self.source_completed.set()
+
+    async def consume_destination_authorization(self, transfer_uuid: UUID) -> object:
+        if transfer_uuid != self.destination_id:
+            raise ToolFailure(
+                "workspace_transfer_integrity_failed",
+                "Destination child authorization mismatched",
+            )
+        assert self.destination_path is not None
+        assert self.expected_size is not None
+        return SimpleNamespace(
+            directory_operation_id=self.operation_id,
+            transfer_uuid=transfer_uuid,
+            destination_path=self.destination_path,
+            relative_path=self.destination_path.name,
+            expected_size=self.expected_size,
+        )
+
+    async def report_destination_child_progress(
+        self, transfer_uuid: UUID, *, byte_count: int = 0
+    ) -> None:
+        assert transfer_uuid == self.destination_id
+        self.destination_progress.append(byte_count)
+
+    def validate_destination_child_parent(self, transfer_uuid: UUID) -> None:
+        assert transfer_uuid == self.destination_id
+
+    async def complete_destination_authorization(
+        self, transfer_uuid: UUID, *, success: bool
+    ) -> None:
+        assert transfer_uuid == self.destination_id
+        self.destination_terminal.append(success)
+        self.destination_completed.set()
+
+    async def record_destination_commit(
+        self,
+        directory_operation_id: UUID,
+        transfer_uuid: UUID,
+        **metadata: object,
+    ) -> None:
+        assert directory_operation_id == self.operation_id
+        assert transfer_uuid == self.destination_id
+        if self.commit_started is not None:
+            self.commit_started.set()
+        if self.release_commit is not None:
+            await self.release_commit.wait()
+        self.commits.append(dict(metadata))
+        self.destination_terminal.append(True)
+        self.destination_completed.set()
 
 
 def test_binary_header_is_exactly_bounded_and_uuidv7_checked() -> None:
@@ -318,8 +442,7 @@ def test_wire_managers_share_runtime_local_transfer_capacity(tmp_path: Path) -> 
             rejection = next(
                 json.loads(item)
                 for item in second_socket.sent
-                if isinstance(item, str)
-                and json.loads(item).get("id") == str(third_slot)
+                if isinstance(item, str) and json.loads(item).get("id") == str(third_slot)
             )
             assert rejection["code"] == "tool_device_busy"
         finally:
@@ -327,6 +450,660 @@ def test_wire_managers_share_runtime_local_transfer_capacity(tmp_path: Path) -> 
             await _stop(second_manager, second_writer, second_writer_task)
         assert await drains.wait(timeout_seconds=1)
         assert admission.active_count == 0
+
+    asyncio.run(exercise())
+
+
+def test_directory_source_child_consumes_authorization_and_reports_progress(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        payload = b"directory child payload"
+        source = tmp_path / "child.bin"
+        source.write_bytes(payload)
+        hooks = _DirectoryTransferHooks(
+            source_id=SLOT,
+            source_path=source,
+            fingerprint=_fingerprint(source),
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="child.bin",
+                    dst_path="copy.bin",
+                )
+            )
+            async with asyncio.timeout(5):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            sent_end = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, sent_end["bytes_sent"]),
+                    sha256=cast(str, sent_end["sha256"]),
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.source_completed.wait(), timeout=1)
+
+            assert sum(hooks.source_progress) == len(payload)
+            assert hooks.source_terminal == [True]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_source_child_rejects_a_changed_opened_fingerprint(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        source = tmp_path / "child.bin"
+        source.write_bytes(b"new version")
+        hooks = _DirectoryTransferHooks(
+            source_id=SLOT,
+            source_path=source,
+            fingerprint="stale-fingerprint",
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="child.bin",
+                    dst_path="copy.bin",
+                )
+            )
+            end = await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.source_completed.wait(), timeout=1)
+            assert end["code"] == "workspace_file_changed"
+            assert not any(
+                isinstance(item, str) and json.loads(item).get("type") == "transfer_begin"
+                for item in socket.sent
+            )
+            assert hooks.source_terminal == [False]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_destination_child_bypasses_owner_subtree_and_returns_commit_metadata(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        destination_root = tmp_path / "reserved"
+        destination_root.mkdir()
+        destination = destination_root / "child.bin"
+        payload = b"destination child payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=len(payload),
+        )
+        locks = PathLocks()
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path,
+            path_locks=locks,
+            directory_managers=lambda: (hooks,),
+        )
+        try:
+            async with locks.reserve_subtree(hooks.operation_id, str(destination_root)):
+                await manager.handle_control(
+                    TransferBegin(
+                        id=SLOT,
+                        direction="server_to_client",
+                        purpose="file_transfer",
+                        src_path="source.bin",
+                        dst_path="reserved/child.bin",
+                        total_bytes=len(payload),
+                    )
+                )
+                await _wait_receiver_ready(manager)
+                await manager.handle_binary(encode_binary_chunk(SLOT, payload))
+                await manager.handle_control(
+                    TransferEnd(
+                        id=SLOT,
+                        ack=False,
+                        ok=True,
+                        bytes_sent=len(payload),
+                        sha256=digest,
+                    )
+                )
+                ack = await _wait_for_transfer_end(socket, SLOT, ack=True, ok=True)
+
+            assert destination.read_bytes() == payload
+            assert ack["created"] is True
+            assert isinstance(ack["etag"], str)
+            assert hooks.destination_progress == [len(payload)]
+            assert hooks.destination_terminal == [True]
+            assert hooks.commits == [
+                {
+                    "relative_path": "child.bin",
+                    "destination_fingerprint": ack["etag"],
+                    "verified_size": len(payload),
+                    "verified_sha256": digest,
+                }
+            ]
+            await _wait_slot_closed(manager, SLOT)
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=len(payload),
+                )
+            )
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_transfer_integrity_failed",
+            )
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_destination_authorization_path_mismatch_is_rejected(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        expected = tmp_path / "reserved" / "expected.bin"
+        expected.parent.mkdir()
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=expected,
+            expected_size=1,
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/wrong.bin",
+                    total_bytes=1,
+                )
+            )
+            failure = await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_transfer_integrity_failed",
+            )
+            assert not (tmp_path / "reserved" / "wrong.bin").exists()
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code=cast(str, failure["code"]),
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.destination_completed.wait(), timeout=1)
+            assert hooks.destination_terminal == [False]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_destination_parent_validation_runs_before_parent_creation(
+    tmp_path: Path,
+) -> None:
+    class RejectingHooks(_DirectoryTransferHooks):
+        def validate_destination_child_parent(self, transfer_uuid: UUID) -> None:
+            super().validate_destination_child_parent(transfer_uuid)
+            raise ToolFailure("workspace_file_changed", "Destination parent changed")
+
+    async def exercise() -> None:
+        destination = tmp_path / "reserved" / "nested" / "child.bin"
+        hooks = RejectingHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=1,
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/nested/child.bin",
+                    total_bytes=1,
+                )
+            )
+            failure = await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_file_changed",
+            )
+            assert not destination.parent.exists()
+            assert not tuple(tmp_path.rglob("*.tmp"))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code=cast(str, failure["code"]),
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.destination_completed.wait(), timeout=1)
+            assert hooks.destination_terminal == [False]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("declared_size", [None, 3])
+def test_directory_destination_rejects_missing_or_wrong_manifest_size_before_fs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    declared_size: int | None,
+) -> None:
+    original_resolve = transfer_module._resolve_destination
+    resolution_attempted = threading.Event()
+
+    def tracked_resolve(
+        snapshot: TransferConfigSnapshot, destination_path: str
+    ) -> tuple[WorkspacePaths, Path]:
+        resolution_attempted.set()
+        return original_resolve(snapshot, destination_path)
+
+    monkeypatch.setattr(transfer_module, "_resolve_destination", tracked_resolve)
+
+    async def exercise() -> None:
+        destination = tmp_path / "reserved" / "child.bin"
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=4,
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            begin = (
+                TransferBegin.model_construct(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=None,
+                )
+                if declared_size is None
+                else TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=declared_size,
+                )
+            )
+            await manager.handle_control(begin)
+            failure = await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
+                code="workspace_transfer_integrity_failed",
+            )
+            assert not destination.parent.exists()
+            assert resolution_attempted.is_set() is False
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=False,
+                    code=cast(str, failure["code"]),
+                )
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.destination_completed.wait(), timeout=1)
+            assert hooks.destination_terminal == [False]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_destination_publish_records_commit_before_propagating_cancellation(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        destination_root = tmp_path / "reserved"
+        destination_root.mkdir()
+        destination = destination_root / "child.bin"
+        payload = b"committed before cancellation"
+        digest = hashlib.sha256(payload).hexdigest()
+        commit_started = asyncio.Event()
+        release_commit = asyncio.Event()
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=len(payload),
+            commit_started=commit_started,
+            release_commit=release_commit,
+        )
+        manager, writer, _socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        shutdown: asyncio.Task[None] | None = None
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=len(payload),
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, payload))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=len(payload),
+                    sha256=digest,
+                )
+            )
+            await asyncio.wait_for(commit_started.wait(), timeout=1)
+            assert destination.read_bytes() == payload
+
+            shutdown = asyncio.create_task(manager.shutdown())
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+            release_commit.set()
+            await asyncio.wait_for(shutdown, timeout=1)
+
+            assert hooks.destination_terminal == [True]
+            assert hooks.commits[0]["verified_sha256"] == digest
+        finally:
+            release_commit.set()
+            if shutdown is not None:
+                await asyncio.gather(shutdown, return_exceptions=True)
+            await writer.stop()
+            await writer_task
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_directory_destination_parent_fsync_eio_never_records_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if os.path.samestat(os.fstat(descriptor), os.stat(tmp_path / "reserved")):
+            raise OSError(errno.EIO, "injected directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    async def exercise() -> None:
+        destination_root = tmp_path / "reserved"
+        destination_root.mkdir()
+        destination = destination_root / "child.bin"
+        payload = b"durability"
+        digest = hashlib.sha256(payload).hexdigest()
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=len(payload),
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=len(payload),
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, payload))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=len(payload),
+                    sha256=digest,
+                )
+            )
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=True,
+                ok=False,
+                code="workspace_storage_unavailable",
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.destination_completed.wait(), timeout=1)
+            assert not destination.exists()
+            assert hooks.commits == []
+            assert hooks.destination_terminal == [False]
+            assert not any(
+                isinstance(item, str)
+                and json.loads(item).get("type") == "transfer_end"
+                and json.loads(item).get("ack") is True
+                and json.loads(item).get("ok") is True
+                for item in socket.sent
+            )
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_directory_destination_fsync_cleanup_preserves_external_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    destination_root = tmp_path / "reserved"
+    destination_root.mkdir()
+    destination = destination_root / "child.bin"
+    external = b"external replacement"
+
+    def replace_then_fail(_parent: Path) -> None:
+        destination.unlink()
+        destination.write_bytes(external)
+        raise OSError(errno.EIO, "injected directory fsync failure")
+
+    monkeypatch.setattr(transfer_module, "_fsync_parent_strict", replace_then_fail)
+
+    async def exercise() -> None:
+        payload = b"durability"
+        digest = hashlib.sha256(payload).hexdigest()
+        hooks = _DirectoryTransferHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=len(payload),
+        )
+        manager, writer, socket, writer_task = await _manager(
+            tmp_path, directory_managers=lambda: (hooks,)
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=len(payload),
+                )
+            )
+            await _wait_receiver_ready(manager)
+            await manager.handle_binary(encode_binary_chunk(SLOT, payload))
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=len(payload),
+                    sha256=digest,
+                )
+            )
+            await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=True,
+                ok=False,
+                code="workspace_storage_unavailable",
+            )
+            await _wait_slot_closed(manager, SLOT)
+            await asyncio.wait_for(hooks.destination_completed.wait(), timeout=1)
+            assert destination.read_bytes() == external
+            assert hooks.commits == []
+            assert hooks.destination_terminal == [False]
+        finally:
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_directory_destination_failure_completes_after_abandoned_filesystem_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_fsync = os.fsync
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_fsync(descriptor: int) -> None:
+        started.set()
+        release.wait(timeout=2)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", delayed_fsync)
+
+    async def exercise() -> None:
+        destination_root = tmp_path / "reserved"
+        destination_root.mkdir()
+        destination = destination_root / "child.bin"
+        locks = PathLocks()
+        temporary_holder: list[Path] = []
+        handle_holder: list[object] = []
+
+        class ObservingHooks(_DirectoryTransferHooks):
+            async def complete_destination_authorization(
+                self, transfer_uuid: UUID, *, success: bool
+            ) -> None:
+                assert temporary_holder[0].exists() is False
+                assert getattr(handle_holder[0], "closed", False) is True
+                assert locks.reservation_count == 0
+                await super().complete_destination_authorization(transfer_uuid, success=success)
+
+        hooks = ObservingHooks(
+            destination_id=SLOT,
+            destination_path=destination,
+            expected_size=0,
+        )
+        admission = LocalTransferAdmission(capacity=1)
+        drains = LocalTransferDrainRegistry()
+        manager, writer, _socket, writer_task = await _manager(
+            tmp_path,
+            admission=admission,
+            drains=drains,
+            path_locks=locks,
+            directory_managers=lambda: (hooks,),
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="reserved/child.bin",
+                    total_bytes=0,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            temporary = manager._slots[SLOT].temporary
+            assert temporary is not None
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=0,
+                    sha256=hashlib.sha256(b"").hexdigest(),
+                )
+            )
+            assert await asyncio.to_thread(started.wait, 1)
+            handle = manager._slots[SLOT].destination_handle
+            assert handle is not None
+            temporary_holder.append(temporary)
+            handle_holder.append(handle)
+
+            await manager.shutdown()
+            assert hooks.destination_terminal == []
+            assert temporary.exists()
+            assert manager.path_locks.reservation_count == 1
+            assert admission.active_count == 1
+
+            release.set()
+            assert await drains.wait(timeout_seconds=1)
+            assert hooks.destination_terminal == [False]
+            assert temporary.exists() is False
+            assert manager.path_locks.reservation_count == 0
+            assert admission.active_count == 0
+        finally:
+            release.set()
+            await drains.wait(timeout_seconds=1)
+            await writer.stop()
+            await writer_task
 
     asyncio.run(exercise())
 
@@ -843,9 +1620,7 @@ def test_workspace_upload_rechecks_symlinked_parent_before_commit(
     check_calls = 0
     original_check = transfer_module._destination_parent_unchanged
 
-    def gated_parent_check(
-        paths: WorkspacePaths, path: str, destination: Path
-    ) -> bool:
+    def gated_parent_check(paths: WorkspacePaths, path: str, destination: Path) -> bool:
         nonlocal check_calls
         check_calls += 1
         if check_calls == 2:
@@ -1064,8 +1839,7 @@ def test_receiver_failure_before_ready_rejects_binary_and_accepts_late_ack(
                     (
                         json.loads(item)
                         for item in socket.sent
-                        if isinstance(item, str)
-                        and json.loads(item)["type"] == "transfer_end"
+                        if isinstance(item, str) and json.loads(item)["type"] == "transfer_end"
                     ),
                     None,
                 )
@@ -1077,9 +1851,7 @@ def test_receiver_failure_before_ready_rejects_binary_and_accepts_late_ack(
             assert failure["code"] == "workspace_storage_unavailable"
 
             with pytest.raises(ProtocolError):
-                await manager.handle_binary(
-                    encode_binary_chunk(SLOT, b"binary-before-ready")
-                )
+                await manager.handle_binary(encode_binary_chunk(SLOT, b"binary-before-ready"))
 
             matching_ack = TransferEnd(
                 id=SLOT,
@@ -1541,9 +2313,7 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
                 for item in socket.sent
                 if isinstance(item, str) and json.loads(item)["type"] == "transfer_end"
             ]
-            assert ends and ends[-1].get("ok") is True, [
-                item.get("code") for item in ends
-            ]
+            assert ends and ends[-1].get("ok") is True, [item.get("code") for item in ends]
             end = ends[-1]
             await manager.handle_control(
                 TransferEnd(
