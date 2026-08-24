@@ -2189,7 +2189,7 @@ def _scan_directory(
             _check_forward(stop)
             relative_path = child.name if not prefix else f"{prefix}/{child.name}"
             try:
-                info = child.stat(follow_symlinks=False)
+                info = os.stat(child.path, follow_symlinks=False)
             except FileNotFoundError as exc:
                 raise ToolFailure("workspace_file_changed", "Source changed during scan") from exc
             except OSError as exc:
@@ -2506,7 +2506,7 @@ def _verify_destination_tree(
         for child in children:
             _check_forward(stop)
             relative = child.name if not prefix else f"{prefix}/{child.name}"
-            info = child.stat(follow_symlinks=False)
+            info = os.stat(child.path, follow_symlinks=False)
             if _is_link_or_reparse(info):
                 raise ToolFailure(
                     "workspace_transfer_integrity_failed", "Destination contains a link"

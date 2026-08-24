@@ -426,6 +426,9 @@ class TransferManager:
             return
         self._closed = True
         slots = list(self._slots.values())
+        cleanup_tasks = {
+            slot.cleanup_task for slot in slots if slot.cleanup_task is not None
+        }
         overflow: WriterOverflowError | None = None
         for slot in slots:
             if slot.final_end is None:
@@ -436,10 +439,16 @@ class TransferManager:
             if slot.inbound is not None:
                 with contextlib.suppress(asyncio.QueueFull):
                     slot.inbound.put_nowait(None)
-            if slot.task is not None:
+            if slot.task is not None and slot.task not in cleanup_tasks:
                 slot.task.cancel()
-        if self._tasks:
-            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+        worker_tasks = tuple(task for task in self._tasks if task not in cleanup_tasks)
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        if cleanup_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in cleanup_tasks),
+                return_exceptions=True,
+            )
         if self._blocking_tasks:
             await asyncio.wait(tuple(self._blocking_tasks), timeout=_TO_THREAD_CANCEL_GRACE_SECONDS)
         for slot in list(self._slots.values()):
@@ -1362,6 +1371,9 @@ class TransferManager:
         self._remember_tombstone(slot_id, end, local_failure_end=end)
 
     async def _finish_slot(self, slot: _Slot) -> None:
+        self._remember_slot_tombstone(slot)
+
+    def _remember_slot_tombstone(self, slot: _Slot) -> None:
         self._remember_tombstone(
             slot.slot_id,
             slot.final_end,
@@ -1375,27 +1387,23 @@ class TransferManager:
             binary_bytes_seen=slot.inbound_bytes + slot.late_binary_bytes,
         )
 
+    def _retire_slot(self, slot: _Slot) -> None:
+        if self._slots.get(slot.slot_id) is not slot:
+            return
+        self._slots.pop(slot.slot_id)
+        self._remember_slot_tombstone(slot)
+
     async def _cleanup_slot(self, slot: _Slot) -> None:
         if slot.cleanup_task is not None:
             return
-        self._slots.pop(slot.slot_id, None)
-        if slot.final_end is not None:
-            self._remember_tombstone(
-                slot.slot_id,
-                slot.final_end,
-                sender_success_end=slot.sender_success_end,
-                local_failure_end=slot.local_failure_end,
-                remote_failure_end=slot.remote_failure_end,
-                crossing_failure_ack_sent=slot.crossing_failure_ack_sent,
-                receiver_ready=slot.receiver_ready,
-                receiver_failed=slot.role == "receiver" and slot.state == "ABORTED",
-                declared_bytes=slot.begin.total_bytes if slot.begin is not None else None,
-                binary_bytes_seen=slot.inbound_bytes + slot.late_binary_bytes,
-            )
+        current_cleanup = asyncio.current_task()
+        assert current_cleanup is not None
+        slot.cleanup_task = current_cleanup
         lease = slot.lease
         slot.lease = None
         drains = tuple(task for task in slot.abandoned_drains if not task.done())
         if drains:
+            self._retire_slot(slot)
             cleanup = asyncio.create_task(self._drain_slot_resources(slot, drains))
             slot.cleanup_task = cleanup
             if lease is not None:
@@ -1407,6 +1415,7 @@ class TransferManager:
             await self._cleanup_slot_resources(slot)
             await self._complete_directory_child(slot)
         finally:
+            self._retire_slot(slot)
             if lease is not None:
                 lease.release()
 

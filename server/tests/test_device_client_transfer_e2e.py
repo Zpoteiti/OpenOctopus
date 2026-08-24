@@ -320,6 +320,8 @@ async def test_real_file_transfer_and_device_workspace_relay(
             )
             assert rest_transfer.status_code == 200, rest_transfer.text
             assert rest_transfer.json() == {
+                "kind": "file",
+                "files_transferred": 1,
                 "bytes_transferred": len(rest_bytes),
                 "sha256": _sha256(rest_bytes),
                 "warnings": [],
@@ -743,6 +745,8 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
             copy = await transfer("copy-source.bin", "copy-result.bin", mode="copy")
             assert copy.status_code == 200, copy.text
             assert copy.json() == {
+                "kind": "file",
+                "files_transferred": 1,
                 "bytes_transferred": len(copy_bytes),
                 "sha256": _sha256(copy_bytes),
                 "warnings": [],
@@ -917,6 +921,8 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
             )
             assert reconnected.status_code == 200, reconnected.text
             assert reconnected.json() == {
+                "kind": "file",
+                "files_transferred": 1,
                 "bytes_transferred": len(reconnect_bytes),
                 "sha256": _sha256(reconnect_bytes),
                 "warnings": [],
@@ -969,6 +975,8 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
                 )
             assert changed.status_code == 200, changed.text
             assert changed.json() == {
+                "kind": "file",
+                "files_transferred": 1,
                 "bytes_transferred": len(changed_original),
                 "sha256": _sha256(changed_original),
                 "warnings": ["source_delete_failed"],

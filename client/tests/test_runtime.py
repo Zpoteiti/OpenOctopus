@@ -748,7 +748,7 @@ def test_connection_retains_slow_transfer_shutdown_across_reconnect(
 def test_shutdown_cancels_watchdog_after_retained_transfer_drain_quiesces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(connection_module, "_SHUTDOWN_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(connection_module, "_SHUTDOWN_GRACE_SECONDS", 0.1)
     monkeypatch.setattr(connection_module, "_SHUTDOWN_WATCHDOG_SECONDS", 0.5)
 
     async def exercise() -> None:
@@ -799,7 +799,7 @@ def test_shutdown_cancels_watchdog_after_retained_transfer_drain_quiesces(
             while not runtime._ever_ready:
                 await asyncio.sleep(0)
             runtime.request_shutdown()
-            assert await asyncio.wait_for(connection, timeout=1) is CloseDisposition.SHUTDOWN
+            assert await asyncio.wait_for(connection, timeout=2) is CloseDisposition.SHUTDOWN
             assert runtime._local_transfer_drains.pending_count == 1
             assert runtime._shutdown_cleanup_incomplete is False
 

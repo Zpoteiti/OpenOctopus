@@ -58,6 +58,63 @@ def _fingerprint(path: Path) -> str:
     return opaque_stat_fingerprint((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
 
 
+def test_directory_scan_and_verify_use_fresh_path_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    file = source / "file.txt"
+    file.write_bytes(b"data")
+    real_scandir = os.scandir
+
+    class EntryWithoutIdentity:
+        def __init__(self, entry: Any) -> None:
+            self.name = cast(str, entry.name)
+            self.path = cast(str, entry.path)
+
+        def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+            del follow_symlinks
+            raise AssertionError("DirEntry.stat identity must not be used")
+
+    class ScandirWithoutIdentity:
+        def __init__(self, path: Any) -> None:
+            self._iterator = real_scandir(path)
+
+        def __enter__(self) -> Any:
+            return iter(EntryWithoutIdentity(entry) for entry in self._iterator)
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            self._iterator.close()
+
+    monkeypatch.setattr(os, "scandir", ScandirWithoutIdentity)
+    scanned = directory_jobs_module._scan_directory(
+        source,
+        threading.Event(),
+        lambda **_values: None,
+        hash_contents=True,
+    )
+    entry = scanned.manifest.entries[0]
+    content = scanned.content_entries[0]
+    fingerprint = _fingerprint(file)
+    assert entry.fingerprint == fingerprint
+
+    committed = directory_jobs_module._CommittedDestination(
+        relative_path=entry.relative_path,
+        destination_fingerprint=fingerprint,
+        verified_size=entry.size,
+        verified_sha256=content.sha256,
+    )
+    directory_jobs_module._verify_destination_tree(
+        source,
+        scanned.manifest,
+        {entry.relative_path: committed},
+        threading.Event(),
+        lambda **_values: None,
+    )
+
+
 def _make_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)

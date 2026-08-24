@@ -2359,6 +2359,134 @@ def test_send_file_waits_for_ready_and_uses_bounded_chunks(tmp_path: Path) -> No
     asyncio.run(exercise())
 
 
+def test_slot_stays_visible_until_resource_cleanup_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = manager._cleanup_slot_resources
+
+        async def pause_cleanup(slot: Any) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await original_cleanup(slot)
+
+        monkeypatch.setattr(manager, "_cleanup_slot_resources", pause_cleanup)
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            await manager.handle_control(TransferReady(id=SLOT))
+            success = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, success["bytes_sent"]),
+                    sha256=cast(str, success["sha256"]),
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+            assert manager.slot_state(SLOT) is not None
+
+            release_cleanup.set()
+            await _wait_slot_closed(manager, SLOT)
+            assert manager.path_locks.reservation_count == 0
+        finally:
+            release_cleanup.set()
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_waits_for_visible_slot_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.bin").write_bytes(b"abc")
+
+    async def exercise() -> None:
+        manager, writer, socket, writer_task = await _manager(tmp_path)
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = manager._cleanup_slot_resources
+        slot: Any = None
+        shutdown: asyncio.Task[None] | None = None
+
+        async def pause_cleanup(current: Any) -> None:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+            await original_cleanup(current)
+
+        monkeypatch.setattr(manager, "_cleanup_slot_resources", pause_cleanup)
+        try:
+            await manager.handle_control(
+                TransferRequest(
+                    id=SLOT,
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="result.bin",
+                )
+            )
+            async with asyncio.timeout(1):
+                while manager.slot_state(SLOT) is not TransferState.BEGUN:
+                    await asyncio.sleep(0.001)
+            slot = manager._slots[SLOT]
+            await manager.handle_control(TransferReady(id=SLOT))
+            success = await _wait_for_transfer_end(socket, SLOT, ack=False, ok=True)
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=True,
+                    ok=True,
+                    bytes_sent=cast(int, success["bytes_sent"]),
+                    sha256=cast(str, success["sha256"]),
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert manager.path_locks.reservation_count == 1
+
+            shutdown = asyncio.create_task(manager.shutdown())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert cleanup_cancelled.is_set() is False
+            assert shutdown.done() is False
+
+            release_cleanup.set()
+            await asyncio.wait_for(shutdown, timeout=1)
+            assert manager.slot_state(SLOT) is None
+            assert manager.path_locks.reservation_count == 0
+        finally:
+            release_cleanup.set()
+            if shutdown is not None:
+                await asyncio.gather(shutdown, return_exceptions=True)
+            if slot is not None and slot.lock_stack is not None:
+                await original_cleanup(slot)
+            await _stop(manager, writer, writer_task)
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(
     ("after_timeout", "ack_ok"),
     (
@@ -2573,14 +2701,14 @@ def test_sender_ack_during_timeout_cleanup_fixes_the_chosen_tombstone(
         manager._idle_timeout = 0.05
         cleanup_started = asyncio.Event()
         release_cleanup = asyncio.Event()
-        original_cleanup = manager._cleanup_slot
+        original_cleanup = manager._cleanup_slot_resources
 
-        async def blocked_cleanup(slot: object) -> None:
+        async def blocked_cleanup(slot: Any) -> None:
             cleanup_started.set()
             await release_cleanup.wait()
-            await original_cleanup(slot)  # type: ignore[arg-type]
+            await original_cleanup(slot)
 
-        monkeypatch.setattr(manager, "_cleanup_slot", blocked_cleanup)
+        monkeypatch.setattr(manager, "_cleanup_slot_resources", blocked_cleanup)
         first_ack = TransferEnd(
             id=SLOT,
             ack=True,
@@ -2613,6 +2741,7 @@ def test_sender_ack_during_timeout_cleanup_fixes_the_chosen_tombstone(
             await manager.handle_control(first_ack)
             release_cleanup.set()
             await _wait_slot_closed(manager, SLOT)
+            assert manager._tombstones[SLOT].ack is True
 
             with pytest.raises(ProtocolError, match="unknown transfer"):
                 await manager.handle_control(
