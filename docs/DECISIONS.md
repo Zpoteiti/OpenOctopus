@@ -7,7 +7,8 @@ Each record captures **what** was decided and **why**, not how it was implemente
 **Current Python-main Device contract:** ADR-133 is the Py7 authority for
 workspace restriction, Protocol v3, Device MCP, and Server `web_fetch` policy.
 ADR-134 is the Py8b authority for same-owner distinct-Client regular-file
-transfer over that unchanged Protocol v3 contract.
+transfer; ADR-087's Py8c clarification extends the same unchanged Protocol v3
+contract to bounded recursive directories.
 The accepted Py8a Server shared-MCP design extends ADR-047/049/071/072/114 with
 admin whole-list CAS, Server-first namespace/capacity, one shared runtime per
 name, bounded fair admission, degraded recovery, and trusted same-UID execution
@@ -848,7 +849,7 @@ asyncio event loop stays responsive. This applies to both server-side
 | message | no | 30s internal | — |
 | web_fetch | no | 30s total, 10s connect | — |
 | cron | no | 10s (DB op) | — |
-| file_transfer | no | stall-detect: abort if no bytes in 30s; same-device move is atomic (instant) | — |
+| file_transfer | no | existing transfer idle/no-progress deadline; eligible same-Client move uses one native rename | — |
 | MCP tools | no OpenOctopus timeout override | 60s public deadline including Server queue time | Server remote calls may shield-drain for one additional 60s while retaining permits; no automatic replay |
 
 - **Exec background sessions follow nanobot's model.** `exec.timeout` is the
@@ -1097,44 +1098,97 @@ turn; cache capacity never changes prompt semantics.
 
 ### ADR-087 · `file_transfer` unified with `mode`; folder semantics are recursive
 
-**Status:** accepted
-**Python-main clarification:** Python-main includes `client -> client` bridging
-in the Tools contract. The server bridges bytes from source device WebSocket to
-destination device WebSocket. All four direction combinations are active:
-`server -> server`, `server -> client`, `client -> server`, `client -> client`.
-Destination exists always rejects — no overwrite flag. Partial transfer cleanup
-is server-orchestrated, destination-executed, best-effort: the server knows
-the transfer manifest and tells the destination to delete already-written
-paths; if cleanup fails (e.g. device disconnect), the tool result returns
-warning and user/agent handles manually. Server workspace writes go through
-`WorkspaceService` to RustFS; the future transfer implementation must use a
-bounded stream and may not add a durable local file cache. Shared
-workspace members have equal permissions; `file_transfer` into a locked
-shared workspace is rejected like any other write.
+**Status:** accepted; Py8b regular-file bridge and Py8c recursive-directory
+semantics implemented (2026-08-24)
+
+**Python-main clarification:** One `file_transfer` automatically handles a
+regular file or recursive directory. All install-site combinations are active:
+`server -> server`, `server -> client`, `client -> server`, one Client to
+itself, and two distinct same-owner Clients. Directory orchestration reuses the
+single-file slot and Py8b relay one child at a time; it adds no public frame,
+Protocol v4, durable job, or Server byte cache.
+
 **Context:** Originally `file_transfer` was a cross-device-only copy primitive. A separate `move_file` was considered for same-device rename. Keeping them separate felt cleaner conceptually, but a unified tool is fewer tool slots for the agent to learn and reuses the cross-device byte-moving machinery for all file relocations.
 **Decision:**
-- **Schema: five required fields** — `openoctopus_src_device`, `src_path`, `openoctopus_dst_device`, `dst_path`, `mode`. `mode` enum: `"copy" | "move"`. The two device fields use the reserved `openoctopus_` prefix (per ADR-041) with source stub `enum: ["server"]`; merge extends.
+- **Schema.** `openoctopus_src_device`, `src_path`,
+  `openoctopus_dst_device`, and `dst_path` are always required. Agent calls may
+  omit `mode`, which defaults to `copy`; REST requires explicit `mode`.
+  `mode` is `copy | move`. Source kind is detected automatically, so there is
+  no `recursive`, `source_kind`, or `overwrite` field.
 - **Behavior matrix:**
-  - Same-device `copy`: native filesystem copy on that device.
-  - Same-device `move`: atomic rename.
-  - Cross-device `copy` (`server -> client`, `client -> server`, `client -> client`): server orchestrates streaming pull-and-push over the device WebSocket; source remains intact.
-  - Cross-device `move`: same stream copy, then delete source only on successful write. If delete fails after a successful copy, both copies exist and the tool result flags a warning. The inverse (neither copy exists) cannot happen — we order copy-then-delete.
-- **Folder semantics.** If `src_path` points to a folder, the operation is recursive. Same-device folder moves remain atomic (single directory-entry rename). Cross-device folder transfers stream each entry; mid-transfer failure triggers best-effort destination cleanup (server-orchestrated, destination-executed).
-- **Rejection cases.** `dst_path` already exists → reject (no implicit overwrite, no overwrite flag). `src_path` does not exist → reject. Symlink-outside-workspace checks apply per each side's `sandbox_mode`.
-- **Quota.** Applies when `openoctopus_dst_device="server"`. Single-op cap (ADR-078) uses total bytes being written (folder sum for recursive). Move from server refunds on successful delete.
-- **SKILL.md validation (applies to BOTH single-file AND folder transfers).** Before any bytes move, the server enumerates every destination path the transfer would produce. For each path that would match `skills/*/SKILL.md` (exactly one level deep, exact filename — same rule as ADR-082), the validator runs against the source content.
-  - **Single-file transfer:** if `dst_path` matches `skills/*/SKILL.md` and content is malformed → reject the transfer; no bytes land.
-  - **Folder transfer:** the server pre-scans the source tree and identifies every file whose final dst path would match `skills/*/SKILL.md`. It validates ALL such files up-front. If **any** is malformed, the **entire transfer** is rejected atomically — no partial copy lands. This closes the gap where recursive folder transfer would otherwise admit invalid skills for later load-time discovery.
-  - Non-SKILL.md files and any files outside the `skills/` tree are untouched by this validator — they transfer normally.
+  - A regular-file copy/move uses the existing implementation. On one Client,
+    move uses its no-replace native rename. Server-to-Server still uses
+    `WorkspaceService` object copy plus conditional delete; an object-prefix
+    operation is not described as atomic rename.
+  - A qualifying nonempty same-Client directory move uses one exclusive
+    no-replace native directory rename. It preserves the source tree including
+    empty subdirectories, and fails rather than falling back to copy/delete
+    when paths cross volumes or the platform lacks a reliable primitive.
+  - Other directory paths copy all manifest files sequentially. Move starts
+    conditional source cleanup only after the complete destination is exact and
+    finalized; it never deletes source during copy.
+- **Directory plan.** The manifest includes every ordinary hidden/noise file;
+  there are no discovery ignore rules. Scan-only directory identities support
+  bounds, revalidation, and cleanup, but copy does not recreate empty
+  directories. A tree with no regular files is rejected. Links,
+  junctions/reparse points, and special files reject the entire operation
+  regardless of `restrict_to_workspace`. The complete canonical manifest is
+  capped at 10,000 entries and 5 MiB; every listed file is opened against its
+  captured size/fingerprint, and same-Client rename performs a final bounded
+  full revalidation before the syscall.
+- **Destination and overlap.** Destination root must be absent and is never
+  overwritten or merged. Filesystem destinations claim an exclusive root;
+  Server object destinations hold an ancestor-aware subtree lease and publish
+  each file atomically no-replace. Source/destination physical overlap on the
+  same captured Client is rejected. Different Device IDs are not compared for
+  host filesystem identity; configuring two Devices over the same physical
+  tree is unsupported.
+- **Quota and resources.** A Server destination reserves aggregate directory
+  bytes before the first publish and applies soft-lock/single-operation quota
+  rules. Existing per-user/global transfer admission, queue/idle timeouts,
+  object IO limits, and 64 KiB chunk queues are reused. Each Client generation
+  admits at most two directory jobs and each operation has at most one active
+  child slot. Jobs/manifests are process-local and generation-bound; there is no
+  resume, range, checkpoint, compression, or restart recovery.
+- **Cleanup and warnings.** Copy failure conditionally deletes only exact
+  entries and empty parents created by this operation. If destination absence
+  is proved, the original transfer error is returned; if not, the result is
+  `tool_execution_outcome_unknown`, never a success warning. Once a complete
+  destination is finalized, source ACK or move cleanup failure does not roll it
+  back. Success may include at most eight canonical symbolic warnings:
+  `transfer_ack_failed`, `source_delete_failed`,
+  `source_changed_after_copy`, and `source_cleanup_incomplete`.
+- **SKILL.md validation.** A single file mapped to
+  `skills/<name>/SKILL.md` is validated by the Server write boundary. For a
+  directory mapped into a personal Server `skills/` subtree, every resulting
+  exact `skills/<name>/SKILL.md` is streamed sequentially through bounded
+  private staging and validated against the same captured fingerprint before
+  the first destination publish. Any failure leaves the destination absent.
+  This is validation-before-first-commit, not whole-tree atomic visibility once
+  ordinary copying begins.
+- **Result.** File and directory success share one bounded aggregate:
+  `kind`, `files_transferred`, `bytes_transferred`, `sha256`, and `warnings`.
+  Directory digest covers the mapped regular-file path/content set, not empty
+  directories or filesystem metadata; no per-entry arrays enter Provider or
+  REST results.
+- **Platform boundary.** Linux, macOS, and Windows use conservative native
+  no-follow, path-representation, case/Unicode-collision, fsync, and rename
+  checks. Native/frozen tests on all three platforms are release evidence; a
+  missing platform primitive is a stable operation failure, not a portability
+  fallback.
 
-**Consequences:** One tool covers rename, move, copy, install-from-client, and cross-device staging. Agents learn one schema. No separate `move_file` tool. `file_transfer` remains server-owned (ADR-040) because only the server can orchestrate cross-device byte streaming, but its targets can be any paired device including the server itself; offline targets fail at dispatch with `device_unreachable`.
+**Consequences:** One tool covers regular files, recursive directories,
+same-Client rename, install-from-Client, and cross-device staging. It remains
+Server-owned (ADR-040) because the Server authorizes routes, admission, and
+cross-site orchestration. Shared workspace permissions/quota apply normally;
+offline targets fail at dispatch with `tool_device_unreachable`.
 
 ### ADR-088 · `write_file` implicitly creates parent directories
 
 **Status:** accepted
 **Context:** Server has no shell, and the shared tool surface has no explicit mkdir. Without auto-creation, saving `skills/new-skill/SKILL.md` would require a precondition step (create folder) that doesn't exist as a tool call.
-**Decision:** `write_file(path, content)` applies `mkdir -p` semantics on the path's parent directory — equivalent to `tokio::fs::create_dir_all(path.parent())` before the write. Behavior identical on server and client. Subject to the normal workspace-bounds checks (`sandbox_mode`) and quota guardrails.
-**Consequences:** Agents and users never have to think about folder creation. Saves `skills/my-new-skill/SKILL.md` in a single call. Empty folders don't exist as first-class entities — they're always a byproduct of some file living there. Deleting the last file leaves the folder behind (harmless, `delete_folder` can clean up later).
+**Decision:** `write_file(path, content)` applies `mkdir -p` semantics on the path's parent directory before the write. Client filesystems create parents natively; Server object paths gain parents implicitly from their key prefix. Both remain subject to normal authorization/path policy (`restrict_to_workspace` on Clients) and Server quota guardrails.
+**Consequences:** Agents and users never have to think about folder creation. Saves `skills/my-new-skill/SKILL.md` in a single call. Server object storage has no first-class empty-directory object. Recursive manifest/copy therefore does not create empty destination directories and rejects a source tree with no regular files. A qualifying same-Client atomic directory move is the structural exception: it renames the existing nonempty directory entry and preserves empty subdirectories already inside it. Client filesystem directories left after deleting their last file remain harmless and can be removed with `delete_folder`.
 
 ---
 
@@ -2131,7 +2185,7 @@ Admin users can delete ordinary users, other admins, and themselves, but deletio
 Manual smoke testing in v1. Wire up later if frontend complexity grows.
 
 ### ADR-067 · No bulk file operations / file rename endpoint
-**Status:** superseded by ADR-087. Originally "single-file ops only; delete + re-upload for rename." Rename/move (including folder rename) is now supported via `file_transfer` with `mode=move` — same-device move is an atomic `tokio::fs::rename`. Bulk operations remain out of scope.
+**Status:** superseded by ADR-087. Originally "single-file ops only; delete + re-upload for rename." `file_transfer` now handles one file or one bounded recursive source directory. A qualifying same-Client move uses a native exclusive rename; Server object-prefix moves remain copy-then-conditional-delete. There is still no arbitrary bulk-item mutation API.
 
 ### ADR-068 · No server-pushed workspace tree invalidation
 When an agent writes a file, the open Workspace tab doesn't auto-refresh. User reload or navigate triggers refetch. WS/SSE push can be added if the UX friction is real.
@@ -2948,7 +3002,9 @@ does not count as production code. Numbered implementation milestones start at
 | **Py5** | Client Alpha | **Decide client language** (Go or Rust); client WS runtime + token connect/reconnect + config push + shared file tool dispatch + `web_fetch` dispatch | Py4 | Real client e2e proves server agent reads/writes via paired client; offline returns `device_unreachable` |
 | **Py6** | Client shell hardening | Persistent shell + reconnect + diagnostics + exec ergonomics | Py5 | Shell tests cover session continuity/reconnect/timeout/cancel/event-loop starvation |
 | **Py7** | Client sandbox + client-side MCP | Client-side file/subprocess jail + client-side MCP register/execute | Py6 | Client sandbox + fake MCP pass on supported platforms |
-| **Py8** | Server MCP security boundary + shared runtime | Admin whole-list CAS API and last-good catalog; FastMCP 3.4.7 stdio/Streamable HTTP/SSE; four surfaces; one shared runtime per name; Server-first namespace/capacity; bounded fair queue and degraded recovery; trusted same-UID stdio with no OS sandbox | Py7 | Three-transport fake MCP E2E passes; Server-first shadow/capacity and Device mutation races pass; queue remains bounded/fair under 500-user pressure; MCP-down leaves `/health` healthy; shutdown leaves no child/connection/task leaks |
+| **Py8a** | Server MCP security boundary + shared runtime | Admin whole-list CAS API and last-good catalog; FastMCP 3.4.7 stdio/Streamable HTTP/SSE; four surfaces; one shared runtime per name; Server-first namespace/capacity; bounded fair queue and degraded recovery; trusted same-UID stdio with no OS sandbox | Py7 | Three-transport fake MCP contract; Server-first shadow/capacity and Device mutation races; bounded/fair queue; degraded MCP leaves `/health` healthy; clean runtime shutdown |
+| **Py8b** | Distinct-Client regular-file transfer | Same-owner Client A→Client B pure relay over one captured Protocol v3 slot; bounded admission; conditional move cleanup; no Server byte staging | Py7 | Five regular-file topologies share one public tool/REST shape; route, integrity, cancellation, late-frame, warning, and no-inner-admission contracts |
+| **Py8c** | Recursive directory transfer | Automatic file/directory dispatch; bounded immutable manifests; five topologies; sequential child slots; exact cleanup; same-Client atomic rename; Skills prevalidation | Py8b | 10,000-entry/5 MiB bounds; no-overwrite/empty/link/drift/cleanup contracts; bounded aggregate result; unchanged Protocol v3 |
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
@@ -2959,14 +3015,15 @@ does not count as production code. Numbered implementation milestones start at
 ### Parallel tracks (post-Py3)
 
 ```
-Py3 ──────────┬── Py4a → Py4 → Py5 → Py6 → Py7 → Py8
+Py3 ──────────┬── Py4a → Py4 → Py5 → Py6 → Py7 → Py8a → Py8b → Py8c
                │
                ├── Py9 (cron/heartbeat)
                │
                └── Py10 (channels)
 ```
 
-Py9 and Py10 depend only on Py3 and can develop concurrently with Py4–Py8.
+Py9 and Py10 depend only on Py3 and can develop concurrently with the
+Py4–Py8c line.
 
 Server milestones use first-party async application code and a OpenOctopus-owned
 Anthropic Messages adapter built on the Anthropic Python SDK where the SDK fits
@@ -3616,6 +3673,11 @@ still requires a command/routing and distributed-admission design.
 
 **Status:** accepted (2026-08-10)
 
+**Py8c clarification:** The single-file, no-Client-bridge, and Linux-only test
+boundaries below are retained as the Py5 milestone record. ADR-134/Py8b adds
+the distinct-Client regular-file relay, and ADR-087/Py8c adds bounded recursive
+directories across Linux, macOS, and Windows without changing Protocol v3.
+
 **Context:** The Py5 Python/PyInstaller feasibility spike established a
 standalone client boundary, but the forward device documents still described
 the earlier Rust client, plaintext token primary key, shell/MCP configuration,
@@ -3625,9 +3687,10 @@ implementation.
 **Decision:**
 
 - The Py5 client is Python 3.12 packaged as a PyInstaller one-folder bundle;
-  the server package is not imported by the client. Linux x86-64 is the current
-  merge-gate platform. Native Windows and macOS frozen verification is deferred
-  until those runners are available.
+  the server package is not imported by the client. Linux x86-64 was the Py5
+  milestone gate. Native Windows and macOS frozen verification was deferred
+  at that milestone and is required by the later cross-platform Client
+  contract.
 - Py5 persists only `workspace_path`, `sandbox_mode`, and `ssrf_denylist` for a
   device. Shell timeout, environment/command policy, and MCP configuration are
   deferred with their implementing milestones and are not sent in `hello_ack`.
@@ -3636,9 +3699,9 @@ implementation.
   a non-secret `token_hint`, and compared by hashing the `Authorization`
   bearer value. Tokens never appear in URLs, logs, or child-process
   environments.
-- Py5 transfers one regular file at a time between the server and a paired
-  device. Folder transfer, client-to-client bridging, range, resume, and
-  compression remain deferred. A transfer uses
+- Py5 transferred one regular file at a time between the Server and a paired
+  Device. At that milestone, folder transfer, Client-to-Client bridging, range,
+  resume, and compression were deferred. A transfer uses
   an optional `transfer_request` (requester to sender), `transfer_begin`
   (sender opens and describes the byte source), `transfer_ready` (receiver has
   reserved its destination or consumer), binary chunks, and two
@@ -3650,11 +3713,10 @@ implementation.
   the immutable provider-hidden device ID plus name; relay validates both, so
   rename, deletion, and later same-name reuse fail closed.
 
-**Consequences:** Py5 has no speculative server-side device configuration and
+**Consequences:** Py5 had no speculative Server-side Device configuration and
 no token recovery path. The protocol is explicit about who may send bytes and
-has a clean extension point for later transfer modes. The existing future
-shell/MCP and folder sections remain documentation for later milestones, not
-Py5 implementation requirements.
+provided the slot later reused by Py8b/Py8c. Shell, MCP, and directory support
+were not Py5 implementation requirements.
 
 ---
 
@@ -3789,9 +3851,9 @@ addition are no longer Python-main contracts.
 **Supersedes and clarifies:** ADR-131's deferral of Client-to-Client transfer is
 superseded for one regular file between two distinct online Devices owned by
 the same authenticated user. ADR-087's four-direction matrix and
-copy-then-conditional-delete rule now apply to regular files. Its recursive
-folder/manifest and multi-file cleanup clauses are not part of Py8b and remain
-deferred to Py8c. The historical ADR bodies remain milestone records.
+copy-then-conditional-delete rule apply to regular files. Py8c subsequently
+implements ADR-087's recursive manifest, sequential child, and exact cleanup
+semantics over this bridge. The historical ADR bodies remain milestone records.
 
 **Decision:** The Server atomically captures both live Device routes and relays
 one existing Protocol v3 transfer slot from source to destination. It retains
@@ -3810,11 +3872,12 @@ neither warning triggers replay or rollback. Routing, admission, bridge state,
 and late-frame containment are process-local under the current single-ASGI-
 worker boundary.
 
-**Consequences:** All server/Client and same-owner Client/Client regular-file
-combinations share one public tool and REST shape. Cross-user routing fails
-closed before transfer frames. Recursive directory transfer, resume, range,
-compression, RustFS-backed staging, and cross-worker bridge routing remain out
-of scope.
+**Consequences:** All Server/Client and same-owner Client/Client regular-file
+combinations share one public tool and REST shape. Py8c reuses the same slot for
+one recursive-directory child at a time; it adds no second byte pump or public
+wire surface. Cross-user routing fails closed before transfer frames. Resume,
+range, compression, durable directory jobs, and cross-worker bridge routing
+remain out of scope.
 
 ---
 

@@ -2,13 +2,12 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131, 134). When the implementation drifts from this doc, fix one or the other.
 
-**Py8a milestone:** the fixed surface is the eleven shared tools plus
-server-orchestrated single-regular-file `file_transfer` and the three
-client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). Device
+**Py8 milestone:** the fixed surface is the eleven shared tools plus
+server-orchestrated `file_transfer` and the three client-only shell tools
+(`exec`, `write_stdin`, `list_exec_sessions`). `file_transfer` automatically
+handles one regular file or one recursive directory between any two install
+sites owned by the same user, including two distinct online Clients. Device
 and admin shared-service Server MCP add dynamic tools from four surfaces.
-Py8b allows `file_transfer` between any two install sites owned by the same
-user, including two distinct online Clients; recursive directory transfer
-remains outside the current tool contract.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -75,7 +74,7 @@ This is a *design* document. Use it during implementation as the source of truth
 | `notebook_edit` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Edit Jupyter notebook cells |
 | `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — Server admin denylist and independent per-Device Client denylist |
 | `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
-| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `openoctopus_client/transfer.py` | Copy or move one regular file between any two same-owner install sites |
+| `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `directory_transfer.py`/site backends + `openoctopus_client/transfer.py` | Copy or move one regular file or recursive directory between any two same-owner install sites |
 | `cron` | future placeholder | — | — | Not registered in the current tool registry |
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
 | `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
@@ -917,17 +916,24 @@ web session. Py6 does not expose channel, chat, or button arguments.
 
 ### `file_transfer`
 
-**Lives in:** `openctopus_server/tools/file_transfer.py`
+**Lives in:** public schema/routing in
+`openctopus_server/tools/file_transfer.py`; manifest/coordinator in
+`openctopus_server/tools/directory_transfer.py`; endpoint adapters in
+`server_directory_backend.py`, `cross_site_directory_backend.py`, and
+`device_directory_jobs.py`; Client byte slots in
+`openoctopus_client/transfer.py` and private jobs in
+`openoctopus_client/tools/directory_jobs.py`.
 
-**Purpose:** Copy or move one regular file across any two same-owner install
-sites: `server -> server`, `server -> client`, `client -> server`, same-client
-local, or two distinct Clients. Recursive folder transfer is not supported.
-Server-to-server uses `WorkspaceService`; Client legs use the device WebSocket.
-A distinct-Client transfer is a bounded pure relay: the Server forwards bytes
-from the source Client to the destination Client without a Server temporary
-file, durable cache, or RustFS staging object. An existing destination is
-always rejected (no overwrite flag). Disconnected device targets return
-`tool_device_unreachable`.
+**Purpose:** Copy or move one regular file or one recursive directory across
+any two same-owner install sites: `server -> server`, `server -> client`,
+`client -> server`, same-client local, or two distinct Clients. Source kind is
+detected automatically; there is no `recursive` argument or second tool.
+Server-to-server uses `WorkspaceService`; Client legs use the Device WebSocket.
+A distinct-Client transfer is a bounded pure relay: the Server forwards one
+file at a time from the source Client to the destination Client without a
+Server durable byte cache or RustFS staging object. An existing destination
+root is always rejected; transfer never overwrites or merges. Disconnected
+Device targets return `tool_device_unreachable`.
 
 **Agent-visible schema after merge:** the source schema contains the two
 intrinsic device fields, `src_path`, `dst_path`, and optional `mode` (default
@@ -936,21 +942,21 @@ exposing the tool to the model.
 ```json
 {
   "name": "file_transfer",
-  "description": "Transfer one regular file between the server or paired devices. Use mode='copy' to leave the source intact, or mode='move' to remove it after the destination commits. Destination is rejected if it already exists.",
+  "description": "Transfer one regular file or recursive directory between the server or paired devices. Use mode='copy' to leave the source intact, or mode='move' to remove it after the destination commits. Destination is rejected if it already exists.",
   "input_schema": {
     "type": "object",
     "properties": {
       "openoctopus_src_device": {
         "type": "string",
         "enum": ["server"],
-        "description": "Device where the source regular file lives.",
+        "description": "Device where the source file or directory lives.",
         "x-openoctopus-device": true
       },
       "src_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_src_device." },
       "openoctopus_dst_device": {
         "type": "string",
         "enum": ["server"],
-        "description": "Device where the regular file should land.",
+        "description": "Device where the file or directory should land.",
         "x-openoctopus-device": true
       },
       "dst_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_dst_device. Must not already exist." },
@@ -979,29 +985,78 @@ remain visible and return `tool_device_unreachable` at dispatch.
 - The source schema in `openctopus_server` declares
   `openoctopus_src_device` and `openoctopus_dst_device`; the merge step extends
   both enums with paired device names.
-- `server -> server` reads, writes, and conditionally deletes through `WorkspaceService`, rejecting an existing destination before the copy.
-- `server -> client` and `client -> server` first resolve the named user device and require it to be connected. For client sources the server sends `transfer_request`; the byte sender then sends `transfer_begin`, waits for the receiver's `transfer_ready`, streams bounded binary chunks, and finishes with `transfer_end(ack=false)`. The receiver returns the final `transfer_end(ack=true)` acknowledgement. Both directions use the protocol in `PROTOCOL.md §4` with SHA-256 verification and bounded queues, without a durable local file cache.
+- The source endpoint performs a no-follow probe. A regular file uses the
+  existing single-file path. A directory produces a complete immutable
+  manifest and is copied sequentially with at most one active child file slot.
+- `server -> server` reads, writes, and conditionally deletes through
+  `WorkspaceService`. Server directory prefixes are copied per file and are
+  not presented as an atomic object-store rename.
+- `server -> client` and `client -> server` first resolve the named user Device
+  and require it to be connected. For Client sources the Server sends
+  `transfer_request`; the byte sender then sends `transfer_begin`, waits for
+  the receiver's `transfer_ready`, streams bounded binary chunks, and finishes
+  with `transfer_end(ack=false)`. The receiver returns the final
+  `transfer_end(ack=true)` acknowledgement. Directory orchestration reuses
+  this exact single-file slot for each manifest entry.
 - When both device fields name the same paired client, the server dispatches
-  the private `transfer_local` action; the client copies or moves one regular
-  file under its path policy without a WebSocket transfer slot.
+  a private local action. A qualifying same-Client directory move uses one
+  exclusive no-replace native directory rename and preserves empty
+  subdirectories. It fails rather than falling back to copy/delete when a
+  reliable atomic rename is unavailable or the paths cross volumes. Other
+  local operations use the sequential directory plan.
 - For two distinct Clients, the Server atomically captures two online routes
-  owned by the authenticated user and relays one slot through a bounded
-  four-chunk queue. It verifies byte count and SHA-256 but never persists the
-  payload. The destination Client performs its normal temporary-file,
-  verification, fsync, and atomic no-replace commit.
-- `move` is copy-then-conditional-delete. The source is deleted only after the
-  destination success ACK is delivered. A failed conditional delete leaves
-  both copies and returns `source_delete_failed`; an unconfirmed source ACK
-  after destination commit returns `transfer_ack_failed` and prevents source
-  deletion. These are success warnings, not automatic retry signals.
-- **Reject** if `dst_path` already exists (no implicit overwrite, no overwrite flag), `src_path` does not exist, a device name is unknown, or `mode` is not `copy` / `move`.
+  owned by the authenticated user and relays each child through the existing
+  bounded queue. It verifies byte count and SHA-256 but never persists the
+  payload. The destination Client performs temporary-file verification, fsync,
+  and atomic no-replace commit. Two different Device IDs that happen to expose
+  the same physical filesystem tree are an unsupported deployment topology;
+  OpenOctopus does not compare host filesystem identity across Devices.
+- A directory manifest contains every ordinary file plus scan-only directory
+  identities, with at most 10,000 total entries and a 5 MiB canonical encoded
+  size. Links, junctions/reparse points, and special files reject the whole
+  operation. Copy does not recreate empty directories, and a source directory
+  with no regular files is rejected. Paths are mapped beneath `dst_path` with
+  no overwrite or merge semantics.
+- Before a directory targeting a personal Server `skills/` subtree publishes
+  its first destination entry, every mapped `skills/<name>/SKILL.md` is streamed
+  through bounded private staging and validated. Validation failure leaves the
+  destination absent. This is a validation-before-first-commit guarantee, not
+  whole-tree atomic visibility.
+- `move` is copy-all-then-conditional-delete. Copy failure conditionally
+  removes only entries created by this operation. If complete cleanup cannot
+  be proved, the error is `tool_execution_outcome_unknown`; it is not safe to
+  retry automatically. After a complete destination is finalized, source
+  acknowledgement or conditional source cleanup failures remain success and
+  return bounded symbolic warnings (`transfer_ack_failed`,
+  `source_delete_failed`, `source_changed_after_copy`, or
+  `source_cleanup_incomplete`).
+- Success is one bounded aggregate: `kind` (`file` or `directory`),
+  `files_transferred`, `bytes_transferred`, canonical content `sha256`, and up
+  to eight deduplicated warnings. It never returns per-entry arrays. Directory
+  digest covers the mapped regular-file path/content set, not empty directories
+  or filesystem metadata.
+- **Reject** if the destination root exists, the source is missing or has an
+  unsupported kind, a source directory contains no regular files,
+  source/destination physically overlap on one captured Device, a manifest
+  bound is exceeded, source fingerprints drift, a Device is unknown, or `mode`
+  is not `copy` / `move`. A zero-byte regular file remains valid.
+
+Directory state is process-local and generation-bound. There are no public or
+durable directory jobs, range reads, resume/checkpoint tokens, compression, or
+automatic replay. Each Client generation admits at most two directory jobs;
+each operation owns at most one child slot, reuses existing bounded 64 KiB
+chunks/queues and transfer admission, and retains no complete file or tree in
+memory. Linux, macOS, and Windows use conservative native path, collision, and
+no-follow checks; platform-native and frozen tests are required for release,
+while unsupported atomic primitives fail explicitly.
 
 **Timeout:** Server-to-server path is normal workspace I/O. Device transfer stall detection belongs to the transfer-slot implementation.
 **Result cap:** short status text normalized as a normal tool result.
 **Errors:** `tool_invalid_args` for malformed args;
 `tool_device_unreachable` for offline or stale device targets;
 `tool_device_busy` for bounded transfer admission; destination/path policy
-errors such as `workspace_file_changed`; `workspace_transfer_timeout`,
+errors such as `workspace_file_changed`; `workspace_directory_too_large` for
+manifest bounds; `workspace_transfer_timeout`,
 `workspace_transfer_integrity_failed`, and `workspace_storage_unavailable` for
 stream or storage failures; `tool_execution_outcome_unknown` when an issued
 result cannot be established.
@@ -1552,7 +1607,9 @@ The agent sees errors as normal tool results and adapts on the next iteration (A
 - **`save_memory` / `edit_memory` / `update_soul`** — specialty tools dropped per Appendix A principle 1 ("generic over specialty"). MEMORY.md and SOUL.md are files, edited via `edit_file` / `write_file`.
 - **`install_skill`** — dropped per ADR-084. Skills are installed via `file_transfer` from a client (where the user runs the installer) or via the web UI.
 - **`read_skill`** — same. Skills are read via `read_file`.
-- **`bulk_*` operations** — single-file ops only (ADR-067, superseded by ADR-087 for the rename case).
+- **`bulk_*` operations** — there is no general bulk mutation surface.
+  `file_transfer` recursively handles exactly one source directory under its
+  bounded manifest contract; it does not expose arbitrary item batches.
 - **Per-session `web_fetch` bypasses** — Server policy is admin-global and
   Client policy is per Device; Agent calls cannot disable either snapshot.
 - **Agent-managed Server MCP** — only admins can read or replace Server MCP
