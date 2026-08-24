@@ -54,6 +54,44 @@ def test_file_transfer_schema_marks_both_device_fields() -> None:
         "openoctopus_dst_device",
         "dst_path",
     ]
+    assert "regular file or directory tree" in schema["description"]
+
+
+def test_file_transfer_outcome_validates_kind_count_and_normalizes_warnings() -> None:
+    outcome = FileTransferOutcome(
+        kind="directory",
+        files_transferred=3,
+        bytes_transferred=12,
+        sha256="a" * 64,
+        warnings=(
+            "source_cleanup_incomplete",
+            "transfer_ack_failed",
+            "source_changed_after_copy",
+            "transfer_ack_failed",
+        ),
+    )
+
+    assert outcome.warnings == (
+        "transfer_ack_failed",
+        "source_changed_after_copy",
+        "source_cleanup_incomplete",
+    )
+
+    with pytest.raises(ValueError):
+        FileTransferOutcome(
+            kind="file",
+            files_transferred=2,
+            bytes_transferred=12,
+            sha256="a" * 64,
+        )
+
+    with pytest.raises(ValueError):
+        FileTransferOutcome(
+            kind="directory",
+            files_transferred=0,
+            bytes_transferred=0,
+            sha256="a" * 64,
+        )
 
 
 @pytest.mark.parametrize(
@@ -124,6 +162,7 @@ async def test_distinct_clients_resolve_once_then_dispatch_one_bridge(
     )
 
     assert result.is_error is False
+    assert "file, 1 file" in str(result.content)
     assert "12 bytes" in str(result.content)
     assert session.execute_calls == 1
     assert session.closed is True
@@ -742,7 +781,10 @@ class _SameClientRegistry:
         return SimpleNamespace(
             is_error=False,
             code=None,
-            content='{"bytes_transferred":12,"sha256":"%s","warnings":[]}' % ("a" * 64),
+            content=(
+                '{"kind":"file","files_transferred":1,'
+                '"bytes_transferred":12,"sha256":"%s","warnings":[]}' % ("a" * 64)
+            ),
         )
 
 

@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_TRANSFER_WARNING_ORDER = (
+    "transfer_ack_failed",
+    "source_delete_failed",
+    "source_changed_after_copy",
+    "source_cleanup_incomplete",
+)
 
 
 class FileEditRequest(BaseModel):
@@ -91,11 +98,34 @@ class StructuredPatchResponse(BaseModel):
 class TransferResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    kind: Literal["file", "directory"]
+    files_transferred: int = Field(ge=1, le=10_000)
     bytes_transferred: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    warnings: list[Literal["transfer_ack_failed", "source_delete_failed"]] = Field(
-        max_length=8
-    )
+    warnings: list[
+        Literal[
+            "transfer_ack_failed",
+            "source_delete_failed",
+            "source_changed_after_copy",
+            "source_cleanup_incomplete",
+        ]
+    ] = Field(max_length=8)
+
+    @field_validator("warnings")
+    @classmethod
+    def validate_warning_order(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or value != sorted(
+            value,
+            key=_TRANSFER_WARNING_ORDER.index,
+        ):
+            raise ValueError("transfer warnings must be unique and canonically ordered")
+        return value
+
+    @model_validator(mode="after")
+    def validate_kind_count(self) -> TransferResponse:
+        if self.kind == "file" and self.files_transferred != 1:
+            raise ValueError("file transfer count must be one")
+        return self
 
 
 class GrepContextLine(BaseModel):

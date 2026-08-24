@@ -20,6 +20,8 @@ class _Workspace:
     async def transfer_server_to_server(self, db: object, **kwargs: object) -> object:
         del db, kwargs
         return SimpleNamespace(
+            kind="file",
+            files_transferred=1,
             bytes_transferred=12,
             sha256="a" * 64,
             warnings=("source_delete_failed",),
@@ -48,6 +50,8 @@ async def test_transfer_route_projects_the_shared_machine_outcome() -> None:
     )
 
     assert response.model_dump() == {
+        "kind": "file",
+        "files_transferred": 1,
         "bytes_transferred": 12,
         "sha256": "a" * 64,
         "warnings": ["source_delete_failed"],
@@ -189,10 +193,21 @@ def test_runtime_openapi_documents_transfer_result_and_strict_request() -> None:
         "description": "Seconds to wait before retrying",
         "schema": {"type": "integer", "minimum": 1},
     }
-    assert response_schema["required"] == ["bytes_transferred", "sha256", "warnings"]
+    assert response_schema["required"] == [
+        "kind",
+        "files_transferred",
+        "bytes_transferred",
+        "sha256",
+        "warnings",
+    ]
     assert response_schema["additionalProperties"] is False
     assert response_schema["properties"]["warnings"]["items"] == {
-        "enum": ["transfer_ack_failed", "source_delete_failed"],
+        "enum": [
+            "transfer_ack_failed",
+            "source_delete_failed",
+            "source_changed_after_copy",
+            "source_cleanup_incomplete",
+        ],
         "type": "string",
     }
 
@@ -200,9 +215,49 @@ def test_runtime_openapi_documents_transfer_result_and_strict_request() -> None:
 def test_transfer_response_rejects_unknown_warning() -> None:
     with pytest.raises(ValidationError):
         TransferResponse(
+            kind="file",
+            files_transferred=1,
             bytes_transferred=12,
             sha256="a" * 64,
             warnings=["unexpected_warning"],
+        )
+
+
+@pytest.mark.parametrize(
+    "warnings",
+    [
+        ["source_cleanup_incomplete", "source_changed_after_copy"],
+        ["source_changed_after_copy", "source_changed_after_copy"],
+    ],
+)
+def test_transfer_response_rejects_noncanonical_warnings(
+    warnings: list[str],
+) -> None:
+    with pytest.raises(ValidationError):
+        TransferResponse(
+            kind="directory",
+            files_transferred=2,
+            bytes_transferred=12,
+            sha256="a" * 64,
+            warnings=warnings,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "files_transferred"),
+    [("file", 0), ("file", 2), ("directory", 0), ("directory", 10_001)],
+)
+def test_transfer_response_enforces_kind_count(
+    kind: str,
+    files_transferred: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        TransferResponse(
+            kind=kind,  # type: ignore[arg-type]
+            files_transferred=files_transferred,
+            bytes_transferred=12,
+            sha256="a" * 64,
+            warnings=[],
         )
 
 

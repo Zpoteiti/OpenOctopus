@@ -958,6 +958,8 @@ async def transfer_workspace_file(
     except Exception as exc:
         _raise_device_transfer(exc, settings)
     return TransferResponse(
+        kind=outcome.kind,
+        files_transferred=outcome.files_transferred,
         bytes_transferred=outcome.bytes_transferred,
         sha256=outcome.sha256,
         warnings=list(outcome.warnings),

@@ -46,9 +46,10 @@ from openctopus_server.workspace.service import TransferPathTicket
 FILE_TRANSFER_SCHEMA: dict[str, Any] = {
     "name": "file_transfer",
     "description": (
-        "Transfer one regular file between the server or paired devices. Use mode='copy' "
-        "to leave the source intact, or mode='move' to remove it after the destination "
-        "commits. Destination is rejected if it already exists."
+        "Transfer one regular file or directory tree between the server or paired devices. "
+        "Directories are recursive. Use mode='copy' to leave the source intact, or "
+        "mode='move' to remove it after the destination commits. Destination is rejected "
+        "if it already exists."
     ),
     "input_schema": {
         "type": "object",
@@ -138,22 +139,48 @@ class _FileTransferArgs(TransferRequest):
 # OpenAPI component follows the documented ``TransferRequest`` schema name.
 FileTransferRequest = TransferRequest
 
+_TRANSFER_WARNING_PRIORITY = (
+    "transfer_ack_failed",
+    "source_delete_failed",
+    "source_changed_after_copy",
+    "source_cleanup_incomplete",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FileTransferOutcome:
     """Typed result shared by the agent tool and Workspace REST route."""
 
+    kind: Literal["file", "directory"]
+    files_transferred: int
     bytes_transferred: int
     sha256: str
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.kind == "file":
+            if self.files_transferred != 1:
+                raise ValueError("file transfer count must be one")
+        elif self.kind == "directory":
+            if not 1 <= self.files_transferred <= 10_000:
+                raise ValueError("directory transfer count is invalid")
+        else:
+            raise ValueError("transfer kind is invalid")
         if self.bytes_transferred < 0:
             raise ValueError("transfer byte count must be non-negative")
         if len(self.sha256) != 64 or any(
             character not in "0123456789abcdef" for character in self.sha256
         ):
             raise ValueError("transfer SHA-256 must be a lowercase hexadecimal digest")
+        unknown = set(self.warnings).difference(_TRANSFER_WARNING_PRIORITY)
+        if unknown:
+            raise ValueError("transfer warning is invalid")
+        normalized = tuple(
+            warning for warning in _TRANSFER_WARNING_PRIORITY if warning in self.warnings
+        )
+        if len(normalized) > 8:
+            raise ValueError("too many transfer warnings")
+        object.__setattr__(self, "warnings", normalized)
 
 
 class _TransferWorkspace(Protocol):
@@ -261,7 +288,7 @@ class _TransferRegistry(Protocol):
 
 
 class FileTransferTool(Tool):
-    """Server-owned orchestration for one regular-file transfer.
+    """Server-owned orchestration for one regular-file or directory transfer.
 
     The class only retains authorization tickets and transfer callbacks.  It
     never keeps a database session while the transfer manager waits on a
@@ -330,10 +357,12 @@ class FileTransferTool(Tool):
             return _error(ErrorCode.WORKSPACE_STORAGE_ERROR, "File transfer failed")
 
         warning = "" if not outcome.warnings else f" Warnings: {', '.join(outcome.warnings)}."
+        file_label = "file" if outcome.files_transferred == 1 else "files"
         return ToolResult(
             content=(
                 f"Transferred {parsed.src_path} to {parsed.dst_path} "
-                f"({outcome.bytes_transferred} bytes, sha256={outcome.sha256}).{warning}"
+                f"({outcome.kind}, {outcome.files_transferred} {file_label}, "
+                f"{outcome.bytes_transferred} bytes, sha256={outcome.sha256}).{warning}"
             )
         )
 
@@ -612,6 +641,8 @@ class FileTransferTool(Tool):
         except ValidationError as exc:
             raise TransferIntegrityError from exc
         return FileTransferOutcome(
+            kind="file",
+            files_transferred=1,
             bytes_transferred=result.bytes_transferred,
             sha256=result.sha256,
             warnings=tuple(result.warnings),
@@ -793,6 +824,8 @@ def _coerce_transfer_outcome(result: Any) -> FileTransferOutcome:
     if isinstance(result, FileTransferOutcome):
         return result
     return FileTransferOutcome(
+        kind=getattr(result, "kind", "file"),
+        files_transferred=getattr(result, "files_transferred", 1),
         bytes_transferred=result.bytes_transferred,
         sha256=result.sha256,
         warnings=tuple(result.warnings),
