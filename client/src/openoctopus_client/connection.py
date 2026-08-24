@@ -61,6 +61,10 @@ from openoctopus_client.transfer import (
     TransferConfigSnapshot,
     TransferManager,
 )
+from openoctopus_client.transfer_admission import (
+    LocalTransferAdmission,
+    LocalTransferDrainRegistry,
+)
 from openoctopus_client.writer import SerializedWriter, TextWebSocket, WriterOverflowError
 
 LOGGER = logging.getLogger(__name__)
@@ -334,6 +338,10 @@ class ClientRuntime:
         self._hello_factory = hello_factory or self._new_hello
         self._random_value = random_value
         self._path_locks = PathLocks()
+        self._local_transfer_admission = LocalTransferAdmission(
+            capacity=MAX_ACTIVE_TRANSFER_SLOTS
+        )
+        self._local_transfer_drains = LocalTransferDrainRegistry()
         self._shell_inventory = shell_inventory or discover_shells()
         self._exec_sessions: _RuntimeExecManager = exec_session_manager or ExecSessionManager()
         self._exec_policy_lock = asyncio.Lock()
@@ -478,6 +486,7 @@ class ClientRuntime:
             await asyncio.gather(
                 self._shutdown_exec_sessions(),
                 self._shutdown_mcp(),
+                self._shutdown_local_transfer_drains(),
             )
             if not self._shutdown_cleanup_incomplete:
                 self._cancel_shutdown_watchdog()
@@ -737,6 +746,8 @@ class ClientRuntime:
                         ),
                         writer,
                         path_locks=self._path_locks,
+                        admission=self._local_transfer_admission,
+                        drain_registry=self._local_transfer_drains,
                     )
                     self._transfer_manager = transfer_manager
                     transfer_failure_task = asyncio.create_task(
@@ -953,18 +964,24 @@ class ClientRuntime:
             await _stop_writer(writer, writer_task)
             transfer_stopped = True
             if transfer_shutdown_task is not None:
-                transfer_stopped = await _wait_task_bounded(
-                    transfer_shutdown_task, _SHUTDOWN_GRACE_SECONDS
+                done, _ = await asyncio.wait(
+                    {transfer_shutdown_task}, timeout=_SHUTDOWN_GRACE_SECONDS
                 )
+                transfer_stopped = transfer_shutdown_task in done
+                if transfer_stopped:
+                    _consume_task_result(transfer_shutdown_task)
+                else:
+                    assert transfer_manager is not None
+                    self._local_transfer_drains.retain(
+                        transfer_shutdown_task, owner=transfer_manager
+                    )
             worker_stopped = await worker.stop(
                 timeout=_SHUTDOWN_GRACE_SECONDS if shutdown_requested else None
             )
             config_stopped = await self._wait_for_config_tasks(
                 timeout=_SHUTDOWN_GRACE_SECONDS if shutdown_requested else None
             )
-            if shutdown_requested and (
-                not transfer_stopped or not worker_stopped or not config_stopped
-            ):
+            if shutdown_requested and (not worker_stopped or not config_stopped):
                 self._shutdown_cleanup_incomplete = True
             if shutdown_requested:
                 with contextlib.suppress(TimeoutError):
@@ -983,6 +1000,8 @@ class ClientRuntime:
             restrict_to_workspace=restrict_to_workspace,
             ssrf_denylist=denylist,
             path_locks=self._path_locks,
+            transfer_admission=self._local_transfer_admission,
+            transfer_drains=self._local_transfer_drains,
         )
 
     def _new_hello(self) -> Hello:
@@ -1197,6 +1216,17 @@ class ClientRuntime:
         try:
             await self._mcp_supervisor.shutdown()
         except Exception:
+            self._shutdown_cleanup_incomplete = True
+
+    async def _shutdown_local_transfer_drains(self) -> None:
+        try:
+            complete = await self._local_transfer_drains.wait(
+                timeout_seconds=_SHUTDOWN_WATCHDOG_SECONDS
+            )
+        except Exception:
+            self._shutdown_cleanup_incomplete = True
+            return
+        if not complete:
             self._shutdown_cleanup_incomplete = True
 
     def _track_config_task(self, task: asyncio.Task[Any]) -> None:

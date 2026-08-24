@@ -14,6 +14,7 @@ from uuid import UUID
 
 import pytest
 
+import openoctopus_client.connection as connection_module
 from openoctopus_client import cli
 from openoctopus_client.config import ConfigurationError, load_config
 from openoctopus_client.connection import (
@@ -203,6 +204,52 @@ def test_load_config_consumes_secret_and_builds_device_websocket_url() -> None:
     assert config.token.reveal() == "openoctopus_dev_secret-value"
     assert "OPENOCTOPUS_DEVICE_TOKEN" not in environment
     assert "secret-value" not in repr(config.token)
+
+
+def test_runtime_owns_shared_local_transfer_admission_and_drain_registry(
+    tmp_path: Path,
+) -> None:
+    runtime = ClientRuntime(load_config(_environment()))
+    first = cast(
+        dispatcher_module.ClientToolDispatcher,
+        runtime._default_dispatcher(tmp_path, True, []),
+    )
+    second = cast(
+        dispatcher_module.ClientToolDispatcher,
+        runtime._default_dispatcher(tmp_path, True, []),
+    )
+
+    assert first._transfer_admission is runtime._local_transfer_admission
+    assert second._transfer_admission is runtime._local_transfer_admission
+    assert first._transfer_drains is runtime._local_transfer_drains
+    assert second._transfer_drains is runtime._local_transfer_drains
+
+
+def test_runtime_shutdown_waits_for_local_transfer_drains() -> None:
+    async def exercise() -> None:
+        runtime = ClientRuntime(load_config(_environment()))
+        release = asyncio.Event()
+        lease = runtime._local_transfer_admission.try_acquire()
+        assert lease is not None
+
+        async def blocked() -> None:
+            await release.wait()
+
+        blocked_task = asyncio.create_task(blocked())
+        runtime._local_transfer_drains.adopt(
+            lease, (blocked_task,), owner=object()
+        )
+
+        async def stop_without_connecting() -> CloseDisposition:
+            release.set()
+            return CloseDisposition.SHUTDOWN
+
+        runtime._run_connection_attempt = stop_without_connecting  # type: ignore[method-assign]
+        assert await runtime.run() == 0
+        assert runtime._local_transfer_admission.active_count == 0
+        assert runtime._local_transfer_drains.pending_count == 0
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize(
@@ -635,6 +682,137 @@ def test_runtime_becomes_ready_only_after_matching_config_applied_ack(tmp_path: 
     }
     assert runtime._ever_ready is True
     assert disposition is CloseDisposition.RETRY
+
+
+def test_connection_retains_slow_transfer_shutdown_across_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(connection_module, "_SHUTDOWN_GRACE_SECONDS", 0.01)
+
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+        release = asyncio.Event()
+        cancelled = False
+        captured: dict[str, object] = {}
+
+        class SlowTransferManager:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args
+                captured.update(kwargs)
+                self.failed: asyncio.Future[None] = (
+                    asyncio.get_running_loop().create_future()
+                )
+
+            async def shutdown(self, *, code: str = "peer_disconnected") -> None:
+                nonlocal cancelled
+                del code
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+
+        monkeypatch.setattr(connection_module, "TransferManager", SlowTransferManager)
+        socket = _RecordingSocket(
+            [
+                *_handshake_frames(
+                    hello_id,
+                    _device_config(
+                        workspace_path=str(tmp_path),
+                        restrict_to_workspace=True,
+                        ssrf_denylist=[],
+                    ),
+                ),
+                None,
+            ]
+        )
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+        )
+
+        assert await runtime.run_connection(socket) is CloseDisposition.RETRY
+        assert captured["admission"] is runtime._local_transfer_admission
+        assert captured["drain_registry"] is runtime._local_transfer_drains
+        assert runtime._local_transfer_drains.pending_count == 1
+        assert cancelled is False
+
+        release.set()
+        assert await runtime._local_transfer_drains.wait(timeout_seconds=1)
+        assert runtime._local_transfer_drains.pending_count == 0
+        assert cancelled is False
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_cancels_watchdog_after_retained_transfer_drain_quiesces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(connection_module, "_SHUTDOWN_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(connection_module, "_SHUTDOWN_WATCHDOG_SECONDS", 0.5)
+
+    async def exercise() -> None:
+        hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
+        release = asyncio.Event()
+        forced: list[int] = []
+
+        class SlowTransferManager:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+                self.failed: asyncio.Future[None] = (
+                    asyncio.get_running_loop().create_future()
+                )
+
+            async def shutdown(self, *, code: str = "peer_disconnected") -> None:
+                del code
+                await release.wait()
+
+        class ShutdownSocket(_RecordingSocket):
+            async def recv(self) -> str | None:
+                try:
+                    value = next(self._received)
+                except StopIteration:
+                    await asyncio.Event().wait()
+                    raise AssertionError("unreachable")
+                await self._config_applied_gate.before_recv(value)
+                return value
+
+        monkeypatch.setattr(connection_module, "TransferManager", SlowTransferManager)
+        frames: list[str | None] = [
+            *_handshake_frames(
+                hello_id,
+                _device_config(
+                    workspace_path=str(tmp_path),
+                    restrict_to_workspace=True,
+                    ssrf_denylist=[],
+                ),
+            )
+        ]
+        socket = ShutdownSocket(frames)
+        runtime = ClientRuntime(
+            load_config(_environment()),
+            hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
+            hard_exit=forced.append,
+        )
+        try:
+            connection = asyncio.create_task(runtime.run_connection(socket))
+            while not runtime._ever_ready:
+                await asyncio.sleep(0)
+            runtime.request_shutdown()
+            assert await asyncio.wait_for(connection, timeout=1) is CloseDisposition.SHUTDOWN
+            assert runtime._local_transfer_drains.pending_count == 1
+            assert runtime._shutdown_cleanup_incomplete is False
+
+            release.set()
+            await runtime._shutdown_local_transfer_drains()
+            assert runtime._shutdown_cleanup_incomplete is False
+            runtime._cancel_shutdown_watchdog()
+            assert forced == []
+        finally:
+            release.set()
+            runtime._cancel_shutdown_watchdog()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_acknowledges_config_update_after_local_activation(tmp_path: Path) -> None:

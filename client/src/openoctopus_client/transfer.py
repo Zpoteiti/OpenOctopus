@@ -28,9 +28,15 @@ from openoctopus_client.tools.common import ToolFailure
 from openoctopus_client.tools.fingerprints import opaque_stat_fingerprint
 from openoctopus_client.tools.locks import PathLocks
 from openoctopus_client.tools.paths import WorkspacePaths
+from openoctopus_client.transfer_admission import (
+    LOCAL_TRANSFER_CAPACITY,
+    LocalTransferAdmission,
+    LocalTransferDrainRegistry,
+    LocalTransferLease,
+)
 from openoctopus_client.writer import SerializedWriter, WriterOverflowError
 
-MAX_ACTIVE_TRANSFER_SLOTS = 2
+MAX_ACTIVE_TRANSFER_SLOTS = LOCAL_TRANSFER_CAPACITY
 TRANSFER_CHUNKS_PER_SLOT = 4
 TRANSFER_CHUNK_BYTES = 64 * 1024
 MAX_BINARY_CHUNK_BYTES = TRANSFER_CHUNK_BYTES
@@ -139,6 +145,7 @@ class _Slot:
     remote_end: TransferEnd | None = None
     task: asyncio.Task[None] | None = None
     source_fd: int | None = None
+    destination_handle: Any | None = None
     source_path: Path | None = None
     source_identity: tuple[int, int, int, int, int] | None = None
     destination_initial_fingerprint: str | None = None
@@ -151,6 +158,9 @@ class _Slot:
     crossing_failure_ack_sent: bool = False
     receiver_ready: bool = False
     late_binary_bytes: int = 0
+    lease: LocalTransferLease | None = None
+    abandoned_drains: set[asyncio.Task[None]] = field(default_factory=set)
+    cleanup_task: asyncio.Task[None] | None = None
 
 
 class TransferManager:
@@ -170,6 +180,8 @@ class TransferManager:
         ssrf_denylist: list[str] | tuple[str, ...] = (),
         device_name: str = "",
         path_locks: PathLocks | None = None,
+        admission: LocalTransferAdmission | None = None,
+        drain_registry: LocalTransferDrainRegistry | None = None,
         idle_timeout_seconds: float = TRANSFER_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         if isinstance(workspace, TransferConfigSnapshot):
@@ -184,6 +196,10 @@ class TransferManager:
         self._snapshot = snapshot
         self._writer = writer
         self._locks = path_locks or PathLocks()
+        self._admission = admission or LocalTransferAdmission(
+            capacity=MAX_ACTIVE_TRANSFER_SLOTS
+        )
+        self._drains = drain_registry or LocalTransferDrainRegistry()
         self._idle_timeout = max(0.1, idle_timeout_seconds)
         self._slots: dict[UUID, _Slot] = {}
         self._tasks: set[asyncio.Task[None]] = set()
@@ -381,7 +397,8 @@ class TransferManager:
         snapshot: TransferConfigSnapshot,
     ) -> None:
         self._ensure_new_slot(request.id)
-        if len(self._slots) >= MAX_ACTIVE_TRANSFER_SLOTS:
+        lease = self._admission.try_acquire()
+        if lease is None:
             self._send_terminal_rejection(request.id, "tool_device_busy")
             return
         slot = _Slot(
@@ -391,6 +408,7 @@ class TransferManager:
             snapshot=snapshot,
             state="REQUESTED",
             request=request,
+            lease=lease,
         )
         self._slots[request.id] = slot
         slot.task = self._spawn(self._send_requested(slot))
@@ -401,11 +419,12 @@ class TransferManager:
         snapshot: TransferConfigSnapshot,
     ) -> None:
         self._ensure_new_slot(begin.id)
-        if len(self._slots) >= MAX_ACTIVE_TRANSFER_SLOTS:
-            self._send_terminal_rejection(begin.id, "tool_device_busy")
-            return
         if begin.direction != "server_to_client":
             raise TransferProtocolError("Client cannot receive a client_to_server begin")
+        lease = self._admission.try_acquire()
+        if lease is None:
+            self._send_terminal_rejection(begin.id, "tool_device_busy")
+            return
         slot = _Slot(
             slot_id=begin.id,
             role="receiver",
@@ -414,6 +433,7 @@ class TransferManager:
             state="BEGUN",
             begin=begin,
             inbound=asyncio.Queue(maxsize=TRANSFER_CHUNKS_PER_SLOT),
+            lease=lease,
         )
         self._slots[begin.id] = slot
         slot.task = self._spawn(self._prepare_receiver(slot))
@@ -644,6 +664,7 @@ class TransferManager:
 
     async def _run_filesystem(
         self,
+        slot: _Slot,
         function: Any,
         *args: Any,
         on_abandoned: Callable[[Any], Any] | None = None,
@@ -653,6 +674,7 @@ class TransferManager:
             *args,
             tracker=self._blocking_tasks,
             on_abandoned=on_abandoned,
+            abandoned_drains=slot.abandoned_drains,
         )
 
     def _cancel_slot_worker(self, slot: _Slot) -> None:
@@ -681,6 +703,7 @@ class TransferManager:
             )
         try:
             paths, destination = await self._run_filesystem(
+                slot,
                 _resolve_destination,
                 slot.snapshot,
                 begin.dst_path,
@@ -698,6 +721,7 @@ class TransferManager:
         slot.destination_paths = paths
         try:
             reservation = await self._run_filesystem(
+                slot,
                 _prepare_destination,
                 paths,
                 destination,
@@ -735,6 +759,7 @@ class TransferManager:
                 )
             try:
                 destination_unchanged = await self._run_filesystem(
+                    slot,
                     _destination_parent_unchanged,
                     slot.destination_paths,
                     slot.begin.dst_path,
@@ -749,10 +774,12 @@ class TransferManager:
                     "workspace_file_changed", "Destination parent changed during transfer"
                 )
             file_handle, slot.temporary_identity = await self._run_filesystem(
+                slot,
                 _open_temp,
                 slot.temporary,
                 on_abandoned=_close_open_temp_result,
             )
+            slot.destination_handle = file_handle
             idle_deadline = asyncio.get_running_loop().time() + self._idle_timeout
             while True:
                 try:
@@ -768,26 +795,31 @@ class TransferManager:
                     slot.inbound.task_done()
                     break
                 if chunk:
-                    await self._run_filesystem(file_handle.write, chunk)
+                    await self._run_filesystem(slot, file_handle.write, chunk)
                     slot.received_bytes += len(chunk)
                     slot.received_digest.update(chunk)
                     slot.state = "STREAMING"
                     idle_deadline = asyncio.get_running_loop().time() + self._idle_timeout
                 slot.inbound.task_done()
-            await asyncio.wait_for(self._run_filesystem(file_handle.flush), self._idle_timeout)
             await asyncio.wait_for(
-                self._run_filesystem(os.fsync, file_handle.fileno()), self._idle_timeout
+                self._run_filesystem(slot, file_handle.flush), self._idle_timeout
+            )
+            await asyncio.wait_for(
+                self._run_filesystem(slot, os.fsync, file_handle.fileno()),
+                self._idle_timeout,
             )
             open_identity = _identity(
-                await self._run_filesystem(os.fstat, file_handle.fileno())
+                await self._run_filesystem(slot, os.fstat, file_handle.fileno())
             )
             # Close before the rename so Windows does not reject replacing an
             # open destination handle; the finally block still owns cleanup
             # if closing itself fails.
-            await self._run_filesystem(file_handle.close)
+            await self._run_filesystem(slot, file_handle.close)
             file_handle = None
+            slot.destination_handle = None
             digest = slot.received_digest.hexdigest()
             slot.temporary_identity = await self._run_filesystem(
+                slot,
                 _identity_after_close,
                 slot.temporary,
                 open_identity,
@@ -823,6 +855,7 @@ class TransferManager:
                 )
             try:
                 destination_unchanged = await self._run_filesystem(
+                    slot,
                     _destination_parent_unchanged,
                     slot.destination_paths,
                     slot.begin.dst_path,
@@ -837,12 +870,14 @@ class TransferManager:
                     "workspace_file_changed", "Destination parent changed during transfer"
                 )
             if not await self._run_filesystem(
+                slot,
                 _temporary_unchanged, slot.temporary, slot.temporary_identity
             ):
                 raise TransferOperationError(
                     "workspace_file_changed", "Temporary destination changed during transfer"
                 )
             current_fingerprint = await self._run_filesystem(
+                slot,
                 _stat_fingerprint, slot.destination
             )
             if slot.purpose == "workspace_upload":
@@ -851,6 +886,7 @@ class TransferManager:
                         "workspace_file_changed", "Destination changed during transfer"
                     )
                 await self._run_filesystem(
+                    slot,
                     _commit_replace,
                     slot.temporary,
                     slot.destination,
@@ -862,6 +898,7 @@ class TransferManager:
                         "workspace_file_changed", "Destination changed during transfer"
                     )
                 await self._run_filesystem(
+                    slot,
                     _commit_no_replace,
                     slot.temporary,
                     slot.destination,
@@ -871,6 +908,7 @@ class TransferManager:
             slot.state = "COMMITTED"
             if slot.purpose == "workspace_upload":
                 committed_etag = await self._run_filesystem(
+                    slot,
                     _stat_fingerprint, slot.destination
                 )
                 if committed_etag is None or slot.destination_created is None:
@@ -915,9 +953,10 @@ class TransferManager:
             )
             del exc
         finally:
-            if file_handle is not None:
+            if file_handle is not None and not _has_pending_drains(slot):
                 with contextlib.suppress(OSError):
-                    await self._run_filesystem(file_handle.close)
+                    await self._run_filesystem(slot, file_handle.close)
+                slot.destination_handle = None
             await self._cleanup_slot(slot)
 
     async def _await_rejection_ack(self, slot: _Slot) -> None:
@@ -935,6 +974,7 @@ class TransferManager:
         try:
             try:
                 source = await self._run_filesystem(
+                    slot,
                     _resolve_source,
                     slot.snapshot,
                     request.src_path,
@@ -945,6 +985,7 @@ class TransferManager:
             slot.lock_stack = source_lock
             await source_lock.enter_async_context(self._locks.hold(str(source)))
             fd, initial = await self._run_filesystem(
+                slot,
                 _open_source,
                 source,
                 on_abandoned=_close_open_source_result,
@@ -977,14 +1018,18 @@ class TransferManager:
             hasher = hashlib.sha256()
             bytes_sent = 0
             while True:
-                chunk = await self._run_filesystem(os.read, fd, TRANSFER_CHUNK_BYTES)
+                chunk = await self._run_filesystem(
+                    slot, os.read, fd, TRANSFER_CHUNK_BYTES
+                )
                 if not chunk:
                     break
                 hasher.update(chunk)
                 bytes_sent += len(chunk)
                 await self._writer.wait_enqueue_binary(slot.slot_id, chunk)
             await self._writer.drain_binary(slot.slot_id)
-            if not await self._run_filesystem(_source_unchanged, source, fd, initial):
+            if not await self._run_filesystem(
+                slot, _source_unchanged, source, fd, initial
+            ):
                 raise TransferOperationError(
                     "workspace_file_changed", "Source changed during transfer"
                 )
@@ -1039,10 +1084,10 @@ class TransferManager:
             self._enqueue_end(slot, ok=False, code=code, ack=False)
             await self._wait_for_failure_ack(slot, had_begun=had_begun)
         finally:
-            if fd is not None:
+            if fd is not None and not _has_pending_drains(slot):
                 with contextlib.suppress(OSError):
-                    await self._run_filesystem(os.close, fd)
-            slot.source_fd = None
+                    await self._run_filesystem(slot, os.close, fd)
+                slot.source_fd = None
             if self._writer.has_binary_lane(slot.slot_id):
                 with contextlib.suppress(WriterOverflowError):
                     await self._writer.drain_binary(slot.slot_id)
@@ -1106,13 +1151,8 @@ class TransferManager:
         )
 
     async def _cleanup_slot(self, slot: _Slot) -> None:
-        if slot.temporary is not None:
-            with contextlib.suppress(OSError):
-                await self._run_filesystem(slot.temporary.unlink)
-            slot.temporary = None
-        if slot.lock_stack is not None:
-            await slot.lock_stack.aclose()
-            slot.lock_stack = None
+        if slot.cleanup_task is not None:
+            return
         self._slots.pop(slot.slot_id, None)
         if slot.final_end is not None:
             self._remember_tombstone(
@@ -1127,6 +1167,51 @@ class TransferManager:
                 declared_bytes=slot.begin.total_bytes if slot.begin is not None else None,
                 binary_bytes_seen=slot.inbound_bytes + slot.late_binary_bytes,
             )
+        lease = slot.lease
+        slot.lease = None
+        drains = tuple(task for task in slot.abandoned_drains if not task.done())
+        if drains:
+            cleanup = asyncio.create_task(self._drain_slot_resources(slot, drains))
+            slot.cleanup_task = cleanup
+            if lease is not None:
+                self._drains.adopt(lease, (cleanup,), owner=self)
+            else:
+                self._drains.retain(cleanup, owner=self)
+            return
+        try:
+            await self._cleanup_slot_resources(slot)
+        finally:
+            if lease is not None:
+                lease.release()
+
+    async def _drain_slot_resources(
+        self,
+        slot: _Slot,
+        drains: tuple[asyncio.Task[None], ...],
+    ) -> None:
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in drains),
+            return_exceptions=True,
+        )
+        await self._cleanup_slot_resources(slot)
+
+    @staticmethod
+    async def _cleanup_slot_resources(slot: _Slot) -> None:
+        if slot.destination_handle is not None:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(slot.destination_handle.close)
+            slot.destination_handle = None
+        if slot.source_fd is not None:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(os.close, slot.source_fd)
+            slot.source_fd = None
+        if slot.temporary is not None:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(slot.temporary.unlink)
+            slot.temporary = None
+        if slot.lock_stack is not None:
+            await slot.lock_stack.aclose()
+            slot.lock_stack = None
 
     def _remember_tombstone(
         self,
@@ -1658,68 +1743,65 @@ async def receive_chunks(chunks: AsyncIterator[bytes], manager: TransferManager)
         await manager.handle_binary(chunk)
 
 
+def _has_pending_drains(slot: _Slot) -> bool:
+    return any(not task.done() for task in slot.abandoned_drains)
+
+
 async def _to_thread_safely(
     function: Any,
     *args: Any,
     tracker: set[asyncio.Task[Any]] | None = None,
     on_abandoned: Callable[[Any], Any] | None = None,
+    abandoned_drains: set[asyncio.Task[None]] | None = None,
 ) -> Any:
     """Bound cancellation while a worker-thread filesystem call is running."""
 
     task = asyncio.create_task(asyncio.to_thread(function, *args))
-    abandoned = False
-    cleanup_started = False
-
-    def cleanup_abandoned_result(completed: asyncio.Task[Any]) -> None:
-        nonlocal cleanup_started
-        if (
-            not abandoned
-            or cleanup_started
-            or on_abandoned is None
-            or completed.cancelled()
-        ):
-            return
-        cleanup_started = True
-        try:
-            result = completed.result()
-        except BaseException:
-            return
-        cleanup_task = asyncio.create_task(asyncio.to_thread(on_abandoned, result))
-        if tracker is None:
-            cleanup_task.add_done_callback(_consume_thread_result)
-        else:
-            tracker.add(cleanup_task)
-            cleanup_task.add_done_callback(
-                lambda completed_cleanup: _finish_tracked_thread(
-                    completed_cleanup, tracker
-                )
-            )
-
     if tracker is None:
         task.add_done_callback(_consume_thread_result)
-        task.add_done_callback(cleanup_abandoned_result)
     else:
         tracker.add(task)
-
-        def finish_tracked_thread(completed: asyncio.Task[Any]) -> None:
-            tracker.discard(completed)
-            _consume_thread_result(completed)
-            cleanup_abandoned_result(completed)
-
-        task.add_done_callback(finish_tracked_thread)
+        task.add_done_callback(
+            lambda completed: _finish_tracked_thread(completed, tracker)
+        )
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        abandoned = True
-        if task.done():
-            cleanup_abandoned_result(task)
-        with contextlib.suppress(BaseException):
-            await asyncio.wait_for(
-                asyncio.shield(task), _TO_THREAD_CANCEL_GRACE_SECONDS
+        drain = asyncio.create_task(_drain_abandoned_thread(task, on_abandoned))
+        if abandoned_drains is not None:
+            abandoned_drains.add(drain)
+
+            def finish_abandoned(completed: asyncio.Task[None]) -> None:
+                abandoned_drains.discard(completed)
+                _consume_thread_result(completed)
+
+            drain.add_done_callback(finish_abandoned)
+        elif tracker is None:
+            drain.add_done_callback(_consume_thread_result)
+        else:
+            tracker.add(drain)
+            drain.add_done_callback(
+                lambda completed: _finish_tracked_thread(completed, tracker)
             )
-        if task.done():
-            cleanup_abandoned_result(task)
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({drain}, timeout=_TO_THREAD_CANCEL_GRACE_SECONDS)
         raise
+
+
+async def _drain_abandoned_thread(
+    task: asyncio.Task[Any], on_abandoned: Callable[[Any], Any] | None
+) -> None:
+    try:
+        result = await asyncio.shield(task)
+    except BaseException:
+        return
+    if on_abandoned is None:
+        return
+    cleanup = asyncio.create_task(asyncio.to_thread(on_abandoned, result))
+    try:
+        await asyncio.shield(cleanup)
+    except BaseException:
+        _consume_thread_result(cleanup)
 
 
 def _consume_future_exception(future: asyncio.Future[Any]) -> None:

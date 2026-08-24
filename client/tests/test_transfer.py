@@ -33,6 +33,10 @@ from openoctopus_client.transfer import (
     TransferManager,
     TransferState,
 )
+from openoctopus_client.transfer_admission import (
+    LocalTransferAdmission,
+    LocalTransferDrainRegistry,
+)
 from openoctopus_client.writer import SerializedWriter, WriterOverflowError
 
 SLOT = UUID("0190d5a7-0000-7000-8000-000000000002")
@@ -49,11 +53,24 @@ class Socket:
 
 async def _manager(
     workspace: Path,
+    *,
+    admission: LocalTransferAdmission | None = None,
+    drains: LocalTransferDrainRegistry | None = None,
 ) -> tuple[TransferManager, SerializedWriter, Socket, asyncio.Task[None]]:
     socket = Socket()
     writer = SerializedWriter()
     writer_task = asyncio.create_task(writer.run(socket))
-    return TransferManager(workspace, writer), writer, socket, writer_task
+    return (
+        TransferManager(
+            workspace,
+            writer,
+            admission=admission,
+            drain_registry=drains,
+        ),
+        writer,
+        socket,
+        writer_task,
+    )
 
 
 async def _stop(
@@ -251,6 +268,69 @@ def test_third_local_transfer_start_is_rejected_without_allocating_a_slot(
     asyncio.run(exercise())
 
 
+def test_wire_managers_share_runtime_local_transfer_capacity(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        admission = LocalTransferAdmission(capacity=2)
+        drains = LocalTransferDrainRegistry()
+        first = await _manager(tmp_path, admission=admission, drains=drains)
+        second = await _manager(tmp_path, admission=admission, drains=drains)
+        first_manager, first_writer, _, first_writer_task = first
+        second_manager, second_writer, second_socket, second_writer_task = second
+        third_slot = new_uuid7()
+        try:
+            await first_manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="first.bin",
+                    total_bytes=1,
+                )
+            )
+            await second_manager.handle_control(
+                TransferBegin(
+                    id=SLOT_2,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="second.bin",
+                    total_bytes=1,
+                )
+            )
+            await _wait_receiver_ready(first_manager, SLOT)
+            await _wait_receiver_ready(second_manager, SLOT_2)
+
+            await second_manager.handle_control(
+                TransferBegin(
+                    id=third_slot,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.bin",
+                    dst_path="third.bin",
+                    total_bytes=1,
+                )
+            )
+            await second_writer.drain()
+
+            assert admission.active_count == 2
+            assert second_manager.active_slot_ids == {SLOT_2}
+            rejection = next(
+                json.loads(item)
+                for item in second_socket.sent
+                if isinstance(item, str)
+                and json.loads(item).get("id") == str(third_slot)
+            )
+            assert rejection["code"] == "tool_device_busy"
+        finally:
+            await _stop(first_manager, first_writer, first_writer_task)
+            await _stop(second_manager, second_writer, second_writer_task)
+        assert await drains.wait(timeout_seconds=1)
+        assert admission.active_count == 0
+
+    asyncio.run(exercise())
+
+
 def test_writer_round_robins_binary_lanes_and_prioritizes_controls() -> None:
     async def exercise() -> list[str | bytes]:
         socket = Socket()
@@ -435,13 +515,19 @@ def test_cancelled_sender_closes_a_late_source_result(
     monkeypatch.setattr(transfer_module, "_open_source", delayed_open_source)
 
     async def exercise() -> None:
-        manager, writer, _, writer_task = await _manager(tmp_path)
+        admission = LocalTransferAdmission(capacity=1)
+        drains = LocalTransferDrainRegistry()
+        manager, writer, _, writer_task = await _manager(
+            tmp_path, admission=admission, drains=drains
+        )
         try:
             await manager.handle_control(
                 TransferRequest(id=SLOT, purpose="http_relay", src_path="source.bin")
             )
             assert await asyncio.to_thread(started.wait, 1)
             await manager.shutdown()
+            assert admission.active_count == 1
+            assert admission.try_acquire() is None
             release.set()
             fd = result_holder[0][0]
             for _ in range(100):
@@ -452,6 +538,8 @@ def test_cancelled_sender_closes_a_late_source_result(
                 await asyncio.sleep(0.001)
             with pytest.raises(OSError):
                 os.fstat(fd)
+            assert await drains.wait(timeout_seconds=1)
+            assert admission.active_count == 0
         finally:
             release.set()
             await writer.stop()
@@ -502,6 +590,70 @@ def test_cancelled_receiver_closes_a_late_temp_handle(
                     break
                 await asyncio.sleep(0.001)
             assert getattr(handle, "closed", False)
+        finally:
+            release.set()
+            await writer.stop()
+            await writer_task
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_receiver_keeps_temp_until_blocked_fsync_drains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_fsync = os.fsync
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_fsync(descriptor: int) -> None:
+        started.set()
+        release.wait(timeout=2)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", delayed_fsync)
+
+    async def exercise() -> None:
+        admission = LocalTransferAdmission(capacity=1)
+        drains = LocalTransferDrainRegistry()
+        manager, writer, _, writer_task = await _manager(
+            tmp_path, admission=admission, drains=drains
+        )
+        try:
+            await manager.handle_control(
+                TransferBegin(
+                    id=SLOT,
+                    direction="server_to_client",
+                    purpose="file_transfer",
+                    src_path="source.txt",
+                    dst_path="result.txt",
+                    total_bytes=0,
+                )
+            )
+            await _wait_receiver_ready(manager)
+            temporary = manager._slots[SLOT].temporary
+            assert temporary is not None
+            await manager.handle_control(
+                TransferEnd(
+                    id=SLOT,
+                    ack=False,
+                    ok=True,
+                    bytes_sent=0,
+                    sha256=hashlib.sha256(b"").hexdigest(),
+                )
+            )
+            assert await asyncio.to_thread(started.wait, 1)
+
+            await manager.shutdown()
+            assert temporary.exists()
+            assert manager.slot_state(SLOT) is None
+            assert admission.active_count == 1
+            assert manager.path_locks.reservation_count == 1
+
+            release.set()
+            assert await drains.wait(timeout_seconds=1)
+            assert temporary.exists() is False
+            assert admission.active_count == 0
+            assert manager.path_locks.reservation_count == 0
         finally:
             release.set()
             await writer.stop()
