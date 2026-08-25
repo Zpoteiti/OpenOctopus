@@ -31,16 +31,22 @@ def test_message_response():
 def test_session_response():
     sess = SessionResponse(
         id=uuid4(),
+        user_id=uuid4(),
         session_key="key",
         channel="web",
         chat_id="chat",
         title="title",
+        last_inbound_at=None,
         unread=False,
+        cancel_requested=False,
         created_at=datetime.now(UTC),
     )
     assert sess.channel == "web"
 
 
 def test_error_response():
-    err = ErrorResponse(code="workspace_not_found", message="not found", detail={"path": "/x"})
-    assert err.detail == {"path": "/x"}
+    err = ErrorResponse(code="workspace_not_found", message="not found")
+    assert err.model_dump() == {
+        "code": "workspace_not_found",
+        "message": "not found",
+    }

@@ -68,7 +68,13 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
 
 
 async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
-    data = payload.model_dump(exclude_none=True)
+    if any(getattr(payload, field) is None for field in payload.model_fields_set):
+        raise ConfigError(
+            ErrorCode.CONFIG_VALIDATION_FAILED,
+            "Config values cannot be null",
+        )
+
+    data = payload.model_dump(exclude_unset=True)
     existing = await _get_all_rows(db)
 
     if data.get("llm_api_key") == _REDACTED:

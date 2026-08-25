@@ -70,9 +70,9 @@ info:
     - UUIDs unless noted.
 
     **Python-main chat consumption pattern (ADR-121):**
-    `POST /api/sessions/{id}/messages` durably accepts the user message, wakes
+    `POST /api/sessions/{session_id}/messages` durably accepts the user message, wakes
     the session runner, and may stream best-effort newline-delimited JSON events
-    for that HTTP connection. `GET /api/sessions/{id}/messages` reads only
+    for that HTTP connection. `GET /api/sessions/{session_id}/messages` reads only
     PostgreSQL-backed canonical messages and run status. Reconnect falls back to
     polling `GET messages`; missed token deltas are not replayed.
     Each POST subscriber has bounded buffering. A client that cannot consume
@@ -95,7 +95,7 @@ info:
 
     - Discord and Telegram ingress. Those are internal adapter modules inside
       `openoctopus_server`, not public HTTP endpoints. The only public ingress for
-      chat messages is `POST /api/sessions/{id}/messages` (browser) plus the
+      chat messages is `POST /api/sessions/{session_id}/messages` (browser) plus the
       `WS /ws/device` handshake for devices.
 
 servers:
@@ -229,6 +229,7 @@ paths:
                 properties:
                   jwt: { type: string }
                   user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/auth/logout:
@@ -323,11 +324,12 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Session' }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
-  /api/sessions/{id}:
+  /api/sessions/{session_id}:
     description: Python-main browser chat session route.
     parameters:
-      - name: id
+      - name: session_id
         in: path
         required: true
         schema: { type: string, format: uuid }
@@ -342,7 +344,7 @@ paths:
 
         These metadata updates are allowed for web and non-web sessions because
         they do not write messages into the session, do not wake the runner, and
-        do not affect `session_key` routing. `GET /api/sessions/{id}/messages`
+        do not affect `session_key` routing. `GET /api/sessions/{session_id}/messages`
         is a pure read and never updates `last_read_at`; frontends call this
         PATCH only after the relevant messages are actually visible to the user.
 
@@ -392,22 +394,26 @@ paths:
         be deleted here like other history.
 
         Deletion is a hard stop, not a safe-boundary cancel. The server first
-        terminates any in-memory runner and live/queued POST streams for this
-        session, then deletes the `sessions` row. `ON DELETE CASCADE` removes
-        canonical `messages`, durable `pending_messages`, and `turn_runs`. The
-        server does not insert a stop marker or synthetic tool results because
-        the transcript is being removed.
+        quiesces the in-memory runner, then deletes the `sessions` row.
+        `session_deleted` is sent to live/queued POST streams only after that
+        transaction commits. `ON DELETE CASCADE` removes canonical `messages`,
+        durable `pending_messages`, and `turn_runs`. If the delete transaction
+        rolls back, the session remains, the interrupted turn becomes
+        `abandoned`, and no false deletion event is emitted. The server does
+        not insert a stop marker or synthetic tool results because successful
+        deletion removes the transcript.
       responses:
         '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Active cron session; delete the cron job through `/api/cron/{id}` first.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
-  /api/sessions/{id}/messages:
+  /api/sessions/{session_id}/messages:
     description: Python-main browser chat message route.
     parameters:
-      - name: id
+      - name: session_id
         in: path
         required: true
         schema: { type: string, format: uuid }
@@ -478,10 +484,10 @@ paths:
         without changing this detached-runner contract. Internal compaction
         call lifecycle is outside this public `turn_id` definition.
 
-        If `{id}` does not exist, the server atomically creates a browser web
-        session owned by the authenticated user: `id={id}`,
-        `chat_id={id}`, `session_key=web:{id}`, and `title="New chat"`. If
-        `{id}` already exists, the server verifies ownership before accepting
+        If `{session_id}` does not exist, the server atomically creates a browser web
+        session owned by the authenticated user: `id={session_id}`,
+        `chat_id={session_id}`, `session_key=web:{session_id}`, and `title="New chat"`. If
+        `{session_id}` already exists, the server verifies ownership before accepting
         the message. Existing sessions owned by another user return `404`
         without revealing whether the id exists.
 
@@ -511,14 +517,14 @@ paths:
         arrivals remain pending for the following call. The latest
         still-connected queued stream for the captured batch receives its live
         preview. Reconnect/recovery uses
-        `GET /api/sessions/{id}/messages`; missed token deltas are not replayed.
+        `GET /api/sessions/{session_id}/messages`; missed token deltas are not replayed.
 
         Py2 retries a transient provider failure only before the first
         text/thinking delta is emitted. A later failure persists a
         `synthetic_assistant_error`, marks the turn failed, and discards the
         incomplete assistant preview from durable state.
 
-        **Browser write allow-list (ADR-098).** `{id}` is `sessions.id`, not
+        **Browser write allow-list (ADR-098).** `{session_id}` is `sessions.id`, not
         `session_key`. The server accepts writes only when `channel == "web"`
         and `session_key` starts with `web:`. Discord/Telegram/cron/heartbeat
         sessions are read-only through browser REST and receive messages
@@ -550,17 +556,25 @@ paths:
                     `tool_use`, `tool_result`, `thinking`,
                     `redacted_thinking`, `document`, and OpenAI `image_url`
                     blocks are rejected.
-                  items: { $ref: '#/components/schemas/ContentBlock' }
+                  items: { $ref: '#/components/schemas/UserContentBlock' }
                 attachments:
                   type: array
-                  maxItems: 0
+                  maxItems: 10
                   description: |
-                    Required for the stable request shape, but Py2 and Py3
-                    require this array to be empty. They accept text and direct
-                    inline base64 images through `content`; workspace/device attachment
-                    references begin with the Py4 workspace-files milestone.
+                    References to existing files in the authenticated user's
+                    Server workspace. Upload bytes first through the workspace
+                    file API, then send the original virtual path here. The
+                    message API never moves, copies, or deletes the file.
+
+                    Non-image files add a path marker so the agent can inspect
+                    them with workspace tools. JPEG, PNG, GIF, and WebP files
+                    also add a base64 image snapshot. At most 8 MiB of image
+                    bytes may be expanded across one request.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
+              anyOf:
+                - properties: { content: { minItems: 1 } }
+                - properties: { attachments: { minItems: 1 } }
               additionalProperties: false
       responses:
         '200':
@@ -581,17 +595,25 @@ paths:
           description: |
             Session id is not a valid UUID, session is not browser-writable,
             JSON/content shape is invalid, or an image block is malformed.
-            Py2 rejects a non-empty `attachments` array. If present, `effort`
-            must be `null` or one of `off`, `low`, `medium`, `high`, `xhigh`,
-            or `max`.
+            Attachment paths must resolve inside the authenticated user's
+            Server workspace and supported attachment images must fit the
+            aggregate 8 MiB expansion limit. If present, `effort` must be
+            `null` or one of `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
-          description: Session id exists for another user, or another ownership check failed without revealing existence.
+          description: Session id exists for another user, or an attachment workspace/file does not exist.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: The user cannot read a referenced shared-workspace attachment.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: The Provider is not configured, or attachment storage is unavailable.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
-  /api/sessions/{id}/cancel:
+  /api/sessions/{session_id}/cancel:
     description: Session runner cancellation route.
     parameters:
-      - name: id
+      - name: session_id
         in: path
         required: true
         schema: { type: string, format: uuid }
@@ -628,6 +650,7 @@ paths:
                 type: object
                 properties:
                   cancel_requested: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   #
@@ -652,6 +675,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkspacePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
     post:
       tags: [Workspaces]
       summary: Create a shared workspace (caller auto-added to allow-list)
@@ -716,6 +740,7 @@ paths:
         '200':
           description: OK
           content: { application/json: { schema: { $ref: '#/components/schemas/Workspace' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
@@ -771,6 +796,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkspaceMemberPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
     post:
       tags: [Workspaces]
       summary: Add a user to the allow-list
@@ -798,11 +824,12 @@ paths:
         '201':
           description: Member added.
           content: { application/json: { schema: { $ref: '#/components/schemas/WorkspaceMember' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '409':
           description: Adding this user would create an unresolvable `name@suffix` collision in their accessible set.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
-  /api/workspaces/{workspace_ref}/members/{user_id}:
+  /api/workspaces/{workspace_ref}/members/{member_user_id}:
     description: Workspace membership route.
     parameters:
       - name: workspace_ref
@@ -810,7 +837,7 @@ paths:
         required: true
         description: The `name@suffix` form (ADR-108).
         schema: { type: string }
-      - name: user_id
+      - name: member_user_id
         in: path
         required: true
         schema: { type: string }
@@ -823,6 +850,7 @@ paths:
         intent. RustFS purge is idempotent and retried after transient failure.
       responses:
         '204': { description: Removed. }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   #
   # --- Workspace Files ---
@@ -956,6 +984,9 @@ paths:
               schema: { $ref: '#/components/schemas/FileMutation' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Invalid SKILL.md after upload, if skill validation is active for the target path.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: Quota/precondition conflict, paired device offline (`tool_device_unreachable`), or operation exceeds the 64 MiB device upload cap (`workspace_upload_too_large`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1024,6 +1055,9 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Invalid SKILL.md produced by an edit, if skill validation is active for a target path.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: Quota lock, operation exceeds quota, or paired device is offline (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1127,6 +1161,9 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Invalid SKILL.md produced by an edit, if skill validation is active for a target path.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: No match, quota lock, invalid patch, operation exceeds quota, or paired device is offline (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1408,6 +1445,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DeviceConfig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Devices]
@@ -1482,6 +1520,7 @@ paths:
         `openoctopus_device` enums.
       responses:
         '204': { description: Removed. }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /api/devices/{name}/regenerate-token:
@@ -1514,6 +1553,7 @@ paths:
                 properties:
                   token: { type: string }
                   device: { $ref: '#/components/schemas/Device' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   #
@@ -1625,7 +1665,7 @@ paths:
         `session_key="cron:{job_id}"`; the job's `message` is injected into
         that session as a synthesized user message when the schedule fires.
         Cron sessions do not inherit the creator session's chat history and
-        are not writable through `POST /api/sessions/{id}/messages`.
+        are not writable through `POST /api/sessions/{session_id}/messages`.
 
         The shared helper validates the schedule before storing it:
         exactly one of `every_seconds`, `cron_expr`, or `at`; positive
@@ -1858,20 +1898,31 @@ paths:
               additionalProperties: false
               description: Partial update — keys present are updated, keys absent are untouched.
               properties:
-                quota_bytes: { type: integer, format: int64, minimum: 1 }
-                shared_workspace_quota_bytes: { type: integer, format: int64, minimum: 1 }
-                llm_endpoint: { type: string, minLength: 1 }
-                llm_api_key: { type: string, minLength: 1 }
-                llm_model: { type: string, minLength: 1 }
-                llm_max_context_tokens: { type: integer, format: int64, minimum: 1 }
-                llm_compaction_threshold_tokens: { type: integer, format: int64, minimum: 4001 }
-                llm_max_concurrent_requests: { type: integer, format: int64, minimum: 0, maximum: 1000000 }
-                llm_max_output_tokens: { type: integer, format: int64, minimum: 1, maximum: 1000000 }
+                quota_bytes:
+                  { type: integer, format: int64, minimum: 1, example: 524288000, description: Per-user personal workspace quota in bytes. }
+                shared_workspace_quota_bytes:
+                  { type: integer, format: int64, minimum: 1, example: 524288000, description: Maximum quota for one shared workspace in bytes. }
+                llm_endpoint:
+                  { type: string, minLength: 1, example: https://api.siliconflow.cn, description: Unversioned Anthropic-compatible API base URL; omit /v1. }
+                llm_api_key:
+                  { type: string, minLength: 1, example: sk-your-provider-key, description: New provider credential. Omit to retain the current key. }
+                llm_model:
+                  { type: string, minLength: 1, example: Qwen/Qwen3.5-4B, description: Provider model identifier. }
+                llm_max_context_tokens:
+                  { type: integer, format: int64, minimum: 1, example: 131072, description: Provider context-window size. }
+                llm_compaction_threshold_tokens:
+                  { type: integer, format: int64, minimum: 4001, example: 16000, description: Remaining-token headroom that triggers compaction. }
+                llm_max_concurrent_requests:
+                  { type: integer, format: int64, minimum: 0, maximum: 1000000, example: 8, description: In-flight provider-call cap; zero means unlimited. }
+                llm_max_output_tokens:
+                  { type: integer, format: int64, minimum: 1, maximum: 1000000, example: 16384, description: Output budget including thinking tokens. }
                 web_fetch_denylist:
                   type: array
                   maxItems: 256
                   uniqueItems: true
                   items: { type: string, minLength: 1, maxLength: 512 }
+                  example: [127.0.0.0/8, 169.254.169.254/32]
+                  description: Complete canonical Server web_fetch denylist; an empty array permits all otherwise-valid targets.
       responses:
         '200':
           description: OK
@@ -1978,14 +2029,15 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '503':
           description: A personal-workspace usage scan failed; no partial page is returned.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
-  /api/admin/users/{id}:
+  /api/admin/users/{user_id}:
     description: Python-main admin user management route.
     parameters:
-      - name: id
+      - name: user_id
         in: path
         required: true
         schema: { type: string, format: uuid }
@@ -2003,6 +2055,7 @@ paths:
         - bearerAuth: [admin]
       responses:
         '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Deleting this user would remove the last admin.
@@ -2076,6 +2129,8 @@ components:
             `workspace_transfer_integrity_failed`,
             `network_ssrf_blocked`, `tool_ambiguous_edit`,
             `tool_no_match`, `tool_invalid_schedule`, `auth_last_admin_required`,
+            `invalid_request`, `session_invalid_request`,
+            `session_has_cron_job`,
             `tool_content_conversion_busy`,
             `tool_content_conversion_resource_exceeded`, and
             `tool_content_conversion_failed`. Admin/Device MCP mutation codes
@@ -2097,36 +2152,58 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes, llm_max_output_tokens, web_fetch_denylist]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, web_fetch_denylist]
       description: |
         Admin-visible effective config. Quota keys are always present because
         missing rows default to 500 MiB (`524288000`).
         `llm_max_output_tokens` is always present and defaults to `16384`
-        without seeding a row. Other unconfigured LLM keys are omitted.
+        without seeding a row. Other unconfigured LLM keys are returned as null.
         Configured `llm_api_key` is returned as `"<redacted>"`.
       properties:
         quota_bytes:
           type: integer
           format: int64
+          example: 524288000
           description: Effective per-user personal workspace quota. Defaults to 500 MiB when no row is configured.
         shared_workspace_quota_bytes:
           type: integer
           format: int64
+          example: 524288000
           description: Effective quota ceiling for a single shared workspace. Defaults to 500 MiB when no row is configured.
-        llm_endpoint: { type: string }
+        llm_endpoint:
+          type: [string, "null"]
+          example: https://api.siliconflow.cn
+          description: Unversioned Anthropic-compatible API base URL; do not include /v1.
         llm_api_key:
-          type: string
-          description: Present as `"<redacted>"` when configured; raw value is never returned here.
-        llm_model: { type: string }
-        llm_max_context_tokens: { type: integer, format: int64 }
-        llm_compaction_threshold_tokens: { type: integer, format: int64 }
-        llm_max_concurrent_requests: { type: integer, format: int64 }
+          type: [string, "null"]
+          example: <redacted>
+          description: Null when unset; `"<redacted>"` when configured. The raw value is never returned.
+        llm_model:
+          type: [string, "null"]
+          example: Qwen/Qwen3.5-4B
+          description: Provider model identifier.
+        llm_max_context_tokens:
+          type: [integer, "null"]
+          format: int64
+          example: 131072
+          description: Configured provider context-window size.
+        llm_compaction_threshold_tokens:
+          type: [integer, "null"]
+          format: int64
+          example: 16000
+          description: Remaining-token headroom that triggers history compaction.
+        llm_max_concurrent_requests:
+          type: [integer, "null"]
+          format: int64
+          example: 8
+          description: Maximum in-flight provider calls; zero means unlimited.
         llm_max_output_tokens:
           type: integer
           format: int64
           default: 16384
           minimum: 1
           maximum: 1000000
+          example: 16384
           description: Effective provider output budget, including thinking and visible output.
         web_fetch_denylist:
           type: array
@@ -2158,19 +2235,22 @@ components:
 
     Session:
       type: object
-      required: [id, user_id, session_key, channel, chat_id, title, unread, created_at]
+      additionalProperties: false
+      required: [id, user_id, session_key, channel, chat_id, title, last_inbound_at, unread, cancel_requested, created_at]
       properties:
-        id: { type: string }
-        user_id: { type: string }
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
         session_key:
           type: string
-          description: Composite key; usually `{channel}:{chat_id}` (ADR-006). Browser sessions use `web:{id}` and clients cannot set or rename it.
+          description: Composite key; usually `{channel}:{chat_id}` (ADR-006). Browser sessions use `web:{session_id}` and clients cannot set or rename it.
         channel: { type: string }
         chat_id: { type: string }
         title:
           type: string
           description: Human-facing mutable title. Defaults to `New chat`.
-        last_inbound_at: { type: string, format: date-time }
+        last_inbound_at:
+          type: [string, "null"]
+          format: date-time
         unread:
           type: boolean
           description: |
@@ -2383,11 +2463,37 @@ components:
 
     Effort:
       type: string
-      enum: [off, low, medium, high, xhigh, max]
+      enum: ["off", low, medium, high, xhigh, max]
       description: |
         Optional browser-selected per-turn thinking effort. `null`, omitted, or
         `off` sends `thinking.type=disabled`. Non-off values send
         `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+
+    UserContentBlock:
+      description: Browser-writable Anthropic user content block.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, text]
+          properties:
+            type: { type: string, enum: [text] }
+            text: { type: string, minLength: 1 }
+        - type: object
+          additionalProperties: false
+          required: [type, source]
+          properties:
+            type: { type: string, enum: [image] }
+            source:
+              type: object
+              additionalProperties: false
+              required: [type, media_type, data]
+              properties:
+                type: { type: string, enum: [base64] }
+                media_type: { type: string, enum: [image/jpeg, image/png, image/gif, image/webp] }
+                data:
+                  type: string
+                  minLength: 1
+                  description: Base64-encoded image bytes without a data URL prefix.
 
     ContentBlock:
       description: Anthropic Messages content block. See ADR-059, ADR-101, ADR-117.
@@ -2485,18 +2591,17 @@ components:
       properties:
         openoctopus_device:
           type: string
+          enum: [server]
           description: |
-            Required file target. `server` names the built-in server workspace;
-            a known paired device name creates an online-only reference without
-            opening the file. Unknown/deleted device names fail the message tool;
-            a paired-but-offline device remains a reference and is reported as
-            `tool_device_unreachable` when the browser later downloads it.
+            Browser attachment refs currently target only the authenticated
+            user's built-in Server workspace.
         path:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: |
-            Original virtual path supplied to `message`. A shared-workspace
-            rename can make it stale; recover through `workspace_id` and
-            `workspace_relative_path`.
+            Existing virtual workspace path. The message keeps this original
+            path and does not move, copy, rename, or delete the object.
 
     MessageDeliveryRef:
       description: |

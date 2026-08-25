@@ -5,6 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -21,6 +22,8 @@ from openctopus_server.db.models import (
     TurnRun,
     User,
 )
+from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.anthropic import (
     DeltaCallback,
     ProviderInvocationError,
@@ -37,6 +40,7 @@ from openctopus_server.services.messages import (
     promote_pending_for_turn,
 )
 from openctopus_server.services.turn_runs import abandon_running_turns
+from openctopus_server.workspace.service import WorkspaceService, get_workspace_service
 
 
 @dataclass(slots=True)
@@ -1013,6 +1017,168 @@ async def test_invalid_attachment_and_unconfigured_provider_fail_before_persiste
     assert unconfigured.json()["code"] == "provider_not_configured"
     missing = await user_client.get(f"/api/sessions/{session_id}/messages")
     assert missing.status_code == 404
+
+
+async def test_server_workspace_attachment_is_persisted_and_sent_to_provider(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    provider = FakeProvider([FakeStep(content=[{"type": "text", "text": "done"}])])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    workspace_service.read.return_value = b"%PDF-1.7"
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    session_id = uuid4()
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "content": [],
+            "attachments": [
+                {
+                    "openoctopus_device": "server",
+                    "path": "reports/report.pdf",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    marker = {
+        "type": "text",
+        "text": "User uploaded file to device='server', path=\"reports/report.pdf\"",
+    }
+    assert provider.calls[0]["messages"][0]["content"][1:] == [marker]
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["messages"][0]["content"] == [marker]
+    workspace_service.read.assert_awaited_once()
+    workspace_service.read_with_metadata.assert_not_awaited()
+    await runtime.close()
+
+
+async def test_attachment_resolution_failure_precedes_message_persistence(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    workspace_service.read.side_effect = WorkspaceError(
+        ErrorCode.WORKSPACE_NOT_FOUND,
+        "Workspace file not found",
+    )
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    session_id = uuid4()
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "content": [],
+            "attachments": [
+                {
+                    "openoctopus_device": "server",
+                    "path": "missing.pdf",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "workspace_not_found"
+    history = await user_client.get(f"/api/sessions/{session_id}/messages")
+    assert history.status_code == 404
+
+
+async def test_attachment_preflight_rejects_unconfigured_provider_before_workspace_io(
+    user_client,
+    test_app,
+):
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+
+    response = await user_client.post(
+        f"/api/sessions/{uuid4()}/messages",
+        json={
+            "content": [],
+            "attachments": [
+                {
+                    "openoctopus_device": "server",
+                    "path": "private/report.pdf",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "provider_not_configured"
+    workspace_service.read.assert_not_awaited()
+    workspace_service.read_with_metadata.assert_not_awaited()
+
+
+async def test_attachment_preflight_rejects_non_writable_sessions_before_workspace_io(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        owner = (
+            await db.execute(select(User).where(User.email == "user@test.com"))
+        ).scalar_one()
+        outsider = User(
+            id=uuid4(),
+            email="attachment-outsider@test.com",
+            password_hash="unused",
+            name="Attachment Outsider",
+        )
+        db.add(outsider)
+        await db.flush()
+        foreign_id = uuid4()
+        non_web_id = uuid4()
+        db.add_all(
+            [
+                Session(
+                    id=foreign_id,
+                    user_id=outsider.id,
+                    session_key=f"web:{foreign_id}",
+                    channel="web",
+                    chat_id=str(foreign_id),
+                    title="Foreign",
+                ),
+                Session(
+                    id=non_web_id,
+                    user_id=owner.id,
+                    session_key=f"telegram:{non_web_id}",
+                    channel="telegram",
+                    chat_id=str(non_web_id),
+                    title="Telegram",
+                ),
+            ]
+        )
+        await db.commit()
+
+    for session_id in (foreign_id, non_web_id):
+        response = await user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={
+                "content": [],
+                "attachments": [
+                    {
+                        "openoctopus_device": "server",
+                        "path": "private/report.pdf",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 404
+        assert response.json()["code"] == "not_found"
+
+    workspace_service.read.assert_not_awaited()
+    workspace_service.read_with_metadata.assert_not_awaited()
 
 
 async def test_direct_inline_image_is_persisted_and_sent_to_provider(

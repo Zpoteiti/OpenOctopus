@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
@@ -64,6 +64,9 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.INVALID_MESSAGE_CONTENT: 400,
     ErrorCode.INVALID_CURSOR: 400,
+    ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.SESSION_INVALID_REQUEST: 400,
+    ErrorCode.SESSION_HAS_CRON_JOB: 409,
     ErrorCode.PROVIDER_NOT_CONFIGURED: 503,
     ErrorCode.PROVIDER_UNAVAILABLE: 503,
     ErrorCode.PROVIDER_PROTOCOL_ERROR: 502,
@@ -94,6 +97,40 @@ async def openoctopus_error_handler(request: Request, exc: Exception) -> JSONRes
 def register_error_handler(app: FastAPI) -> None:
     app.add_exception_handler(OpenOctopusError, openoctopus_error_handler)
     app.add_exception_handler(RequestValidationError, message_validation_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+
+
+async def http_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    del request
+    assert isinstance(exc, StarletteHTTPException)
+    if exc.status_code == 404:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "code": ErrorCode.NOT_FOUND.value,
+                "message": "Route not found",
+            },
+        )
+    if exc.status_code == 405:
+        return JSONResponse(
+            status_code=405,
+            content={
+                "code": ErrorCode.INVALID_REQUEST.value,
+                "message": "Method not allowed",
+            },
+            headers={"Allow": exc.headers["Allow"]} if exc.headers and "Allow" in exc.headers else None,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": ErrorCode.INVALID_REQUEST.value,
+            "message": "Request failed",
+        },
+        headers=exc.headers,
+    )
 
 
 async def message_validation_handler(
@@ -101,6 +138,14 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    if request.url.path == "/api/admin/config":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": ErrorCode.CONFIG_VALIDATION_FAILED.value,
+                "message": "Admin configuration is invalid",
+            },
+        )
     if request.url.path == "/api/admin/server-mcp":
         return JSONResponse(
             status_code=422,
@@ -152,6 +197,18 @@ async def message_validation_handler(
                     "message": "Message query parameters are invalid",
                 },
             )
-    response = await request_validation_exception_handler(request, exc)
-    assert isinstance(response, JSONResponse)
-    return response
+    if request.method == "PATCH" and request.url.path.startswith("/api/sessions/"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": ErrorCode.SESSION_INVALID_REQUEST.value,
+                "message": "Session request is invalid",
+            },
+        )
+    return JSONResponse(
+        status_code=400,
+        content={
+            "code": ErrorCode.INVALID_REQUEST.value,
+            "message": "Request is invalid",
+        },
+    )

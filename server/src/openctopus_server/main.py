@@ -2,6 +2,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -41,6 +42,69 @@ DEVICE_WS_MAX_SIZE = MAX_TEXT_FRAME_BYTES
 DEVICE_WS_MAX_QUEUE = 1
 DEVICE_WS_PER_MESSAGE_DEFLATE = False
 DEVICE_WS_PROTOCOL_PING_INTERVAL = None
+_DOMAIN_422_OPERATIONS = {
+    ("/api/admin/server-mcp", "put"),
+    ("/api/devices/{name}/config", "patch"),
+    ("/api/workspace/files/{path}", "put"),
+    ("/api/workspace/files/{path}", "patch"),
+    ("/api/workspace/patch", "post"),
+    ("/api/workspace/transfer", "post"),
+}
+_VALIDATION_422_OPERATIONS = {
+    ("/api/admin/server-mcp", "put"),
+}
+
+
+class OpenOctopusAPI(FastAPI):
+    def openapi(self) -> dict[str, Any]:
+        schema = super().openapi()
+        _normalize_validation_responses(schema)
+        return schema
+
+
+def _normalize_validation_responses(schema: dict[str, Any]) -> None:
+    for path, path_item in schema.get("paths", {}).items():
+        for method, operation in path_item.items():
+            if not isinstance(operation, dict):
+                continue
+            responses = operation.get("responses")
+            if not isinstance(responses, dict):
+                continue
+            validation = responses.get("422")
+            if not _is_generated_validation_response(validation):
+                continue
+            key = (path, method)
+            if key not in _VALIDATION_422_OPERATIONS:
+                responses.setdefault("400", _validation_error_response())
+            if key in _DOMAIN_422_OPERATIONS:
+                responses["422"] = _validation_error_response()
+            else:
+                responses.pop("422")
+
+    components = schema.get("components", {}).get("schemas", {})
+    components.pop("HTTPValidationError", None)
+    components.pop("ValidationError", None)
+
+
+def _validation_error_response() -> dict[str, Any]:
+    return {
+        "description": "Invalid request.",
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+            }
+        },
+    }
+
+
+def _is_generated_validation_response(response: object) -> bool:
+    if not isinstance(response, dict):
+        return False
+    try:
+        ref = response["content"]["application/json"]["schema"]["$ref"]
+    except (KeyError, TypeError):
+        return False
+    return isinstance(ref, str) and ref == "#/components/schemas/HTTPValidationError"
 
 
 async def _close_lifespan_resources(
@@ -239,7 +303,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="OpenOctopus", lifespan=_lifespan)
+    app = OpenOctopusAPI(title="OpenOctopus", lifespan=_lifespan)
     app.state.server_mcp_authority = ServerMcpAuthorityFence(
         empty_server_mcp_envelope()
     )

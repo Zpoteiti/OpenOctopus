@@ -1,16 +1,14 @@
 import base64
 import binascii
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    SerializerFunctionWrapHandler,
     field_validator,
-    model_serializer,
     model_validator,
 )
 
@@ -21,21 +19,38 @@ from ..provider.wire_types import (
     TextBlock,
 )
 
-UserContentBlock = Annotated[
+type UserContentBlock = Annotated[
     TextBlock | ImageBlock,
     Field(discriminator="type"),
 ]
 
 
-class PostMessageRequest(BaseModel):
+class MessageAttachmentRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    openoctopus_device: Literal["server"]
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class PostMessageRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "anyOf": [
+                {"properties": {"content": {"minItems": 1}}},
+                {"properties": {"attachments": {"minItems": 1}}},
+            ]
+        },
+    )
+
     effort: Effort | None = None
-    content: list[UserContentBlock] = Field(min_length=1)
-    attachments: list[dict[str, Any]] = Field(max_length=0)
+    content: list[UserContentBlock]
+    attachments: list[MessageAttachmentRef] = Field(max_length=10)
 
     @model_validator(mode="after")
     def validate_user_content(self) -> "PostMessageRequest":
+        if not self.content and not self.attachments:
+            raise ValueError("content and attachments must not both be empty")
         for block in self.content:
             if isinstance(block, TextBlock):
                 if not block.text.strip():
@@ -97,10 +112,19 @@ type DeliveryRefResponse = Annotated[
 
 
 class MessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: UUID
     session_id: UUID
-    role: str
-    message_kind: str
+    role: Literal["user", "assistant"]
+    message_kind: Literal[
+        "human",
+        "assistant",
+        "tool_result",
+        "synthetic_tool_result",
+        "synthetic_assistant_error",
+        "compaction_summary",
+    ]
     content: list[ContentBlock]
     delivery_refs: list[DeliveryRefResponse]
     is_compacted: bool
@@ -108,6 +132,8 @@ class MessageResponse(BaseModel):
 
 
 class PendingMessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: UUID
     session_id: UUID
     content: list[ContentBlock]
@@ -116,20 +142,12 @@ class PendingMessageResponse(BaseModel):
 
 
 class MessagesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     messages: list[MessageResponse]
     pending_messages: list[PendingMessageResponse]
-    status: str
+    status: Literal["idle", "running", "failed", "abandoned"]
     active_turn_id: UUID | None
     last_message_id: UUID | None
     pending_count: int
     has_more_before: bool
-
-    @model_serializer(mode="wrap")
-    def serialize_required_nullable_fields(
-        self,
-        handler: SerializerFunctionWrapHandler,
-    ) -> dict[str, Any]:
-        data: dict[str, Any] = handler(self)
-        data["active_turn_id"] = self.active_turn_id
-        data["last_message_id"] = self.last_message_id
-        return data
