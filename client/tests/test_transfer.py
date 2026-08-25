@@ -3421,10 +3421,7 @@ def test_receiver_end_wakes_empty_stream_and_commits_zero_byte_file(tmp_path: Pa
             await manager.handle_control(
                 TransferEnd(id=SLOT, ack=False, ok=True, bytes_sent=0, sha256=digest)
             )
-            for _ in range(100):
-                if manager.active_count == 0:
-                    break
-                await asyncio.sleep(0.001)
+            await _wait_slot_closed(manager, SLOT)
             assert manager.active_count == 0
             await writer.drain()
             assert (tmp_path / "empty.txt").read_bytes() == b""
