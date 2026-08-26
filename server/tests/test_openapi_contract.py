@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode
 
 from openctopus_server.main import create_app
 
@@ -21,9 +22,27 @@ _DEFERRED_OPERATIONS = {
 
 def _static_openapi() -> dict[str, Any]:
     path = Path(__file__).parents[2] / "docs" / "API.yaml"
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    source = path.read_text(encoding="utf-8")
+    node = yaml.compose(source, Loader=yaml.SafeLoader)
+    assert node is not None
+    _assert_unique_mapping_keys(node)
+    document = yaml.safe_load(source)
     assert isinstance(document, dict)
     return document
+
+
+def _assert_unique_mapping_keys(node: Node) -> None:
+    if isinstance(node, MappingNode):
+        seen: set[str] = set()
+        for key, value in node.value:
+            assert isinstance(key, ScalarNode), "OpenAPI mapping keys must be scalar"
+            assert key.value not in seen, f"duplicate OpenAPI mapping key: {key.value}"
+            seen.add(key.value)
+            _assert_unique_mapping_keys(value)
+        return
+    for child in getattr(node, "value", ()):
+        if isinstance(child, Node):
+            _assert_unique_mapping_keys(child)
 
 
 def _operations(document: dict[str, Any]) -> set[tuple[str, str]]:

@@ -29,6 +29,7 @@
 
 - React Router：浏览器路由和登录/管理员访问边界；
 - TanStack Query：Server 状态缓存、失效和轮询；
+- `i18next` + `react-i18next`：集中管理用户可见文案与语言切换；
 - `openapi-typescript`：从 `docs/API.yaml` 生成只包含类型的 API 契约；
 - `react-markdown` + GFM：安全展示 Agent Markdown；不启用原始 HTML；
 - Vitest、Testing Library、MSW：组件、API 和流式状态测试；
@@ -58,7 +59,7 @@ Server Docker 镜像通过多阶段构建生成 `frontend/dist`。FastAPI 在所
 
 注册和登录只依赖 Server 设置的 HttpOnly Cookie。注册页中的 Admin Token 是可选字段；Server 不会因 Token 不匹配而拒绝普通注册，因此前端始终以响应中的 `is_admin` 为准，并在用户填写 Token 但得到普通账户时明确提示。退出后清空内存缓存并回到登录页。账户删除成功后执行同样清理。
 
-桌面端使用固定侧栏，窄屏使用顶部导航。主题支持 `auto`、`light`、`dark` 三态；`auto` 响应 `prefers-color-scheme` 的实时变化。
+桌面端使用固定侧栏，窄屏使用顶部导航。主题支持 `auto`、`light`、`dark` 三态；`auto` 响应 `prefers-color-scheme` 的实时变化。第一版默认英文，同时提供英文/简体中文切换。显式选择保存在 `localStorage`，不存储身份或业务数据；所有用户可见文案通过集中资源表渲染，便于后续增加语言包。
 
 ## 6. 会话与聊天
 
@@ -135,7 +136,7 @@ Linux + 当前 Node LTS：
 5. Vite production build；
 6. Playwright Chromium 核心流程。
 
-组件测试覆盖认证路由、管理员可见性、主题、NDJSON 跨 chunk 解析、流断开后的 canonical 恢复、文件 ETag 冲突、一次性 Token 和稳定错误码。Playwright 覆盖登录、发送/停止、附件、Workspace 文本编辑、设备创建和管理员配置；测试使用真实 FastAPI/PostgreSQL/RustFS，Provider 使用仓库内可控测试服务。
+组件测试覆盖认证路由、管理员可见性、主题、停止当前 turn、NDJSON 跨 chunk 解析、流断开后的 canonical 恢复、文件 ETag 冲突、一次性 Token 和稳定错误码。Playwright 覆盖注册与登录、发送、附件、Workspace 文本编辑、设备创建和管理员配置；测试使用真实 FastAPI/PostgreSQL/RustFS，Provider 使用仓库内可控测试服务。
 
 前端产物是平台无关浏览器资源，不重复在 Windows/macOS CI 跑相同浏览器矩阵，也不做像素快照。
 

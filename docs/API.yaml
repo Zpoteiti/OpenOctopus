@@ -191,6 +191,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [jwt, user]
                 properties:
                   jwt: { type: string }
                   user: { $ref: '#/components/schemas/User' }
@@ -226,6 +227,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [jwt, user]
                 properties:
                   jwt: { type: string }
                   user: { $ref: '#/components/schemas/User' }
@@ -1060,9 +1062,6 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: Quota lock, operation exceeds quota, or paired device is offline (`tool_device_unreachable`).
-          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
-        '422':
-          description: Invalid SKILL.md after edit, if skill validation is active for the edited path.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     delete:
       tags: [Workspace Files]

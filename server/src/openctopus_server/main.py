@@ -2,6 +2,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
@@ -18,6 +19,7 @@ from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.protocol import MAX_TEXT_FRAME_BYTES
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.http import register_error_handler
+from openctopus_server.frontend import FRONTEND_BUILD_DIR, install_frontend
 from openctopus_server.mcp.authority import ServerMcpAuthorityFence
 from openctopus_server.mcp.models import ServerMcpEnvelope, empty_server_mcp_envelope
 from openctopus_server.mcp.supervisor import ServerMcpSupervisor
@@ -302,13 +304,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
 
-def create_app() -> FastAPI:
+def create_app(*, frontend_dir: Path | None = FRONTEND_BUILD_DIR) -> FastAPI:
     app = OpenOctopusAPI(title="OpenOctopus", lifespan=_lifespan)
     app.state.server_mcp_authority = ServerMcpAuthorityFence(
         empty_server_mcp_envelope()
     )
     app.include_router(api_router)
     register_error_handler(app)
+    install_frontend(app, frontend_dir)
     return app
 
 
