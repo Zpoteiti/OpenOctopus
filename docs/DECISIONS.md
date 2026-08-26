@@ -39,11 +39,11 @@ These supersede the historical ADR set in the previous Plexus codebase — most 
 **Decision:** One monorepo. `openoctopus/server/` is the Python server. `openoctopus/client/` will be a Go or Rust project (language decided at client milestone). No `openoctopus_common` Python package. Tool source schemas, error codes, identity validation, and merge logic all live in the server package. The client implements the wire protocol directly against `PROTOCOL.md` — it matches tool calls by name, executes them, and returns `tool_result` frames.
 **Consequences:** Server owns all tool schema definitions, normalization, and truncation. Client is a standalone binary — no Python runtime required on devices. Shared contract is documentation, not code.
 
-### ADR-002 · Frontend embedded in server binary (prod); Vite + proxy (dev)
+### ADR-002 · Same-origin React frontend in the Server image
 
-**Status:** accepted
-**Decision:** In release builds, the React frontend is compiled by `npm run build` and baked into the server binary via `rust-embed`. In dev, `npm run dev` runs Vite on `:5173` with a proxy for `/api/*` and `/ws/device` pointing to the running server on `:8080`.
-**Consequences:** Single artifact in prod (one `cargo build --release` produces a deployable binary). Fast dev loop (frontend HMR via Vite, server compiled separately).
+**Status:** accepted (revised for Python-main, 2026-08-26)
+**Decision:** The browser frontend lives in top-level `frontend/` and uses React, TypeScript, and Vite. Production uses a multi-stage Docker build and FastAPI serves the compiled SPA from the same origin after all API routes. Development runs Vite with `/api` and `/health` proxied to FastAPI on `:8080`. History API fallback never captures API, health, OpenAPI, documentation, or device WebSocket paths.
+**Consequences:** Browser auth remains HttpOnly-cookie based without CORS or client token storage. The production Server image contains one web application and API deployment unit, while frontend HMR and API-only source development remain independent.
 
 ### ADR-003 · Browser REST; devices use WebSocket
 
@@ -2181,8 +2181,10 @@ Voice notes save to workspace as-is. Users wire their own transcription by runni
 ### ADR-065 · Last admin is protected
 Admin users can delete ordinary users, other admins, and themselves, but deletion is rejected when it would remove the last remaining admin. Re-bootstrapping through direct DB access is avoidable product friction even for self-hosted deployments, so the admin API returns `409 Conflict` with code `last_admin_required` instead.
 
-### ADR-066 · No frontend test harness (Vitest/RTL/Playwright)
-Manual smoke testing in v1. Wire up later if frontend complexity grows.
+### ADR-066 · Frontend contract and browser test harness
+**Status:** accepted (revised, 2026-08-26)
+**Decision:** Generate TypeScript API types from `docs/API.yaml`; test frontend state and components with Vitest/Testing Library and core real-service flows with Playwright Chromium on Linux. CI also runs strict TypeScript, lint, generated-contract drift, and a production build. Pixel snapshots and duplicate Windows/macOS browser jobs are outside the gate.
+**Consequences:** Browser streaming recovery, auth visibility, workspace edits, one-time secrets, and API drift receive automated coverage without adding a cross-platform browser matrix.
 
 ### ADR-067 · No bulk file operations / file rename endpoint
 **Status:** superseded by ADR-087. Originally "single-file ops only; delete + re-upload for rename." `file_transfer` now handles one file or one bounded recursive source directory. A qualifying same-Client move uses a native exclusive rename; Server object-prefix moves remain copy-then-conditional-delete. There is still no arbitrary bulk-item mutation API.
@@ -2273,30 +2275,15 @@ provider validation described above; those keys are now accepted only after the
 
 ## 13. Distribution
 
-### ADR-102 · Distribution targets — Linux-only server (musl), all-three-OS client; GitHub Releases as the sole channel
+### ADR-102 · Distribution targets — Linux Server image and all-three-OS Client artifacts
 
-**Status:** accepted
-**Context:** OpenOctopus serves a heterogeneous user base — Linux dev-ops boxes, macOS leadership, Windows engineers — but the production server is overwhelmingly Linux. We need a release strategy that ships single-binary artifacts for the realistic deployment matrix without taking on distro-packaging or container-distribution burden.
-**Decision:**
+**Status:** accepted (revised for Python-main, 2026-08-26)
+**Context:** The Python Server depends on PostgreSQL, RustFS and document-conversion libraries, while the Python Client must run directly on heterogeneous user devices. Their deployment units are intentionally different.
+**Decision:** Production Server releases are Linux Docker images for `linux/amd64` and `linux/arm64`; the image includes the FastAPI application and compiled frontend from ADR-002. Source installs remain a development path, not the primary production artifact. Client releases remain frozen GitHub Release artifacts for Linux, macOS and Windows on the architectures covered by their native test matrix. No APT/YUM/Homebrew channel is introduced.
 
-**Targets:**
+The frontend does not invent download URLs or expose a Client download panel until a versioned release-manifest API exists. Device pairing continues to show the one-time token and the documented environment-variable startup command.
 
-| Crate | Targets | Linkage |
-|---|---|---|
-| **openoctopus_server** | `linux-x86_64`, `linux-aarch64` | musl static |
-| **openoctopus_client** | `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, `windows-x86_64.exe` | musl on Linux; native libc on macOS/Windows |
-
-The server's macOS/Windows targets are deliberately omitted in v1 — production deployment is overwhelmingly Linux, and supporting Windows server adds non-trivial code complexity (UNC path normalization for `messages.content` path-text markers, Windows symlink + junction handling in `workspace_fs` per ADR-045, ACL semantics for `skills/` validation). Admins who want to run the server on macOS/Windows can `cargo build --release` and accept untested status. Revisit post-M3 if real demand emerges.
-
-**Linux uses musl.** All OpenOctopus dependencies are pure Rust (sqlx, rustls, axum, tungstenite, rmcp), so musl-static linking produces one binary per architecture that runs on every distro from ancient CentOS to current Alpine without modification. No need for Debian/CentOS/RHEL-specific builds. Trade-offs (slower musl malloc, historically funky DNS resolver) are negligible for a network-bound service.
-
-**Naming:** `openoctopus-{server,client}-v{X.Y.Z}-{os}-{arch}[.exe]`. Server tarball includes the embedded frontend bundle (per ADR-002). Client is a single static binary.
-
-**Channel:** **GitHub Releases only**, tagged per version. No Docker images in v1 (revisit when there's first-real-deployment demand). No APT/YUM repos. No Homebrew tap. A source install from `github.com/<owner>/OpenOctopus` can remain a fallback for users who want to track main.
-
-**M3 frontend integration:** the **Settings → Devices** tab surfaces a download link section. Frontend reads the deployed server's `GET /api/version` and renders direct links to the GitHub Release assets pinned to that exact version (so a deployment running v0.3.4 doesn't push users a v0.4.0 client that may not handshake against the older protocol). User-agent detection picks the matching binary as the primary CTA; the other targets sit behind a "Other platforms" disclosure.
-
-**Consequences:** One channel to maintain (GitHub Releases). One binary per (crate × target). Linux distro-independence comes for free via musl. Frontend's download UX is version-correct by construction. Future container/distro-package channels add zero ADR debt because GitHub Releases is just "the artifact store" — anything else is a republishing layer over it.
+**Consequences:** Server dependencies and browser assets ship as one reproducible Linux deployment unit. Client artifacts remain native to the machine that executes tools. Registry publication, signing and release-manifest details require their own release slice; the current Dockerfile and CI build are merge gates rather than a promise that an image has been published.
 
 ### ADR-104 · openoctopus_client CLI surface, env vars, and failure semantics
 
@@ -3008,8 +2995,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
-| **Py12** | Frontend | React/Vite SPA with static assets; dev proxy to server; workspace/files, sessions, devices, system config management UIs | — | — |
-| **Py13** | Packaging + scale-out | Docker images, pip distribution, deployment docs; multi-worker scale-out (future ADR) | Py12 | — |
+| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Accepted design: `2026-08-26-browser-frontend-design.zh.md`; implementation and real browser gate pending |
+| **Py13** | Release + scale-out | Publish/sign Docker and Client artifacts, deployment docs; multi-worker scale-out remains a future ADR | Frontend | — |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
 
 ### Parallel tracks (post-Py3)

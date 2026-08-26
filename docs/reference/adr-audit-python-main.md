@@ -127,7 +127,7 @@ from the page-lifetime SSE/no-token-streaming design.
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
 | ADR-001 | Three-crate workspace | `Supersede` | Replaced with one monorepo containing independent Python 3.12 `server/` and `client/` packages. No common package; the wire/docs remain the shared contract. |
-| ADR-002 | Frontend embedded in server binary; Vite + proxy | `Rewrite-needed` | Rust binary embedding does not carry forward. Frontend/dev-server/packaging policy needs a Python/Docker-era decision later. |
+| ADR-002 | Same-origin React frontend in the Server image | `Translate` | Top-level React/TypeScript/Vite frontend; FastAPI serves the compiled SPA from the production Server image and Vite proxies API traffic during development. |
 | ADR-003 | Browser REST; devices use WebSocket | `Supersede` | Device WebSocket carries forward. ADR-121 supersedes the old browser per-session SSE stream with streaming `POST messages` for the current turn and `GET messages` polling for canonical history/status. Browser web sessions are created implicitly by `POST messages` when the client-generated UUID is missing. |
 | ADR-004 | Auth: cookie for browser, bearer for programmatic | `Translate` | Keep the browser cookie/programmatic bearer split, implemented with the Python web stack. |
 | ADR-005 | Single `InboundMessage` shape; no `EventKind` | `Translate` | Keep one normalized ingress shape, implemented as Pydantic DTOs and durable session input handling. |
@@ -334,7 +334,7 @@ after frontend completion.
 | ADR-063 | No Dream (deferred, ADR-055) | `Archive-only` | Covered by ADR-055. This ADR is a reference only. |
 | ADR-064 | No server-side Whisper/ASR | `Keep` | Voice notes save to workspace as-is. Users run transcription on client devices. Server does not host ASR models. |
 | ADR-065 | Last admin is protected | `Translate` | Keep the product behavior: delete is rejected with `409 last_admin_required` when it would remove the final admin. Python implementation in admin API routes. |
-| ADR-066 | No frontend test harness (Vitest/RTL/Playwright) | `Keep` | Frontend remains a later milestone (Py12+). Manual smoke testing in development. |
+| ADR-066 | Frontend contract and browser test harness | `Supersede` | Generate OpenAPI TypeScript types; use Vitest/Testing Library plus Linux Chromium Playwright and production-build CI. |
 | ADR-067 | No bulk file operations / file rename endpoint | `Archive-only` | Superseded by ADR-087 (`file_transfer` with `mode=move`). No independent status for Python-main. |
 | ADR-068 | No server-pushed workspace tree invalidation | `Keep` | Workspace file tree in browser does not auto-refresh. User reload or navigate triggers refetch. WS push can be added later if UX friction is real. |
 | ADR-069 | No real migrations framework in v1 | `Archive-only` | Rust `sqlx::include_str!("schema.sql")` bootstrap does not carry forward. Python-main uses SQLAlchemy `create_all()` for dev bootstrap. Alembic or equivalent migration framework is deferred until production launch after frontend completion; before that, the project is dev-machine-only with reset-on-bootstrap. |
@@ -395,7 +395,7 @@ are historical only.
 
 | ADR | Title | Python-main status | Python-main note |
 |---|---|---|---|
-| ADR-102 | Distribution targets — Linux-only server, all-OS client; GitHub Releases | `Translate` | Rust musl-static binary distribution does not carry forward. Python-main distribution uses pip packages / Docker images (decision deferred to after frontend completion). The principle of GitHub Releases as the distribution channel carries forward. Frontend download-link integration is a later milestone. |
+| ADR-102 | Linux Server image and all-three-OS Client artifacts | `Translate` | Production Server is a Linux Docker image containing FastAPI and the compiled frontend; native frozen Client artifacts remain on GitHub Releases. Publishing/signing is a later release slice. |
 | ADR-103 | No multi-server multiplexing in openoctopus_client | `Translate` | One client process talks to exactly one OpenOctopus server. This product constraint is language-independent. Python client uses the same model: single `OPENOCTOPUS_DEVICE_TOKEN`, single WS connection. |
 | ADR-104 | openoctopus_client CLI surface, env vars, and failure semantics | `Translate` | Keep startup contract: two env vars (`OPENOCTOPUS_DEVICE_TOKEN`, `OPENOCTOPUS_SERVER_URL`), `run`/`version` subcommands, backoff-forever reconnect, cancel-on-SIGTERM shutdown. Rust-specific details (`tracing` backend, `secrecy` crate) replaced with Python equivalents (`logging`, `pydantic.SecretStr`). |
 | ADR-107 | Versioning policy — pre-1.0 collapsed-tier; protocol version independent | `Translate` | Keep pre-1.0 two-tier scheme (`0.m.x+1`=compatible, `0.m+1.0`=breaking) and independent protocol version. Post-1.0 full SemVer cutover deferred. Binary version and protocol version remain separate. |
