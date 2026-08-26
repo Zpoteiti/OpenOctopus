@@ -24,6 +24,42 @@ async def test_error_handler_returns_code_and_message(async_client):
     assert "message" in body
 
 
+async def test_unmatched_route_and_method_use_stable_error_envelopes(async_client):
+    missing = await async_client.get("/api/does-not-exist")
+    method = await async_client.put("/health")
+
+    assert missing.status_code == 404
+    assert missing.json() == {"code": "not_found", "message": "Route not found"}
+    assert method.status_code == 405
+    assert method.json() == {
+        "code": "invalid_request",
+        "message": "Method not allowed",
+    }
+
+
+async def test_generic_validation_uses_stable_error_envelope(user_client):
+    response = await user_client.get("/api/sessions/not-a-uuid/messages")
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "Request is invalid",
+    }
+
+
+async def test_admin_config_validation_uses_config_error_envelope(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"unknown_key": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "config_validation_failed",
+        "message": "Admin configuration is invalid",
+    }
+
+
 async def test_workspace_error_handler_preserves_retry_header() -> None:
     response = await openoctopus_error_handler(
         Request({"type": "http", "method": "GET", "path": "/", "headers": []}),

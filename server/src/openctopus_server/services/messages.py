@@ -13,7 +13,7 @@ from openctopus_server.chat.repair import synthetic_tool_result
 from openctopus_server.chat.runtime_context import build_runtime_block
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun, User
-from openctopus_server.dto.message import MessagesResponse, PostMessageRequest
+from openctopus_server.dto.message import MessagesResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.provider.config import load_provider_config
@@ -32,7 +32,8 @@ async def accept_message(
     *,
     user: User,
     session_id: UUID,
-    body: PostMessageRequest,
+    content: list[dict[str, Any]],
+    effort: Effort | None,
     runner_instance_id: UUID,
 ) -> AcceptedMessage:
     now = datetime.now(UTC)
@@ -58,18 +59,14 @@ async def accept_message(
             db.add(session)
             await db.flush()
             created_session = True
-        elif (
-            session.user_id != user.id
-            or session.channel != "web"
-            or not session.session_key.startswith("web:")
-        ):
+        elif not _is_writable_web_session(session, user_id=user.id):
             raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
         else:
             session.last_inbound_at = now
 
         stored_content = [
             build_runtime_block(timestamp=now.isoformat(), session=session, user_id=user.id),
-            *[block.model_dump(mode="json", exclude_none=True) for block in body.content],
+            *content,
         ]
         db.add(
             PendingMessage(
@@ -78,7 +75,7 @@ async def accept_message(
                 user_id=user.id,
                 session_key=session.session_key,
                 content=stored_content,
-                effort=body.effort.value if body.effort is not None else None,
+                effort=effort.value if effort is not None else None,
                 received_at=now,
             )
         )
@@ -123,6 +120,19 @@ async def accept_message(
     except Exception:
         await db.rollback()
         raise
+
+
+async def preflight_message_target(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    session_id: UUID,
+) -> None:
+    """Reject unusable message targets before resolving browser attachments."""
+    await load_provider_config(db)
+    session = await db.scalar(select(Session).where(Session.id == session_id))
+    if session is not None and not _is_writable_web_session(session, user_id=user_id):
+        raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
 
 
 async def reserve_pending_turn(
@@ -581,8 +591,8 @@ async def get_messages_response(
 ) -> MessagesResponse:
     if before is not None and after is not None:
         raise ChatError(ErrorCode.INVALID_CURSOR, "before and after are mutually exclusive")
-    session = await _owned_session(db, user_id=user_id, session_id=session_id)
     await _advisory_lock(db, session_id, shared=True)
+    session = await _owned_session(db, user_id=user_id, session_id=session_id)
     anchor_id = before if before is not None else after
     anchor: Message | None = None
     if anchor_id is not None:
@@ -679,6 +689,14 @@ async def _owned_session(
     if session is None:
         raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
     return session
+
+
+def _is_writable_web_session(session: Session, *, user_id: UUID) -> bool:
+    return (
+        session.user_id == user_id
+        and session.channel == "web"
+        and session.session_key.startswith("web:")
+    )
 
 
 async def _pending_rows(

@@ -125,6 +125,18 @@ class _SessionState:
     active_preview_message_ids: frozenset[UUID] = field(default_factory=frozenset)
 
 
+@dataclass(slots=True)
+class _SessionOperation:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    leases: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DetachedSession:
+    session_id: UUID
+    subscribers: tuple[StreamSubscriber, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedTurn:
     turn: TurnStart
@@ -243,13 +255,14 @@ class ChatRuntime:
         self._activation_tasks: set[asyncio.Task[None]] = set()
         self._states: dict[UUID, _SessionState] = {}
         self._states_lock = asyncio.Lock()
+        self._session_operations: dict[UUID, _SessionOperation] = {}
 
     def set_provider_factory(self, factory: ProviderFactory) -> None:
         if self._providers:
             raise RuntimeError("Cannot replace provider factory after provider use")
         self._provider_factory = factory
 
-    def schedule(self, accepted: AcceptedMessage) -> None:
+    async def schedule(self, accepted: AcceptedMessage) -> None:
         if accepted.turn is None:
             return
         task = asyncio.create_task(
@@ -258,6 +271,71 @@ class ChatRuntime:
         )
         self._activation_tasks.add(task)
         task.add_done_callback(self._activation_tasks.discard)
+        await await_future_cancellation_safe(task)
+
+    @asynccontextmanager
+    async def session_operation(self, session_id: UUID) -> AsyncIterator[None]:
+        operation = self._session_operations.get(session_id)
+        if operation is None:
+            operation = _SessionOperation()
+            self._session_operations[session_id] = operation
+        operation.leases += 1
+        try:
+            async with operation.lock:
+                yield
+        finally:
+            operation.leases -= 1
+            if (
+                operation.leases == 0
+                and self._session_operations.get(session_id) is operation
+            ):
+                self._session_operations.pop(session_id)
+
+    async def terminate_session(self, session_id: UUID) -> None:
+        detached = await self.detach_session(session_id)
+        self.finalize_detached_session(detached, deleted=True)
+
+    async def detach_session(self, session_id: UUID) -> DetachedSession:
+        async with self._states_lock:
+            state = self._states.pop(session_id, None)
+        if state is None:
+            return DetachedSession(session_id=session_id, subscribers=())
+
+        async with state.lock:
+            task = state.runner_task
+            state.runner_task = None
+            state.starts.clear()
+            subscribers = [
+                *state.turn_subscribers.values(),
+                *state.queued_subscribers.values(),
+            ]
+            state.turn_subscribers.clear()
+            state.queued_subscribers.clear()
+            state.active_turn_id = None
+            state.active_preview_message_ids = frozenset()
+
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return DetachedSession(
+            session_id=session_id,
+            subscribers=tuple(subscribers),
+        )
+
+    def finalize_detached_session(
+        self,
+        detached: DetachedSession,
+        *,
+        deleted: bool,
+    ) -> None:
+        event = {
+            "type": "session_deleted",
+            "session_id": str(detached.session_id),
+        }
+        for subscriber in detached.subscribers:
+            if deleted:
+                subscriber.send(event)
+            subscriber.close()
 
     async def register(self, accepted: AcceptedMessage) -> StreamSubscriber:
         subscriber = StreamSubscriber(

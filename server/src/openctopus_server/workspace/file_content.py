@@ -241,7 +241,7 @@ def render_file_content(
 ) -> str | list[dict[str, Any]]:
     if offset < 1 or limit < 1:
         raise _invalid("File offset and limit must be positive")
-    media_type = _image_media_type(data)
+    media_type = image_media_type(data)
     if media_type is not None:
         return [
             {"type": "text", "text": f"Image: {path}"},
@@ -350,7 +350,7 @@ async def render_streamed_text(
     return _cap(rendered)
 
 
-def _image_media_type(data: bytes) -> str | None:
+def image_media_type(data: bytes) -> str | None:
     for signature, media_type in _IMAGE_SIGNATURES:
         if data.startswith(signature):
             if media_type == "image/webp" and data[8:12] != b"WEBP":

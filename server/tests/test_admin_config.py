@@ -3,6 +3,7 @@ import asyncio
 import httpx
 import pytest
 
+from openctopus_server.dto.config import AdminConfig
 from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
 from openctopus_server.services import system_config
 from openctopus_server.services.system_config import validate_llm_identity
@@ -43,8 +44,30 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_endpoint"] is None
     assert body["llm_api_key"] is None
     assert body["llm_model"] is None
+    assert body["llm_max_context_tokens"] is None
+    assert body["llm_compaction_threshold_tokens"] is None
+    assert body["llm_max_concurrent_requests"] is None
     assert body["llm_max_output_tokens"] == 16384
     assert body["web_fetch_denylist"] == list(DEFAULT_SSRF_DENYLIST)
+    assert set(body) == set(AdminConfig.model_fields)
+
+
+def test_admin_config_openapi_requires_nullable_unconfigured_fields():
+    schema = AdminConfig.model_json_schema(mode="serialization")
+
+    assert set(schema["required"]) == set(AdminConfig.model_fields)
+    for field in {
+        "llm_endpoint",
+        "llm_api_key",
+        "llm_model",
+        "llm_max_context_tokens",
+        "llm_compaction_threshold_tokens",
+        "llm_max_concurrent_requests",
+    }:
+        assert {item.get("type") for item in schema["properties"][field]["anyOf"]} == {
+            "string" if field in {"llm_endpoint", "llm_api_key", "llm_model"} else "integer",
+            "null",
+        }
 
 
 async def test_patch_web_fetch_denylist_canonicalizes_and_allows_empty(admin_client):
@@ -125,21 +148,56 @@ async def test_invalid_web_fetch_denylist_entry_is_rejected(admin_client, entry)
     assert response.json()["code"] == "config_validation_failed"
 
 
-async def test_null_web_fetch_denylist_is_rejected_without_changing_policy(admin_client):
+@pytest.mark.parametrize(
+    "field",
+    [
+        "quota_bytes",
+        "shared_workspace_quota_bytes",
+        "llm_endpoint",
+        "llm_api_key",
+        "llm_model",
+        "llm_max_context_tokens",
+        "llm_compaction_threshold_tokens",
+        "llm_max_concurrent_requests",
+        "llm_max_output_tokens",
+        "web_fetch_denylist",
+    ],
+)
+async def test_explicit_null_config_field_is_rejected_without_changes(admin_client, field):
+    before = (await admin_client.get("/api/admin/config")).json()
+    rejected = await admin_client.patch(
+        "/api/admin/config",
+        json={field: None},
+    )
+
+    assert rejected.status_code == 400
+    assert rejected.json() == {
+        "code": "config_validation_failed",
+        "message": "Config values cannot be null",
+    }
+    assert (await admin_client.get("/api/admin/config")).json() == before
+
+
+async def test_patch_omitted_fields_keep_existing_values(admin_client):
     initial = await admin_client.patch(
         "/api/admin/config",
-        json={"web_fetch_denylist": ["example.com"]},
+        json={
+            "quota_bytes": 1234,
+            "shared_workspace_quota_bytes": 2345,
+            "web_fetch_denylist": ["example.com"],
+        },
     )
     assert initial.status_code == 200
 
-    rejected = await admin_client.patch(
+    updated = await admin_client.patch(
         "/api/admin/config",
-        json={"web_fetch_denylist": None},
+        json={"quota_bytes": 3456},
     )
 
-    assert rejected.status_code == 422
-    stored = await admin_client.get("/api/admin/config")
-    assert stored.json()["web_fetch_denylist"] == ["example.com"]
+    assert updated.status_code == 200
+    assert updated.json()["quota_bytes"] == 3456
+    assert updated.json()["shared_workspace_quota_bytes"] == 2345
+    assert updated.json()["web_fetch_denylist"] == ["example.com"]
 
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):
@@ -172,20 +230,22 @@ async def test_patch_config_llm_success(admin_client, monkeypatch):
     assert captured["path"] == "/v1/models"
 
 
-async def test_patch_config_unknown_key_returns_422(admin_client):
+async def test_patch_config_unknown_key_returns_400(admin_client):
     response = await admin_client.patch(
         "/api/admin/config",
         json={"unknown_key": "value"},
     )
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
 
 
-async def test_patch_config_invalid_value_returns_422(admin_client):
+async def test_patch_config_invalid_value_returns_400(admin_client):
     response = await admin_client.patch(
         "/api/admin/config",
         json={"quota_bytes": 0},
     )
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
 
 
 async def test_patch_max_output_tokens(admin_client):
