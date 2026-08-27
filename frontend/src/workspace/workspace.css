@@ -1,15 +1,21 @@
 .oo-workspace-page {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   overflow: auto;
-  padding: 28px 44px 42px;
 }
 
 .oo-workspace-alert,
 .oo-workspace-notice {
   border-radius: 9px;
   font-size: 12px;
-  margin: 0 0 14px;
+  margin: 0;
   padding: 10px 13px;
+}
+
+.oo-workspace-page > .oo-workspace-alert,
+.oo-workspace-page > .oo-workspace-notice {
+  margin: 14px 20px 0;
 }
 
 .oo-workspace-alert {
@@ -30,7 +36,7 @@
   display: grid;
   gap: 12px;
   grid-template-columns: minmax(180px, 1fr) minmax(140px, .5fr) auto;
-  margin-bottom: 16px;
+  margin: 16px 20px 0;
   padding: 16px;
 }
 
@@ -53,12 +59,17 @@
 }
 
 .oo-workspace-browser {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   display: grid;
+  flex: 1 0 auto;
   grid-template-columns: 190px minmax(320px, 1fr) minmax(220px, 280px);
   min-height: 520px;
   overflow: hidden;
+}
+
+.oo-workspace-create + .oo-workspace-browser,
+.oo-workspace-page > .oo-workspace-alert + .oo-workspace-browser,
+.oo-workspace-page > .oo-workspace-notice + .oo-workspace-browser {
+  margin-top: 14px;
 }
 
 .oo-workspace-locations,
@@ -189,29 +200,88 @@
 }
 .oo-workspace-delete-file { color: var(--danger); margin: 0 0 12px 7px; }
 
+.oo-workspace-file-header,
+.oo-workspace-file-list button {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 30px minmax(160px, 1fr) 96px 86px;
+}
+
+.oo-workspace-file-header {
+  border-bottom: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 9px;
+  letter-spacing: .04em;
+  padding: 9px 14px;
+}
+
+.oo-workspace-file-header span:first-child { grid-column: 2; }
+.oo-workspace-file-header span:not(:first-child) { text-align: right; }
 .oo-workspace-file-list { list-style: none; margin: 0; padding: 0; }
 .oo-workspace-file-list li { border-bottom: 1px solid var(--line); }
-.oo-workspace-file-list li.special { background: color-mix(in srgb, var(--accent-soft), transparent 40%); }
 .oo-workspace-file-list button {
   align-items: center;
   background: transparent;
   border: 0;
-  display: grid;
-  gap: 10px;
-  grid-template-columns: 30px minmax(100px, 1fr) auto 70px 68px;
-  min-height: 50px;
+  min-height: 48px;
   padding: 7px 14px;
   text-align: left;
   width: 100%;
 }
 .oo-workspace-file-list button:hover { background: var(--panel-soft); }
+.oo-workspace-file-list button.selected { background: var(--accent-soft); }
 .oo-workspace-file-list button:disabled { cursor: default; opacity: .7; }
 .oo-workspace-file-icon { border-radius: 6px; font-size: 6px; height: 25px; width: 25px; }
-.oo-workspace-file-icon.directory { background: color-mix(in srgb, #d1a23b, transparent 86%); color: #9a6c0e; }
-.oo-workspace-file-name { font-size: 11px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.oo-workspace-file-tag { border: 1px solid var(--accent); border-radius: 999px; color: var(--accent-strong); font-size: 8px; padding: 3px 6px; }
+.oo-workspace-file-icon.directory {
+  background: color-mix(in srgb, var(--warning), transparent 86%);
+  color: var(--warning);
+  font-size: 0;
+  position: relative;
+}
+.oo-workspace-file-icon.directory::before {
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  bottom: 5px;
+  content: '';
+  height: 10px;
+  position: absolute;
+  width: 15px;
+}
+.oo-workspace-file-icon.directory::after {
+  border: 1.5px solid currentColor;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  content: '';
+  height: 4px;
+  left: 5px;
+  position: absolute;
+  top: 5px;
+  width: 7px;
+}
+.oo-workspace-file-main { align-items: center; display: flex; gap: 8px; min-width: 0; }
+.oo-workspace-file-name { font-size: 11px; font-weight: 700; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oo-workspace-file-tag { border-radius: 999px; color: var(--accent-strong); flex: 0 0 auto; font-size: 8px; padding: 3px 6px; }
 .oo-workspace-file-kind,
 .oo-workspace-file-size { color: var(--faint); font-size: 9px; text-align: right; }
+.oo-workspace-file-list li[data-special="attachments"] .oo-workspace-file-icon,
+.oo-workspace-file-list li[data-special="attachments"] .oo-workspace-file-tag,
+.oo-workspace-file-list li[data-special="soul"] .oo-workspace-file-icon,
+.oo-workspace-file-list li[data-special="soul"] .oo-workspace-file-tag {
+  background: color-mix(in srgb, var(--accent), transparent 86%);
+  color: var(--accent-strong);
+}
+.oo-workspace-file-list li[data-special="skills"] .oo-workspace-file-icon,
+.oo-workspace-file-list li[data-special="skills"] .oo-workspace-file-tag,
+.oo-workspace-file-list li[data-special="skill-definition"] .oo-workspace-file-icon,
+.oo-workspace-file-list li[data-special="skill-definition"] .oo-workspace-file-tag {
+  background: color-mix(in srgb, var(--warning), transparent 86%);
+  color: var(--warning);
+}
+.oo-workspace-file-list li[data-special="memory"] .oo-workspace-file-icon,
+.oo-workspace-file-list li[data-special="memory"] .oo-workspace-file-tag {
+  background: color-mix(in srgb, var(--success), transparent 86%);
+  color: var(--success);
+}
 .oo-workspace-empty { color: var(--faint); font-size: 11px; padding: 28px; text-align: center; }
 
 .oo-workspace-inspector > p { color: var(--muted); font-size: 10px; line-height: 1.55; }
@@ -230,7 +300,7 @@
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  margin-top: 18px;
+  margin: 18px 20px 24px;
   padding: 18px;
 }
 .oo-workspace-members > div:first-child { display: flex; gap: 16px; justify-content: space-between; }
@@ -251,13 +321,11 @@
 .oo-workspace-member-warning { color: var(--danger); font-size: 9px; max-width: 360px; text-align: right; }
 
 @media (max-width: 1100px) {
-  .oo-workspace-page { padding: 22px; }
   .oo-workspace-browser { grid-template-columns: 170px minmax(300px, 1fr); }
   .oo-workspace-inspector { border-left: 0; border-top: 1px solid var(--line); grid-column: 1 / -1; }
 }
 
 @media (max-width: 760px) {
-  .oo-workspace-page { padding: 14px; }
   .oo-workspace-create { grid-template-columns: 1fr; }
   .oo-workspace-browser { display: block; }
   .oo-workspace-locations { border-bottom: 1px solid var(--line); border-right: 0; }
@@ -265,10 +333,20 @@
   .oo-workspace-toolbar > div { justify-content: space-between; }
   .oo-workspace-new-file { grid-template-columns: 1fr auto; }
   .oo-workspace-new-file label { grid-column: 1 / -1; }
-  .oo-workspace-file-list button { grid-template-columns: 28px minmax(90px, 1fr) auto; }
-  .oo-workspace-file-kind,
-  .oo-workspace-file-size { display: none; }
+  .oo-workspace-file-header,
+  .oo-workspace-file-list button { grid-template-columns: 28px minmax(90px, 1fr) 68px; }
+  .oo-workspace-file-header span:nth-child(2),
+  .oo-workspace-file-kind { display: none; }
+  .oo-workspace-file-header span:nth-child(3) { grid-column: 3; }
   .oo-workspace-members > div:first-child { display: block; }
   .oo-workspace-members p { margin-top: 7px; }
   .oo-workspace-members form { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .oo-workspace-file-header,
+  .oo-workspace-file-list button { grid-template-columns: 28px minmax(90px, 1fr); }
+  .oo-workspace-file-header span:nth-child(3),
+  .oo-workspace-file-size,
+  .oo-workspace-file-tag { display: none; }
 }

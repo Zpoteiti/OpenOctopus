@@ -40,6 +40,13 @@ interface EditorState {
   etag: string | null
 }
 
+type SpecialEntryKind = 'attachments' | 'skills' | 'soul' | 'memory' | 'skill-definition'
+
+interface SpecialEntry {
+  kind: SpecialEntryKind
+  tag: string
+}
+
 const TEXT_EXTENSIONS = new Set([
   'c', 'conf', 'cpp', 'css', 'csv', 'go', 'h', 'html', 'ini', 'java', 'js', 'json',
   'jsx', 'log', 'md', 'markdown', 'properties', 'ps1', 'py', 'rb', 'rs', 'sh', 'sql',
@@ -506,20 +513,42 @@ export function WorkspacePage(): ReactNode {
               </form>
             ) : null}
 
+            <div className="oo-workspace-file-header">
+              <span>{t('workspace.nameColumn', { defaultValue: 'Name' })}</span>
+              <span>{t('workspace.type', { defaultValue: 'Type' })}</span>
+              <span>{t('workspace.size', { defaultValue: 'Size' })}</span>
+            </div>
             {directoryLoading ? <p className="oo-workspace-empty">{t('workspace.loadingDirectory', { defaultValue: 'Loading directory…' })}</p> : null}
             {directoryTruncated ? <p className="oo-workspace-alert">{t('workspace.directoryTruncated', { defaultValue: 'The Server scan limit was reached. This list may be incomplete.' })}</p> : null}
             {!directoryLoading && entries.length === 0 ? <p className="oo-workspace-empty">{t('workspace.emptyDirectory', { defaultValue: 'This directory is empty.' })}</p> : null}
             <ul className="oo-workspace-file-list" aria-label={t('workspace.fileList', { defaultValue: 'Workspace files' })}>
               {entries.map((entry) => {
-                const tag = specialTag(entry, t)
+                const special = specialEntry(entry, t)
+                const entryType = kindLabel(entry.kind, t)
+                const entrySize = entry.kind === 'file' ? formatBytes(entry.size) : '—'
+                const accessibleName = [
+                  entry.name,
+                  special?.tag,
+                  `${t('workspace.type', { defaultValue: 'Type' })}: ${entryType}`,
+                  `${t('workspace.size', { defaultValue: 'Size' })}: ${entrySize}`,
+                ].filter(Boolean).join(', ')
                 return (
-                  <li key={entry.path} className={tag ? 'special' : undefined}>
-                    <button type="button" disabled={!['file', 'directory'].includes(entry.kind)} onClick={() => void selectEntry(entry)}>
+                  <li key={entry.path} data-special={special?.kind}>
+                    <button
+                      type="button"
+                      aria-label={accessibleName}
+                      aria-pressed={entry.kind === 'file' ? selectedEntry?.path === entry.path : undefined}
+                      className={selectedEntry?.path === entry.path ? 'selected' : undefined}
+                      disabled={!['file', 'directory'].includes(entry.kind)}
+                      onClick={() => void selectEntry(entry)}
+                    >
                       <span aria-hidden="true" className={`oo-workspace-file-icon ${entry.kind}`}>{entry.kind === 'directory' ? '▰' : '▤'}</span>
-                      <span className="oo-workspace-file-name">{entry.name}</span>
-                      {tag ? <span className="oo-workspace-file-tag">{tag}</span> : null}
-                      <span className="oo-workspace-file-kind">{kindLabel(entry.kind, t)}</span>
-                      <span className="oo-workspace-file-size">{entry.kind === 'file' ? formatBytes(entry.size) : '—'}</span>
+                      <span className="oo-workspace-file-main">
+                        <span className="oo-workspace-file-name">{entry.name}</span>
+                        {special ? <span className="oo-workspace-file-tag">{special.tag}</span> : null}
+                      </span>
+                      <span className="oo-workspace-file-kind">{entryType}</span>
+                      <span className="oo-workspace-file-size">{entrySize}</span>
                     </button>
                   </li>
                 )
@@ -656,12 +685,12 @@ function LocationButton({
   )
 }
 
-function specialTag(entry: ListDirEntry, t: TFunction): string | null {
-  if (entry.name === 'SOUL.md') return t('workspace.specialSoul', { defaultValue: 'Agent identity' })
-  if (entry.name === 'MEMORY.md') return t('workspace.specialMemory', { defaultValue: 'Long-term memory' })
-  if (entry.name === 'skills' && entry.kind === 'directory') return t('workspace.specialSkills', { defaultValue: 'Skills' })
-  if (entry.name === '.attachments' && entry.kind === 'directory') return t('workspace.specialAttachments', { defaultValue: 'Attachments' })
-  if (entry.name === 'SKILL.md') return t('workspace.specialSkillDefinition', { defaultValue: 'Skill definition' })
+function specialEntry(entry: ListDirEntry, t: TFunction): SpecialEntry | null {
+  if (entry.name === 'SOUL.md' && entry.kind === 'file') return { kind: 'soul', tag: t('workspace.specialSoul', { defaultValue: 'Agent identity' }) }
+  if (entry.name === 'MEMORY.md' && entry.kind === 'file') return { kind: 'memory', tag: t('workspace.specialMemory', { defaultValue: 'Long-term memory' }) }
+  if (entry.name === 'skills' && entry.kind === 'directory') return { kind: 'skills', tag: t('workspace.specialSkills', { defaultValue: 'Skills' }) }
+  if (entry.name === '.attachments' && entry.kind === 'directory') return { kind: 'attachments', tag: t('workspace.specialAttachments', { defaultValue: 'Attachments' }) }
+  if (entry.name === 'SKILL.md' && entry.kind === 'file') return { kind: 'skill-definition', tag: t('workspace.specialSkillDefinition', { defaultValue: 'Skill definition' }) }
   return null
 }
 

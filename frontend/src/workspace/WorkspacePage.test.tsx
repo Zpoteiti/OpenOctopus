@@ -159,9 +159,9 @@ function renderPage(path = '/workspace') {
 }
 
 describe('WorkspacePage', () => {
-  it('lists real workspace/device locations and highlights agent files without invented metadata', async () => {
+  it('renders a file-manager list and highlights special agent files without invented metadata', async () => {
     vi.stubGlobal('fetch', baseFetch())
-    renderPage()
+    const { container } = renderPage()
 
     expect(await screen.findByText('Workspace')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'New shared Workspace' })).toBeInTheDocument()
@@ -173,6 +173,21 @@ describe('WorkspacePage', () => {
     expect(screen.getByText('Long-term memory')).toBeInTheDocument()
     expect(screen.getByText('Skills')).toBeInTheDocument()
     expect(screen.getByText('Attachments')).toBeInTheDocument()
+    const header = container.querySelector('.oo-workspace-file-header')
+    expect(header).not.toBeNull()
+    expect(header).not.toHaveAttribute('aria-hidden')
+    expect(within(header as HTMLElement).getByText('Name')).toBeInTheDocument()
+    expect(within(header as HTMLElement).getByText('Type')).toBeInTheDocument()
+    expect(within(header as HTMLElement).getByText('Size')).toBeInTheDocument()
+
+    const skills = screen.getByRole('button', { name: /skills.*Folder/i })
+    expect(skills).toHaveAccessibleName(/Type: Folder.*Size: —/i)
+    expect(skills.closest('li')).toHaveAttribute('data-special', 'skills')
+    expect(skills.querySelector('.oo-workspace-file-icon')).toHaveClass('directory')
+    expect(screen.getByRole('button', { name: /\.attachments.*Folder/i }).closest('li')).toHaveAttribute('data-special', 'attachments')
+    expect(screen.getByRole('button', { name: /SOUL\.md.*File/i }).closest('li')).toHaveAttribute('data-special', 'soul')
+    expect(screen.getByRole('button', { name: /MEMORY\.md.*File/i }).closest('li')).toHaveAttribute('data-special', 'memory')
+    expect(screen.getByRole('button', { name: /projects.*Folder/i }).closest('li')).not.toHaveAttribute('data-special')
     expect(screen.queryByText(/MIME|modified/i)).not.toBeInTheDocument()
   })
 
@@ -208,7 +223,10 @@ describe('WorkspacePage', () => {
     const user = userEvent.setup()
     renderPage()
 
-    await user.click(await screen.findByRole('button', { name: /SOUL\.md/ }))
+    const soul = await screen.findByRole('button', { name: /SOUL\.md/ })
+    expect(soul).toHaveAttribute('aria-pressed', 'false')
+    await user.click(soul)
+    expect(soul).toHaveAttribute('aria-pressed', 'true')
     const editor = await screen.findByRole('textbox', { name: 'File content' })
     expect(editor).toHaveValue('# Soul\nBe practical.')
     await user.clear(editor)
