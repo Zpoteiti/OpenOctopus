@@ -16,6 +16,7 @@ from openctopus_server.chat.device_snapshot import (
 from openctopus_server.db.models import (
     DiscordConfig,
     Session,
+    SystemConfig,
     TelegramConfig,
     User,
     Workspace,
@@ -24,6 +25,7 @@ from openctopus_server.db.models import (
 from openctopus_server.devices.registry import DeviceLiveMetadata, DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.services.system_config import DEFAULT_SOUL
 from openctopus_server.workspace.fs import DirectoryPage
 from openctopus_server.workspace.skills import (
     ALWAYS_ON_MAX_BYTES,
@@ -95,6 +97,9 @@ async def build_system_prompt(
         .scalars()
         .all()
     )
+    configured_soul = await db.scalar(
+        select(SystemConfig.value).where(SystemConfig.key == "default_soul")
+    )
     await db.commit()
 
     live_metadata: dict[UUID, DeviceLiveMetadata] = {}
@@ -104,7 +109,7 @@ async def build_system_prompt(
             if metadata is not None:
                 live_metadata[device.id] = metadata
 
-    soul = "You are OpenOctopus, the user's personal AI partner."
+    soul = configured_soul if isinstance(configured_soul, str) else DEFAULT_SOUL
     memory = ""
     skills: tuple[SkillInfo, ...] = ()
     if workspace_service is not None:

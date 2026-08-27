@@ -2881,6 +2881,9 @@ export interface paths {
          *         budget includes thinking and visible output, applies to the next
          *         provider turn, and does not expand the configured context window.
          *         ADR-101, ADR-125.
+         *       - `default_soul` (string) — global fallback agent identity used when
+         *         the user's personal `SOUL.md` is absent. Personal SOUL takes
+         *         precedence. Changes apply from the next agent turn.
          *       - `web_fetch_denylist` (string array) — effective canonical SSRF
          *         denylist for Server-site `web_fetch`. Missing storage uses the
          *         private/reserved/metadata default. Explicit `[]` permits all
@@ -2964,6 +2967,10 @@ export interface paths {
          *     entries. URLs, paths, userinfo, wildcard, and regex forms are invalid.
          *     The whole candidate validates before any field is written; successful
          *     changes apply to later fetches without restart.
+         *
+         *     `default_soul`, when present, replaces the global fallback agent
+         *     identity. It applies from the next agent turn only when the user's
+         *     personal `SOUL.md` is absent; a personal file takes precedence.
          */
         patch: {
             parameters: {
@@ -3026,6 +3033,11 @@ export interface paths {
                          * @example 16384
                          */
                         llm_max_output_tokens?: number;
+                        /**
+                         * @description Default agent identity used when a personal SOUL.md is absent.
+                         * @example You are OpenOctopus, the user's personal AI partner.
+                         */
+                        default_soul?: string;
                         /**
                          * @description Complete canonical Server web_fetch denylist; an empty array permits all otherwise-valid targets.
                          * @example [
@@ -3380,6 +3392,11 @@ export interface components {
              * @example 16384
              */
             llm_max_output_tokens: number;
+            /**
+             * @description Default agent identity used when a personal SOUL.md is absent.
+             * @example You are OpenOctopus, the user's personal AI partner.
+             */
+            default_soul: string;
             /** @description Effective canonical Server web_fetch denylist; explicit empty permits all otherwise-valid targets. */
             web_fetch_denylist: string[];
         };

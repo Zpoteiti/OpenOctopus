@@ -1817,6 +1817,9 @@ paths:
             budget includes thinking and visible output, applies to the next
             provider turn, and does not expand the configured context window.
             ADR-101, ADR-125.
+          - `default_soul` (string) — global fallback agent identity used when
+            the user's personal `SOUL.md` is absent. Personal SOUL takes
+            precedence. Changes apply from the next agent turn.
           - `web_fetch_denylist` (string array) — effective canonical SSRF
             denylist for Server-site `web_fetch`. Missing storage uses the
             private/reserved/metadata default. Explicit `[]` permits all
@@ -1885,6 +1888,10 @@ paths:
         entries. URLs, paths, userinfo, wildcard, and regex forms are invalid.
         The whole candidate validates before any field is written; successful
         changes apply to later fetches without restart.
+
+        `default_soul`, when present, replaces the global fallback agent
+        identity. It applies from the next agent turn only when the user's
+        personal `SOUL.md` is absent; a personal file takes precedence.
       security:
         - cookieAuth: [admin]
         - bearerAuth: [admin]
@@ -1915,6 +1922,8 @@ paths:
                   { type: integer, format: int64, minimum: 0, maximum: 1000000, example: 8, description: In-flight provider-call cap; zero means unlimited. }
                 llm_max_output_tokens:
                   { type: integer, format: int64, minimum: 1, maximum: 1000000, example: 16384, description: Output budget including thinking tokens. }
+                default_soul:
+                  { type: string, minLength: 1, maxLength: 32000, pattern: '.*\S.*', example: "You are OpenOctopus, the user's personal AI partner.", description: Default agent identity used when a personal SOUL.md is absent. }
                 web_fetch_denylist:
                   type: array
                   maxItems: 256
@@ -2151,7 +2160,7 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, web_fetch_denylist]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, default_soul, web_fetch_denylist]
       description: |
         Admin-visible effective config. Quota keys are always present because
         missing rows default to 500 MiB (`524288000`).
@@ -2204,6 +2213,13 @@ components:
           maximum: 1000000
           example: 16384
           description: Effective provider output budget, including thinking and visible output.
+        default_soul:
+          type: string
+          minLength: 1
+          maxLength: 32000
+          pattern: '.*\S.*'
+          example: "You are OpenOctopus, the user's personal AI partner."
+          description: Default agent identity used when a personal SOUL.md is absent.
         web_fetch_denylist:
           type: array
           maxItems: 256

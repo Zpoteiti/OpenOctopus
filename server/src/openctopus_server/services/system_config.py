@@ -21,6 +21,7 @@ from openctopus_server.network_policy import (
 
 _QUOTA_DEFAULT = 524288000  # 500 MiB
 LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
+DEFAULT_SOUL = "You are OpenOctopus, the user's personal AI partner."
 _REDACTED = "<redacted>"
 _TOKEN_LIMIT_KEYS = {
     "llm_max_context_tokens",
@@ -38,6 +39,7 @@ _CONFIG_KEYS = {
     "llm_compaction_threshold_tokens",
     "llm_max_concurrent_requests",
     "llm_max_output_tokens",
+    "default_soul",
     "web_fetch_denylist",
 }
 
@@ -59,6 +61,7 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
         llm_compaction_threshold_tokens=rows.get("llm_compaction_threshold_tokens"),
         llm_max_concurrent_requests=rows.get("llm_max_concurrent_requests"),
         llm_max_output_tokens=rows.get("llm_max_output_tokens", LLM_MAX_OUTPUT_TOKENS_DEFAULT),
+        default_soul=rows.get("default_soul", DEFAULT_SOUL),
         web_fetch_denylist=list(
             canonicalize_ssrf_denylist(
                 rows.get("web_fetch_denylist", DEFAULT_SSRF_DENYLIST)

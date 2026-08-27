@@ -11,8 +11,21 @@ from openctopus_server.dto.user import UserResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import AuthError
 from openctopus_server.services import users
+from openctopus_server.services.system_config import get_config_view
+from openctopus_server.workspace.service import WorkspaceService, get_workspace_service
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
+
+INITIAL_MEMORY = """# Getting started
+
+No personal profile has been recorded yet. In an early conversation, ask the user:
+
+- how they would like to be addressed;
+- what they would like to call you and what role or personality they want you to have;
+- which stable preferences and personal facts they want you to remember.
+
+Update SOUL.md and MEMORY.md with their answers.
+"""
 
 
 class RegisterRequest(BaseModel):
@@ -33,13 +46,32 @@ class AuthResponse(BaseModel):
 
 
 @router.post("/register", response_model=AuthResponse, status_code=201)
-async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)) -> JSONResponse:
+async def register(
+    body: RegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    workspace: WorkspaceService = Depends(get_workspace_service),
+) -> JSONResponse:
+    config = await get_config_view(db)
     user = await users.create_user(
         db,
         email=body.email,
         password=body.password,
         name=body.name,
         admin_token=body.admin_token,
+    )
+    await workspace.write(
+        db,
+        user_id=user.id,
+        path="SOUL.md",
+        data=config.default_soul.encode(),
+        if_none_match=True,
+    )
+    await workspace.write(
+        db,
+        user_id=user.id,
+        path="MEMORY.md",
+        data=INITIAL_MEMORY.encode(),
+        if_none_match=True,
     )
     token = create_jwt(user.id)
     response = JSONResponse(
