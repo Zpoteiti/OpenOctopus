@@ -79,12 +79,22 @@ export function AdminSettingsPage(): ReactNode {
     event.preventDefault()
     patchConfig.mutate({ web_fetch_denylist: lines(new FormData(event.currentTarget).get('web_fetch_denylist')) })
   }
+  const saveDefaultSoul = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault()
+    patchConfig.mutate({ default_soul: String(new FormData(event.currentTarget).get('default_soul') ?? '') })
+  }
 
   return (
     <div className="page-scroll">
       <PageHeader eyebrow={t('nav.admin')} title={t('admin.settings')} description={t('admin.settingsDescription')} actions={<AdminTabs />} />
       <ErrorNotice error={patchConfig.error} />
       <div className="settings-stack">
+        <Card title={t('admin.defaultSoul')} description={t('admin.defaultSoulDescription')}>
+          <form className="form-grid" onSubmit={saveDefaultSoul}>
+            <label className="full-row">{t('admin.defaultSoul')}<textarea name="default_soul" rows={6} maxLength={32000} defaultValue={value.default_soul} required /></label>
+            <div className="form-actions full-row"><button className="primary-button" disabled={patchConfig.isPending}>{t('admin.saveDefaultSoul')}</button></div>
+          </form>
+        </Card>
         <Card title={t('admin.provider')} description={t('admin.providerDescription')}>
           <form className="form-grid" onSubmit={saveProvider}>
             <label className="full-row">{t('admin.apiBaseUrl')}<input name="llm_endpoint" type="url" defaultValue={value.llm_endpoint ?? ''} placeholder="https://api.siliconflow.cn" /></label>
@@ -92,11 +102,20 @@ export function AdminSettingsPage(): ReactNode {
             <label>{t('admin.model')}<input name="llm_model" defaultValue={value.llm_model ?? ''} placeholder="Qwen/Qwen3.5-4B" /></label>
             <label>{t('admin.contextWindow')}<input name="llm_max_context_tokens" type="number" min="1" defaultValue={value.llm_max_context_tokens ?? ''} /></label>
             <label>{t('admin.compactionThreshold')}<input name="llm_compaction_threshold_tokens" type="number" min="4001" defaultValue={value.llm_compaction_threshold_tokens ?? ''} /></label>
-            <div>
-              <label htmlFor="llm-max-concurrent">{t('admin.maxConcurrent')}</label>
-              <input id="llm-max-concurrent" name="llm_max_concurrent_requests" type="number" min="0" max="1000000" defaultValue={value.llm_max_concurrent_requests ?? ''} />
-              <small>{t('admin.unlimited')}</small>
-            </div>
+            <label>
+              {t('admin.maxConcurrent')}
+              <input
+                id="llm-max-concurrent"
+                name="llm_max_concurrent_requests"
+                type="number"
+                min="0"
+                max="1000000"
+                defaultValue={value.llm_max_concurrent_requests ?? ''}
+                aria-label={t('admin.maxConcurrent')}
+                aria-describedby="llm-max-concurrent-help"
+              />
+              <small id="llm-max-concurrent-help">{t('admin.unlimited')}</small>
+            </label>
             <label>{t('admin.maxOutput')}<input name="llm_max_output_tokens" type="number" min="1" max="1000000" defaultValue={value.llm_max_output_tokens} required /></label>
             <div className="form-actions full-row"><button className="primary-button" disabled={patchConfig.isPending}>{t('admin.saveProvider')}</button></div>
           </form>

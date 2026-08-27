@@ -1,11 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 import { apiJson } from '../api/client'
 import type { User } from '../api/types'
 import { Card, ErrorNotice, PageHeader } from '../components/Page'
+import { LanguageSelector } from '../i18n/LanguageSelector'
+import { ThemeToggle } from '../theme/ThemeToggle'
 
 export function AccountPage({ user }: { user: User }): ReactNode {
   const { t } = useTranslation()
@@ -56,6 +58,30 @@ export function AccountPage({ user }: { user: User }): ReactNode {
           <label className="full-row">{t('account.newPassword')}<input ref={passwordRef} name="password" type="password" minLength={8} autoComplete="new-password" placeholder={t('account.passwordPlaceholder')} /></label>
           <div className="form-actions full-row"><button className="primary-button" disabled={update.isPending}>{t('account.saveProfile')}</button></div>
         </form>
+      </Card>
+      <Card title={t('account.preferences')} description={t('account.preferencesDescription')}>
+        <div className="account-preferences">
+          <div className="preference-setting">
+            <div className="preference-setting-copy">
+              <strong>{t('language.label')}</strong>
+              <small>{t('account.languageDescription')}</small>
+            </div>
+            <LanguageSelector />
+          </div>
+          <div className="preference-setting">
+            <div className="preference-setting-copy">
+              <strong>{t('account.appearance')}</strong>
+              <small>{t('account.appearanceDescription')}</small>
+            </div>
+            <ThemeToggle />
+          </div>
+        </div>
+      </Card>
+      <Card title={t('account.agentFiles')} description={t('account.agentFilesDescription')}>
+        <div className="form-actions">
+          <Link className="secondary-button" to="/workspace?path=SOUL.md">{t('account.editSoul')}</Link>
+          <Link className="secondary-button" to="/workspace?path=MEMORY.md">{t('account.editMemory')}</Link>
+        </div>
       </Card>
       <Card title={t('account.session')}><button className="secondary-button" onClick={() => logout.mutate()} disabled={logout.isPending}>{t('account.logout')}</button></Card>
       <Card title={t('account.deleteTitle')} description={t('account.deleteDescription')} tone="danger">

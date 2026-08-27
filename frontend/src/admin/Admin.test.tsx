@@ -48,6 +48,7 @@ describe('admin pages', () => {
       llm_compaction_threshold_tokens: 16000,
       llm_max_concurrent_requests: 8,
       llm_max_output_tokens: 16384,
+      default_soul: "You are OpenOctopus, the user's personal AI partner.",
       web_fetch_denylist: ['127.0.0.0/8'],
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -63,7 +64,9 @@ describe('admin pages', () => {
     expect(await screen.findByDisplayValue('https://api.siliconflow.cn')).toBeInTheDocument()
     expect(screen.getByLabelText('API Key')).toHaveValue('')
     expect(screen.getByLabelText('Compaction headroom')).toHaveAttribute('min', '4001')
-    expect(screen.getByLabelText('Maximum concurrent requests')).toHaveAttribute('max', '1000000')
+    const maxConcurrent = screen.getByLabelText('Maximum concurrent requests')
+    expect(maxConcurrent).toHaveAttribute('max', '1000000')
+    expect(maxConcurrent.closest('label')).not.toBeNull()
     expect(screen.getByLabelText('Maximum output tokens')).toHaveAttribute('max', '1000000')
     expect(Number(screen.getByLabelText('Personal Workspace quota').getAttribute('min'))).toBeGreaterThan(0)
     await user.click(screen.getByRole('button', { name: 'Validate and save Provider' }))
@@ -85,6 +88,7 @@ describe('admin pages', () => {
       llm_compaction_threshold_tokens: null,
       llm_max_concurrent_requests: null,
       llm_max_output_tokens: 16384,
+      default_soul: "You are OpenOctopus, the user's personal AI partner.",
       web_fetch_denylist: [],
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -109,6 +113,39 @@ describe('admin pages', () => {
       llm_model: 'model-1',
       llm_max_output_tokens: 16384,
     })
+  })
+
+  it('saves the default SOUL independently from Provider configuration', async () => {
+    const patches: unknown[] = []
+    const config = {
+      quota_bytes: 524288000,
+      shared_workspace_quota_bytes: 524288000,
+      llm_endpoint: null,
+      llm_api_key: null,
+      llm_model: null,
+      llm_max_context_tokens: null,
+      llm_compaction_threshold_tokens: null,
+      llm_max_concurrent_requests: null,
+      llm_max_output_tokens: 16384,
+      default_soul: 'Default identity',
+      web_fetch_denylist: [],
+    }
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === 'PATCH') {
+        patches.push(JSON.parse(String(init.body)))
+        return json({ ...config, default_soul: 'Company-wide identity' })
+      }
+      return json(config)
+    }))
+
+    renderPage(<AdminSettingsPage />)
+    const user = userEvent.setup()
+    const soul = await screen.findByRole('textbox', { name: 'Default SOUL' })
+    await user.clear(soul)
+    await user.type(soul, 'Company-wide identity')
+    await user.click(screen.getByRole('button', { name: 'Save default SOUL' }))
+
+    await waitFor(() => expect(patches).toEqual([{ default_soul: 'Company-wide identity' }]))
   })
 
   it('describes user count as page-local and does not invent role controls', async () => {

@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import i18n from '../i18n'
+import { ThemeProvider } from '../theme/ThemeToggle'
 import { AccountPage } from './Account'
 
 function json(body: unknown, status = 200): Response {
@@ -18,6 +19,22 @@ beforeEach(async () => {
 })
 
 describe('AccountPage', () => {
+  it('links directly to the personal SOUL and MEMORY files', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <ThemeProvider>
+          <MemoryRouter>
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+          </MemoryRouter>
+        </ThemeProvider>
+      </QueryClientProvider>,
+    )
+
+    expect(screen.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
+    expect(screen.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+  })
+
   it('updates only submitted profile fields', async () => {
     const patches: unknown[] = []
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -31,9 +48,11 @@ describe('AccountPage', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'Old Name', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
-        </MemoryRouter>
+        <ThemeProvider>
+          <MemoryRouter>
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'Old Name', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+          </MemoryRouter>
+        </ThemeProvider>
       </QueryClientProvider>,
     )
 
@@ -53,9 +72,11 @@ describe('AccountPage', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
-        </MemoryRouter>
+        <ThemeProvider>
+          <MemoryRouter>
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+          </MemoryRouter>
+        </ThemeProvider>
       </QueryClientProvider>,
     )
 

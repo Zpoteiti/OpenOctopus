@@ -108,10 +108,17 @@ describe('application routes', () => {
     expect(await screen.findByRole('link', { name: 'Admin settings' })).toBeInTheDocument()
   })
 
-  it('provides a three-state theme control', async () => {
+  it('keeps language and theme preferences on the account page', async () => {
     mockApi(regularUser)
     renderApp('/chat')
     const user = userEvent.setup()
+    await screen.findByRole('navigation', { name: 'Main navigation' })
+    expect(screen.queryByRole('button', { name: 'Theme: System' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Language' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('link', { name: 'Account' }))
+    expect(await screen.findByRole('heading', { name: 'Account' })).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Language' })).toHaveValue('en')
     const toggle = await screen.findByRole('button', { name: 'Theme: System' })
     await user.click(toggle)
     expect(document.documentElement.dataset.theme).toBe('light')
@@ -120,6 +127,14 @@ describe('application routes', () => {
     expect(document.documentElement.dataset.theme).toBe('dark')
     await user.click(toggle)
     await waitFor(() => expect(toggle).toHaveAccessibleName('Theme: System'))
+  })
+
+  it('applies a saved theme when opening a page without the preference control', async () => {
+    window.localStorage.setItem('openoctopus-theme', 'dark')
+    mockApi(regularUser)
+    renderApp('/chat')
+    await screen.findByRole('navigation', { name: 'Main navigation' })
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe('dark'))
   })
 
   it('keeps the optional admin token on the registration page', async () => {

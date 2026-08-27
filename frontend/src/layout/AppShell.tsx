@@ -6,8 +6,6 @@ import { useTranslation } from 'react-i18next'
 import { Brand } from '../auth/auth'
 import { useAuthenticatedUser } from '../auth/context'
 import { loadSessions } from '../chat/chatApi'
-import { LanguageSelector } from '../i18n/LanguageSelector'
-import { ThemeToggle } from '../theme/ThemeToggle'
 
 const NAV_ITEMS = [
   { to: '/chat', icon: 'C', labelKey: 'nav.chat' },
@@ -62,14 +60,13 @@ export function AppShell(): ReactNode {
             )}
           </div>
           <footer className="sidebar-footer">
-            <Link className="profile-button" to="/account">
+            <Link className="profile-button" to="/account" aria-label={t('account.title')} title={t('account.title')}>
               <span className="avatar">{initials}</span>
               <span className="profile-copy">
                 <strong className="profile-name">{user.name}</strong>
                 <small className="profile-role">{user.is_admin ? t('nav.administrator') : t('nav.member')}</small>
               </span>
             </Link>
-            <div className="preference-controls"><LanguageSelector /><ThemeToggle compact /></div>
           </footer>
         </aside>
         <section className="workspace"><Outlet /></section>

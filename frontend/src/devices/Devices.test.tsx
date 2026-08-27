@@ -47,6 +47,21 @@ beforeEach(async () => {
 })
 
 describe('device pages', () => {
+  it('shows a clear placeholder instead of a fake Client download link', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/devices') return json([])
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+
+    renderPage(<DeviceListPage />)
+    await user.click(await screen.findByRole('button', { name: 'Download Client' }))
+
+    expect(screen.getByText('Client downloads are not published yet. Release links and setup scripts will appear here.')).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Download Client' })).not.toBeInTheDocument()
+  })
+
   it('lists real device fields and reveals a newly issued token once', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = []
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

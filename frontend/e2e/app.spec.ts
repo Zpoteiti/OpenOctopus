@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
 test.describe.configure({ mode: 'serial' })
 
@@ -32,6 +32,14 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await expect(page.getByRole('link', { name: 'Admin settings' })).toBeVisible()
 
   await page.goto('/account')
+  await expectSinglePaneToFillWorkspace(page)
+  await expect(page.locator('.page-scroll').getByLabel('Language')).toBeVisible()
+  await expect(page.locator('.page-scroll').getByRole('button', { name: 'Theme: System' })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
+  await expect(page.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.getByRole('link', { name: 'Account' })).toBeVisible()
+  await page.setViewportSize({ width: 1280, height: 720 })
   await page.getByRole('button', { name: 'Sign out' }).click()
   await expect(page).toHaveURL(/\/login$/)
   await page.getByLabel('Email').fill(email)
@@ -41,6 +49,9 @@ test('admin can configure and use the browser application', async ({ page }) => 
 
   await page.getByRole('link', { name: 'Admin settings' }).click()
   await expect(page.getByRole('heading', { name: 'System configuration' })).toBeVisible()
+  await expectSinglePaneToFillWorkspace(page)
+  await expect(page.getByLabel('Default SOUL')).toHaveValue("You are OpenOctopus, the user's personal AI partner.")
+  await expectFieldsToAlign(page, 'Maximum concurrent requests', 'Maximum output tokens')
   await page.getByLabel('API Base URL').fill('http://127.0.0.1:18080')
   await page.getByLabel('API Key').fill('frontend-e2e-key')
   await page.getByLabel('Model').fill('openoctopus-e2e-model')
@@ -64,6 +75,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
 
   await page.getByRole('link', { name: 'Devices' }).click()
   await expect(page.getByRole('heading', { name: 'Devices' })).toBeVisible()
+  await expectSinglePaneToFillWorkspace(page)
   await page.getByRole('button', { name: 'Add device' }).click()
   await page.getByLabel('Device name').fill(deviceName)
   const deviceCreated = page.waitForResponse((response) => (
@@ -98,6 +110,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
 
   await page.getByRole('link', { name: 'Chat', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'What would you like your agent to do?' })).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Message', exact: true })).toHaveCSS('border-radius', '8px')
   await page.locator('input.chat-file-input').setInputFiles({
     name: attachmentName,
     mimeType: 'text/plain',
@@ -108,3 +121,26 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await page.getByRole('button', { name: 'Send message' }).click()
   await expect(page.getByText('Smoke reply from test provider.')).toBeVisible({ timeout: 30_000 })
 })
+
+async function expectSinglePaneToFillWorkspace(page: Page): Promise<void> {
+  const dimensions = await page.locator('.workspace').evaluate((workspace) => {
+    const pane = workspace.querySelector(':scope > .page-scroll')
+    if (!(pane instanceof HTMLElement)) throw new Error('single-pane route is missing page-scroll')
+    return {
+      paneHeight: pane.getBoundingClientRect().height,
+      workspaceHeight: workspace.getBoundingClientRect().height,
+    }
+  })
+  expect(dimensions.paneHeight).toBeGreaterThanOrEqual(dimensions.workspaceHeight - 1)
+}
+
+async function expectFieldsToAlign(page: Page, firstLabel: string, secondLabel: string): Promise<void> {
+  const [first, second] = await Promise.all([
+    page.getByLabel(firstLabel).boundingBox(),
+    page.getByLabel(secondLabel).boundingBox(),
+  ])
+  expect(first).not.toBeNull()
+  expect(second).not.toBeNull()
+  expect(Math.abs(first!.y - second!.y)).toBeLessThanOrEqual(1)
+  expect(Math.abs(first!.height - second!.height)).toBeLessThanOrEqual(1)
+}
