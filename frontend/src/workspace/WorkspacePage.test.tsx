@@ -218,6 +218,48 @@ describe('WorkspacePage', () => {
     expect(await screen.findByText('File saved.')).toBeInTheDocument()
   })
 
+  it('opens a personal agent file from an account-page deep link', async () => {
+    vi.stubGlobal('fetch', baseFetch((url, init) => {
+      if (url === '/api/workspace/files/MEMORY.md?openoctopus_device=server' && !init?.method) {
+        return new Response('Remember concise answers.', { headers: { ETag: '"memory-etag"' } })
+      }
+      return undefined
+    }))
+
+    renderPage('/workspace?path=MEMORY.md')
+
+    expect(await screen.findByRole('textbox', { name: 'File content' }))
+      .toHaveValue('Remember concise answers.')
+    expect(screen.getByRole('heading', { name: 'MEMORY.md' })).toBeInTheDocument()
+  })
+
+  it('creates a missing personal agent file from its account-page deep link', async () => {
+    const fetchMock = baseFetch((url, init) => {
+      if (url === '/api/workspace/list/.?openoctopus_device=server&recursive=false&limit=200&offset=0') {
+        return json({ ...rootEntries, items: rootEntries.items.filter((entry) => entry.name !== 'SOUL.md') })
+      }
+      if (url === '/api/workspace/files/SOUL.md?openoctopus_device=server' && init?.method === 'PUT') {
+        expect(new Headers(init.headers).get('If-None-Match')).toBe('*')
+        expect(init.body).toBe('My personal identity')
+        return json({ path: 'SOUL.md', size: 20, etag: 'created-etag', created: true }, 201, { ETag: '"created-etag"' })
+      }
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    renderPage('/workspace?path=SOUL.md')
+    const editor = await screen.findByRole('textbox', { name: 'File content' })
+    await user.type(editor, 'My personal identity')
+    await user.click(screen.getByRole('button', { name: 'Save file' }))
+
+    expect(await screen.findByText('File saved.')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace/files/SOUL.md?openoctopus_device=server',
+      expect.objectContaining({ method: 'PUT' }),
+    )
+  })
+
   it('keeps the latest selected file content and ETag when an earlier read resolves last', async () => {
     const firstRead = deferred<Response>()
     const fetchMock = baseFetch((url, init) => {
@@ -423,6 +465,51 @@ describe('WorkspacePage', () => {
     await user.click(screen.getByRole('button', { name: 'Upload file' }))
 
     expect(await screen.findByText('File uploaded.')).toBeInTheDocument()
+  })
+
+  it('creates a blank text file and opens it in the editor', async () => {
+    const fetchMock = baseFetch((url, init) => {
+      if (url === '/api/workspace/files/draft.md?openoctopus_device=server' && init?.method === 'PUT') {
+        expect(new Headers(init.headers).get('If-None-Match')).toBe('*')
+        expect(init.body).toBe('')
+        return json({ path: 'draft.md', size: 0, etag: 'draft-etag', created: true }, 201, { ETag: '"draft-etag"' })
+      }
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'New file' }))
+    await user.type(screen.getByLabelText('File name'), 'draft.md')
+    await user.click(screen.getByRole('button', { name: 'Create file' }))
+
+    expect(await screen.findByRole('heading', { name: 'draft.md' })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'File content' })).toHaveValue('')
+    expect(screen.getByText('File created.')).toBeInTheDocument()
+  })
+
+  it('deletes the selected file after explicit confirmation', async () => {
+    const fetchMock = baseFetch((url, init) => {
+      if (url === '/api/workspace/files/notes.txt?openoctopus_device=server' && !init?.method) {
+        return new Response('notes', { headers: { ETag: '"notes-etag"' } })
+      }
+      if (url === '/api/workspace/files/notes.txt?openoctopus_device=server' && init?.method === 'DELETE') {
+        expect(new Headers(init.headers).get('If-Match')).toBe('"notes-etag"')
+        return new Response(null, { status: 204 })
+      }
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: /notes\.txt/ }))
+    await user.click(screen.getByRole('button', { name: 'Delete file' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm deletion' }))
+
+    expect(await screen.findByText('File deleted.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /notes\.txt/ })).not.toBeInTheDocument()
   })
 
   it('does not refresh a new directory with a stale upload completion', async () => {

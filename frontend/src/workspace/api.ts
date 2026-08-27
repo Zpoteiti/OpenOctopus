@@ -122,13 +122,13 @@ export async function saveTextFile(
   path: string,
   device: string,
   content: string,
-  etag: string,
+  etag: string | null,
 ): Promise<{ mutation: FileMutation; etag: string }> {
   const response = await rawRequest(fileUrl(path, device), {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/octet-stream',
-      'If-Match': etag,
+      [etag === null ? 'If-None-Match' : 'If-Match']: etag ?? '*',
     },
     body: content,
   })
@@ -150,6 +150,15 @@ export async function uploadFile(
     body: file,
   })
   return await response.json() as FileMutation
+}
+
+export async function deleteFile(
+  path: string,
+  device: string,
+  etag: string | null,
+): Promise<void> {
+  const headers = etag ? { 'If-Match': etag } : undefined
+  await rawRequest(fileUrl(path, device), { method: 'DELETE', headers })
 }
 
 export function createSharedWorkspace(name: string, quotaBytes: number): Promise<Workspace> {

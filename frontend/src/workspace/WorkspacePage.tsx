@@ -1,7 +1,7 @@
 import type { TFunction } from 'i18next'
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useParams } from 'react-router-dom'
+import { useParams, useSearchParams } from 'react-router-dom'
 
 import { ApiError } from '../api/client'
 import { useAuthenticatedUser } from '../auth/context'
@@ -10,6 +10,7 @@ import {
   MAX_TEXT_PREVIEW_BYTES,
   addMember,
   createSharedWorkspace,
+  deleteFile,
   fileUrl,
   listDevices,
   listDirectory,
@@ -36,7 +37,7 @@ interface Location {
 
 interface EditorState {
   content: string
-  etag: string
+  etag: string | null
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -49,6 +50,8 @@ export function WorkspacePage(): ReactNode {
   const { t } = useTranslation()
   const currentUser = useAuthenticatedUser()
   const { workspaceRef } = useParams<{ workspaceRef: string }>()
+  const [searchParams] = useSearchParams()
+  const requestedAgentFile = searchParams.get('path')
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [devices, setDevices] = useState<Device[]>([])
   const [selectedKey, setSelectedKey] = useState('')
@@ -63,6 +66,9 @@ export function WorkspacePage(): ReactNode {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [upload, setUpload] = useState<File | null>(null)
+  const [showNewFile, setShowNewFile] = useState(false)
+  const [newFileName, setNewFileName] = useState('')
+  const [pendingFileDelete, setPendingFileDelete] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createQuota, setCreateQuota] = useState('500')
@@ -84,7 +90,7 @@ export function WorkspacePage(): ReactNode {
     setBusy(false)
   }, [])
 
-  const activateLocation = useCallback((location: Location) => {
+  const activateLocation = useCallback((location: Location, agentFile?: string | null) => {
     const request = ++locationRequest.current
     fileReadRequest.current += 1
     invalidateOperations()
@@ -92,6 +98,9 @@ export function WorkspacePage(): ReactNode {
     setCurrentPath(location.root)
     setSelectedEntry(null)
     setEditor(null)
+    setShowNewFile(false)
+    setNewFileName('')
+    setPendingFileDelete(false)
     setEntries([])
     setMembers([])
     setPendingMemberRemoval(null)
@@ -101,10 +110,35 @@ export function WorkspacePage(): ReactNode {
     setDirectoryLoading(true)
 
     const tasks: Promise<unknown>[] = [
-      listDirectory(location.root, location.device).then((page) => {
+      listDirectory(location.root, location.device).then(async (page) => {
         if (request !== locationRequest.current) return
         setEntries(page.items)
         setDirectoryTruncated(page.truncated)
+        if (
+          location.workspace?.type !== 'personal'
+          || !['SOUL.md', 'MEMORY.md'].includes(agentFile ?? '')
+        ) return
+        const existing = page.items.find((candidate) => candidate.path === agentFile)
+        const entry = existing ?? {
+          name: agentFile as string,
+          path: agentFile as string,
+          kind: 'file' as const,
+          size: 0,
+        }
+        const fileRequest = ++fileReadRequest.current
+        setSelectedEntry(entry)
+        if (!existing) {
+          setEditor({ content: '', etag: null })
+          return
+        }
+        if (entry.size > MAX_TEXT_PREVIEW_BYTES) {
+          setError(textPreviewTooLarge())
+          return
+        }
+        const nextEditor = await readTextFile(entry.path, location.device)
+        if (request === locationRequest.current && fileRequest === fileReadRequest.current) {
+          setEditor(nextEditor)
+        }
       }),
     ]
     const shared = location.workspace?.type === 'shared' ? location.workspace : undefined
@@ -133,7 +167,7 @@ export function WorkspacePage(): ReactNode {
           ? workspacePage.items.find((workspace) => workspace.ref === workspaceRef)
           : undefined
         const initial = requested ?? workspacePage.items.find((workspace) => workspace.type === 'personal') ?? workspacePage.items[0]
-        if (initial) activateLocation(workspaceLocation(initial))
+        if (initial) activateLocation(workspaceLocation(initial), requestedAgentFile)
       })
       .catch((caught: unknown) => {
         if (active) setError(errorMessage(caught))
@@ -147,7 +181,7 @@ export function WorkspacePage(): ReactNode {
       fileReadRequest.current += 1
       operationRequest.current += 1
     }
-  }, [activateLocation, workspaceRef])
+  }, [activateLocation, requestedAgentFile, workspaceRef])
 
   async function openDirectory(path: string): Promise<void> {
     if (!selectedLocation) return
@@ -159,6 +193,9 @@ export function WorkspacePage(): ReactNode {
     setNotice(null)
     setSelectedEntry(null)
     setEditor(null)
+    setShowNewFile(false)
+    setNewFileName('')
+    setPendingFileDelete(false)
     try {
       const page = await listDirectory(path, selectedLocation.device)
       if (request !== locationRequest.current) return
@@ -181,6 +218,7 @@ export function WorkspacePage(): ReactNode {
     invalidateOperations()
     setSelectedEntry(entry)
     setEditor(null)
+    setPendingFileDelete(false)
     setNotice(null)
     setError(null)
     if (entry.kind !== 'file' || !isTextFile(entry.name) || !selectedLocation) return
@@ -222,9 +260,11 @@ export function WorkspacePage(): ReactNode {
       if (request !== operationRequest.current) return
       setEditor({ content: editor.content, etag: saved.etag })
       setSelectedEntry({ ...selectedEntry, size: saved.mutation.size })
-      setEntries((current) => current.map((entry) => (
-        entry.path === selectedEntry.path ? { ...entry, size: saved.mutation.size } : entry
-      )))
+      setEntries((current) => current.some((entry) => entry.path === selectedEntry.path)
+        ? current.map((entry) => (
+            entry.path === selectedEntry.path ? { ...entry, size: saved.mutation.size } : entry
+          ))
+        : [...current, { ...selectedEntry, size: saved.mutation.size }])
       setNotice(i18n.t('workspace.saveSuccess', { defaultValue: 'File saved.' }))
     } catch (caught) {
       if (request !== operationRequest.current) return
@@ -260,6 +300,59 @@ export function WorkspacePage(): ReactNode {
     } catch (caught) {
       if (request !== operationRequest.current) return
       setError(errorMessage(caught))
+    } finally {
+      if (request === operationRequest.current) setBusy(false)
+    }
+  }
+
+  async function submitNewFile(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault()
+    if (!selectedLocation) return
+    const filename = newFileName.trim()
+    if (safeFilename(filename) !== filename || !isTextFile(filename)) {
+      setError(i18n.t('workspace.invalidNewFile', {
+        defaultValue: 'Enter a text filename such as notes.md without any path separators.',
+      }))
+      return
+    }
+    const request = ++operationRequest.current
+    const path = currentPath === '.' ? filename : `${currentPath.replace(/\/$/, '')}/${filename}`
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const saved = await saveTextFile(path, selectedLocation.device, '', null)
+      if (request !== operationRequest.current) return
+      const entry: ListDirEntry = { name: filename, path, kind: 'file', size: saved.mutation.size }
+      setEntries((current) => [...current.filter((item) => item.path !== path), entry])
+      setSelectedEntry(entry)
+      setEditor({ content: '', etag: saved.etag })
+      setShowNewFile(false)
+      setNewFileName('')
+      setNotice(i18n.t('workspace.createFileSuccess', { defaultValue: 'File created.' }))
+    } catch (caught) {
+      if (request === operationRequest.current) setError(errorMessage(caught))
+    } finally {
+      if (request === operationRequest.current) setBusy(false)
+    }
+  }
+
+  async function deleteSelectedFile(): Promise<void> {
+    if (!selectedEntry || selectedEntry.kind !== 'file' || !selectedLocation) return
+    const request = ++operationRequest.current
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      await deleteFile(selectedEntry.path, selectedLocation.device, editor?.etag ?? null)
+      if (request !== operationRequest.current) return
+      setEntries((current) => current.filter((entry) => entry.path !== selectedEntry.path))
+      setSelectedEntry(null)
+      setEditor(null)
+      setPendingFileDelete(false)
+      setNotice(i18n.t('workspace.deleteFileSuccess', { defaultValue: 'File deleted.' }))
+    } catch (caught) {
+      if (request === operationRequest.current) setError(errorMessage(caught))
     } finally {
       if (request === operationRequest.current) setBusy(false)
     }
@@ -391,6 +484,9 @@ export function WorkspacePage(): ReactNode {
                 <code>{currentPath}</code>
               </div>
               <div className="oo-workspace-upload">
+                <button type="button" disabled={busy} onClick={() => setShowNewFile((current) => !current)}>
+                  {t('workspace.newFile', { defaultValue: 'New file' })}
+                </button>
                 <label>
                   {t('workspace.chooseUpload', { defaultValue: 'Choose file' })}
                   <input type="file" onChange={(event) => setUpload(event.target.files?.[0] ?? null)} />
@@ -398,6 +494,17 @@ export function WorkspacePage(): ReactNode {
                 <button type="button" disabled={!upload || busy} onClick={() => void submitUpload()}>{t('workspace.upload', { defaultValue: 'Upload file' })}</button>
               </div>
             </div>
+
+            {showNewFile ? (
+              <form className="oo-workspace-new-file" onSubmit={(event) => void submitNewFile(event)}>
+                <label>
+                  {t('workspace.fileName', { defaultValue: 'File name' })}
+                  <input autoFocus value={newFileName} onChange={(event) => setNewFileName(event.target.value)} placeholder="notes.md" />
+                </label>
+                <button type="submit" disabled={busy}>{t('workspace.createFile', { defaultValue: 'Create file' })}</button>
+                <button type="button" disabled={busy} onClick={() => { setShowNewFile(false); setNewFileName('') }}>{t('common.cancel')}</button>
+              </form>
+            ) : null}
 
             {directoryLoading ? <p className="oo-workspace-empty">{t('workspace.loadingDirectory', { defaultValue: 'Loading directory…' })}</p> : null}
             {directoryTruncated ? <p className="oo-workspace-alert">{t('workspace.directoryTruncated', { defaultValue: 'The Server scan limit was reached. This list may be incomplete.' })}</p> : null}
@@ -432,6 +539,21 @@ export function WorkspacePage(): ReactNode {
                 </dl>
                 {selectedEntry.kind === 'file' ? (
                   <a className="oo-workspace-download" href={fileUrl(selectedEntry.path, selectedLocation?.device ?? 'server')} download>{t('workspace.download', { defaultValue: 'Download file' })}</a>
+                ) : null}
+                {selectedEntry.kind === 'file' ? (
+                  <button
+                    className="oo-workspace-delete-file"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      if (pendingFileDelete) void deleteSelectedFile()
+                      else setPendingFileDelete(true)
+                    }}
+                  >
+                    {pendingFileDelete
+                      ? t('workspace.confirmDeleteFile', { defaultValue: 'Confirm deletion' })
+                      : t('workspace.deleteFile', { defaultValue: 'Delete file' })}
+                  </button>
                 ) : null}
                 {selectedEntry.kind === 'file' && !isTextFile(selectedEntry.name) ? <p>{t('workspace.notText', { defaultValue: 'This file is not opened as text. You can download it instead.' })}</p> : null}
                 {editor ? (

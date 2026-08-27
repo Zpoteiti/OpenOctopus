@@ -161,6 +161,33 @@
   white-space: nowrap;
   width: 1px;
 }
+.oo-workspace-new-file {
+  align-items: end;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+  padding: 10px 13px;
+}
+.oo-workspace-new-file label { display: grid; font-size: 10px; font-weight: 700; gap: 5px; }
+.oo-workspace-new-file input {
+  background: var(--field);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  min-height: 31px;
+  padding: 0 9px;
+}
+.oo-workspace-new-file button,
+.oo-workspace-delete-file {
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--ink);
+  min-height: 31px;
+  padding: 7px 10px;
+}
+.oo-workspace-delete-file { color: var(--danger); margin: 0 0 12px 7px; }
 
 .oo-workspace-file-list { list-style: none; margin: 0; padding: 0; }
 .oo-workspace-file-list li { border-bottom: 1px solid var(--line); }
@@ -236,6 +263,8 @@
   .oo-workspace-locations { border-bottom: 1px solid var(--line); border-right: 0; }
   .oo-workspace-toolbar { align-items: stretch; flex-direction: column; }
   .oo-workspace-toolbar > div { justify-content: space-between; }
+  .oo-workspace-new-file { grid-template-columns: 1fr auto; }
+  .oo-workspace-new-file label { grid-column: 1 / -1; }
   .oo-workspace-file-list button { grid-template-columns: 28px minmax(90px, 1fr) auto; }
   .oo-workspace-file-kind,
   .oo-workspace-file-size { display: none; }
