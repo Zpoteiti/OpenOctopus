@@ -1,6 +1,6 @@
 import { ApiError, apiJson } from '../api/client'
 import { parseNdjsonStream } from '../api/ndjson'
-import type { Session } from '../api/types'
+import type { Effort, Session } from '../api/types'
 import i18n from '../i18n'
 import type { ChatMessage, MessageHistory } from './model'
 
@@ -19,6 +19,7 @@ export interface SendChatMessageOptions {
   sessionId: string
   text: string
   files: File[]
+  effort?: Effort
   idFactory: () => string
   onEvent: (event: StreamEvent) => void
 }
@@ -114,6 +115,7 @@ export async function sendChatMessage(options: SendChatMessageOptions): Promise<
   const attachments = await uploadAttachments(options.files, options.idFactory)
   const hasText = options.text.trim().length > 0
   const body = {
+    ...(options.effort === undefined ? {} : { effort: options.effort }),
     content: hasText ? [{ type: 'text', text: options.text }] : [],
     attachments,
   }

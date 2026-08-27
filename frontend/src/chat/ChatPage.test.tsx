@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -80,6 +80,119 @@ describe('ChatPage', () => {
     expect(await screen.findByRole('heading', { name: 'What would you like your agent to do?' })).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Message' })).toBeInTheDocument()
     expect(screen.getByText('0 devices online')).toBeInTheDocument()
+  })
+
+  it('sends with Enter while Shift+Enter inserts a newline', async () => {
+    await i18n.changeLanguage('en')
+    let postedBody: unknown
+    let finishRequest: ((response: Response) => void) | undefined
+    const pendingResponse = new Promise<Response>((resolve) => {
+      finishRequest = resolve
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        postedBody = JSON.parse(String(init.body))
+        return pendingResponse
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+
+    renderChat('/chat', 5, () => '11111111-1111-4111-8111-111111111111')
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Reasoning effort' }), 'high')
+    await user.type(composer, 'first line')
+    fireEvent.keyDown(composer, { key: 'Enter', code: 'Enter', isComposing: true })
+    expect(postedBody).toBeUndefined()
+    await user.keyboard('{Shift>}{Enter}{/Shift}second line')
+    expect(composer).toHaveValue('first line\nsecond line')
+
+    await user.keyboard('{Enter}')
+
+    await waitFor(() => expect(postedBody).toEqual({
+      effort: 'high',
+      content: [{ type: 'text', text: 'first line\nsecond line' }],
+      attachments: [],
+    }))
+    expect(composer).toHaveValue('')
+
+    finishRequest?.(new Response([
+      '{"type":"message_accepted","message_id":"message-1","disposition":"started","created_session":true}',
+      '{"type":"turn_finished","turn_id":"turn-1","status":"completed"}',
+      '',
+    ].join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } }))
+    await waitFor(() => expect(composer).not.toBeDisabled())
+  })
+
+  it('keeps live reasoning inside the assistant turn after the pending user message', async () => {
+    await i18n.changeLanguage('en')
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const encoder = new TextEncoder()
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) return jsonResponse(history())
+      if (url === `/api/sessions/${baseSession.id}/messages` && init?.method === 'POST') {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { streamController = controller },
+        }), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+
+    renderChat(`/chat/${baseSession.id}`)
+    await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Latest question')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(streamController).toBeDefined())
+    await act(async () => {
+      streamController?.enqueue(encoder.encode([
+        '{"type":"message_accepted","message_id":"message-user","disposition":"started","created_session":false}',
+        '{"type":"token_delta","turn_id":"turn-1","channel":"thinking","text":"Checking sources"}',
+        '{"type":"token_delta","turn_id":"turn-1","channel":"text","text":"Draft answer"}',
+        '',
+      ].join('\n')))
+    })
+
+    const userMessage = screen.getByText('Latest question').closest('article')
+    const reasoning = screen.getByText('Reasoning')
+    const assistantMessage = reasoning.closest('article')
+    expect(userMessage).not.toBeNull()
+    expect(assistantMessage).toHaveClass('chat-message-assistant', 'chat-message-live')
+    expect(assistantMessage).toContainElement(screen.getByText('Draft answer'))
+    expect(assistantMessage).toContainElement(screen.getByText('OpenOctopus'))
+    expect(userMessage?.compareDocumentPosition(assistantMessage as Node) ?? 0)
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+
+    await act(async () => streamController?.close())
+  })
+
+  it('restores the draft when the Server rejects a message before accepting it', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return jsonResponse({ code: 'provider_unavailable', message: 'Provider unavailable' }, 503)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+
+    renderChat('/chat', 5, () => '11111111-1111-4111-8111-111111111111')
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'keep this draft')
+    await user.keyboard('{Enter}')
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Provider unavailable'))
+    expect(composer).toHaveValue('keep this draft')
   })
 
   it('keeps selected browser attachments after clearing the file input', async () => {
@@ -249,6 +362,86 @@ describe('ChatPage', () => {
     expect(row).not.toBeNull()
     expect(row?.querySelector('header strong')).toHaveTextContent('工具结果')
     expect(row).toHaveClass('chat-message-assistant')
+  })
+
+  it('collapses intermediate reasoning and tool messages while keeping the final reply visible', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        return jsonResponse(history({
+          messages: [
+            {
+              id: 'human-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
+              content: [{ type: 'text', text: 'Inspect the API' }], delivery_refs: [], is_compacted: false,
+              created_at: '2026-08-26T10:00:01Z',
+            },
+            {
+              id: 'assistant-tool', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+              content: [
+                { type: 'thinking', thinking: 'I should fetch the schema.' },
+                { type: 'tool_use', name: 'web_fetch', input: { url: 'https://example.com' } },
+              ], delivery_refs: [], is_compacted: false,
+              created_at: '2026-08-26T10:00:02Z',
+            },
+            {
+              id: 'tool-result', session_id: baseSession.id, role: 'user', message_kind: 'tool_result',
+              content: [{ type: 'tool_result', content: 'OpenAPI schema' }], delivery_refs: [], is_compacted: false,
+              created_at: '2026-08-26T10:00:03Z',
+            },
+            {
+              id: 'assistant-final', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+              content: [{ type: 'text', text: 'The API exposes four endpoints.' }], delivery_refs: [], is_compacted: false,
+              created_at: '2026-08-26T10:00:04Z',
+            },
+          ],
+          last_message_id: 'assistant-final',
+        }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+
+    renderChat(`/chat/${baseSession.id}`)
+
+    const summary = await screen.findByText('Work details · 2 steps')
+    const details = summary.closest('details')
+    expect(details).not.toBeNull()
+    expect(details).not.toHaveAttribute('open')
+    expect(screen.getByText('The API exposes four endpoints.').closest('details')).toBeNull()
+
+    await user.click(summary)
+    expect(details).toHaveAttribute('open')
+    expect(details).toContainElement(screen.getByText('Tool call: web_fetch'))
+    expect(within(details as HTMLElement).getAllByText('Tool result')).toHaveLength(2)
+  })
+
+  it('shows the latest tool in the collapsed summary while a turn is running', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        return jsonResponse(history({
+          messages: [{
+            id: 'assistant-tool', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+            content: [{ type: 'tool_use', name: 'web_fetch', input: {} }], delivery_refs: [], is_compacted: false,
+            created_at: '2026-08-26T10:00:01Z',
+          }],
+          status: 'running', active_turn_id: 'turn-1', last_message_id: 'assistant-tool',
+        }))
+      }
+      if (url.includes('/messages?after=assistant-tool')) return new Promise<Response>(() => {})
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat(`/chat/${baseSession.id}`, 60_000)
+
+    const summary = await screen.findByText('Working · web_fetch')
+    expect(summary.closest('details')).not.toHaveAttribute('open')
   })
 
   it('polls persisted history with an after cursor while a turn is running', async () => {
@@ -428,6 +621,7 @@ describe('ChatPage', () => {
     expect(screen.getByRole('textbox', { name: '消息' })).toBeDisabled()
     expect(fileInput).toBeDisabled()
     expect(screen.getByRole('button', { name: '移除' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: '思考强度' })).toBeDisabled()
     expect(document.querySelector<HTMLButtonElement>('.composer-actions .text-button')).toBeDisabled()
 
     await act(async () => { await router.navigate(`/chat/${sessionB.id}`) })

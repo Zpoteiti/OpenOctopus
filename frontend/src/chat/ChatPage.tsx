@@ -7,7 +7,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import remarkGfm from 'remark-gfm'
 
 import { ApiError, apiJson } from '../api/client'
-import type { Device, Session } from '../api/types'
+import type { Device, Effort, Session } from '../api/types'
 import {
   MessageStreamError,
   cancelSession,
@@ -75,6 +75,7 @@ export function ChatPage({
   )
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
+  const [effort, setEffort] = useState<Effort>('off')
   const [sending, setSending] = useState(false)
   const [notice, setNotice] = useState<NoticeState | null>(null)
   const [liveText, setLiveText] = useState('')
@@ -174,7 +175,12 @@ export function ChatPage({
     })
   }, [historyVersion, refreshSessions, renderedLastMessageId, session?.unread, sessionId, visibleLatestKey])
 
-  const processEvent = useCallback((event: StreamEvent, targetSessionId: string, sentText: string) => {
+  const processEvent = useCallback((
+    event: StreamEvent,
+    targetSessionId: string,
+    sentText: string,
+    sentEffort: Effort,
+  ) => {
     if (event.type === 'message_accepted') {
       const pendingContent: ContentBlock[] = sentText.trim()
         ? [{ type: 'text', text: sentText }]
@@ -188,7 +194,7 @@ export function ChatPage({
             id: event.message_id,
             session_id: targetSessionId,
             content: pendingContent,
-            effort: null,
+            effort: sentEffort,
             received_at: new Date().toISOString(),
           },
         ],
@@ -266,6 +272,7 @@ export function ChatPage({
 
     const sentText = text
     const sentFiles = files
+    const sentEffort = effort
     const targetSessionId = sessionId ?? idFactory()
     const isNewSession = sessionId === undefined
     let shouldRecover = false
@@ -275,6 +282,7 @@ export function ChatPage({
     followLatestSession.current = targetSessionId
 
     setSending(true)
+    setText('')
     setStreamSessionId(targetSessionId)
     setNotice(null)
     setLiveText('')
@@ -287,6 +295,7 @@ export function ChatPage({
         sessionId: targetSessionId,
         text: sentText,
         files: sentFiles,
+        effort: sentEffort,
         idFactory,
         onEvent: (streamEvent) => {
           if (streamGeneration.current !== generation || activeViewSession.current !== targetSessionId) return
@@ -294,11 +303,10 @@ export function ChatPage({
             shouldRecover = true
             if (isNewSession) navigate(`/chat/${targetSessionId}`, { replace: true })
           }
-          processEvent(streamEvent, targetSessionId, sentText)
+          processEvent(streamEvent, targetSessionId, sentText, sentEffort)
         },
       })
       if (streamGeneration.current === generation && activeViewSession.current === targetSessionId) {
-        setText('')
         setFiles([])
       }
     } catch (error) {
@@ -309,9 +317,14 @@ export function ChatPage({
         if (error.accepted) {
           setText('')
           setFiles([])
+        } else {
+          setText(sentText)
+          setFiles(sentFiles)
         }
         if (isNewSession) navigate(`/chat/${targetSessionId}`, { replace: true })
       } else {
+        setText(sentText)
+        setFiles(sentFiles)
         setNotice({
           sessionId: targetSessionId,
           message: chatErrorMessage(error, t('chat.sendFailed', {
@@ -471,7 +484,13 @@ export function ChatPage({
                 {t('chat.historyLimit', { defaultValue: 'Showing the 200 most recent saved messages.' })}
               </p>
             ) : null}
-            {history?.messages.map((message) => <MessageRow key={message.id} message={message} />)}
+            {history ? (
+              <Transcript
+                messages={history.messages}
+                running={history.status === 'running'}
+                toolProgress={toolProgress}
+              />
+            ) : null}
             {renderedLastMessageId ? <span ref={latestMessageMarker} className="chat-latest-marker" aria-hidden="true" /> : null}
             {history?.pending_messages.map((message) => (
               <article key={message.id} className="chat-message chat-message-user chat-message-pending">
@@ -482,16 +501,16 @@ export function ChatPage({
                 <ContentBlocks blocks={message.content} />
               </article>
             ))}
-            {showingStream && liveThinking ? (
-              <details className="chat-thinking">
-                <summary>{t('chat.thinking', { defaultValue: 'Thinking' })}</summary>
-                <p>{liveThinking}</p>
-              </details>
-            ) : null}
-            {showingStream && liveText ? (
+            {showingStream && (liveThinking || liveText) ? (
               <article className="chat-message chat-message-assistant chat-message-live">
                 <header><strong>OpenOctopus</strong><span>{t('chat.generating', { defaultValue: 'Generating' })}</span></header>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveText}</ReactMarkdown>
+                {liveThinking ? (
+                  <details className="chat-thinking">
+                    <summary>{t('chat.thinking', { defaultValue: 'Thinking' })}</summary>
+                    <p>{liveThinking}</p>
+                  </details>
+                ) : null}
+                {liveText ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveText}</ReactMarkdown> : null}
               </article>
             ) : null}
             {showingStream && toolProgress ? <p className="chat-tool-progress">{toolProgress}</p> : null}
@@ -522,25 +541,53 @@ export function ChatPage({
               rows={2}
               value={text}
               onChange={(event) => setText(event.target.value)}
+              onKeyDown={(event) => {
+                if (
+                  event.key !== 'Enter'
+                  || event.shiftKey
+                  || event.nativeEvent.isComposing
+                  || event.nativeEvent.keyCode === 229
+                ) return
+                event.preventDefault()
+                event.currentTarget.form?.requestSubmit()
+              }}
               disabled={sending}
             />
             <div className="composer-actions">
-              <input
-                ref={fileInput}
-                className="chat-file-input"
-                type="file"
-                multiple
-                disabled={sending}
-                aria-label={t('chat.selectAttachments', { defaultValue: 'Choose attachments' })}
-                onChange={(event) => {
-                  const selectedFiles = Array.from(event.target.files ?? [])
-                  setFiles((current) => [...current, ...selectedFiles])
-                  event.target.value = ''
-                }}
-              />
-              <button type="button" className="text-button" disabled={sending} onClick={() => fileInput.current?.click()}>
-                ＋ {t('draftChat.attachment')}
-              </button>
+              <div className="composer-tools">
+                <input
+                  ref={fileInput}
+                  className="chat-file-input"
+                  type="file"
+                  multiple
+                  disabled={sending}
+                  aria-label={t('chat.selectAttachments', { defaultValue: 'Choose attachments' })}
+                  onChange={(event) => {
+                    const selectedFiles = Array.from(event.target.files ?? [])
+                    setFiles((current) => [...current, ...selectedFiles])
+                    event.target.value = ''
+                  }}
+                />
+                <button type="button" className="text-button" disabled={sending} onClick={() => fileInput.current?.click()}>
+                  ＋ {t('draftChat.attachment')}
+                </button>
+                <label className="composer-effort">
+                  <span>{t('chat.reasoningEffort')}</span>
+                  <select
+                    aria-label={t('chat.reasoningEffort')}
+                    value={effort}
+                    disabled={sending}
+                    onChange={(event) => setEffort(event.target.value as Effort)}
+                  >
+                    <option value="off">{t('chat.effortOff')}</option>
+                    <option value="low">{t('chat.effortLow')}</option>
+                    <option value="medium">{t('chat.effortMedium')}</option>
+                    <option value="high">{t('chat.effortHigh')}</option>
+                    <option value="xhigh">{t('chat.effortXHigh')}</option>
+                    <option value="max">{t('chat.effortMax')}</option>
+                  </select>
+                </label>
+              </div>
               <button
                 className="send-button"
                 aria-label={t('draftChat.send')}
@@ -722,6 +769,106 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
       ) : null}
     </article>
   )
+}
+
+function Transcript({
+  messages,
+  running,
+  toolProgress,
+}: {
+  messages: ChatMessage[]
+  running: boolean
+  toolProgress: string | null
+}): ReactNode {
+  const { t } = useTranslation()
+  const groups: ChatMessage[][] = []
+
+  for (const message of messages) {
+    if (message.message_kind === 'compaction_summary') {
+      groups.push([message])
+      continue
+    }
+    if (message.message_kind === 'human' || groups.length === 0) {
+      groups.push([message])
+      continue
+    }
+    const current = groups.at(-1)
+    if (!current || current[0]?.message_kind === 'compaction_summary') {
+      groups.push([message])
+    } else {
+      current.push(message)
+    }
+  }
+
+  let activeGroupIndex = -1
+  for (let index = groups.length - 1; index >= 0; index -= 1) {
+    if (groups[index]?.[0]?.message_kind !== 'compaction_summary') {
+      activeGroupIndex = index
+      break
+    }
+  }
+
+  return groups.map((group, groupIndex) => {
+    if (group.length === 1 && group[0]?.message_kind === 'compaction_summary') {
+      return <MessageRow key={group[0].id} message={group[0]} />
+    }
+
+    const human = group[0]?.message_kind === 'human' ? group[0] : null
+    const responses = human ? group.slice(1) : group
+    let finalIndex = -1
+    for (let index = responses.length - 1; index >= 0; index -= 1) {
+      if (isFinalReply(responses[index])) {
+        finalIndex = index
+        break
+      }
+    }
+    const finalReply = finalIndex >= 0 ? responses[finalIndex] : null
+    const process = responses.filter((_, index) => index !== finalIndex)
+    const active = running && groupIndex === activeGroupIndex
+    const latestTool = findLatestTool(process)
+    const summary = active
+      ? toolProgress ?? (latestTool
+          ? t('chat.currentWork', { tool: latestTool, defaultValue: 'Working · {{tool}}' })
+          : t('chat.workInProgress', { defaultValue: 'Working…' }))
+      : t('chat.workDetails', {
+          count: process.length,
+          defaultValue: 'Work details · {{count}} steps',
+        })
+
+    return (
+      <div className="chat-turn" key={human?.id ?? group[0]?.id ?? groupIndex}>
+        {human ? <MessageRow message={human} /> : null}
+        {process.length ? (
+          <details className={`chat-work-log${active ? ' chat-work-log-active' : ''}`}>
+            <summary><span aria-hidden="true" className="chat-work-status" />{summary}</summary>
+            <div className="chat-work-log-messages">
+              {process.map((message) => <MessageRow key={message.id} message={message} />)}
+            </div>
+          </details>
+        ) : null}
+        {finalReply ? <MessageRow message={finalReply} /> : null}
+      </div>
+    )
+  })
+}
+
+function isFinalReply(message: ChatMessage): boolean {
+  if (!['assistant', 'synthetic_assistant_error'].includes(message.message_kind)) return false
+  if (message.content.some((block) => block.type === 'tool_use')) return false
+  return message.delivery_refs.length > 0 || message.content.some((block) => (
+    block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0
+  ))
+}
+
+function findLatestTool(messages: ChatMessage[]): string | null {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = message.content[blockIndex]
+      if (block.type === 'tool_use' && typeof block.name === 'string') return block.name
+    }
+  }
+  return null
 }
 
 function ContentBlocks({ blocks }: { blocks: ContentBlock[] }): ReactNode {

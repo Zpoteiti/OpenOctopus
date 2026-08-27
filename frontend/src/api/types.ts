@@ -2,6 +2,7 @@ import type { components, paths } from './openapi'
 
 export type User = components['schemas']['User']
 export type Session = components['schemas']['Session']
+export type Effort = components['schemas']['Effort']
 export type AuthResponse =
   paths['/api/auth/login']['post']['responses'][200]['content']['application/json']
 export type RegisterRequest =

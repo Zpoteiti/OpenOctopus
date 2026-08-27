@@ -144,6 +144,7 @@ describe('chat API', () => {
       sessionId: 'session-1',
       text: 'summarize this',
       files: [new File(['data'], 'report.txt', { type: 'text/plain' })],
+      effort: 'high',
       idFactory: () => 'file-id',
       onEvent: (event) => events.push(event),
     })
@@ -154,6 +155,7 @@ describe('chat API', () => {
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('If-None-Match')).toBe('*')
     expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/sessions/session-1/messages')
     expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      effort: 'high',
       content: [{ type: 'text', text: 'summarize this' }],
       attachments: [{ openoctopus_device: 'server', path: '.attachments/uploads/file-id/report.txt' }],
     })
