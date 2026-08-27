@@ -21,7 +21,7 @@ beforeEach(async () => {
 describe('AccountPage', () => {
   it('links directly to the personal SOUL and MEMORY files', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-    render(
+    const { container } = render(
       <QueryClientProvider client={client}>
         <ThemeProvider>
           <MemoryRouter>
@@ -33,6 +33,7 @@ describe('AccountPage', () => {
 
     expect(screen.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
     expect(screen.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+    expect(container.querySelector('.settings-stack')?.querySelectorAll(':scope > .card')).toHaveLength(5)
   })
 
   it('updates only submitted profile fields', async () => {
