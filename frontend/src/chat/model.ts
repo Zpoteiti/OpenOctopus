@@ -1,3 +1,7 @@
+import type { MessageAttachmentRef } from '../api/types'
+
+export type { MessageAttachmentRef } from '../api/types'
+
 export interface ContentBlock {
   type: string
   text?: string
@@ -15,6 +19,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   message_kind: string
   content: ContentBlock[]
+  attachment_refs: MessageAttachmentRef[]
   delivery_refs: Record<string, unknown>[]
   is_compacted: boolean
   created_at: string
@@ -24,6 +29,7 @@ export interface PendingMessage {
   id: string
   session_id: string
   content: ContentBlock[]
+  attachment_refs: MessageAttachmentRef[]
   effort: string | null
   received_at: string
 }

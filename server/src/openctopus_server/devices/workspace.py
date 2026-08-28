@@ -627,14 +627,19 @@ async def dispatch_workspace_action(
     *,
     user: User,
     device_name: str,
+    expected_device_id: UUID | None = None,
     action: DeviceWorkspaceAction,
     registry: DeviceRegistry,
 ) -> Any:
     """Resolve ownership, close DB state, then await the live device call."""
 
-    device_id = await db.scalar(
-        select(Device.id).where(Device.user_id == user.id, Device.name == device_name)
+    query = select(Device.id).where(
+        Device.user_id == user.id,
+        Device.name == device_name,
     )
+    if expected_device_id is not None:
+        query = query.where(Device.id == expected_device_id)
+    device_id = await db.scalar(query)
     if not isinstance(device_id, UUID):
         raise WorkspaceError(
             ErrorCode.TOOL_DEVICE_UNREACHABLE,

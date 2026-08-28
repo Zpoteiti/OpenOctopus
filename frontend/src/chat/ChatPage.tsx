@@ -16,8 +16,12 @@ import {
   loadSessions,
   renameSession,
   sendChatMessage,
+  uploadBrowserAttachment,
+  validateBrowserAttachmentFiles,
+  type MessageAttachmentRef,
   type StreamEvent,
 } from './chatApi'
+import { AttachmentPicker, type AttachmentPickerSource } from './AttachmentPicker'
 import {
   emptyHistory,
   mergeHistory,
@@ -47,6 +51,15 @@ interface NoticeState {
   message: string
 }
 
+interface DraftAttachment {
+  id: string
+  name: string
+  source: string
+  status: 'uploading' | 'ready' | 'failed'
+  file?: File
+  ref?: MessageAttachmentRef
+}
+
 export function ChatPage({
   pollIntervalMs = 1_000,
   idFactory = randomUuid,
@@ -74,7 +87,16 @@ export function ChatPage({
     historyVersion,
   )
   const [text, setText] = useState('')
-  const [files, setFiles] = useState<File[]>([])
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([])
+  const attachmentsRef = useRef<DraftAttachment[]>(attachments)
+  const draftGeneration = useRef(0)
+  const draftTransfer = useRef<{
+    sessionId: string
+    text: string
+    attachments: DraftAttachment[]
+  } | null>(null)
+  const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false)
+  const [pickerSource, setPickerSource] = useState<AttachmentPickerSource | null>(null)
   const [effort, setEffort] = useState<Effort>('off')
   const [sending, setSending] = useState(false)
   const [notice, setNotice] = useState<NoticeState | null>(null)
@@ -85,7 +107,6 @@ export function ChatPage({
   const [visibleLatestKey, setVisibleLatestKey] = useState<string | null>(null)
   const [renaming, setRenaming] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
-  const [draftSessionId, setDraftSessionId] = useState(sessionId)
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const chatScroll = useRef<HTMLDivElement>(null)
@@ -102,20 +123,38 @@ export function ChatPage({
   const showingStream = streamSessionId !== null && streamSessionId === viewSessionId
   const sendingHere = sending && showingStream
   const visibleNotice = notice?.sessionId === viewSessionId ? notice.message : null
+  const attachmentsReady = attachments.every((attachment) => attachment.status === 'ready' && attachment.ref)
   const initiallyScrolledSession = useRef<string | null>(null)
   const followLatestSession = useRef<string | null>(null)
 
-  if (draftSessionId !== sessionId) {
-    setDraftSessionId(sessionId)
-    setText('')
-    setFiles([])
-    setRenaming(false)
-    setTitleDraft('')
+  function replaceAttachments(next: DraftAttachment[]): void {
+    attachmentsRef.current = next
+    setAttachments(next)
+  }
+
+  function updateAttachments(updater: (current: DraftAttachment[]) => DraftAttachment[]): void {
+    replaceAttachments(updater(attachmentsRef.current))
   }
 
   useLayoutEffect(() => {
     activeViewSession.current = viewSessionId
   }, [viewSessionId])
+
+  useLayoutEffect(() => {
+    const transferred = sessionId && draftTransfer.current?.sessionId === sessionId
+      ? draftTransfer.current
+      : null
+    const nextAttachments = transferred?.attachments ?? []
+    draftGeneration.current += 1
+    attachmentsRef.current = nextAttachments
+    if (transferred) draftTransfer.current = null
+    setText(transferred?.text ?? '')
+    setAttachments(nextAttachments)
+    setAttachmentMenuOpen(false)
+    setPickerSource(null)
+    setRenaming(false)
+    setTitleDraft('')
+  }, [sessionId])
 
   useLayoutEffect(() => {
     const root = chatScroll.current
@@ -180,6 +219,7 @@ export function ChatPage({
     targetSessionId: string,
     sentText: string,
     sentEffort: Effort,
+    sentAttachments: MessageAttachmentRef[],
   ) => {
     if (event.type === 'message_accepted') {
       const pendingContent: ContentBlock[] = sentText.trim()
@@ -194,6 +234,7 @@ export function ChatPage({
             id: event.message_id,
             session_id: targetSessionId,
             content: pendingContent,
+            attachment_refs: sentAttachments,
             effort: sentEffort,
             received_at: new Date().toISOString(),
           },
@@ -266,12 +307,94 @@ export function ChatPage({
     if (event.type === 'session_deleted') navigate('/chat', { replace: true })
   }, [navigate, t, updateHistory])
 
+  async function addBrowserFiles(selectedFiles: File[]): Promise<void> {
+    if (!selectedFiles.length) return
+    const generation = draftGeneration.current
+    const currentAttachments = attachmentsRef.current
+    if (currentAttachments.length + selectedFiles.length > 10) {
+      setNotice({
+        sessionId: viewSessionId,
+        message: t('chat.tooManyAttachments', { defaultValue: 'A message can include at most 10 attachments.' }),
+      })
+      return
+    }
+    const drafts = selectedFiles.map((file) => ({
+      id: idFactory(),
+      name: file.name,
+      source: t('chat.thisComputer', { defaultValue: 'This computer' }),
+      status: 'uploading' as const,
+      file,
+    }))
+    const existingBrowserFiles = currentAttachments.flatMap((attachment) => attachment.file ? [attachment.file] : [])
+    updateAttachments((current) => [...current, ...drafts])
+    setNotice(null)
+
+    try {
+      await validateBrowserAttachmentFiles([...existingBrowserFiles, ...selectedFiles])
+    } catch (caught) {
+      if (generation !== draftGeneration.current) return
+      const draftIds = new Set(drafts.map((draft) => draft.id))
+      updateAttachments((current) => current.map((attachment) => draftIds.has(attachment.id)
+        ? { ...attachment, status: 'failed' }
+        : attachment))
+      setNotice({
+        sessionId: viewSessionId,
+        message: chatErrorMessage(caught, t('chat.attachmentUploadFailed', { defaultValue: 'The attachment could not be uploaded.' })),
+      })
+      return
+    }
+    if (generation !== draftGeneration.current) return
+
+    for (const draft of drafts) {
+      if (!attachmentsRef.current.some((attachment) => attachment.id === draft.id)) continue
+      void uploadBrowserAttachment(draft.file, draft.id)
+        .then((ref) => {
+          if (generation !== draftGeneration.current) return
+          updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
+            ? { ...attachment, status: 'ready', ref }
+            : attachment))
+        })
+        .catch(() => {
+          if (generation !== draftGeneration.current) return
+          updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
+            ? { ...attachment, status: 'failed' }
+            : attachment))
+        })
+    }
+  }
+
+  function addExistingAttachment(ref: MessageAttachmentRef): void {
+    if (attachmentsRef.current.length >= 10) {
+      setNotice({
+        sessionId: viewSessionId,
+        message: t('chat.tooManyAttachments', { defaultValue: 'A message can include at most 10 attachments.' }),
+      })
+      return
+    }
+    updateAttachments((current) => [...current, {
+      id: idFactory(),
+      name: attachmentFilename(ref.path),
+      source: ref.openoctopus_device === 'server'
+        ? t('chat.serverWorkspace', { defaultValue: 'Server Workspace' })
+        : ref.openoctopus_device,
+      status: 'ready',
+      ref,
+    }])
+    setPickerSource(null)
+    setNotice(null)
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    if (sending || (!text.trim() && files.length === 0)) return
+    const currentAttachments = attachmentsRef.current
+    const currentAttachmentsReady = currentAttachments.every((attachment) => (
+      attachment.status === 'ready' && attachment.ref
+    ))
+    if (sending || !currentAttachmentsReady || (!text.trim() && currentAttachments.length === 0)) return
 
     const sentText = text
-    const sentFiles = files
+    const sentDraftAttachments = currentAttachments
+    const sentAttachments = currentAttachments.flatMap((attachment) => attachment.ref ? [attachment.ref] : [])
     const sentEffort = effort
     const targetSessionId = sessionId ?? idFactory()
     const isNewSession = sessionId === undefined
@@ -283,6 +406,7 @@ export function ChatPage({
 
     setSending(true)
     setText('')
+    replaceAttachments([])
     setStreamSessionId(targetSessionId)
     setNotice(null)
     setLiveText('')
@@ -294,21 +418,17 @@ export function ChatPage({
       await sendChatMessage({
         sessionId: targetSessionId,
         text: sentText,
-        files: sentFiles,
+        attachments: sentAttachments,
         effort: sentEffort,
-        idFactory,
         onEvent: (streamEvent) => {
           if (streamGeneration.current !== generation || activeViewSession.current !== targetSessionId) return
           if (streamEvent.type === 'message_accepted') {
             shouldRecover = true
             if (isNewSession) navigate(`/chat/${targetSessionId}`, { replace: true })
           }
-          processEvent(streamEvent, targetSessionId, sentText, sentEffort)
+          processEvent(streamEvent, targetSessionId, sentText, sentEffort, sentAttachments)
         },
       })
-      if (streamGeneration.current === generation && activeViewSession.current === targetSessionId) {
-        setFiles([])
-      }
     } catch (error) {
       if (streamGeneration.current !== generation || activeViewSession.current !== targetSessionId) return
       if (error instanceof MessageStreamError) {
@@ -316,15 +436,21 @@ export function ChatPage({
         setNotice({ sessionId: targetSessionId, message: error.message })
         if (error.accepted) {
           setText('')
-          setFiles([])
         } else {
           setText(sentText)
-          setFiles(sentFiles)
+          replaceAttachments(sentDraftAttachments)
+          if (isNewSession) {
+            draftTransfer.current = {
+              sessionId: targetSessionId,
+              text: sentText,
+              attachments: sentDraftAttachments,
+            }
+          }
         }
         if (isNewSession) navigate(`/chat/${targetSessionId}`, { replace: true })
       } else {
         setText(sentText)
-        setFiles(sentFiles)
+        replaceAttachments(sentDraftAttachments)
         setNotice({
           sessionId: targetSessionId,
           message: chatErrorMessage(error, t('chat.sendFailed', {
@@ -499,6 +625,7 @@ export function ChatPage({
                   <span>{t('chat.pending', { defaultValue: 'Pending' })}</span>
                 </header>
                 <ContentBlocks blocks={message.content} />
+                <AttachmentRefs refs={message.attachment_refs} />
               </article>
             ))}
             {showingStream && (liveThinking || liveText) ? (
@@ -519,15 +646,20 @@ export function ChatPage({
 
         {writable ? (
           <form className="composer chat-composer" onSubmit={(event) => void handleSubmit(event)}>
-            {files.length ? (
+            {attachments.length ? (
               <ul className="chat-attachments" aria-label={t('chat.pendingAttachments', { defaultValue: 'Attachments to send' })}>
-                {files.map((file, index) => (
-                  <li key={`${file.name}-${file.lastModified}-${index}`}>
-                    <span>{file.name}</span>
+                {attachments.map((attachment) => (
+                  <li key={attachment.id} data-status={attachment.status}>
+                    <span><strong>{attachment.name}</strong><small>{attachment.source}</small></span>
+                    <em>{attachment.status === 'uploading'
+                      ? t('chat.attachmentUploading', { defaultValue: 'Uploading' })
+                      : attachment.status === 'ready'
+                        ? t('chat.attachmentReady', { defaultValue: 'Ready' })
+                        : t('chat.attachmentFailed', { defaultValue: 'Failed' })}</em>
                     <button
                       type="button"
                       disabled={sending}
-                      onClick={() => setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                      onClick={() => updateAttachments((current) => current.filter((item) => item.id !== attachment.id))}
                     >
                       {t('chat.remove', { defaultValue: 'Remove' })}
                     </button>
@@ -564,13 +696,38 @@ export function ChatPage({
                   aria-label={t('chat.selectAttachments', { defaultValue: 'Choose attachments' })}
                   onChange={(event) => {
                     const selectedFiles = Array.from(event.target.files ?? [])
-                    setFiles((current) => [...current, ...selectedFiles])
                     event.target.value = ''
+                    void addBrowserFiles(selectedFiles)
                   }}
                 />
-                <button type="button" className="text-button" disabled={sending} onClick={() => fileInput.current?.click()}>
-                  ＋ {t('draftChat.attachment')}
-                </button>
+                <div className="chat-attachment-source">
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={t('draftChat.attachment')}
+                    aria-expanded={attachmentMenuOpen}
+                    disabled={sending || attachments.length >= 10}
+                    onClick={() => setAttachmentMenuOpen((current) => !current)}
+                  >＋ {t('draftChat.attachment')}</button>
+                  {attachmentMenuOpen ? (
+                    <div className="chat-attachment-source-menu" role="menu">
+                      <button type="button" role="menuitem" onClick={() => {
+                        setAttachmentMenuOpen(false)
+                        fileInput.current?.click()
+                      }}>{t('chat.thisComputer', { defaultValue: 'This computer' })}</button>
+                      <button type="button" role="menuitem" onClick={() => {
+                        setAttachmentMenuOpen(false)
+                        setPickerSource({ kind: 'server' })
+                      }}>{t('chat.serverWorkspaces', { defaultValue: 'Server Workspaces' })}</button>
+                      {(devices.data ?? []).filter((device) => device.online).map((device) => (
+                        <button key={device.id} type="button" role="menuitem" onClick={() => {
+                          setAttachmentMenuOpen(false)
+                          setPickerSource({ kind: 'device', device })
+                        }}>{device.name}</button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
                 <label className="composer-effort">
                   <span>{t('chat.reasoningEffort')}</span>
                   <select
@@ -591,10 +748,17 @@ export function ChatPage({
               <button
                 className="send-button"
                 aria-label={t('draftChat.send')}
-                disabled={sending || (!text.trim() && files.length === 0)}
+                disabled={sending || !attachmentsReady || (!text.trim() && attachments.length === 0)}
               >{sending ? '…' : '↑'}</button>
             </div>
           </form>
+        ) : null}
+        {pickerSource ? (
+          <AttachmentPicker
+            source={pickerSource}
+            onSelect={addExistingAttachment}
+            onClose={() => setPickerSource(null)}
+          />
         ) : null}
       </div>
     </>
@@ -755,6 +919,7 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
           : formatTime(message.created_at, i18n.resolvedLanguage)}</span>
       </header>
       <ContentBlocks blocks={message.content} />
+      <AttachmentRefs refs={message.attachment_refs} />
       {message.delivery_refs.length ? (
         <ul className="chat-deliveries">
           {message.delivery_refs.map((delivery, index) => (
@@ -768,6 +933,23 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
         </ul>
       ) : null}
     </article>
+  )
+}
+
+function AttachmentRefs({ refs }: { refs: MessageAttachmentRef[] }): ReactNode {
+  const { t } = useTranslation()
+  if (!refs.length) return null
+  return (
+    <ul className="chat-attachment-refs">
+      {refs.map((ref, index) => (
+        <li key={`${attachmentKey(ref)}:${index}`}>
+          <strong>{attachmentFilename(ref.path)}</strong>
+          <small>{ref.openoctopus_device === 'server'
+            ? t('chat.serverWorkspace', { defaultValue: 'Server Workspace' })
+            : ref.openoctopus_device}</small>
+        </li>
+      ))}
+    </ul>
   )
 }
 
@@ -914,6 +1096,15 @@ function ContentBlocks({ blocks }: { blocks: ContentBlock[] }): ReactNode {
 function formatUnknown(value: unknown): string {
   if (typeof value === 'string') return value
   return JSON.stringify(value, null, 2)
+}
+
+function attachmentFilename(path: string): string {
+  const parts = path.split('/').filter(Boolean)
+  return parts.at(-1) ?? path
+}
+
+function attachmentKey(ref: MessageAttachmentRef): string {
+  return `${'device_id' in ref ? ref.device_id : 'server'}:${ref.path}`
 }
 
 function formatTime(value: string, language: string | undefined): string {

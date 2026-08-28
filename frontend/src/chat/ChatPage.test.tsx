@@ -28,7 +28,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 function history(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
+  const result: Record<string, unknown> = {
     messages: [],
     pending_messages: [],
     status: 'idle',
@@ -38,6 +38,31 @@ function history(overrides: Record<string, unknown> = {}): Record<string, unknow
     has_more_before: false,
     ...overrides,
   }
+  for (const key of ['messages', 'pending_messages']) {
+    const rows = result[key]
+    if (Array.isArray(rows)) {
+      result[key] = rows.map((row) => (
+        row && typeof row === 'object'
+          ? { attachment_refs: [], ...row }
+          : row
+      ))
+    }
+  }
+  return result
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((next) => { resolve = next })
+  return { promise, resolve }
+}
+
+function delayedFile(name: string, header: Promise<ArrayBuffer>): File {
+  const file = new File(['data'], name, { type: 'text/plain' })
+  Object.defineProperty(file, 'slice', {
+    value: () => ({ arrayBuffer: () => header }),
+  })
+  return file
 }
 
 function renderChat(path: string, pollIntervalMs = 5, idFactory?: () => string): void {
@@ -195,24 +220,194 @@ describe('ChatPage', () => {
     expect(composer).toHaveValue('keep this draft')
   })
 
-  it('keeps selected browser attachments after clearing the file input', async () => {
+  it('uploads browser files immediately, waits for Ready, and reuses the ref when message retry is needed', async () => {
+    await i18n.changeLanguage('en')
+    let finishUpload: ((response: Response) => void) | undefined
+    const uploadResponse = new Promise<Response>((resolve) => { finishUpload = resolve })
+    let rejectFirstMessage: ((response: Response) => void) | undefined
+    const firstMessageResponse = new Promise<Response>((resolve) => { rejectFirstMessage = resolve })
+    let postCount = 0
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') return uploadResponse
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        postCount += 1
+        if (postCount === 1) return firstMessageResponse
+        return new Response([
+          '{"type":"message_accepted","message_id":"message-1","disposition":"started","created_session":true}',
+          '{"type":"turn_finished","turn_id":"turn-1","status":"completed"}',
+          '',
+        ].join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    renderChat('/chat', 5, () => '11111111-1111-4111-8111-111111111111')
+
+    const input = document.querySelector<HTMLInputElement>('input.chat-file-input')
+    expect(input).not.toBeNull()
+    await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Read this')
+    await user.upload(input!, new File(['attachment'], 'context.txt', { type: 'text/plain' }))
+
+    expect(await screen.findByText('context.txt')).toBeInTheDocument()
+    expect(input).toHaveValue('')
+    expect(screen.getByText('Uploading')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/messages'))).toBe(false)
+
+    finishUpload?.(jsonResponse({ path: '.attachments/uploads/upload-id/context.txt', size: 10, etag: 'etag', created: true }))
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(screen.queryByRole('list', { name: 'Attachments to send' })).not.toBeInTheDocument()
+
+    rejectFirstMessage?.(jsonResponse({ code: 'provider_unavailable', message: 'Try again' }, 503))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Try again')
+    expect(screen.getByText('Ready')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(postCount).toBe(2))
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1)
+    const postBodies = fetchMock.mock.calls
+      .filter(([, init]) => init?.method === 'POST')
+      .map(([, init]) => JSON.parse(String(init?.body)))
+    expect(postBodies).toEqual([
+      expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
+      expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
+    ])
+  })
+
+  it('reserves concurrent browser selections atomically before validating the files', async () => {
+    await i18n.changeLanguage('en')
+    const header = deferred<ArrayBuffer>()
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') {
+        return jsonResponse({ path: url, size: 4, etag: 'etag', created: true })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    let nextId = 0
+    renderChat('/chat', 5, () => `upload-${nextId += 1}`)
+    const input = await screen.findByLabelText('Select attachments')
+    const first = Array.from({ length: 6 }, (_, index) => delayedFile(`first-${index}.txt`, header.promise))
+    const second = Array.from({ length: 6 }, (_, index) => delayedFile(`second-${index}.txt`, header.promise))
+
+    await user.upload(input, first)
+    await user.upload(input, second)
+
+    expect(screen.getAllByText('Uploading')).toHaveLength(6)
+    expect(screen.getByRole('alert')).toHaveTextContent('at most 10 attachments')
+    expect(screen.queryByText('second-0.txt')).not.toBeInTheDocument()
+
+    await act(async () => header.resolve(new ArrayBuffer(12)))
+    await waitFor(() => expect(screen.getAllByText('Ready')).toHaveLength(6))
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(6)
+  })
+
+  it('ignores browser-file validation that completes after leaving its draft session', async () => {
+    await i18n.changeLanguage('en')
+    const sessionA = { ...baseSession, id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', chat_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }
+    const sessionB = { ...baseSession, id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', chat_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }
+    const header = deferred<ArrayBuffer>()
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([sessionA, sessionB])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes(`/api/sessions/${sessionA.id}/messages?limit=200`)) return jsonResponse(history())
+      if (url.includes(`/api/sessions/${sessionB.id}/messages?limit=200`)) return jsonResponse(history())
+      if (url.includes('/api/workspace/files/') && init?.method === 'PUT') {
+        return jsonResponse({ path: url, size: 4, etag: 'etag', created: true })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    const router = createMemoryRouter([
+      { path: '/chat/:sessionId', element: <ChatPage pollIntervalMs={5} /> },
+    ], { initialEntries: [`/chat/${sessionA.id}`] })
+    render(<QueryClientProvider client={queryClient}><RouterProvider router={router} /></QueryClientProvider>)
+    const user = userEvent.setup()
+
+    await user.upload(await screen.findByLabelText('Select attachments'), delayedFile('session-a.txt', header.promise))
+    await act(async () => { await router.navigate(`/chat/${sessionB.id}`) })
+    await act(async () => {
+      header.resolve(new ArrayBuffer(12))
+      await header.promise
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByText('session-a.txt')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0)
+  })
+
+  it('offers local, Server Workspace, and online Client attachment sources', async () => {
     await i18n.changeLanguage('en')
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
       if (url === '/api/sessions?limit=200') return jsonResponse([])
-      if (url === '/api/devices') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([
+        { id: 'device-1', name: 'laptop-cn', online: true },
+        { id: 'device-2', name: 'offline-laptop', online: false },
+      ])
       throw new Error(`Unexpected request: ${url}`)
     }))
     const user = userEvent.setup()
 
     renderChat('/chat')
 
-    const input = document.querySelector<HTMLInputElement>('input.chat-file-input')
-    expect(input).not.toBeNull()
-    await user.upload(input!, new File(['attachment'], 'context.txt', { type: 'text/plain' }))
+    await user.click(await screen.findByRole('button', { name: 'Attachment' }))
+    expect(screen.getByRole('menuitem', { name: 'This computer' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Server Workspaces' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'laptop-cn' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'offline-laptop' })).not.toBeInTheDocument()
+  })
 
-    expect(await screen.findByText('context.txt')).toBeInTheDocument()
-    expect(input).toHaveValue('')
+  it('renders structured attachment refs for saved and pending user messages', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        return jsonResponse(history({
+          messages: [{
+            id: 'human-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
+            content: [{ type: 'text', text: 'Use these files' }], delivery_refs: [], is_compacted: false,
+            attachment_refs: [
+              { openoctopus_device: 'server', path: '/Marketing@a4f7e2d1/brief.pdf' },
+              { openoctopus_device: 'laptop-cn', device_id: 'device-1', path: 'reports/current.csv' },
+            ],
+            created_at: '2026-08-26T10:00:01Z',
+          }],
+          pending_messages: [{
+            id: 'pending-1', session_id: baseSession.id, content: [], effort: 'off',
+            attachment_refs: [{ openoctopus_device: 'server', path: 'notes.txt' }],
+            received_at: '2026-08-26T10:00:02Z',
+          }],
+          pending_count: 0,
+          last_message_id: 'human-1',
+        }))
+      }
+      if (url.includes('/messages?after=human-1')) return jsonResponse(history())
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat(`/chat/${baseSession.id}`)
+
+    expect(await screen.findByText('brief.pdf')).toBeInTheDocument()
+    expect(screen.getAllByText('Server Workspace')).toHaveLength(2)
+    expect(screen.getByText('current.csv')).toBeInTheDocument()
+    expect(screen.getByText('laptop-cn')).toBeInTheDocument()
+    expect(screen.getByText('notes.txt')).toBeInTheDocument()
+    expect(screen.getByText('Use these files')).toBeInTheDocument()
   })
 
   it('renders non-web sessions as browser read-only', async () => {
@@ -620,7 +815,7 @@ describe('ChatPage', () => {
 
     expect(screen.getByRole('textbox', { name: '消息' })).toBeDisabled()
     expect(fileInput).toBeDisabled()
-    expect(screen.getByRole('button', { name: '移除' })).toBeDisabled()
+    expect(screen.queryByRole('list', { name: '待发送附件' })).not.toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: '思考强度' })).toBeDisabled()
     expect(document.querySelector<HTMLButtonElement>('.composer-actions .text-button')).toBeDisabled()
 
@@ -949,6 +1144,7 @@ describe('ChatPage', () => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
       if (url === '/api/sessions?limit=200') return jsonResponse([])
       if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/') && init?.method === 'PUT') return jsonResponse({ created: true })
       if (init?.method === 'POST' && url.includes('/messages')) throw new TypeError('network lost')
       if (url.includes('/messages?limit=200')) return jsonResponse(history())
       throw new Error(`Unexpected request: ${url}`)
@@ -957,6 +1153,10 @@ describe('ChatPage', () => {
 
     renderChat('/chat', 5, () => sessionId)
     const textbox = await screen.findByRole('textbox', { name: '消息' })
+    const fileInput = document.querySelector<HTMLInputElement>('input.chat-file-input')
+    expect(fileInput).not.toBeNull()
+    await user.upload(fileInput!, new File(['attachment'], 'report.txt', { type: 'text/plain' }))
+    expect(await screen.findByText('就绪')).toBeInTheDocument()
     await user.type(textbox, 'hello')
     await user.click(screen.getByRole('button', { name: '发送消息' }))
 
@@ -966,6 +1166,17 @@ describe('ChatPage', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => (
       String(url).includes(`/api/sessions/${sessionId}/messages?limit=200`) && init?.method === undefined
     ))).toBe(true))
+    expect(screen.getByRole('textbox', { name: '消息' })).toHaveValue('hello')
+    expect(screen.getByText('report.txt')).toBeInTheDocument()
+    expect(screen.getByText('就绪')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url, init]) => (
+      String(url).includes('/messages') && init?.method === 'POST'
+    ))).toHaveLength(2))
+    expect(fetchMock.mock.calls.filter(([url, init]) => (
+      String(url).includes('/api/workspace/files/') && init?.method === 'PUT'
+    ))).toHaveLength(1)
   })
 
   it('fences late stream events when the user navigates to another conversation', async () => {
@@ -1013,7 +1224,7 @@ describe('ChatPage', () => {
 
     await act(async () => {
       streamController?.enqueue(encoder.encode('{"type":"token_delta","turn_id":"turn-a","channel":"text","text":"A leaked preview"}\n'))
-      streamController?.enqueue(encoder.encode(`{"type":"message_persisted","turn_id":"turn-a","message":{"id":"assistant-a","session_id":"${sessionA.id}","role":"assistant","message_kind":"assistant","content":[{"type":"text","text":"A persisted answer"}],"delivery_refs":[],"is_compacted":false,"created_at":"2026-08-26T10:00:02Z"}}\n`))
+      streamController?.enqueue(encoder.encode(`{"type":"message_persisted","turn_id":"turn-a","message":{"id":"assistant-a","session_id":"${sessionA.id}","role":"assistant","message_kind":"assistant","content":[{"type":"text","text":"A persisted answer"}],"attachment_refs":[],"delivery_refs":[],"is_compacted":false,"created_at":"2026-08-26T10:00:02Z"}}\n`))
     })
 
     expect(screen.queryByText('A leaked preview')).not.toBeInTheDocument()
@@ -1048,7 +1259,7 @@ describe('ChatPage', () => {
             },
             {
               id: 'assistant-message', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'Canonical answer' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
               created_at: '2026-08-26T10:00:02Z',
             },
           ],
@@ -1063,7 +1274,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'assistant-message', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'Canonical answer' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
               created_at: '2026-08-26T10:00:02Z',
             },
           },
@@ -1120,7 +1331,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'message-assistant', session_id: sessionId, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'draft answer' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'draft answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
               created_at: '2026-08-26T10:00:01Z',
             },
           },
@@ -1128,7 +1339,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'message-assistant', session_id: sessionId, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'final answer' }], delivery_refs: [{ type: 'workspace_file', filename: 'report.txt' }], is_compacted: false,
+              content: [{ type: 'text', text: 'final answer' }], attachment_refs: [], delivery_refs: [{ type: 'workspace_file', filename: 'report.txt' }], is_compacted: false,
               created_at: '2026-08-26T10:00:01Z',
             },
           },

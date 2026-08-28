@@ -225,6 +225,13 @@ async def test_stage_one_commit_promotes_only_the_captured_pending_prefix(pg_eng
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         user, session = await _seed_session(db)
         old_human = _message(session.id, kind="human", created_at=now)
+        old_human.attachment_refs = [
+            {
+                "openoctopus_device": "laptop-cn",
+                "device_id": str(uuid4()),
+                "path": "documents/report.pdf",
+            }
+        ]
         old_assistant = _message(
             session.id,
             kind="assistant",
@@ -289,8 +296,10 @@ async def test_stage_one_commit_promotes_only_the_captured_pending_prefix(pg_eng
     assert latest_effort is None
     assert [row.id for row in pending_rows] == [later_pending.id]
     assert old_human.is_compacted
+    assert old_human.attachment_refs[0]["path"] == "documents/report.pdf"
     assert old_assistant.is_compacted
     assert already_compacted.is_compacted
+    assert summary.attachment_refs == []
     active_rows = [row for row in rows if not row.is_compacted]
     assert [row.id for row in active_rows] == [summary.id, first_pending.id]
     assert [row.message_kind for row in active_rows] == [

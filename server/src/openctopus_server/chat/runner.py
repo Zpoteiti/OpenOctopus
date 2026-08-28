@@ -15,6 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.chat.attachments import (
+    build_device_attachment_targets,
+    fence_owner_device_targets,
+)
 from openctopus_server.chat.compaction import (
     StaleCompactionSelectionError,
     commit_stage_one,
@@ -186,6 +190,7 @@ def _build_owner_tool_state(
     devices: Sequence[OwnerDeviceSnapshot],
     *,
     tool_registry: ToolRegistry,
+    attachment_targets: Mapping[str, UUID | None] | None = None,
     server_envelope: ServerMcpEnvelope | None = None,
     runtime_generations: Mapping[str, UUID | None] | None = None,
 ) -> tuple[
@@ -193,7 +198,11 @@ def _build_owner_tool_state(
     OwnerMcpSnapshot | CompositeMcpSnapshot,
     list[dict[str, Any]],
 ]:
-    device_targets = {device.name: device.id for device in devices}
+    attachment_targets = attachment_targets or {}
+    device_targets, device_sites = fence_owner_device_targets(
+        {device.name: device.id for device in devices},
+        attachment_targets,
+    )
     owner_authority = [
         OwnerMcpDevice(
             device_id=device.id,
@@ -201,7 +210,7 @@ def _build_owner_tool_state(
             config_revision=device.config_revision,
             catalog=device.mcp_catalog,
         )
-        for device in devices
+        for device in _attachment_fenced_devices(devices, attachment_targets)
     ]
     mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
     if server_envelope is None:
@@ -217,10 +226,22 @@ def _build_owner_tool_state(
             runtime_generations=runtime_generations,
         )
     registry_schemas = tool_registry.get_tool_schemas(
-        device_names=device_targets.keys(),
+        device_names=device_sites,
         mcp_snapshot=mcp_snapshot,
     )
     return device_targets, mcp_snapshot, registry_schemas
+
+
+def _attachment_fenced_devices(
+    devices: Sequence[OwnerDeviceSnapshot],
+    attachment_targets: Mapping[str, UUID | None],
+) -> tuple[OwnerDeviceSnapshot, ...]:
+    return tuple(
+        device
+        for device in devices
+        if device.name not in attachment_targets
+        or attachment_targets[device.name] == device.id
+    )
 
 
 _UNHANDLED_PROVIDER_FAILURE = _UnhandledProviderFailure()
@@ -968,6 +989,9 @@ class ChatRuntime:
                 raise StaleCompactionSelectionError(
                     "Captured pending rows changed before preflight"
                 )
+            attachment_targets = build_device_attachment_targets(
+                [*active_rows, *pending_rows]
+            )
             system, prospective_messages = await build_provider_context(
                 db,
                 session_id=turn.session_id,
@@ -976,7 +1000,10 @@ class ChatRuntime:
                 workspace_service=self.workspace_service,
                 skills_cache=self.skills_cache,
                 device_registry=self.device_registry,
-                device_snapshot=owner_devices,
+                device_snapshot=_attachment_fenced_devices(
+                    owner_devices,
+                    attachment_targets,
+                ),
             )
             prospective_messages.extend(
                 {
@@ -993,6 +1020,7 @@ class ChatRuntime:
         device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
             owner_devices,
             tool_registry=self.tool_registry,
+            attachment_targets=attachment_targets,
             server_envelope=server_envelope,
             runtime_generations=(
                 self._server_mcp_generation_resolver(server_envelope)
@@ -1069,6 +1097,23 @@ class ChatRuntime:
                     db,
                     user_id=user_id,
                 )
+                provider_visible_rows = list(
+                    (
+                        await db.execute(
+                            select(Message)
+                            .where(
+                                Message.session_id == turn.session_id,
+                                Message.is_compacted.is_(False),
+                            )
+                            .order_by(Message.created_at, Message.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                attachment_targets = build_device_attachment_targets(
+                    provider_visible_rows
+                )
                 system, provider_messages = await build_provider_context(
                     db,
                     session_id=turn.session_id,
@@ -1076,11 +1121,15 @@ class ChatRuntime:
                     workspace_service=self.workspace_service,
                     skills_cache=self.skills_cache,
                     device_registry=self.device_registry,
-                    device_snapshot=owner_devices,
+                    device_snapshot=_attachment_fenced_devices(
+                        owner_devices,
+                        attachment_targets,
+                    ),
                 )
             device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
                 owner_devices,
                 tool_registry=self.tool_registry,
+                attachment_targets=attachment_targets,
                 server_envelope=server_envelope,
                 runtime_generations=(
                     self._server_mcp_generation_resolver(server_envelope)

@@ -388,6 +388,86 @@ async def test_same_session_overlap_is_durable_and_drains(
     await runtime.close()
 
 
+async def test_queued_client_attachment_fences_a_same_name_replacement(
+    user_client,
+    test_app,
+    pg_engine,
+    monkeypatch,
+) -> None:
+    await _configure_provider(pg_engine)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    provider = FakeProvider(
+        [
+            FakeStep(
+                started=started,
+                release=release,
+                content=[{"type": "text", "text": "first answer"}],
+            ),
+            FakeStep(content=[{"type": "text", "text": "second answer"}]),
+        ]
+    )
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    prepared_targets: list[dict[str, UUID]] = []
+    prepared_systems: list[str] = []
+    original_prepare = runtime._prepare_turn
+
+    async def capture_prepared_targets(turn: TurnStart):
+        prepared = await original_prepare(turn)
+        prepared_targets.append(dict(prepared.device_targets))
+        prepared_systems.append(prepared.system)
+        return prepared
+
+    monkeypatch.setattr(runtime, "_prepare_turn", capture_prepared_targets)
+    session_id = uuid4()
+    first_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [{"type": "text", "text": "first"}], "attachments": []},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    created = await user_client.post(
+        "/api/devices",
+        json={"name": "Laptop", "workspace_path": "~/openoctopus/workspace"},
+    )
+    assert created.status_code == 201
+    attached_device_id = created.json()["device"]["id"]
+    attachment_ref = {
+        "openoctopus_device": "laptop",
+        "device_id": attached_device_id,
+        "path": "documents/report.pdf",
+    }
+    second_task = asyncio.create_task(
+        user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [], "attachments": [attachment_ref]},
+        )
+    )
+    pending = await _wait_for_pending(user_client, str(session_id), 1)
+    assert pending["pending_messages"][0]["attachment_refs"] == [attachment_ref]
+    assert pending["pending_messages"][0]["content"] == []
+
+    deleted = await user_client.delete("/api/devices/laptop")
+    assert deleted.status_code == 204
+    replacement = await user_client.post(
+        "/api/devices",
+        json={"name": "Laptop", "workspace_path": "~/replacement"},
+    )
+    assert replacement.status_code == 201
+    assert replacement.json()["device"]["id"] != attached_device_id
+
+    release.set()
+    first_response, second_response = await asyncio.gather(first_task, second_task)
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert prepared_targets[-1] == {"laptop": UUID(attached_device_id)}
+    assert "workspace_root: ~/replacement" not in prepared_systems[-1]
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["messages"][2]["attachment_refs"] == [attachment_ref]
+    await runtime.close()
+
+
 async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
     user_client,
     pg_engine,
@@ -1052,10 +1132,162 @@ async def test_server_workspace_attachment_is_persisted_and_sent_to_provider(
     }
     assert provider.calls[0]["messages"][0]["content"][1:] == [marker]
     history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
-    assert history["messages"][0]["content"] == [marker]
+    assert history["messages"][0]["content"] == []
     workspace_service.read.assert_awaited_once()
     workspace_service.read_with_metadata.assert_not_awaited()
     await runtime.close()
+
+
+async def test_client_attachment_is_persisted_without_fetching_or_copying_bytes(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    created = await user_client.post(
+        "/api/devices",
+        json={"name": "Laptop CN", "workspace_path": "~/openoctopus/workspace"},
+    )
+    assert created.status_code == 201
+    device = created.json()["device"]
+    provider = FakeProvider([FakeStep(content=[{"type": "text", "text": "done"}])])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+    session_id = uuid4()
+    attachment_ref = {
+        "openoctopus_device": "laptop-cn",
+        "device_id": device["id"],
+        "path": "documents/report.pdf",
+    }
+
+    response = await user_client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [], "attachments": [attachment_ref]},
+    )
+
+    assert response.status_code == 200, response.text
+    marker = {
+        "type": "text",
+        "text": (
+            "User attached existing file from device='laptop-cn', "
+            'path="documents/report.pdf". Use read_file on that device to inspect it.'
+        ),
+    }
+    assert provider.calls[0]["messages"][0]["content"][1:] == [marker]
+    assert "attachment_refs" not in json.dumps(
+        [call["messages"] for call in provider.calls]
+    )
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["messages"][0]["content"] == []
+    assert history["messages"][0]["attachment_refs"] == [attachment_ref]
+    assert history["messages"][1]["attachment_refs"] == []
+    workspace_service.read.assert_not_awaited()
+    workspace_service.read_with_metadata.assert_not_awaited()
+    await runtime.close()
+
+
+async def test_client_attachment_identity_must_match_an_owned_device(
+    user_client,
+    test_app,
+    pg_engine,
+):
+    await _configure_provider(pg_engine)
+    created = await user_client.post(
+        "/api/devices",
+        json={"name": "Laptop CN", "workspace_path": "~/openoctopus/workspace"},
+    )
+    assert created.status_code == 201
+    device = created.json()["device"]
+    workspace_service = AsyncMock(spec=WorkspaceService)
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace_service
+
+    for attachment in (
+        {
+            "openoctopus_device": "laptop-cn",
+            "device_id": str(uuid4()),
+            "path": "report.pdf",
+        },
+        {
+            "openoctopus_device": "renamed-laptop",
+            "device_id": device["id"],
+            "path": "report.pdf",
+        },
+    ):
+        session_id = uuid4()
+        response = await user_client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": [], "attachments": [attachment]},
+        )
+        assert response.status_code == 409
+        assert response.json()["code"] == "tool_device_unreachable"
+        assert (await user_client.get(f"/api/sessions/{session_id}/messages")).status_code == 404
+
+    workspace_service.read.assert_not_awaited()
+    workspace_service.read_with_metadata.assert_not_awaited()
+
+
+async def test_pending_attachment_refs_survive_promotion(
+    user_client,
+    pg_engine,
+) -> None:
+    del user_client
+    now = datetime.now(UTC)
+    session_id = uuid4()
+    turn_id = uuid4()
+    pending_id = uuid4()
+    device_id = uuid4()
+    attachment_ref = {
+        "openoctopus_device": "laptop-cn",
+        "device_id": str(device_id),
+        "path": "documents/report.pdf",
+    }
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = (await db.execute(select(User).where(User.email == "user@test.com"))).scalar_one()
+        session = Session(
+            id=session_id,
+            user_id=user.id,
+            session_key=f"web:{session_id}",
+            channel="web",
+            chat_id=str(session_id),
+            title="New chat",
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        db.add_all(
+            [
+                TurnRun(
+                    id=turn_id,
+                    session_id=session_id,
+                    runner_instance_id=uuid4(),
+                    status="running",
+                    started_at=now,
+                ),
+                PendingMessage(
+                    id=pending_id,
+                    session_id=session_id,
+                    user_id=user.id,
+                    session_key=session.session_key,
+                    content=[{"type": "text", "text": "attached"}],
+                    attachment_refs=[attachment_ref],
+                    received_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=turn_id,
+            message_ids=(pending_id,),
+            effort=None,
+        )
+
+        await promote_pending_for_turn(db, turn=turn)
+        promoted = await db.get(Message, pending_id)
+
+    assert promoted is not None
+    assert promoted.attachment_refs == [attachment_ref]
 
 
 async def test_attachment_resolution_failure_precedes_message_persistence(

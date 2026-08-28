@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.protocol import ToolResultFrame, new_uuid7
@@ -123,4 +123,30 @@ async def test_unknown_or_other_users_device_is_reported_as_unreachable(
 
     assert response.status_code == 409
     assert response.json()["code"] == "tool_device_unreachable"
+    assert registry.calls == []
+
+
+async def test_device_directory_picker_fences_name_with_immutable_id(
+    test_app: Any,
+    user_client: Any,
+) -> None:
+    registry = _WorkspaceRegistry()
+    registry.release.set()
+    test_app.dependency_overrides[get_device_registry] = lambda: registry
+    created = await user_client.post(
+        "/api/devices",
+        json={"name": "laptop", "workspace_path": "/tmp/workspace"},
+    )
+    assert created.status_code == 201
+
+    stale = await user_client.get(
+        "/api/workspace/list/subdir",
+        params={
+            "openoctopus_device": "laptop",
+            "openoctopus_device_id": str(uuid4()),
+        },
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "tool_device_unreachable"
     assert registry.calls == []

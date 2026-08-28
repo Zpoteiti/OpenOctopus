@@ -91,12 +91,46 @@ def test_message_openapi_describes_user_input_and_ndjson_response() -> None:
         "/UserContentBlock"
     )
     assert request["properties"]["attachments"]["maxItems"] == 10
+    attachment = runtime["components"]["schemas"]["MessageAttachmentRef"]
+    assert attachment["anyOf"] == [
+        {"$ref": "#/components/schemas/ServerMessageAttachmentRef"},
+        {"$ref": "#/components/schemas/ClientMessageAttachmentRef"},
+    ]
+    server_attachment = runtime["components"]["schemas"]["ServerMessageAttachmentRef"]
+    client_attachment = runtime["components"]["schemas"]["ClientMessageAttachmentRef"]
+    assert set(server_attachment["required"]) == {"openoctopus_device", "path"}
+    assert "device_id" not in server_attachment["properties"]
+    assert set(client_attachment["required"]) == {
+        "openoctopus_device",
+        "device_id",
+        "path",
+    }
+    assert client_attachment["properties"]["openoctopus_device"]["not"] == {
+        "enum": ["server"]
+    }
     assert request["anyOf"] == [
         {"properties": {"content": {"minItems": 1}}},
         {"properties": {"attachments": {"minItems": 1}}},
     ]
     assert set(response_content) == {"application/x-ndjson"}
     assert response_content["application/x-ndjson"]["schema"]["type"] == "string"
+    assert "409" in post["responses"]
+
+
+def test_attachment_refs_are_required_in_public_message_schemas() -> None:
+    schemas = create_app().openapi()["components"]["schemas"]
+
+    assert "attachment_refs" in schemas["MessageResponse"]["required"]
+    assert "attachment_refs" in schemas["PendingMessageResponse"]["required"]
+
+
+def test_device_directory_picker_openapi_accepts_immutable_device_id() -> None:
+    route = create_app().openapi()["paths"]["/api/workspace/list/{path}"]["get"]
+
+    assert any(
+        parameter["name"] == "openoctopus_device_id"
+        for parameter in route["parameters"]
+    )
 
 
 def test_messages_response_runtime_schema_is_structured() -> None:
@@ -142,6 +176,13 @@ def test_static_effort_enum_keeps_off_as_a_string() -> None:
     effort = _static_openapi()["components"]["schemas"]["Effort"]
     assert "off" in effort["enum"]
     assert False not in effort["enum"]
+
+
+def test_static_client_attachment_ref_excludes_server_device_name() -> None:
+    attachment = _static_openapi()["components"]["schemas"]["MessageAttachmentRef"]
+    client_name = attachment["oneOf"][1]["properties"]["openoctopus_device"]
+
+    assert client_name["not"] == {"enum": ["server"]}
 
 
 def test_runtime_validation_responses_match_stable_error_envelope() -> None:

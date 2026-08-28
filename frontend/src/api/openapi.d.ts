@@ -683,15 +683,20 @@ export interface paths {
                          */
                         content: components["schemas"]["UserContentBlock"][];
                         /**
-                         * @description References to existing files in the authenticated user's
-                         *     Server workspace. Upload bytes first through the workspace
-                         *     file API, then send the original virtual path here. The
-                         *     message API never moves, copies, or deletes the file.
+                         * @description References to existing files. `openoctopus_device=server`
+                         *     addresses the authenticated user's personal or accessible
+                         *     shared Server Workspace; upload browser-local bytes through
+                         *     the Workspace file API before sending that ref. A paired
+                         *     Device ref carries both its current name and immutable UUID.
                          *
-                         *     Non-image files add a path marker so the agent can inspect
-                         *     them with workspace tools. JPEG, PNG, GIF, and WebP files
-                         *     also add a base64 image snapshot. At most 8 MiB of image
-                         *     bytes may be expanded across one request.
+                         *     Server files are validated during this request. Non-image
+                         *     Server files add a path marker, while JPEG, PNG, GIF, and
+                         *     WebP files also add a base64 image snapshot, within the
+                         *     aggregate 8 MiB limit. Client refs add a provider-visible
+                         *     path marker but do not read, copy, or upload Client bytes;
+                         *     the agent later uses `read_file` on that Device. The
+                         *     normalized refs are returned as provider-hidden
+                         *     `attachment_refs` in pending and canonical history.
                          */
                         attachments: components["schemas"]["MessageAttachmentRef"][];
                     } | {
@@ -722,10 +727,10 @@ export interface paths {
                 /**
                  * @description Session id is not a valid UUID, session is not browser-writable,
                  *     JSON/content shape is invalid, or an image block is malformed.
-                 *     Attachment paths must resolve inside the authenticated user's
-                 *     Server workspace and supported attachment images must fit the
-                 *     aggregate 8 MiB expansion limit. If present, `effort` must be
-                 *     `null` or one of `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
+                 *     Server attachment paths must resolve inside an accessible Server
+                 *     Workspace and supported attachment images must fit the aggregate
+                 *     8 MiB expansion limit. If present, `effort` must be `null` or one
+                 *     of `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
                  */
                 400: {
                     headers: {
@@ -746,6 +751,15 @@ export interface paths {
                 };
                 /** @description Session id exists for another user, or an attachment workspace/file does not exist. */
                 404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description A Client attachment name and immutable device id no longer identify the same owned Device (`tool_device_unreachable`). */
+                409: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -1752,6 +1766,13 @@ export interface paths {
                  *     `tool_device_unreachable` rather than disappearing from the contract.
                  */
                 openoctopus_device: components["parameters"]["OpenOctopusDevice"];
+                /**
+                 * @description Optional immutable paired-Device identity. Remote attachment pickers
+                 *     supply the id captured with the selected Device name; name/UUID drift
+                 *     returns `tool_device_unreachable` before WebSocket I/O. Omit for
+                 *     `openoctopus_device=server`.
+                 */
+                openoctopus_device_id?: string;
                 /** @description Recursively list all files (default false). */
                 recursive?: boolean;
                 /** @description Maximum entries to return. */
@@ -1777,6 +1798,13 @@ export interface paths {
                      *     `tool_device_unreachable` rather than disappearing from the contract.
                      */
                     openoctopus_device: components["parameters"]["OpenOctopusDevice"];
+                    /**
+                     * @description Optional immutable paired-Device identity. Remote attachment pickers
+                     *     supply the id captured with the selected Device name; name/UUID drift
+                     *     returns `tool_device_unreachable` before WebSocket I/O. Omit for
+                     *     `openoctopus_device=server`.
+                     */
+                    openoctopus_device_id?: string;
                     /** @description Recursively list all files (default false). */
                     recursive?: boolean;
                     /** @description Maximum entries to return. */
@@ -1805,7 +1833,7 @@ export interface paths {
                 400: components["responses"]["BadRequest"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description Paired device is offline (`tool_device_unreachable`). */
+                /** @description Paired device is offline or its name/UUID identity no longer matches (`tool_device_unreachable`). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -3475,10 +3503,17 @@ export interface components {
              *     to display them. `thinking.signature` and raw
              *     `redacted_thinking.data` are omitted from public responses. For
              *     `message_kind=human`, the exact server-generated first
-             *     `<runtime>` text block is also omitted from this public projection;
-             *     stored/provider content is unchanged.
+             *     `<runtime>` text block and exact provider-only attachment marker
+             *     blocks represented by `attachment_refs` are also omitted from this
+             *     public projection; stored/provider content is unchanged.
              */
             content: components["schemas"]["ContentBlock"][];
+            /**
+             * @description Normalized browser attachment references captured with the human
+             *     message. This API sidecar is not sent to the Provider; the path
+             *     marker in `content` remains provider-visible.
+             */
+            attachment_refs: components["schemas"]["MessageAttachmentRef"][];
             /**
              * @description API-only user-visible delivery references produced by the
              *     `message` tool. These refs are not part of provider replay.
@@ -3501,10 +3536,16 @@ export interface components {
             /**
              * @description Sanitized Anthropic user content blocks that will later become the
              *     `messages.content` value for the drained human message. The exact
-             *     server-generated first `<runtime>` text block is omitted from this
-             *     public projection; the pending database row retains it.
+             *     server-generated first `<runtime>` text block and exact provider-only
+             *     attachment marker blocks represented by `attachment_refs` are omitted
+             *     from this public projection; the pending database row retains them.
              */
             content: components["schemas"]["ContentBlock"][];
+            /**
+             * @description Provider-hidden normalized refs that move unchanged to the
+             *     canonical human Message at the next safe-boundary promotion.
+             */
+            attachment_refs: components["schemas"]["MessageAttachmentRef"][];
             /** @description Pending per-turn thinking effort, if supplied. */
             effort?: components["schemas"]["Effort"] | null;
             /** Format: date-time */
@@ -3716,17 +3757,26 @@ export interface components {
                 data: string;
             };
         };
+        /**
+         * @description Provider-hidden browser attachment identity. Server and shared
+         *     Workspace refs are durable paths. Client refs are live pointers fenced
+         *     by an immutable owned Device id; accepting one does not read or copy
+         *     Client bytes.
+         */
         MessageAttachmentRef: {
-            /**
-             * @description Browser attachment refs currently target only the authenticated
-             *     user's built-in Server workspace.
-             * @enum {string}
-             */
+            /** @enum {string} */
             openoctopus_device: "server";
+            /** @description Existing personal or shared Server Workspace path. */
+            path: string;
+        } | {
+            /** @description Owned paired-Device name captured by the picker. */
+            openoctopus_device: string;
             /**
-             * @description Existing virtual workspace path. The message keeps this original
-             *     path and does not move, copy, rename, or delete the object.
+             * Format: uuid
+             * @description Immutable owned Device identity captured with the name.
              */
+            device_id: string;
+            /** @description Client path passed later to the Device `read_file` tool. */
             path: string;
         };
         /**

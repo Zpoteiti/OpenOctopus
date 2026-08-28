@@ -25,11 +25,34 @@ type UserContentBlock = Annotated[
 ]
 
 
-class MessageAttachmentRef(BaseModel):
+class ServerMessageAttachmentRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     openoctopus_device: Literal["server"]
     path: str = Field(min_length=1, max_length=4096)
+
+
+class ClientMessageAttachmentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    openoctopus_device: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        json_schema_extra={"not": {"enum": ["server"]}},
+    )
+    device_id: UUID
+    path: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("openoctopus_device")
+    @classmethod
+    def reject_server_name(cls, value: str) -> str:
+        if value == "server":
+            raise ValueError("Client attachment refs must not use the server device name")
+        return value
+
+
+type MessageAttachmentRef = ServerMessageAttachmentRef | ClientMessageAttachmentRef
 
 
 class PostMessageRequest(BaseModel):
@@ -126,6 +149,7 @@ class MessageResponse(BaseModel):
         "compaction_summary",
     ]
     content: list[ContentBlock]
+    attachment_refs: list[MessageAttachmentRef]
     delivery_refs: list[DeliveryRefResponse]
     is_compacted: bool
     created_at: datetime
@@ -137,6 +161,7 @@ class PendingMessageResponse(BaseModel):
     id: UUID
     session_id: UUID
     content: list[ContentBlock]
+    attachment_refs: list[MessageAttachmentRef]
     effort: Effort | None
     received_at: datetime
 

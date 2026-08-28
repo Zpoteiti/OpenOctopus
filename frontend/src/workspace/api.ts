@@ -26,20 +26,21 @@ export function listDevices(): Promise<Device[]> {
 export async function listDirectory(
   path: string,
   device: string,
+  deviceId?: string,
 ): Promise<ListDirEntryPage> {
   let offset = 0
   const seenOffsets = new Set([offset])
-  let page = await directoryPage(path, device, offset)
+  let page = await directoryPage(path, device, deviceId, offset)
   const items = [...page.items]
 
-  while (!page.truncated && page.next_offset !== null) {
+  while (page.next_offset !== null) {
     const nextOffset = page.next_offset
     if (nextOffset <= offset || seenOffsets.has(nextOffset)) {
       throw new ApiError(502, 'request_failed', 'Directory pagination did not advance')
     }
     offset = nextOffset
     seenOffsets.add(offset)
-    page = await directoryPage(path, device, offset)
+    page = await directoryPage(path, device, deviceId, offset)
     items.push(...page.items)
   }
 
@@ -52,9 +53,17 @@ export async function listDirectory(
   }
 }
 
-function directoryPage(path: string, device: string, offset: number): Promise<ListDirEntryPage> {
+function directoryPage(
+  path: string,
+  device: string,
+  deviceId: string | undefined,
+  offset: number,
+): Promise<ListDirEntryPage> {
+  const deviceFence = deviceId
+    ? `&openoctopus_device_id=${encodeURIComponent(deviceId)}`
+    : ''
   return apiJson(
-    `${workspacePathUrl('/api/workspace/list', path)}?openoctopus_device=${encodeURIComponent(device)}&recursive=false&limit=${DIRECTORY_PAGE_LIMIT}&offset=${offset}`,
+    `${workspacePathUrl('/api/workspace/list', path)}?openoctopus_device=${encodeURIComponent(device)}${deviceFence}&recursive=false&limit=${DIRECTORY_PAGE_LIMIT}&offset=${offset}`,
   )
 }
 

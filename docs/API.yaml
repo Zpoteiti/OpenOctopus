@@ -30,7 +30,7 @@ info:
     | `apply_patch` | `POST /api/workspace/patch` | Query: required `openoctopus_device`; body mirrors nanobot apply_patch args |
     | `delete_file` | `DELETE /api/workspace/files/{path}` | Query: required `openoctopus_device`; always allowed for quota release |
     | `delete_folder` | `DELETE /api/workspace/folders/{path}` | Query: required `openoctopus_device`; recursive, no flag |
-    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`, recursive, limit, offset |
+    | `list_dir` | `GET /api/workspace/list/{path}` | Query: required `openoctopus_device`; optional `openoctopus_device_id`, recursive, limit, offset |
     | `find_files` | `GET /api/workspace/find-files` | Query: required `openoctopus_device`; query/glob/type/include_dirs/sort/limit/offset |
     | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
     | `notebook_edit` | — | Agent-only in Py6; no REST equivalent |
@@ -563,15 +563,20 @@ paths:
                   type: array
                   maxItems: 10
                   description: |
-                    References to existing files in the authenticated user's
-                    Server workspace. Upload bytes first through the workspace
-                    file API, then send the original virtual path here. The
-                    message API never moves, copies, or deletes the file.
+                    References to existing files. `openoctopus_device=server`
+                    addresses the authenticated user's personal or accessible
+                    shared Server Workspace; upload browser-local bytes through
+                    the Workspace file API before sending that ref. A paired
+                    Device ref carries both its current name and immutable UUID.
 
-                    Non-image files add a path marker so the agent can inspect
-                    them with workspace tools. JPEG, PNG, GIF, and WebP files
-                    also add a base64 image snapshot. At most 8 MiB of image
-                    bytes may be expanded across one request.
+                    Server files are validated during this request. Non-image
+                    Server files add a path marker, while JPEG, PNG, GIF, and
+                    WebP files also add a base64 image snapshot, within the
+                    aggregate 8 MiB limit. Client refs add a provider-visible
+                    path marker but do not read, copy, or upload Client bytes;
+                    the agent later uses `read_file` on that Device. The
+                    normalized refs are returned as provider-hidden
+                    `attachment_refs` in pending and canonical history.
                   items: { $ref: '#/components/schemas/MessageAttachmentRef' }
               required: [content, attachments]
               anyOf:
@@ -597,16 +602,19 @@ paths:
           description: |
             Session id is not a valid UUID, session is not browser-writable,
             JSON/content shape is invalid, or an image block is malformed.
-            Attachment paths must resolve inside the authenticated user's
-            Server workspace and supported attachment images must fit the
-            aggregate 8 MiB expansion limit. If present, `effort` must be
-            `null` or one of `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
+            Server attachment paths must resolve inside an accessible Server
+            Workspace and supported attachment images must fit the aggregate
+            8 MiB expansion limit. If present, `effort` must be `null` or one
+            of `off`, `low`, `medium`, `high`, `xhigh`, or `max`.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: Session id exists for another user, or an attachment workspace/file does not exist.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '403':
           description: The user cannot read a referenced shared-workspace attachment.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: A Client attachment name and immutable device id no longer identify the same owned Device (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: The Provider is not configured, or attachment storage is unavailable.
@@ -1176,6 +1184,15 @@ paths:
         description: Directory path on the target `openoctopus_device`, with the same resolution rules as `/api/workspace/files/{path}`.
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
+      - name: openoctopus_device_id
+        in: query
+        required: false
+        schema: { type: string, format: uuid }
+        description: |
+          Optional immutable paired-Device identity. Remote attachment pickers
+          supply the id captured with the selected Device name; name/UUID drift
+          returns `tool_device_unreachable` before WebSocket I/O. Omit for
+          `openoctopus_device=server`.
       - { name: recursive, in: query, required: false, schema: { type: boolean, default: false }, description: 'Recursively list all files (default false).' }
       - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }, description: 'Maximum entries to return.' }
       - { name: offset, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 }, description: 'Skip the first N matching entries.' }
@@ -1192,7 +1209,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Paired device is offline (`tool_device_unreachable`).
+          description: Paired device is offline or its name/UUID identity no longer matches (`tool_device_unreachable`).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/workspace/find-files:
@@ -2277,7 +2294,7 @@ components:
 
     Message:
       type: object
-      required: [id, session_id, role, message_kind, is_compacted, content, delivery_refs, created_at]
+      required: [id, session_id, role, message_kind, is_compacted, content, attachment_refs, delivery_refs, created_at]
       properties:
         id: { type: string }
         session_id: { type: string }
@@ -2311,8 +2328,16 @@ components:
             to display them. `thinking.signature` and raw
             `redacted_thinking.data` are omitted from public responses. For
             `message_kind=human`, the exact server-generated first
-            `<runtime>` text block is also omitted from this public projection;
-            stored/provider content is unchanged.
+            `<runtime>` text block and exact provider-only attachment marker
+            blocks represented by `attachment_refs` are also omitted from this
+            public projection; stored/provider content is unchanged.
+        attachment_refs:
+          type: array
+          items: { $ref: '#/components/schemas/MessageAttachmentRef' }
+          description: |
+            Normalized browser attachment references captured with the human
+            message. This API sidecar is not sent to the Provider; the path
+            marker in `content` remains provider-visible.
         delivery_refs:
           type: array
           items: { $ref: '#/components/schemas/MessageDeliveryRef' }
@@ -2323,7 +2348,7 @@ components:
 
     PendingMessage:
       type: object
-      required: [id, session_id, content, received_at]
+      required: [id, session_id, content, attachment_refs, received_at]
       description: |
         Durable user message accepted while the session runner is active but
         not yet visible to provider replay. On safe-boundary drain, this row is
@@ -2338,8 +2363,15 @@ components:
           description: |
             Sanitized Anthropic user content blocks that will later become the
             `messages.content` value for the drained human message. The exact
-            server-generated first `<runtime>` text block is omitted from this
-            public projection; the pending database row retains it.
+            server-generated first `<runtime>` text block and exact provider-only
+            attachment marker blocks represented by `attachment_refs` are omitted
+            from this public projection; the pending database row retains them.
+        attachment_refs:
+          type: array
+          items: { $ref: '#/components/schemas/MessageAttachmentRef' }
+          description: |
+            Provider-hidden normalized refs that move unchanged to the
+            canonical human Message at the next safe-boundary promotion.
         effort:
           allOf:
             - $ref: '#/components/schemas/Effort'
@@ -2600,23 +2632,42 @@ components:
                 data: { type: string }
 
     MessageAttachmentRef:
-      type: object
-      required: [openoctopus_device, path]
-      additionalProperties: false
-      properties:
-        openoctopus_device:
-          type: string
-          enum: [server]
-          description: |
-            Browser attachment refs currently target only the authenticated
-            user's built-in Server workspace.
-        path:
-          type: string
-          minLength: 1
-          maxLength: 4096
-          description: |
-            Existing virtual workspace path. The message keeps this original
-            path and does not move, copy, rename, or delete the object.
+      description: |
+        Provider-hidden browser attachment identity. Server and shared
+        Workspace refs are durable paths. Client refs are live pointers fenced
+        by an immutable owned Device id; accepting one does not read or copy
+        Client bytes.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [openoctopus_device, path]
+          properties:
+            openoctopus_device: { type: string, enum: [server] }
+            path:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              description: Existing personal or shared Server Workspace path.
+        - type: object
+          additionalProperties: false
+          required: [openoctopus_device, device_id, path]
+          properties:
+            openoctopus_device:
+              type: string
+              minLength: 1
+              maxLength: 64
+              pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+              not: { enum: [server] }
+              description: Owned paired-Device name captured by the picker.
+            device_id:
+              type: string
+              format: uuid
+              description: Immutable owned Device identity captured with the name.
+            path:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              description: Client path passed later to the Device `read_file` tool.
 
     MessageDeliveryRef:
       description: |

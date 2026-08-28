@@ -2,7 +2,9 @@ import { ApiError, apiJson } from '../api/client'
 import { parseNdjsonStream } from '../api/ndjson'
 import type { Effort, Session } from '../api/types'
 import i18n from '../i18n'
-import type { ChatMessage, MessageHistory } from './model'
+import type { ChatMessage, MessageAttachmentRef, MessageHistory } from './model'
+
+export type { MessageAttachmentRef } from './model'
 
 export type StreamEvent =
   | { type: 'message_accepted'; message_id: string; disposition: 'started' | 'queued'; created_session: boolean }
@@ -18,15 +20,9 @@ export type StreamEvent =
 export interface SendChatMessageOptions {
   sessionId: string
   text: string
-  files: File[]
+  attachments: MessageAttachmentRef[]
   effort?: Effort
-  idFactory: () => string
   onEvent: (event: StreamEvent) => void
-}
-
-interface MessageAttachmentRef {
-  openoctopus_device: 'server'
-  path: string
 }
 
 const MAX_ATTACHMENT_IMAGE_BYTES = 8 * 1024 * 1024
@@ -112,12 +108,16 @@ export function deleteSession(sessionId: string): Promise<undefined> {
 }
 
 export async function sendChatMessage(options: SendChatMessageOptions): Promise<void> {
-  const attachments = await uploadAttachments(options.files, options.idFactory)
+  if (options.attachments.length > 10) {
+    throw new Error(i18n.t('chat.tooManyAttachments', {
+      defaultValue: 'A message can include at most 10 attachments.',
+    }))
+  }
   const hasText = options.text.trim().length > 0
   const body = {
     ...(options.effort === undefined ? {} : { effort: options.effort }),
     content: hasText ? [{ type: 'text', text: options.text }] : [],
-    attachments,
+    attachments: options.attachments,
   }
 
   let response: Response
@@ -149,31 +149,22 @@ export async function sendChatMessage(options: SendChatMessageOptions): Promise<
   if (!accepted) throw ambiguousStreamError(false)
 }
 
-async function uploadAttachments(files: File[], idFactory: () => string): Promise<MessageAttachmentRef[]> {
-  if (files.length > 10) {
-    throw new Error(i18n.t('chat.tooManyAttachments', {
-      defaultValue: 'A message can include at most 10 attachments.',
-    }))
-  }
-  await validateAttachmentImages(files)
-  const refs: MessageAttachmentRef[] = []
-  for (const file of files) {
-    const path = `.attachments/uploads/${idFactory()}/${safeFilename(file.name)}`
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
-    await apiJson(`/api/workspace/files/${encodedPath}?openoctopus_device=server`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'If-None-Match': '*',
-      },
-      body: file,
-    })
-    refs.push({ openoctopus_device: 'server', path })
-  }
-  return refs
+export async function uploadBrowserAttachment(file: File, uploadId: string): Promise<MessageAttachmentRef> {
+  await validateBrowserAttachmentFiles([file])
+  const path = `.attachments/uploads/${uploadId}/${safeFilename(file.name)}`
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+  await apiJson(`/api/workspace/files/${encodedPath}?openoctopus_device=server`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'If-None-Match': '*',
+    },
+    body: file,
+  })
+  return { openoctopus_device: 'server', path }
 }
 
-async function validateAttachmentImages(files: File[]): Promise<void> {
+export async function validateBrowserAttachmentFiles(files: File[]): Promise<void> {
   let imageBytes = 0
   for (const file of files) {
     const header = new Uint8Array(await file.slice(0, 12).arrayBuffer())

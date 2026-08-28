@@ -86,7 +86,15 @@ Server Docker 镜像通过多阶段构建生成 `frontend/dist`。FastAPI 在所
 
 ### 6.3 附件
 
-浏览器先把文件通过 Workspace Files `PUT` 写入个人 Server Workspace 的 `.attachments/uploads/{uuid}/{safe_filename}`，新建时发送 `If-None-Match: *`；随后把 `{openoctopus_device: "server", path}` 传给消息 API。每条消息遵守 Server 的 10 个附件和图片总量限制。上传成功但消息发送失败时保留文件，用户可以重试；前端不偷偷删除用户 Workspace 内容。
+附件选择器提供三种来源：
+
+- 当前浏览器所在电脑：浏览器文件选择器读取本机文件，先通过 Workspace Files `PUT` 写入个人 Server Workspace 的 `.attachments/uploads/{uuid}/{safe_filename}`，新建时发送 `If-None-Match: *`；只有所有文件上传成功后才调用消息 API；
+- Server/共享 Workspace：使用 OpenOctopus 文件选择界面选择已有路径，直接发送 `{openoctopus_device: "server", path}`，不复制文件；
+- 已连接 Client：通过 `GET /api/workspace/list/{path}` 浏览远程文件，每次请求同时发送设备名称与 `openoctopus_device_id`；选中后发送 `{openoctopus_device, device_id, path}`，不把 Client 文件上传到 Server Workspace。
+
+Client 引用只表示当前在线文件。Server 在消息接收时验证用户、设备名称和不可变 UUID，但不读取 Client 字节；Agent 后续通过该设备的 `read_file` 操作文件。消息排队或 Server 重启后，持久化的引用继续以名称级 UUID fence 约束路由、Device MCP 与 System Prompt：名称被新设备复用时不允许读到或暴露替代设备；同名出现多个历史 UUID 时该名称暂时不可调用。Compaction 摘要不继承可操作附件引用。
+
+每条消息遵守 Server 的 10 个附件和 Server 图片总量限制。浏览器本机文件上传成功但消息发送失败时保留文件，用户可以重试；前端不偷偷删除用户 Workspace 内容。`attachment_refs` 用于恢复附件 UI，不与 `message` 工具产生的 `delivery_refs` 混用。
 
 ## 7. Workspace
 

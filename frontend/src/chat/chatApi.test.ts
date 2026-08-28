@@ -7,6 +7,7 @@ import {
   loadSessions,
   renameSession,
   sendChatMessage,
+  uploadBrowserAttachment,
   type StreamEvent,
 } from './chatApi'
 
@@ -120,7 +121,7 @@ describe('chat API', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
-  it('uploads browser attachments before posting their server-workspace refs', async () => {
+  it('uploads a browser attachment once and posts its ready ref without re-uploading on retry', async () => {
     const events: StreamEvent[] = []
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -140,12 +141,16 @@ describe('chat API', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
+    const attachment = await uploadBrowserAttachment(
+      new File(['data'], 'report.txt', { type: 'text/plain' }),
+      'file-id',
+    )
+
     await sendChatMessage({
       sessionId: 'session-1',
       text: 'summarize this',
-      files: [new File(['data'], 'report.txt', { type: 'text/plain' })],
+      attachments: [attachment],
       effort: 'high',
-      idFactory: () => 'file-id',
       onEvent: (event) => events.push(event),
     })
 
@@ -177,8 +182,7 @@ describe('chat API', () => {
     await sendChatMessage({
       sessionId: 'session-1',
       text: '  indented text\n',
-      files: [],
-      idFactory: () => 'unused',
+      attachments: [],
       onEvent: () => undefined,
     })
 
@@ -187,7 +191,7 @@ describe('chat API', () => {
     })
   })
 
-  it('rejects more than ten attachments before uploading any bytes', async () => {
+  it('rejects more than ten mixed attachment refs before posting', async () => {
     await i18n.changeLanguage('zh-CN')
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
@@ -195,26 +199,28 @@ describe('chat API', () => {
     await expect(sendChatMessage({
       sessionId: 'session-1',
       text: '',
-      files: Array.from({ length: 11 }, (_, index) => new File(['x'], `${index}.txt`)),
-      idFactory: () => 'file-id',
+      attachments: [
+        ...Array.from({ length: 10 }, (_, index) => ({
+          openoctopus_device: 'server' as const,
+          path: `${index}.txt`,
+        })),
+        { openoctopus_device: 'laptop-cn', device_id: 'device-1', path: 'remote.txt' },
+      ],
       onEvent: () => undefined,
     })).rejects.toThrow('每条消息最多上传 10 个附件')
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('rejects image bytes above the aggregate limit before uploading files', async () => {
+  it('rejects image bytes above the aggregate limit before uploading a browser selection', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     const header = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
     const padding = new Uint8Array(8 * 1024 * 1024 + 1 - header.byteLength)
 
-    await expect(sendChatMessage({
-      sessionId: 'session-1',
-      text: '',
-      files: [new File([header, padding], 'large.png', { type: 'image/png' })],
-      idFactory: () => 'file-id',
-      onEvent: () => undefined,
-    })).rejects.toThrow('8 MiB')
+    await expect(uploadBrowserAttachment(
+      new File([header, padding], 'large.png', { type: 'image/png' }),
+      'file-id',
+    )).rejects.toThrow('8 MiB')
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -233,13 +239,7 @@ describe('chat API', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    await sendChatMessage({
-      sessionId: 'session-1',
-      text: '',
-      files: [new File(['data'], '..')],
-      idFactory: () => 'file-id',
-      onEvent: () => undefined,
-    })
+    await uploadBrowserAttachment(new File(['data'], '..'), 'file-id')
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/workspace/files/.attachments/uploads/file-id/attachment?openoctopus_device=server')
   })
@@ -260,8 +260,7 @@ describe('chat API', () => {
     await expect(sendChatMessage({
       sessionId: 'session-1',
       text: 'hello',
-      files: [],
-      idFactory: () => 'unused',
+      attachments: [],
       onEvent: () => undefined,
     })).rejects.toEqual(expect.objectContaining({ accepted: false }))
     expect(fetchMock).toHaveBeenCalledTimes(1)

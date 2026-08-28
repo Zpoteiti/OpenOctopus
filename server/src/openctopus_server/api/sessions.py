@@ -7,7 +7,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.auth.dependencies import get_current_user
-from openctopus_server.chat.attachments import expand_server_workspace_attachments
+from openctopus_server.chat.attachments import (
+    expand_server_workspace_attachments,
+    normalize_browser_attachment_refs,
+)
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.engine import get_engine
 from openctopus_server.db.models import User
@@ -106,6 +109,7 @@ async def get_messages(
         400: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
     },
 )
@@ -124,6 +128,11 @@ async def post_message(
                 user_id=user.id,
                 session_id=session_id,
             )
+        attachment_refs = await normalize_browser_attachment_refs(
+            db,
+            user_id=user.id,
+            attachments=body.attachments,
+        )
         content = await expand_server_workspace_attachments(
             db,
             workspace_service=workspace_service,
@@ -138,6 +147,7 @@ async def post_message(
             user=user,
             session_id=session_id,
             content=content,
+            attachment_refs=attachment_refs,
             effort=body.effort,
             runner_instance_id=runtime.runner_instance_id,
         )

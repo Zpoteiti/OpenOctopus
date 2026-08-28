@@ -409,7 +409,7 @@ the actual model context window.
 **Decision:** When a channel adapter receives an inbound message with one or more attachment byte payloads, it writes those bytes to the server workspace and adds a text block per attachment: `"User uploaded file to device='server', path=\"<workspace path>\""`. This fires for **every** attachment regardless of MIME type:
 - **Images** — adapter adds the path-text block AND an Anthropic `image` block (base64 inline per ADR-059). After vision-strip retry, the path-text block remains so a non-VLM agent still knows the file exists.
 - **Non-image files** (PDFs, CSVs, audio, archives, anything else) — adapter adds the path-text block ONLY. M1f excludes `document` blocks and `/v1/files`, so non-image bytes never live inline in `messages.content`. The agent reaches them via `read_file` against the workspace path.
-- **Browser path correction** — M1d browser message attachments are refs to existing workspace files: the message API does not write or move bytes, but it still adds the marker for the referenced path and, for image refs, the base64 `image` block. M1f expands attachment refs to paired devices; offline device dereference fails with `device_unreachable`.
+- **Browser path correction** — browser message attachments are refs to existing files: the message API does not write or move Server Workspace bytes, but it still adds the marker for the referenced path and, for Server image refs, the base64 `image` block. ADR-135 expands refs to paired Devices without dereferencing Client bytes during POST; later `read_file` routing is fenced by the captured immutable Device identity.
 
 **Consequences:** Non-VLM agents can still reason about uploaded files structurally. VLM agents have redundancy on images (path + base64), which is fine. Non-image files have a single path of access (workspace `.attachments/`) — uniform model regardless of whether the LLM supports vision.
 
@@ -2848,6 +2848,9 @@ stale `online: true` after its failed push cleaned the registry.
 **Python-main clarification:** ADR-126 removes the stored `messages.role`
 column. `message_kind` remains authoritative and provider projection derives
 the Anthropic wire role.
+**Attachment revision:** ADR-135 supersedes M1f's synchronous paired-Device
+attachment read. Only Server Workspace images expand during POST; Client refs
+remain live identity-fenced paths for a later `read_file` call.
 **Context:** M1f adds the full agent execution loop, device-routed tool
 execution, and multimodal `read_file`. The OpenAI chat-completions bootstrap
 shape cannot represent Anthropic `thinking` / `redacted_thinking` cleanly and
@@ -2872,10 +2875,10 @@ not have.
 - Device wire `tool_result.content` accepts raw `string | blocks[]`; block
   arrays are limited to `text` and `image`. Persisted/provider-facing tool
   results normalize to block arrays with the ADR-095 warning first.
-- Remote image attachment expansion is synchronous in `POST /messages` and uses
-  the fixed `read_file` timeout budget. Structural validation rejects before
-  persistence, but runtime remote-read failures for known devices insert a
-  sanitized unavailable-marker text block instead of rejecting the user message.
+- Server Workspace image attachment expansion is synchronous in
+  `POST /messages`. ADR-135 replaces paired-Device expansion with a live
+  provider-visible path marker plus provider-hidden immutable identity; POST
+  never reads, copies, or snapshots Client bytes.
 - `file_transfer` remains in M1f scope after the core execution loop and must
   cover the documented copy/move success path plus disconnect failure path.
   Slot lifecycle and binary framing stay in `docs/PROTOCOL.md`; M1f adds no new
@@ -3865,6 +3868,61 @@ one recursive-directory child at a time; it adds no second byte pump or public
 wire surface. Cross-user routing fails closed before transfer frames. Resume,
 range, compression, durable directory jobs, and cross-worker bridge routing
 remain out of scope.
+
+---
+
+### ADR-135 · Browser attachments preserve three source identities and fence live Device reads
+
+**Status:** accepted (2026-08-28)
+
+**Context:** The browser can attach a file from its own operating-system picker,
+an existing Server/shared Workspace, or a connected Client. Browser-local bytes
+must finish uploading before a message is accepted. Existing Workspace files
+should not be copied, and a Client file should stay on the user's computer so
+the Agent reads it through that Client. A mutable Device name alone cannot
+distinguish the selected device from a later same-name replacement.
+
+**Decision:**
+
+- Browser-local files are uploaded first to the user's personal Server
+  Workspace `.attachments/uploads/...` path, then referenced as
+  `{openoctopus_device: "server", path}`. Existing personal/shared Workspace
+  paths use the same ref without a copy.
+- A Client ref is `{openoctopus_device, device_id, path}`. POST validates that
+  the exact name and UUID identify one Device owned by the caller, persists the
+  normalized ref, and adds a provider-visible path marker. It does not open the
+  Device connection, fetch bytes, inspect MIME, copy to RustFS, or retry a
+  future read.
+- `pending_messages.attachment_refs` moves unchanged to
+  `messages.attachment_refs` at the safe boundary. Both public pending/history
+  responses return this provider-hidden sidecar. It is distinct from
+  `delivery_refs`, which describes files produced by the Agent's `message`
+  tool. The marker inside stored `content` remains provider-visible so the Agent
+  knows which Device/path to pass to `read_file`, while public pending/history
+  projections omit that exact internal marker and render the sidecar instead.
+- Each Provider iteration aggregates Client attachment refs from all active
+  Message rows plus its captured Pending prefix into a name-level UUID fence.
+  One captured UUID overrides the current same-name Device target; multiple
+  captured UUIDs for one name remove that target while retaining the name in
+  fixed built-in tool schemas, so a call fails unavailable rather than reaching
+  a replacement. System-prompt Device metadata and Device MCP authority are
+  filtered by the same fence and never describe or expose the replacement.
+  This conservative rule intentionally may block a newly paired same-name Device
+  until the stale source is compacted.
+- A compacted source Message retains its sidecar for canonical history, while
+  the generated compaction summary receives no attachment refs. A summary is
+  ordinary text, not an inherited live capability; once source rows leave
+  Provider replay they no longer contribute to the routing fence.
+- Remote file browsing sends the optional `openoctopus_device_id` with
+  `GET /api/workspace/list/{path}`. The Server verifies name and UUID before any
+  WebSocket I/O, matching the existing fenced download route.
+
+**Consequences:** A queued message and a Server restart retain enough identity
+to prevent same-name replacement from redirecting Agent reads. Client content
+remains live and may legitimately become unavailable if the Device disconnects,
+renames, is deleted, or its file changes. OpenOctopus does not snapshot Client
+bytes, promise historical replay of those bytes, or attempt cross-platform path
+canonicalization on the Server.
 
 ---
 

@@ -730,6 +730,7 @@ async def list_directory(
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
     openoctopus_device: str = Query(..., min_length=1, max_length=64),
+    openoctopus_device_id: UUID | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: WorkspaceService = Depends(get_workspace_service),
@@ -747,6 +748,7 @@ async def list_directory(
             db,
             user=user,
             device_name=openoctopus_device,
+            expected_device_id=openoctopus_device_id,
             action=action,
             registry=registry,
         )
