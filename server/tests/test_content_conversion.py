@@ -223,6 +223,7 @@ async def test_two_real_conversions_fit_the_one_gibibyte_child_limit_concurrentl
         ("report.xlsx", _xlsx_bytes(), ("Summary 汇总", "Octopus", "章鱼", "|")),
         ("slides.pptx", _pptx_bytes(), ("Status 状态", "English and 中文", "读取文件", "|")),
     ],
+    ids=("xlsx", "pptx"),
 )
 async def test_office_tables_and_bilingual_text_are_preserved(
     path: str,

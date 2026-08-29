@@ -22,6 +22,17 @@ def _run(dispatcher: ClientToolDispatcher, name: str, **args: Any) -> ToolOutput
     return asyncio.run(dispatcher.execute(name, args))
 
 
+def _expected_canonical_path(path: Path) -> str:
+    resolved = path.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    try:
+        relative = resolved.relative_to(home)
+    except ValueError:
+        return str(resolved)
+    suffix = relative.as_posix()
+    return "~" if not suffix or suffix == "." else f"~/{suffix}"
+
+
 def _make_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -65,7 +76,7 @@ def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> N
         "ok": True,
         "operation": "edit_file",
         "requested_path": "notes/a.txt",
-        "canonical_path": str(workspace / "notes/a.txt"),
+        "canonical_path": _expected_canonical_path(workspace / "notes/a.txt"),
         "result": "edited",
         "replacements": 1,
         "size_bytes": len(b"three\nfour\n"),
@@ -82,7 +93,9 @@ def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> N
     assert patch_payload["operation"] == "apply_patch"
     assert patch_payload["dry_run"] is False
     assert patch_payload["edits"][0]["requested_path"] == "notes/a.txt"
-    assert patch_payload["edits"][0]["canonical_path"] == str(workspace / "notes/a.txt")
+    assert patch_payload["edits"][0]["canonical_path"] == _expected_canonical_path(
+        workspace / "notes/a.txt"
+    )
     assert (workspace / "notes/a.txt").read_text().endswith("five\n")
 
 
@@ -98,7 +111,7 @@ def test_file_mutation_result_returns_a_reusable_canonical_path(tmp_path: Path) 
         "ok": True,
         "operation": "write_file",
         "requested_path": "notes/a.txt",
-        "canonical_path": str(workspace / "notes/a.txt"),
+        "canonical_path": _expected_canonical_path(workspace / "notes/a.txt"),
         "bytes_written": 5,
     }
 
@@ -218,13 +231,13 @@ def test_delete_results_identify_the_reusable_target_path(tmp_path: Path) -> Non
         "ok": True,
         "operation": "delete_file",
         "requested_path": "file.txt",
-        "canonical_path": str(workspace / "file.txt"),
+        "canonical_path": _expected_canonical_path(workspace / "file.txt"),
     }
     assert json.loads(cast(str, deleted_folder.content)) == {
         "ok": True,
         "operation": "delete_folder",
         "requested_path": "folder",
-        "canonical_path": str(workspace / "folder"),
+        "canonical_path": _expected_canonical_path(workspace / "folder"),
     }
 
 
@@ -254,7 +267,9 @@ def test_discovery_grep_and_notebook_edit(tmp_path: Path) -> None:
     changed_payload = json.loads(cast(str, changed.content))
     assert changed_payload["operation"] == "notebook_edit"
     assert changed_payload["requested_path"] == "book.ipynb"
-    assert changed_payload["canonical_path"] == str(workspace / "book.ipynb")
+    assert changed_payload["canonical_path"] == _expected_canonical_path(
+        workspace / "book.ipynb"
+    )
     assert "x=2" in (workspace / "book.ipynb").read_text()
 
 

@@ -49,6 +49,7 @@ from openctopus_server.mcp.models import empty_server_mcp_envelope
 from openctopus_server.mcp.supervisor import ServerMcpSupervisor
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import ToolRegistry, _owned_mcp_route_resolver
+from openctopus_server.workspace.service import get_workspace_service
 from openctopus_server.workspace.storage import get_object_storage
 
 pytestmark = pytest.mark.skipif(
@@ -74,6 +75,11 @@ class _RemoteMcpProcess:
 
 class _HealthyObjectStorage:
     async def check_health(self) -> None:
+        return None
+
+
+class _RegistrationWorkspace:
+    async def write(self, *args: Any, **kwargs: Any) -> None:
         return None
 
 
@@ -450,6 +456,7 @@ async def test_real_server_mcp_admin_agent_shadow_drift_and_cleanup(
         app.state.server_mcp_supervisor = supervisor
         app.state.server_mcp_authority = authority
         app.dependency_overrides[get_object_storage] = lambda: _HealthyObjectStorage()
+        app.dependency_overrides[get_workspace_service] = lambda: _RegistrationWorkspace()
         oo_server, oo_task, oo_url, oo_listener = await _start_server(app)
 
         async with AsyncSession(pg_engine, expire_on_commit=False) as db:

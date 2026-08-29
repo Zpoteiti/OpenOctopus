@@ -663,6 +663,12 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
             jwt = auth["jwt"]
             user_id = UUID(auth["user"]["id"])
             headers = {"Authorization": f"Bearer {jwt}"}
+            registration_objects = dict(fake_rustfs.objects)
+            registration_write_counts = (
+                fake_rustfs.put_calls,
+                fake_rustfs.copy_calls,
+                fake_rustfs.remove_calls,
+            )
 
             async def create_device(name: str, workspace: Path) -> tuple[str, str, UUID]:
                 response = await http_client.post(
@@ -987,12 +993,12 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
                 destination_workspace / "changed-result.bin"
             ).read_bytes() == changed_original
 
-            assert fake_rustfs.objects == {}
-            assert (fake_rustfs.put_calls, fake_rustfs.copy_calls, fake_rustfs.remove_calls) == (
-                0,
-                0,
-                0,
-            )
+            assert fake_rustfs.objects == registration_objects
+            assert (
+                fake_rustfs.put_calls,
+                fake_rustfs.copy_calls,
+                fake_rustfs.remove_calls,
+            ) == registration_write_counts
             assert not list(source_workspace.glob(".*.openoctopus-*.tmp"))
             assert not list(destination_workspace.glob(".*.openoctopus-*.tmp"))
     finally:
