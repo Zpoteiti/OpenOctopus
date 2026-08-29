@@ -2613,7 +2613,7 @@ async def test_finalize_timeout_cleanup_preserves_cause_only_when_complete(
 
 @pytest.mark.asyncio
 async def test_idle_reserved_destination_cleanup_preserves_timeout_error(tmp_path: Path) -> None:
-    manager = _manager(tmp_path, idle_timeout_seconds=0.05)
+    manager = _manager(tmp_path)
     operation_id = _operation_id()
     manifest = _small_manifest()
     try:
@@ -2636,6 +2636,9 @@ async def test_idle_reserved_destination_cleanup_preserves_timeout_error(tmp_pat
             },
         )
         await _destination_status(manager, operation_id, started.expected_digest, {"reserved"})
+        record = manager._active[(UUID(operation_id), "destination")]
+        record.last_progress_at = time.monotonic() - manager._idle_timeout - 1
+        await manager._expire_idle_jobs()
         status = await _destination_status(
             manager,
             operation_id,
