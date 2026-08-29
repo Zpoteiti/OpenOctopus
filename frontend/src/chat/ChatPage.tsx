@@ -89,6 +89,7 @@ export function ChatPage({
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<DraftAttachment[]>([])
   const attachmentsRef = useRef<DraftAttachment[]>(attachments)
+  const attachmentTasks = useRef(new Map<string, Promise<void>>())
   const draftGeneration = useRef(0)
   const draftTransfer = useRef<{
     sessionId: string
@@ -123,7 +124,7 @@ export function ChatPage({
   const showingStream = streamSessionId !== null && streamSessionId === viewSessionId
   const sendingHere = sending && showingStream
   const visibleNotice = notice?.sessionId === viewSessionId ? notice.message : null
-  const attachmentsReady = attachments.every((attachment) => attachment.status === 'ready' && attachment.ref)
+  const attachmentsSendable = attachments.every(canSubmitDraftAttachment)
   const initiallyScrolledSession = useRef<string | null>(null)
   const followLatestSession = useRef<string | null>(null)
 
@@ -334,38 +335,72 @@ export function ChatPage({
     updateAttachments((current) => [...current, ...drafts])
     setNotice(null)
 
-    try {
-      await validateBrowserAttachmentFiles([...existingBrowserFiles, ...selectedFiles])
-    } catch (caught) {
-      if (generation !== draftGeneration.current) return
-      const draftIds = new Set(drafts.map((draft) => draft.id))
-      updateAttachments((current) => current.map((attachment) => draftIds.has(attachment.id)
-        ? { ...attachment, status: 'failed' }
-        : attachment))
-      setNotice({
-        sessionId: viewSessionId,
-        message: chatErrorMessage(caught, t('chat.attachmentUploadFailed', { defaultValue: 'The attachment could not be uploaded.' })),
-      })
-      return
-    }
-    if (generation !== draftGeneration.current) return
+    startBrowserAttachmentTask(drafts, [...existingBrowserFiles, ...selectedFiles], generation)
+  }
 
-    for (const draft of drafts) {
-      if (!attachmentsRef.current.some((attachment) => attachment.id === draft.id)) continue
-      void uploadBrowserAttachment(draft.file, draft.id)
-        .then((ref) => {
-          if (generation !== draftGeneration.current) return
-          updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
-            ? { ...attachment, status: 'ready', ref }
-            : attachment))
-        })
-        .catch(() => {
-          if (generation !== draftGeneration.current) return
-          updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
+  function startBrowserAttachmentTask(
+    drafts: DraftAttachment[],
+    filesToValidate: File[],
+    generation: number,
+  ): void {
+    const draftIds = new Set(drafts.map((draft) => draft.id))
+    updateAttachments((current) => current.map((attachment) => draftIds.has(attachment.id)
+      ? { ...attachment, status: 'uploading' }
+      : attachment))
+    const task = (async () => {
+      let failure: unknown
+      try {
+        await validateBrowserAttachmentFiles(filesToValidate)
+        if (generation !== draftGeneration.current) return
+        const results = await Promise.allSettled(drafts.map(async (draft) => {
+          if (!attachmentsRef.current.some((attachment) => attachment.id === draft.id)) return
+          try {
+            const ref = await uploadBrowserAttachment(draft.file, draft.id)
+            if (generation !== draftGeneration.current) return
+            updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
+              ? { ...attachment, status: 'ready', ref }
+              : attachment))
+          } catch (caught) {
+            if (generation === draftGeneration.current) {
+              updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
+                ? { ...attachment, status: 'failed' }
+                : attachment))
+            }
+            throw caught
+          }
+        }))
+        failure = results.find((result) => result.status === 'rejected')?.reason ?? null
+      } catch (caught) {
+        failure = caught
+        if (generation === draftGeneration.current) {
+          updateAttachments((current) => current.map((attachment) => draftIds.has(attachment.id)
             ? { ...attachment, status: 'failed' }
             : attachment))
+        }
+      }
+      if (failure && generation === draftGeneration.current) {
+        setNotice({
+          sessionId: activeViewSession.current,
+          message: chatErrorMessage(failure, t('chat.attachmentUploadFailed', {
+            defaultValue: 'The attachment could not be uploaded.',
+          })),
         })
-    }
+      }
+    })()
+    for (const draft of drafts) attachmentTasks.current.set(draft.id, task)
+    void task.finally(() => {
+      for (const draft of drafts) {
+        if (attachmentTasks.current.get(draft.id) === task) attachmentTasks.current.delete(draft.id)
+      }
+    })
+  }
+
+  async function waitForAttachmentTasks(draftIds: Set<string>): Promise<void> {
+    const tasks = [...new Set([...draftIds].flatMap((draftId) => {
+      const task = attachmentTasks.current.get(draftId)
+      return task ? [task] : []
+    }))]
+    await Promise.allSettled(tasks)
   }
 
   function addExistingAttachment(ref: MessageAttachmentRef): void {
@@ -392,34 +427,62 @@ export function ChatPage({
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     const currentAttachments = attachmentsRef.current
-    const currentAttachmentsReady = currentAttachments.every((attachment) => (
-      attachment.status === 'ready' && attachment.ref
-    ))
-    if (sending || !currentAttachmentsReady || (!text.trim() && currentAttachments.length === 0)) return
+    if (sending || !currentAttachments.every(canSubmitDraftAttachment) || (!text.trim() && currentAttachments.length === 0)) return
 
     const sentText = text
-    const sentDraftAttachments = currentAttachments
-    const sentAttachments = currentAttachments.flatMap((attachment) => attachment.ref ? [attachment.ref] : [])
+    let sentDraftAttachments = currentAttachments
+    let sentAttachments: MessageAttachmentRef[] = []
     const sentEffort = effort
     const targetSessionId = sessionId ?? idFactory()
     const isNewSession = sessionId === undefined
+    const attachmentGeneration = draftGeneration.current
+    const attachmentIds = new Set(currentAttachments.map((attachment) => attachment.id))
+    const failedAtStart = currentAttachments.filter((attachment) => attachment.status === 'failed' && attachment.file)
     let shouldRecover = false
     const generation = streamGeneration.current + 1
     streamGeneration.current = generation
-    activeViewSession.current = targetSessionId
-    followLatestSession.current = targetSessionId
 
     setSending(true)
-    setText('')
-    replaceAttachments([])
-    setStreamSessionId(targetSessionId)
     setNotice(null)
-    setLiveText('')
-    setLiveThinking('')
-    setToolProgress(null)
-    if (isNewSession) setLocallyCreatedSessionId(targetSessionId)
 
     try {
+      if (failedAtStart.length) {
+        startBrowserAttachmentTask(
+          failedAtStart,
+          currentAttachments.flatMap((attachment) => attachment.file ? [attachment.file] : []),
+          attachmentGeneration,
+        )
+      }
+      await waitForAttachmentTasks(attachmentIds)
+      if (attachmentGeneration !== draftGeneration.current) return
+
+      const settledAttachments = [...attachmentIds].flatMap((attachmentId) => {
+        const attachment = attachmentsRef.current.find((candidate) => candidate.id === attachmentId)
+        return attachment ? [attachment] : []
+      })
+      if (
+        settledAttachments.length !== attachmentIds.size
+        || !settledAttachments.every((attachment) => attachment.status === 'ready' && attachment.ref)
+      ) {
+        setNotice({
+          sessionId: viewSessionId,
+          message: t('chat.attachmentUploadFailed', { defaultValue: 'The attachment could not be uploaded.' }),
+        })
+        return
+      }
+
+      sentDraftAttachments = settledAttachments
+      sentAttachments = settledAttachments.flatMap((attachment) => attachment.ref ? [attachment.ref] : [])
+      activeViewSession.current = targetSessionId
+      followLatestSession.current = targetSessionId
+      setText('')
+      replaceAttachments([])
+      setStreamSessionId(targetSessionId)
+      setLiveText('')
+      setLiveThinking('')
+      setToolProgress(null)
+      if (isNewSession) setLocallyCreatedSessionId(targetSessionId)
+
       await sendChatMessage({
         sessionId: targetSessionId,
         text: sentText,
@@ -759,7 +822,7 @@ export function ChatPage({
               <button
                 className="send-button"
                 aria-label={t('draftChat.send')}
-                disabled={sending || !attachmentsReady || (!text.trim() && attachments.length === 0)}
+                disabled={sending || !attachmentsSendable || (!text.trim() && attachments.length === 0)}
               >{sending ? '…' : '↑'}</button>
             </div>
           </form>
@@ -1112,6 +1175,10 @@ function formatUnknown(value: unknown): string {
 function attachmentFilename(path: string): string {
   const parts = path.split('/').filter(Boolean)
   return parts.at(-1) ?? path
+}
+
+function canSubmitDraftAttachment(attachment: DraftAttachment): boolean {
+  return Boolean(attachment.ref || attachment.file)
 }
 
 function clipboardImageFiles(event: ClipboardEvent<HTMLTextAreaElement>): File[] {

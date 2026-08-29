@@ -220,7 +220,7 @@ describe('ChatPage', () => {
     expect(composer).toHaveValue('keep this draft')
   })
 
-  it('uploads browser files immediately, waits for Ready, and reuses the ref when message retry is needed', async () => {
+  it('uploads browser files immediately, waits for the in-flight upload on send, and reuses the ref when message retry is needed', async () => {
     await i18n.changeLanguage('en')
     let finishUpload: ((response: Response) => void) | undefined
     const uploadResponse = new Promise<Response>((resolve) => { finishUpload = resolve })
@@ -256,12 +256,15 @@ describe('ChatPage', () => {
     expect(await screen.findByText('context.txt')).toBeInTheDocument()
     expect(input).toHaveValue('')
     expect(screen.getByText('Uploading')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).not.toBeDisabled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/messages'))).toBe(false)
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/messages'))).toBe(false)
 
     finishUpload?.(jsonResponse({ path: '.attachments/uploads/upload-id/context.txt', size: 10, etag: 'etag', created: true }))
-    expect(await screen.findByText('Ready')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1))
     expect(screen.queryByRole('list', { name: 'Attachments to send' })).not.toBeInTheDocument()
 
     rejectFirstMessage?.(jsonResponse({ code: 'provider_unavailable', message: 'Try again' }, 503))
@@ -278,6 +281,72 @@ describe('ChatPage', () => {
       expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
       expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
     ])
+  })
+
+  it('waits for every parallel upload to settle before unlocking a failed send and retries only failed files', async () => {
+    await i18n.changeLanguage('en')
+    const failedUpload = deferred<Response>()
+    const slowUpload = deferred<Response>()
+    let failedFilePutCount = 0
+    let postedBody: Record<string, unknown> | undefined
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/fail.txt') && init?.method === 'PUT') {
+        failedFilePutCount += 1
+        return failedFilePutCount === 1
+          ? failedUpload.promise
+          : jsonResponse({ path: '.attachments/uploads/fail-id/fail.txt', size: 4, etag: 'retry', created: true })
+      }
+      if (url.includes('/slow.txt') && init?.method === 'PUT') return slowUpload.promise
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        postedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        return new Response([
+          '{"type":"message_accepted","message_id":"message-1","disposition":"started","created_session":true}',
+          '{"type":"turn_finished","turn_id":"turn-1","status":"completed"}',
+          '',
+        ].join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    let nextId = 0
+    renderChat('/chat', 5, () => nextId++ === 0 ? 'fail-id' : nextId === 2 ? 'slow-id' : 'session-id')
+
+    const input = await screen.findByLabelText('Select attachments')
+    await user.upload(input, [
+      new File(['fail'], 'fail.txt', { type: 'text/plain' }),
+      new File(['slow'], 'slow.txt', { type: 'text/plain' }),
+    ])
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(2))
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await act(async () => failedUpload.resolve(jsonResponse({ code: 'upload_failed', message: 'Upload failed' }, 503)))
+
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0)
+
+    await act(async () => slowUpload.resolve(jsonResponse({ path: '.attachments/uploads/slow-id/slow.txt', size: 4, etag: 'slow', created: true })))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('attachment could not be uploaded')
+    expect(screen.getByText('fail.txt').closest('li')).toHaveAttribute('data-status', 'failed')
+    expect(screen.getByText('slow.txt').closest('li')).toHaveAttribute('data-status', 'ready')
+    expect(screen.getByRole('button', { name: 'Send message' })).not.toBeDisabled()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0)
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => expect(postedBody).toEqual(expect.objectContaining({
+      attachments: expect.arrayContaining([
+        { openoctopus_device: 'server', path: '.attachments/uploads/fail-id/fail.txt' },
+        { openoctopus_device: 'server', path: '.attachments/uploads/slow-id/slow.txt' },
+      ]),
+    })))
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/fail.txt') && init?.method === 'PUT')).toHaveLength(2)
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).includes('/slow.txt') && init?.method === 'PUT')).toHaveLength(1)
   })
 
   it('uploads a pasted image immediately and sends its ready attachment ref', async () => {
@@ -318,12 +387,12 @@ describe('ChatPage', () => {
     expect(await screen.findByText('pasted-image.png')).toBeInTheDocument()
     expect(screen.getByText('Uploading')).toBeInTheDocument()
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1)
-    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
-
-    finishUpload?.(jsonResponse({ path: '.attachments/uploads/paste-id/pasted-image.png', size: 8, etag: 'etag', created: true }))
-    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).not.toBeDisabled()
 
     await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(postedBody).toBeUndefined()
+
+    finishUpload?.(jsonResponse({ path: '.attachments/uploads/paste-id/pasted-image.png', size: 8, etag: 'etag', created: true }))
     await waitFor(() => expect(postedBody).toEqual({
       effort: 'off',
       content: [],
