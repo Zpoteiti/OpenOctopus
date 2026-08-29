@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import type { ClipboardEvent, FormEvent, ReactNode } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { useTranslation } from 'react-i18next'
@@ -55,7 +55,7 @@ interface DraftAttachment {
   id: string
   name: string
   source: string
-  status: 'uploading' | 'pending' | 'ready' | 'failed'
+  status: 'uploading' | 'ready' | 'failed'
   file?: File
   ref?: MessageAttachmentRef
 }
@@ -123,7 +123,7 @@ export function ChatPage({
   const showingStream = streamSessionId !== null && streamSessionId === viewSessionId
   const sendingHere = sending && showingStream
   const visibleNotice = notice?.sessionId === viewSessionId ? notice.message : null
-  const attachmentsReady = attachments.every(canSendDraftAttachment)
+  const attachmentsReady = attachments.every((attachment) => attachment.status === 'ready' && attachment.ref)
   const initiallyScrolledSession = useRef<string | null>(null)
   const followLatestSession = useRef<string | null>(null)
 
@@ -134,13 +134,6 @@ export function ChatPage({
 
   function updateAttachments(updater: (current: DraftAttachment[]) => DraftAttachment[]): void {
     replaceAttachments(updater(attachmentsRef.current))
-  }
-
-  function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>): void {
-    const images = clipboardImageFiles(event)
-    if (!images.length) return
-    event.preventDefault()
-    void addBrowserFiles(images)
   }
 
   useLayoutEffect(() => {
@@ -352,42 +345,22 @@ export function ChatPage({
     }
     if (generation !== draftGeneration.current) return
 
-    const draftIds = new Set(drafts.map((draft) => draft.id))
-    updateAttachments((current) => current.map((attachment) => draftIds.has(attachment.id)
-      ? { ...attachment, status: 'pending' }
-      : attachment))
-  }
-
-  async function uploadDraftAttachments(
-    drafts: DraftAttachment[],
-    generation: number,
-  ): Promise<DraftAttachment[]> {
-    return Promise.all(drafts.map(async (draft) => {
-      if (draft.ref) return draft
-      if (!draft.file) throw new Error('The attachment file is no longer available.')
-      if (draftGeneration.current !== generation) return draft
-
-      updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
-        ? { ...attachment, status: 'uploading' }
-        : attachment))
-      try {
-        const ref = await uploadBrowserAttachment(draft.file, draft.id)
-        const uploadedDraft = { ...draft, status: 'ready' as const, ref }
-        if (draftGeneration.current === generation) {
+    for (const draft of drafts) {
+      if (!attachmentsRef.current.some((attachment) => attachment.id === draft.id)) continue
+      void uploadBrowserAttachment(draft.file, draft.id)
+        .then((ref) => {
+          if (generation !== draftGeneration.current) return
           updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
-            ? uploadedDraft
+            ? { ...attachment, status: 'ready', ref }
             : attachment))
-        }
-        return uploadedDraft
-      } catch (error) {
-        if (draftGeneration.current === generation) {
+        })
+        .catch(() => {
+          if (generation !== draftGeneration.current) return
           updateAttachments((current) => current.map((attachment) => attachment.id === draft.id
             ? { ...attachment, status: 'failed' }
             : attachment))
-        }
-        throw error
-      }
-    }))
+        })
+    }
   }
 
   function addExistingAttachment(ref: MessageAttachmentRef): void {
@@ -414,41 +387,34 @@ export function ChatPage({
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     const currentAttachments = attachmentsRef.current
-    const currentAttachmentsReady = currentAttachments.every(canSendDraftAttachment)
+    const currentAttachmentsReady = currentAttachments.every((attachment) => (
+      attachment.status === 'ready' && attachment.ref
+    ))
     if (sending || !currentAttachmentsReady || (!text.trim() && currentAttachments.length === 0)) return
 
     const sentText = text
-    let sentDraftAttachments = currentAttachments
-    let sentAttachments: MessageAttachmentRef[] = []
+    const sentDraftAttachments = currentAttachments
+    const sentAttachments = currentAttachments.flatMap((attachment) => attachment.ref ? [attachment.ref] : [])
     const sentEffort = effort
     const targetSessionId = sessionId ?? idFactory()
     const isNewSession = sessionId === undefined
-    const attachmentGeneration = draftGeneration.current
     let shouldRecover = false
-    let uploadsCompleted = false
     const generation = streamGeneration.current + 1
     streamGeneration.current = generation
+    activeViewSession.current = targetSessionId
+    followLatestSession.current = targetSessionId
 
     setSending(true)
+    setText('')
+    replaceAttachments([])
+    setStreamSessionId(targetSessionId)
     setNotice(null)
+    setLiveText('')
+    setLiveThinking('')
+    setToolProgress(null)
+    if (isNewSession) setLocallyCreatedSessionId(targetSessionId)
 
     try {
-      const uploadedDraftAttachments = await uploadDraftAttachments(currentAttachments, attachmentGeneration)
-      if (draftGeneration.current !== attachmentGeneration) return
-      sentDraftAttachments = uploadedDraftAttachments
-      sentAttachments = uploadedDraftAttachments.flatMap((attachment) => attachment.ref ? [attachment.ref] : [])
-      uploadsCompleted = true
-
-      activeViewSession.current = targetSessionId
-      followLatestSession.current = targetSessionId
-      setText('')
-      replaceAttachments([])
-      setStreamSessionId(targetSessionId)
-      setLiveText('')
-      setLiveThinking('')
-      setToolProgress(null)
-      if (isNewSession) setLocallyCreatedSessionId(targetSessionId)
-
       await sendChatMessage({
         sessionId: targetSessionId,
         text: sentText,
@@ -464,17 +430,6 @@ export function ChatPage({
         },
       })
     } catch (error) {
-      if (!uploadsCompleted) {
-        if (streamGeneration.current !== generation || draftGeneration.current !== attachmentGeneration) return
-        setText(sentText)
-        setNotice({
-          sessionId: viewSessionId,
-          message: chatErrorMessage(error, t('chat.attachmentUploadFailed', {
-            defaultValue: 'The attachment could not be uploaded.',
-          })),
-        })
-        return
-      }
       if (streamGeneration.current !== generation || activeViewSession.current !== targetSessionId) return
       if (error instanceof MessageStreamError) {
         shouldRecover = true
@@ -703,8 +658,6 @@ export function ChatPage({
                     <span><strong>{attachment.name}</strong><small>{attachment.source}</small></span>
                     <em>{attachment.status === 'uploading'
                       ? t('chat.attachmentUploading', { defaultValue: 'Uploading' })
-                      : attachment.status === 'pending'
-                        ? t('chat.attachmentPending', { defaultValue: 'Waiting to send' })
                       : attachment.status === 'ready'
                         ? t('chat.attachmentReady', { defaultValue: 'Ready' })
                         : t('chat.attachmentFailed', { defaultValue: 'Failed' })}</em>
@@ -725,7 +678,6 @@ export function ChatPage({
               rows={2}
               value={text}
               onChange={(event) => setText(event.target.value)}
-              onPaste={handleComposerPaste}
               onKeyDown={(event) => {
                 if (
                   event.key !== 'Enter'
@@ -1154,29 +1106,6 @@ function formatUnknown(value: unknown): string {
 function attachmentFilename(path: string): string {
   const parts = path.split('/').filter(Boolean)
   return parts.at(-1) ?? path
-}
-
-function canSendDraftAttachment(attachment: DraftAttachment): boolean {
-  return (attachment.status === 'pending' && Boolean(attachment.file))
-    || (attachment.status === 'ready' && Boolean(attachment.ref))
-}
-
-function clipboardImageFiles(event: ClipboardEvent<HTMLTextAreaElement>): File[] {
-  return Array.from(event.clipboardData.items)
-    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-    .flatMap((item, index) => {
-      const file = item.getAsFile()
-      if (!file) return []
-      if (file.name) return [file]
-      return [new File([file], `pasted-image${imageExtension(file.type, index)}`, { type: file.type })]
-    })
-}
-
-function imageExtension(type: string, index: number): string {
-  const extension = type.split('/')[1]?.split('+')[0]
-  if (extension === 'jpeg') return '.jpg'
-  if (extension && /^[a-z0-9]+$/i.test(extension)) return `.${extension}`
-  return index ? `-${index + 1}.bin` : '.bin'
 }
 
 function attachmentKey(ref: MessageAttachmentRef): string {
