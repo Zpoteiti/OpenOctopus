@@ -59,11 +59,23 @@ from openctopus_server.tools.directory_transfer import (
     DirectoryTransferCoordinator,
     DirectoryTransferResult,
 )
+from openctopus_server.tools.file_results import (
+    FILE_RESULT_MAX_OUTPUT_CHARS,
+    file_transfer_result,
+)
 from openctopus_server.tools.server_directory_backend import ServerDirectoryTransferBackend
 from openctopus_server.workspace.fs import ServerFileSourceProbe, WorkspaceFS
 from openctopus_server.workspace.service import (
     TransferPathTicket,
     WorkspaceService,
+)
+
+_TRANSFER_PATH_SEMANTICS = (
+    "Relative paths use the selected install site's Workspace. ~/ uses the OS user home "
+    "on a Client and the authenticated user's personal Workspace on server. Absolute paths "
+    "use the selected site's native namespace: /name@suffix/... on server, or a native "
+    "absolute path on a Client. Server paths normalize backslashes to '/'. On Windows use "
+    "a drive-absolute or UNC path."
 )
 
 FILE_TRANSFER_SCHEMA: dict[str, Any] = {
@@ -85,7 +97,7 @@ FILE_TRANSFER_SCHEMA: dict[str, Any] = {
             },
             "src_path": {
                 "type": "string",
-                "description": "Path on openoctopus_src_device.",
+                "description": f"Source path. {_TRANSFER_PATH_SEMANTICS}",
                 "minLength": 1,
                 "maxLength": 4096,
             },
@@ -97,7 +109,9 @@ FILE_TRANSFER_SCHEMA: dict[str, Any] = {
             },
             "dst_path": {
                 "type": "string",
-                "description": "Path on openoctopus_dst_device. Must not already exist.",
+                "description": (
+                    f"Destination path; it must not already exist. {_TRANSFER_PATH_SEMANTICS}"
+                ),
                 "minLength": 1,
                 "maxLength": 4096,
             },
@@ -330,6 +344,9 @@ class FileTransferTool(Tool):
     def schema(self) -> dict[str, Any]:
         return deepcopy(FILE_TRANSFER_SCHEMA)
 
+    def max_output_chars(self) -> int:
+        return FILE_RESULT_MAX_OUTPUT_CHARS
+
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
             parsed = _FileTransferArgs.model_validate(args)
@@ -372,13 +389,18 @@ class FileTransferTool(Tool):
         except Exception:
             return _error(ErrorCode.WORKSPACE_STORAGE_ERROR, "File transfer failed")
 
-        warning = "" if not outcome.warnings else f" Warnings: {', '.join(outcome.warnings)}."
-        file_label = "file" if outcome.files_transferred == 1 else "files"
         return ToolResult(
-            content=(
-                f"Transferred {parsed.src_path} to {parsed.dst_path} "
-                f"({outcome.kind}, {outcome.files_transferred} {file_label}, "
-                f"{outcome.bytes_transferred} bytes, sha256={outcome.sha256}).{warning}"
+            content=file_transfer_result(
+                mode=parsed.mode,
+                source_device=parsed.openoctopus_src_device,
+                source_path=parsed.src_path,
+                destination_device=parsed.openoctopus_dst_device,
+                destination_path=parsed.dst_path,
+                kind=outcome.kind,
+                files_transferred=outcome.files_transferred,
+                bytes_transferred=outcome.bytes_transferred,
+                sha256=outcome.sha256,
+                warnings=outcome.warnings,
             )
         )
 

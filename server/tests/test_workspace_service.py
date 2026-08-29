@@ -474,6 +474,24 @@ async def test_tool_write_rejects_more_than_eight_mib_before_storage() -> None:
     workspace_fs.write_collected_upload.assert_not_awaited()
 
 
+async def test_home_alias_preserves_personal_skill_validation() -> None:
+    workspace_fs = _workspace_fs_mock()
+    service = WorkspaceService(workspace_fs)
+    fake_db = _FakeSession()
+    _install_fake_resolver(service, fake_db)
+
+    with pytest.raises(WorkspaceError) as caught:
+        await service.write(
+            fake_db,  # type: ignore[arg-type]
+            user_id=uuid4(),
+            path="~/skills/demo/SKILL.md",
+            data=b"not a Skill manifest",
+        )
+
+    assert caught.value.code is ErrorCode.WORKSPACE_INVALID_SKILL_FORMAT
+    workspace_fs.write_collected_upload.assert_not_awaited()
+
+
 @pytest.mark.parametrize("mode", ["stat", "write", "search"])
 async def test_single_target_storage_does_not_hold_database_transaction(mode: str) -> None:
     entered = asyncio.Event()

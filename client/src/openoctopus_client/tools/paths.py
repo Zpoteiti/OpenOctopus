@@ -23,12 +23,29 @@ class WorkspacePaths:
     def root(self) -> Path:
         return self._root
 
+    def canonical(self, path: Path) -> str:
+        """Return a reusable tool path without exposing the local home directory."""
+
+        home = Path.home().resolve(strict=False)
+        try:
+            relative = path.relative_to(home)
+        except ValueError:
+            return str(path)
+        suffix = relative.as_posix()
+        return "~" if not suffix or suffix == "." else f"~/{suffix}"
+
     def resolve(self, value: str, *, directory: bool | None = None) -> Path:
-        supplied = Path(value)
-        drive = ntpath.splitdrive(value)[0]
-        if not value or "\x00" in value or (drive and not supplied.is_absolute()):
+        supplied = _expand_current_user_home(value)
+        if (
+            not value
+            or len(value) > 4096
+            or "\x00" in value
+            or (os.name == "nt" and _is_ambiguous_windows_path(value))
+            or (os.name != "nt" and _is_windows_path_on_posix(value))
+        ):
             raise ToolFailure("tool_path_outside_workspace", "Path is invalid")
         candidate = supplied if supplied.is_absolute() else self._root / supplied
+        candidate = Path(os.path.normpath(candidate))
         self._check_existing_components(candidate)
         resolved_parent, tail = self._closest_existing_parent(candidate)
         resolved = resolved_parent.joinpath(*tail)
@@ -104,6 +121,26 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _expand_current_user_home(value: str) -> Path:
+    if value == "~":
+        return Path.home()
+    if value.startswith(("~/", "~\\")):
+        return Path.home() / value[2:].lstrip("/\\")
+    return Path(value)
+
+
+def _is_ambiguous_windows_path(value: str) -> bool:
+    drive, _ = ntpath.splitdrive(value)
+    return (bool(drive) and not ntpath.isabs(value)) or (
+        not drive and value.startswith(("/", "\\"))
+    )
+
+
+def _is_windows_path_on_posix(value: str) -> bool:
+    drive, _ = ntpath.splitdrive(value)
+    return bool(drive) and not value.startswith("/")
 
 
 def _is_reparse_or_symlink(path: Path, mode: int | None = None) -> bool:

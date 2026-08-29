@@ -63,6 +63,7 @@ MAX_GREP_BYTES = 2 * 1024 * 1024
 MAX_SCAN_OBJECTS = 10_000
 MAX_RESPONSE_BYTES = 5_000_000
 MAX_REDIRECTS = 10
+_FILE_RESULT_JSON_MAX_CHARS = 49_500
 _LOCAL_TRANSFER_CANCEL_GRACE_SECONDS = 0.1
 type FileFingerprint = tuple[int, int, int, int, int, str]
 _NOISE = frozenset(
@@ -331,7 +332,7 @@ class ClientToolDispatcher:
             new = item.new_text
             assert new is not None
             targets.append((item.path, target, item.action, old, new))
-        if len({str(item[1]) for item in targets}) != len(targets):
+        if len({item[1] for item in targets}) != len(targets):
             raise ToolFailure("tool_invalid_args", "Patch paths must be unique")
         async with self._locks.hold(*(str(item[1]) for item in targets)):
             prepared: list[tuple[str, Path, str, int, bool, str | None]] = []
@@ -903,10 +904,16 @@ class ClientToolDispatcher:
     async def _write_file(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
         content = _required_str(args, "content")
+        encoded = content.encode("utf-8")
         resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
-            await self._run_mutation(self._atomic_write, resolved, content.encode("utf-8"))
-        return ToolOutput(f"Wrote {path} ({len(content.encode('utf-8'))} bytes).")
+            await self._run_mutation(self._atomic_write, resolved, encoded)
+        return self._file_mutation_result(
+            "write_file",
+            requested_path=path,
+            resolved_path=resolved,
+            bytes_written=len(encoded),
+        )
 
     async def _edit_file(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
@@ -944,8 +951,13 @@ class ClientToolDispatcher:
                 raise ToolFailure("workspace_file_changed", "File changed during the edit")
             await self._run_mutation(self._atomic_write, resolved, updated.encode("utf-8"))
         verb = "Created" if created else "Edited"
-        return ToolOutput(
-            f"{verb} {path}: {replacements} replacement(s), {len(updated.encode('utf-8'))} bytes."
+        return self._file_mutation_result(
+            "edit_file",
+            requested_path=path,
+            resolved_path=resolved,
+            result=verb.lower(),
+            replacements=replacements,
+            size_bytes=len(updated.encode("utf-8")),
         )
 
     async def _apply_patch(self, args: dict[str, Any]) -> ToolOutput:
@@ -978,7 +990,7 @@ class ClientToolDispatcher:
                     cast(str, new),
                 )
             )
-        if len({str(item[1]) for item in parsed}) != len(parsed):
+        if len({item[1] for item in parsed}) != len(parsed):
             raise ToolFailure("tool_invalid_args", "Patch paths must be unique")
         async with self._locks.hold(*(str(item[1]) for item in parsed)):
             prepared: list[tuple[str, Path, str, int, FileFingerprint | None]] = []
@@ -1018,23 +1030,32 @@ class ClientToolDispatcher:
                         )
                 for _, target, updated, _, _ in prepared:
                     await self._run_mutation(self._atomic_write, target, updated.encode("utf-8"))
-        verb = "Validated" if dry_run else "Applied"
-        lines = [f"{verb} {len(prepared)} workspace edit(s)."]
-        lines.extend(
-            (
-                f"- {parsed[index][2]} {display}: {len(updated.encode('utf-8'))} bytes, "
-                f"{count} replacement(s)"
+        return ToolOutput(
+            _file_patch_result(
+                dry_run=dry_run,
+                edits=[
+                    {
+                        "action": parsed[index][2],
+                        "requested_path": display,
+                        "canonical_path": self._paths.canonical(target),
+                        "size_bytes": len(updated.encode("utf-8")),
+                        "replacements": count,
+                    }
+                    for index, (display, target, updated, count, _) in enumerate(prepared)
+                ],
             )
-            for index, (display, _, updated, count, _) in enumerate(prepared)
         )
-        return ToolOutput("\n".join(lines))
 
     async def _delete_file(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
         resolved = await self._resolve_path(path, directory=False)
         async with self._locks.hold(str(resolved)):
             await self._run_mutation(resolved.unlink)
-        return ToolOutput(f"Deleted file {path}.")
+        return self._file_mutation_result(
+            "delete_file",
+            requested_path=path,
+            resolved_path=resolved,
+        )
 
     async def _delete_folder(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
@@ -1042,7 +1063,11 @@ class ClientToolDispatcher:
         _reject_protected_directory_delete(resolved, self._paths.root)
         async with self._locks.hold(str(resolved)):
             await self._run_mutation(shutil.rmtree, resolved)
-        return ToolOutput(f"Deleted folder {path}.")
+        return self._file_mutation_result(
+            "delete_folder",
+            requested_path=path,
+            resolved_path=resolved,
+        )
 
     async def _list_dir(self, args: dict[str, Any]) -> ToolOutput:
         path = self._path_arg(args)
@@ -1292,7 +1317,12 @@ class ClientToolDispatcher:
             ):
                 raise ToolFailure("workspace_file_changed", "Notebook changed during the edit")
             await self._run_mutation(self._atomic_write, target, updated.encode("utf-8"))
-        return ToolOutput(f"Edited notebook {path} ({len(updated.encode('utf-8'))} bytes).")
+        return self._file_mutation_result(
+            "notebook_edit",
+            requested_path=path,
+            resolved_path=target,
+            size_bytes=len(updated.encode("utf-8")),
+        )
 
     @staticmethod
     def _edit_notebook_sync(
@@ -1372,6 +1402,27 @@ class ClientToolDispatcher:
 
     def _path_arg(self, args: dict[str, Any]) -> str:
         return _required_str(args, "path")
+
+    def _file_mutation_result(
+        self,
+        operation: str,
+        *,
+        requested_path: str,
+        resolved_path: Path,
+        **details: Any,
+    ) -> ToolOutput:
+        return ToolOutput(
+            json.dumps(
+                {
+                    "ok": True,
+                    "operation": operation,
+                    "requested_path": requested_path,
+                    "canonical_path": self._paths.canonical(resolved_path),
+                    **details,
+                },
+                ensure_ascii=False,
+            )
+        )
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
         if len(data) > MAX_TEXT_EDIT_BYTES:
@@ -2463,6 +2514,27 @@ def _required_str(args: dict[str, Any], name: str) -> str:
     if not isinstance(value, str):
         raise ToolFailure("tool_invalid_args", f"{name} is required and must be a string")
     return value
+
+
+def _file_patch_result(*, dry_run: bool, edits: list[dict[str, Any]]) -> str:
+    total_edits = len(edits)
+    retained = list(edits)
+    while True:
+        payload: dict[str, Any] = {
+            "ok": True,
+            "operation": "apply_patch",
+            "dry_run": dry_run,
+            "total_edits": total_edits,
+            "edits": retained,
+        }
+        if len(retained) != total_edits:
+            payload["omitted_edits"] = total_edits - len(retained)
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if len(encoded) <= _FILE_RESULT_JSON_MAX_CHARS:
+            return encoded
+        if not retained:
+            raise ValueError("patch summary cannot fit the structured result bound")
+        retained.pop()
 
 
 def _contains_nul(value: object) -> bool:

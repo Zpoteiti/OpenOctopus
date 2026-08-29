@@ -32,7 +32,11 @@ from openctopus_server.workspace.fs import (
     WorkspaceTarget,
     get_workspace_fs,
 )
-from openctopus_server.workspace.resolver import ResolvedWorkspacePath, WorkspacePathResolver
+from openctopus_server.workspace.resolver import (
+    ResolvedWorkspacePath,
+    WorkspacePathResolver,
+    normalize_virtual_workspace_path,
+)
 from openctopus_server.workspace.search import (
     MAX_GREP_BYTES,
     MAX_GREP_RESULT_CHARS,
@@ -1374,6 +1378,7 @@ def _search_path(path: str) -> str:
 
 
 def _personal_relative_path(path: str, user_id: UUID) -> str:
+    path = normalize_virtual_workspace_path(path)
     if not path.startswith("/"):
         return path
     return path.removeprefix(f"/{user_id}/") if path.startswith(f"/{user_id}/") else ""

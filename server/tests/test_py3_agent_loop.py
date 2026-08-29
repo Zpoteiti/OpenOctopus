@@ -567,7 +567,14 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
         assert workspace.writes and workspace.writes[0][1:] == ("notes/a.txt", b"hello")
         provider_result = provider.calls[1]["messages"][-1]["content"][0]
         assert provider_result["tool_use_id"] == "write-1"
-        assert "Wrote notes/a.txt (5 bytes)." in str(provider_result["content"])
+        assert json.loads(provider_result["content"][1]["text"]) == {
+            "ok": True,
+            "operation": "write_file",
+            "device": "server",
+            "requested_path": "notes/a.txt",
+            "canonical_path": "~/notes/a.txt",
+            "bytes_written": 5,
+        }
         assert workspace.read_paths == ["SOUL.md", "MEMORY.md"] * 2
         assert workspace.list_calls == 1
     finally:

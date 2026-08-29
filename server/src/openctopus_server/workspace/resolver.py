@@ -32,6 +32,7 @@ class WorkspacePathResolver:
         user_id: UUID,
         path: str,
     ) -> ResolvedWorkspacePath:
+        path = normalize_virtual_workspace_path(path)
         if not path.startswith("/"):
             await _lock_personal_workspace(db, user_id)
             return ResolvedWorkspacePath(
@@ -74,6 +75,16 @@ class WorkspacePathResolver:
             relative_path=relative_path,
             quota_bytes=workspace.quota_bytes,
         )
+
+
+def normalize_virtual_workspace_path(path: str) -> str:
+    """Map the home alias to the authenticated user's personal Workspace."""
+    path = path.replace("\\", "/")
+    if path == "~":
+        return ""
+    if path.startswith("~/"):
+        return path[2:].lstrip("/")
+    return path
 
 
 async def _personal_quota(db: AsyncSession) -> int:
