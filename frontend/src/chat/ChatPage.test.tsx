@@ -220,7 +220,7 @@ describe('ChatPage', () => {
     expect(composer).toHaveValue('keep this draft')
   })
 
-  it('uploads browser files immediately, waits for Ready, and reuses the ref when message retry is needed', async () => {
+  it('defers browser file upload until send, uploads before POST, and reuses the ref when message retry is needed', async () => {
     await i18n.changeLanguage('en')
     let finishUpload: ((response: Response) => void) | undefined
     const uploadResponse = new Promise<Response>((resolve) => { finishUpload = resolve })
@@ -255,14 +255,17 @@ describe('ChatPage', () => {
 
     expect(await screen.findByText('context.txt')).toBeInTheDocument()
     expect(input).toHaveValue('')
-    expect(screen.getByText('Uploading')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+    expect(await screen.findByText('Waiting to send')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).not.toBeDisabled()
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/messages'))).toBe(false)
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0)
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1))
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0)
 
     finishUpload?.(jsonResponse({ path: '.attachments/uploads/upload-id/context.txt', size: 10, etag: 'etag', created: true }))
-    expect(await screen.findByText('Ready')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Send message' }))
-    expect(screen.queryByRole('list', { name: 'Attachments to send' })).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('list', { name: 'Attachments to send' })).not.toBeInTheDocument())
 
     rejectFirstMessage?.(jsonResponse({ code: 'provider_unavailable', message: 'Try again' }, 503))
     expect(await screen.findByRole('alert')).toHaveTextContent('Try again')
@@ -278,6 +281,57 @@ describe('ChatPage', () => {
       expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
       expect.objectContaining({ attachments: [{ openoctopus_device: 'server', path: expect.stringContaining('/context.txt') }] }),
     ])
+  })
+
+  it('turns a pasted clipboard image into a browser attachment and sends its uploaded ref', async () => {
+    await i18n.changeLanguage('en')
+    let postedBody: Record<string, unknown> | undefined
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') {
+        return jsonResponse({ path: '.attachments/uploads/paste-id/pasted-image.png', size: 8, etag: 'etag', created: true })
+      }
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        postedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        return new Response([
+          '{"type":"message_accepted","message_id":"message-1","disposition":"started","created_session":true}',
+          '{"type":"turn_finished","turn_id":"turn-1","status":"completed"}',
+          '',
+        ].join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    renderChat('/chat', 5, () => 'paste-id')
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const image = new File([
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ], '', { type: 'image/png' })
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+      },
+    })
+
+    expect(await screen.findByText('pasted-image.png')).toBeInTheDocument()
+    expect(await screen.findByText('Waiting to send')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0)
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(postedBody).toEqual({
+      effort: 'off',
+      content: [],
+      attachments: [{
+        openoctopus_device: 'server',
+        path: '.attachments/uploads/paste-id/pasted-image.png',
+      }],
+    }))
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1)
   })
 
   it('reserves concurrent browser selections atomically before validating the files', async () => {
@@ -308,8 +362,8 @@ describe('ChatPage', () => {
     expect(screen.queryByText('second-0.txt')).not.toBeInTheDocument()
 
     await act(async () => header.resolve(new ArrayBuffer(12)))
-    await waitFor(() => expect(screen.getAllByText('Ready')).toHaveLength(6))
-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(6)
+    await waitFor(() => expect(screen.getAllByText('Waiting to send')).toHaveLength(6))
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0)
   })
 
   it('ignores browser-file validation that completes after leaving its draft session', async () => {
@@ -1180,7 +1234,7 @@ describe('ChatPage', () => {
     const fileInput = document.querySelector<HTMLInputElement>('input.chat-file-input')
     expect(fileInput).not.toBeNull()
     await user.upload(fileInput!, new File(['attachment'], 'report.txt', { type: 'text/plain' }))
-    expect(await screen.findByText('就绪')).toBeInTheDocument()
+    expect(await screen.findByText('待发送')).toBeInTheDocument()
     await user.type(textbox, 'hello')
     await user.click(screen.getByRole('button', { name: '发送消息' }))
 
