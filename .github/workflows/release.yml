@@ -1,0 +1,308 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: release-preflight
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify release tag and package versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import runpy
+          import tomllib
+          from pathlib import Path
+
+          client_version = tomllib.loads(Path("client/pyproject.toml").read_text())["project"]["version"]
+          server_version = tomllib.loads(Path("server/pyproject.toml").read_text())["project"]["version"]
+          module_version = runpy.run_path("client/src/openoctopus_client/__init__.py")["__version__"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected_tag = f"v{client_version}"
+          if re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", client_version) is None:
+              raise SystemExit("Release version must contain exactly three numeric components")
+          if server_version != client_version or module_version != client_version:
+              raise SystemExit(
+                  "Client pyproject, Client __version__, and Server pyproject versions must match"
+              )
+          if tag != expected_tag:
+              raise SystemExit(f"Release tag {tag!r} must equal {expected_tag!r}")
+          image_line = next(
+              line for line in Path(".env.example").read_text().splitlines()
+              if line.startswith("OPENOCTOPUS_IMAGE=")
+          )
+          if not image_line.endswith(f":{tag}"):
+              raise SystemExit(".env.example must pin OPENOCTOPUS_IMAGE to the release tag")
+          PY
+
+  client-posix:
+    name: client-${{ matrix.platform }}-${{ matrix.arch }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+          - runner: macos-15-intel
+            platform: macos
+            arch: x64
+    defaults:
+      run:
+        working-directory: client
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: client/pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install ".[dev,build]"
+
+      - name: Verify source
+        run: |
+          python -m ruff check .
+          python -m mypy --strict src tests
+          python -m pytest -q
+
+      - name: Build and smoke frozen bundle
+        env:
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          python -m PyInstaller --noconfirm --clean openoctopus_client.spec
+          export OO_CLIENT_BIN="${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client"
+          python tests/frozen_smoke.py
+          python tests/frozen_runtime_smoke.py
+
+      - name: Package bundle
+        run: |
+          mkdir -p release
+          tar -C dist -czf \
+            "release/openoctopus-client-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" \
+            openoctopus-client
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-client-${{ matrix.platform }}-${{ matrix.arch }}
+          path: client/release/*.tar.gz
+          if-no-files-found: error
+
+  client-windows:
+    name: client-windows-x64
+    needs: preflight
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: client
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: client/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev,build]"
+
+      - name: Verify source
+        run: |
+          python -m ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m mypy --strict src tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and smoke frozen bundle
+        env:
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
+        run: |
+          python -m PyInstaller --noconfirm --clean openoctopus_client.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/frozen_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/frozen_runtime_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package bundle
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path dist/openoctopus-client `
+            -DestinationPath "release/openoctopus-client-$env:GITHUB_REF_NAME-windows-x64.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-client-windows-x64
+          path: client/release/*.zip
+          if-no-files-found: error
+
+  server-verify:
+    name: server-${{ matrix.arch }}-verify
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build architecture-specific Server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ${{ steps.image.outputs.name }}:candidate-${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=server-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=server-${{ matrix.arch }}
+
+      - name: Start the release stack and verify health
+        shell: bash
+        run: |
+          OPENOCTOPUS_IMAGE=${{ steps.image.outputs.name }}:candidate-${{ github.sha }}-${{ matrix.arch }} \
+            docker compose --env-file .env.example \
+              -p "openoctopus-release-${{ matrix.arch }}" \
+              up --detach --no-build --wait
+          curl --fail --silent --show-error http://127.0.0.1:8080/health
+
+      - name: Show Compose logs on failure
+        if: failure()
+        run: |
+          OPENOCTOPUS_IMAGE=${{ steps.image.outputs.name }}:candidate-${{ github.sha }}-${{ matrix.arch }} \
+            docker compose --env-file .env.example \
+              -p "openoctopus-release-${{ matrix.arch }}" logs --no-color
+
+      - name: Publish verified architecture candidate
+        run: docker push "${{ steps.image.outputs.name }}:candidate-${{ github.sha }}-${{ matrix.arch }}"
+
+      - name: Stop Compose stack
+        if: always()
+        run: |
+          OPENOCTOPUS_IMAGE=${{ steps.image.outputs.name }}:candidate-${{ github.sha }}-${{ matrix.arch }} \
+            docker compose --env-file .env.example \
+              -p "openoctopus-release-${{ matrix.arch }}" down --volumes
+
+  server-image:
+    name: publish-server-image
+    needs: [client-posix, client-windows, server-verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Promote verified architecture candidates
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}" \
+            "${{ steps.image.outputs.name }}:candidate-${GITHUB_SHA}-amd64" \
+            "${{ steps.image.outputs.name }}:candidate-${GITHUB_SHA}-arm64"
+
+      - name: Record immutable Server image
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect \
+            "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}" --raw \
+            | sha256sum | awk '{print $1}')"
+          echo "${{ steps.image.outputs.name }}@sha256:${digest}" > server-image.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-server-image
+          path: server-image.txt
+          if-no-files-found: error
+
+  github-release:
+    name: github-release
+    needs: [client-posix, client-windows, server-image]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum ./* > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --title "OpenOctopus $GITHUB_REF_NAME"
+          fi

@@ -8,6 +8,8 @@ on:
       - "docs/API.yaml"
       - "server/**"
       - "Dockerfile"
+      - "compose.yaml"
+      - ".env.example"
       - ".dockerignore"
       - ".github/workflows/frontend.yml"
   pull_request:
@@ -17,6 +19,8 @@ on:
       - "docs/API.yaml"
       - "server/**"
       - "Dockerfile"
+      - "compose.yaml"
+      - ".env.example"
       - ".dockerignore"
       - ".github/workflows/frontend.yml"
 
@@ -172,65 +176,14 @@ jobs:
 
       - name: Start image dependencies and verify published health
         run: |
-          docker network create openoctopus-frontend-ci
-          docker run -d --name frontend-postgres \
-            --network openoctopus-frontend-ci \
-            -e POSTGRES_USER=openoctopus \
-            -e POSTGRES_PASSWORD=octopus \
-            -e POSTGRES_DB=openoctopus \
-            postgres:18.4
-          for attempt in {1..30}; do
-            if docker exec frontend-postgres pg_isready -U openoctopus -d openoctopus; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker logs frontend-postgres
-              exit 1
-            fi
-            sleep 1
-          done
-
-          docker run -d --name frontend-rustfs \
-            --network openoctopus-frontend-ci \
-            -p 9000:9000 \
-            -e RUSTFS_ACCESS_KEY=openoctopus \
-            -e RUSTFS_SECRET_KEY=change-me-object-storage-secret \
-            rustfs/rustfs@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21 \
-            /data
-          for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/live; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker logs frontend-rustfs
-              exit 1
-            fi
-            sleep 1
-          done
-          docker run --rm \
-            --network openoctopus-frontend-ci \
-            --entrypoint python \
-            openoctopus:frontend-ci \
-            -c "from minio import Minio; Minio('frontend-rustfs:9000', access_key='openoctopus', secret_key='change-me-object-storage-secret', secure=False).make_bucket('openoctopus')"
-
-          image_env="$(mktemp)"
-          trap 'rm -f "$image_env"' EXIT
-          grep -v '^OPENOCTOPUS_HOST=' server/.env.example > "$image_env"
-          docker run -d --name frontend-server \
-            --network openoctopus-frontend-ci \
-            -p 8080:8080 \
-            --env-file "$image_env" \
-            -e OPENOCTOPUS_DATABASE_URL=postgresql+asyncpg://openoctopus:octopus@frontend-postgres:5432/openoctopus \
-            -e OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT=http://frontend-rustfs:9000 \
-            openoctopus:frontend-ci
-          for attempt in {1..60}; do
-            if curl --fail --silent http://127.0.0.1:8080/health >/dev/null; then
-              break
-            fi
-            if [ "$attempt" = 60 ]; then
-              docker logs frontend-server
-              exit 1
-            fi
-            sleep 2
-          done
+          OPENOCTOPUS_IMAGE=openoctopus:frontend-ci \
+            docker compose --env-file .env.example up --detach --no-build --wait
           curl --fail --silent --show-error http://127.0.0.1:8080/health
+
+      - name: Show Compose logs on failure
+        if: failure()
+        run: docker compose --env-file .env.example logs --no-color
+
+      - name: Stop Compose stack
+        if: always()
+        run: docker compose --env-file .env.example down --volumes
