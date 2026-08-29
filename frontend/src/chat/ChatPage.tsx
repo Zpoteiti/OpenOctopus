@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import type { FormEvent, ReactNode } from 'react'
+import type { ClipboardEvent, FormEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { useTranslation } from 'react-i18next'
@@ -134,6 +134,11 @@ export function ChatPage({
 
   function updateAttachments(updater: (current: DraftAttachment[]) => DraftAttachment[]): void {
     replaceAttachments(updater(attachmentsRef.current))
+  }
+
+  function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>): void {
+    const images = clipboardImageFiles(event)
+    if (images.length) void addBrowserFiles(images)
   }
 
   useLayoutEffect(() => {
@@ -678,6 +683,7 @@ export function ChatPage({
               rows={2}
               value={text}
               onChange={(event) => setText(event.target.value)}
+              onPaste={handleComposerPaste}
               onKeyDown={(event) => {
                 if (
                   event.key !== 'Enter'
@@ -1106,6 +1112,28 @@ function formatUnknown(value: unknown): string {
 function attachmentFilename(path: string): string {
   const parts = path.split('/').filter(Boolean)
   return parts.at(-1) ?? path
+}
+
+function clipboardImageFiles(event: ClipboardEvent<HTMLTextAreaElement>): File[] {
+  return Array.from(event.clipboardData.items)
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .flatMap((item, index) => {
+      const file = item.getAsFile()
+      if (!file) return []
+      if (file.name) return [file]
+      return [new File([file], pastedImageFilename(file.type, index), {
+        type: file.type,
+        lastModified: file.lastModified,
+      })]
+    })
+}
+
+function pastedImageFilename(type: string, index: number): string {
+  const subtype = type.split('/')[1]?.split('+')[0]
+  const extension = subtype === 'jpeg'
+    ? 'jpg'
+    : subtype && /^[a-z0-9]+$/i.test(subtype) ? subtype : 'bin'
+  return `pasted-image${index ? `-${index + 1}` : ''}.${extension}`
 }
 
 function attachmentKey(ref: MessageAttachmentRef): string {

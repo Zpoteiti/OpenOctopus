@@ -280,6 +280,133 @@ describe('ChatPage', () => {
     ])
   })
 
+  it('uploads a pasted image immediately and sends its ready attachment ref', async () => {
+    await i18n.changeLanguage('en')
+    let finishUpload: ((response: Response) => void) | undefined
+    const uploadResponse = new Promise<Response>((resolve) => { finishUpload = resolve })
+    let postedBody: Record<string, unknown> | undefined
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') return uploadResponse
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        postedBody = JSON.parse(String(init.body)) as Record<string, unknown>
+        return new Response([
+          '{"type":"message_accepted","message_id":"message-1","disposition":"started","created_session":true}',
+          '{"type":"turn_finished","turn_id":"turn-1","status":"completed"}',
+          '',
+        ].join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    renderChat('/chat', 5, () => 'paste-id')
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const image = new File([
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ], '', { type: 'image/png' })
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }],
+      },
+    })
+
+    expect(await screen.findByText('pasted-image.png')).toBeInTheDocument()
+    expect(screen.getByText('Uploading')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+
+    finishUpload?.(jsonResponse({ path: '.attachments/uploads/paste-id/pasted-image.png', size: 8, etag: 'etag', created: true }))
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(postedBody).toEqual({
+      effort: 'off',
+      content: [],
+      attachments: [{
+        openoctopus_device: 'server',
+        path: '.attachments/uploads/paste-id/pasted-image.png',
+      }],
+    }))
+  })
+
+  it('keeps the native text paste when clipboard content also contains an image', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') {
+        return jsonResponse({ path: '.attachments/uploads/paste-id/pasted-image.png', size: 8, etag: 'etag', created: true })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat('/chat', 5, () => 'paste-id')
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    const image = new File([
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ], '', { type: 'image/png' })
+    const nativePasteAllowed = fireEvent.paste(composer, {
+      clipboardData: {
+        items: [
+          { kind: 'string', type: 'text/plain', getAsFile: () => null },
+          { kind: 'file', type: 'image/png', getAsFile: () => image },
+        ],
+        getData: (type: string) => type === 'text/plain' ? 'caption' : '',
+      },
+    })
+
+    expect(nativePasteAllowed).toBe(true)
+    expect(await screen.findByText('pasted-image.png')).toBeInTheDocument()
+  })
+
+  it('gives multiple unnamed pasted images distinct filenames', async () => {
+    await i18n.changeLanguage('en')
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/workspace/files/.attachments/uploads/') && init?.method === 'PUT') {
+        return jsonResponse({ path: url, size: 8, etag: 'etag', created: true })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    let nextId = 0
+
+    renderChat('/chat', 5, () => `paste-${nextId += 1}`)
+
+    const png = new File([
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ], '', { type: 'image/png' })
+    const jpeg = new File([new Uint8Array([0xff, 0xd8, 0xff])], '', { type: 'image/jpeg' })
+    fireEvent.paste(await screen.findByRole('textbox', { name: 'Message' }), {
+      clipboardData: {
+        items: [
+          { kind: 'file', type: 'image/png', getAsFile: () => png },
+          { kind: 'file', type: 'image/jpeg', getAsFile: () => jpeg },
+        ],
+      },
+    })
+
+    expect(await screen.findByText('pasted-image.png')).toBeInTheDocument()
+    expect(await screen.findByText('pasted-image-2.jpg')).toBeInTheDocument()
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(2))
+    expect(fetchMock.mock.calls
+      .filter(([, init]) => init?.method === 'PUT')
+      .map(([url]) => String(url)))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining('/paste-1/pasted-image.png'),
+        expect.stringContaining('/paste-2/pasted-image-2.jpg'),
+      ]))
+  })
+
   it('reserves concurrent browser selections atomically before validating the files', async () => {
     await i18n.changeLanguage('en')
     const header = deferred<ArrayBuffer>()
