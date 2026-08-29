@@ -3228,6 +3228,7 @@ def test_sender_failure_tombstone_accepts_matching_ack_and_rejects_conflict(
                 await manager.handle_control(
                     matching_ack.model_copy(update={"code": "workspace_file_changed"})
                 )
+            await _wait_slot_closed(manager, SLOT)
             assert manager.active_count == 0
         finally:
             await _stop(manager, writer, writer_task)
