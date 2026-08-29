@@ -51,6 +51,7 @@
 .chat-rename { align-items: end; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; display: grid; gap: 8px; grid-template-columns: minmax(150px, 1fr) auto auto; margin-bottom: 18px; padding: 12px; }
 .chat-rename label { font-size: 10px; grid-column: 1 / -1; }
 .chat-rename input { background: var(--field); border: 1px solid var(--line-strong); border-radius: 8px; min-height: 39px; padding: 0 10px; }
+.chat-rename > button { align-items: center; display: inline-flex; justify-content: center; min-height: 39px; min-width: 70px; }
 .chat-message { font-size: 13px; line-height: 1.65; margin: 0 0 22px; }
 .chat-message > header { align-items: center; display: flex; gap: 8px; margin-bottom: 7px; }
 .chat-message > header strong { font-size: 11px; }

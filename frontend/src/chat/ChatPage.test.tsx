@@ -1002,6 +1002,30 @@ describe('ChatPage', () => {
     expect(router.state.location.pathname).toBe(`/chat/${sessionB.id}`)
   })
 
+  it('treats an already absent conversation as a completed deletion', async () => {
+    let deleteRequested = false
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse(deleteRequested ? [] : [baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/messages?limit=200')) return jsonResponse(history())
+      if (url === `/api/sessions/${baseSession.id}` && init?.method === 'DELETE') {
+        deleteRequested = true
+        return jsonResponse({ code: 'session_not_found', message: 'Conversation not found.' }, 404)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const user = userEvent.setup()
+    renderChat(`/chat/${baseSession.id}`)
+
+    await screen.findByRole('textbox', { name: '消息' })
+    await user.click(screen.getByRole('button', { name: '删除' }))
+    await user.click(screen.getByRole('button', { name: '确认删除' }))
+
+    expect(await screen.findByRole('heading', { name: '今天想让 Agent 做什么？' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('shows the stable Server code for Chat control errors', async () => {
     let deleteRequests = 0
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

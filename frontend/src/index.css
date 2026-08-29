@@ -154,9 +154,32 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   opacity: .78;
   width: 18px;
 }
-.section-label { color: var(--faint); font-size: 10px; font-weight: 750; letter-spacing: .08em; margin: 21px 9px 8px; text-transform: uppercase; }
+.section-label { align-items: center; color: var(--faint); display: flex; font-size: 10px; font-weight: 750; justify-content: space-between; letter-spacing: .08em; margin: 21px 9px 8px; text-transform: uppercase; }
+.section-label button { background: transparent; border: 0; color: inherit; cursor: pointer; font: inherit; letter-spacing: 0; padding: 2px 0; text-transform: none; }
+.section-label button:hover { color: var(--ink); }
 .session-list { align-content: start; display: grid; flex: 1; gap: 2px; min-height: 0; overflow-y: auto; }
 .session-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-height: 43px; padding: 6px 9px; }
+.session-row { align-items: center; display: grid; grid-template-columns: minmax(0, 1fr) auto; position: relative; }
+.session-row .session-item { min-width: 0; }
+.session-menu-button { background: transparent; border: 0; border-radius: 7px; color: var(--faint); cursor: pointer; font-size: 13px; height: 30px; letter-spacing: -2px; padding: 0 6px; }
+.session-menu-button:hover, .session-menu-button[aria-expanded="true"] { background: var(--accent-soft); color: var(--ink); }
+.session-action-menu { background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 10px 24px rgba(18, 28, 51, .16); display: grid; min-width: 105px; padding: 4px; position: absolute; right: 4px; top: 36px; z-index: 5; }
+.session-action-menu button { background: transparent; border: 0; border-radius: 6px; color: var(--ink); cursor: pointer; font-size: 10px; padding: 7px 8px; text-align: left; }
+.session-action-menu button:hover { background: var(--accent-soft); }
+.session-danger-action { color: var(--danger) !important; }
+.session-inline-rename, .session-delete-confirm, .session-select-row { border-radius: 8px; display: grid; gap: 6px; padding: 7px 9px; }
+.session-inline-rename { background: var(--panel-soft); }
+.session-inline-rename input { background: var(--field); border: 1px solid var(--line-strong); border-radius: 6px; min-width: 0; padding: 6px 7px; width: 100%; }
+.session-inline-rename div, .session-delete-confirm div { display: flex; gap: 5px; }
+.session-inline-rename button, .session-delete-confirm button, .session-bulk-toolbar button { background: var(--panel); border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); cursor: pointer; font-size: 9px; min-height: 26px; padding: 3px 7px; }
+.session-inline-rename button:disabled, .session-delete-confirm button:disabled, .session-bulk-toolbar button:disabled { cursor: default; opacity: .5; }
+.session-delete-confirm { background: color-mix(in srgb, var(--danger), transparent 94%); }
+.session-delete-confirm strong { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-select-row { align-items: center; cursor: pointer; grid-template-columns: auto minmax(0, 1fr); }
+.session-select-row:hover { background: color-mix(in srgb, var(--accent-soft), transparent 35%); }
+.session-select-row input { accent-color: var(--accent); margin: 0; }
+.session-bulk-toolbar { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 8px 7px; }
+.session-action-error { color: var(--danger); font-size: 9px; line-height: 1.4; margin: 0 9px 7px; }
 .session-copy { min-width: 0; }
 .session-title { color: var(--ink); display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-meta { color: var(--faint); display: block; font-size: 9px; margin-top: 3px; }
@@ -319,7 +342,7 @@ td small { color: var(--muted); margin-top: 3px; }
   .app-shell { border: 0; border-radius: 0; display: block; height: auto; min-height: 100vh; overflow: visible; }
   .sidebar { border-bottom: 1px solid var(--line); border-right: 0; display: grid; grid-template-columns: auto 1fr; min-height: auto; padding: 12px 14px; }
   .sidebar .brand { margin: 0; }
-  .new-session, .section-label, .session-list { display: none; }
+  .new-session, .section-label, .session-list, .session-bulk-toolbar, .session-action-error { display: none; }
   .nav { display: flex; justify-content: flex-end; margin: 0; }
   .nav-item { min-height: 34px; padding: 0 8px; width: auto; }
   .nav-icon { display: none; }

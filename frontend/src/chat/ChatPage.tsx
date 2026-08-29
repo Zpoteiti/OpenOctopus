@@ -522,6 +522,11 @@ export function ChatPage({
       await refreshSessions()
       if (activeViewSession.current === targetSessionId) navigate('/chat', { replace: true })
     } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        await refreshSessions()
+        if (activeViewSession.current === targetSessionId) navigate('/chat', { replace: true })
+        return
+      }
       setNotice({
         sessionId: targetSessionId,
         message: chatErrorMessage(error, t('chat.deleteFailed', {

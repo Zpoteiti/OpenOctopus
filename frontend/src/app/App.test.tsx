@@ -14,6 +14,21 @@ const regularUser = {
   created_at: '2026-08-26T12:00:00Z',
 }
 
+function session(id: string, title: string) {
+  return {
+    id,
+    user_id: regularUser.id,
+    session_key: `web:${id}`,
+    channel: 'web',
+    chat_id: id,
+    title,
+    last_inbound_at: '2026-08-26T10:00:00Z',
+    unread: false,
+    cancel_requested: false,
+    created_at: '2026-08-26T10:00:00Z',
+  }
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -100,6 +115,163 @@ describe('application routes', () => {
     renderApp('/chat')
 
     expect(await screen.findByRole('link', { name: /Chat 9/ })).toBeInTheDocument()
+  })
+
+  it('renames and deletes a conversation from its sidebar menu', async () => {
+    let sessions = [session('session-1', 'Chat 1')]
+    const requests: Array<{ url: string; method: string; body?: string }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      requests.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined })
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.startsWith('/api/sessions?')) return jsonResponse(sessions)
+      if (url === '/api/sessions/session-1' && method === 'PATCH') {
+        sessions = [{ ...sessions[0], title: 'Renamed chat' }]
+        return jsonResponse(sessions[0])
+      }
+      if (url === '/api/sessions/session-1' && method === 'DELETE') {
+        sessions = []
+        return new Response(null, { status: 204 })
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    }))
+
+    renderApp('/chat')
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Actions for Chat 1' }))
+    await user.click(screen.getByRole('button', { name: 'Rename' }))
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'Actions for Chat 1' })).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Actions for Chat 1' }))
+    await user.click(screen.getByRole('button', { name: 'Rename' }))
+    const title = screen.getByRole('textbox', { name: 'Conversation title' })
+    await user.clear(title)
+    await user.type(title, 'Renamed chat')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('button', { name: 'Actions for Renamed chat' })).toHaveFocus()
+
+    await user.click(await screen.findByRole('button', { name: 'Actions for Renamed chat' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+    let confirmDelete = screen.getByRole('button', { name: 'Confirm deletion' })
+    expect(confirmDelete).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'Actions for Renamed chat' })).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Actions for Renamed chat' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+    confirmDelete = screen.getByRole('button', { name: 'Confirm deletion' })
+    await user.click(confirmDelete)
+
+    await waitFor(() => expect(screen.queryByRole('link', { name: /Renamed chat/ })).not.toBeInTheDocument())
+    expect(screen.getByRole('link', { name: 'New chat' })).toHaveFocus()
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ url: '/api/sessions/session-1', method: 'PATCH', body: JSON.stringify({ title: 'Renamed chat' }) }),
+      expect.objectContaining({ url: '/api/sessions/session-1', method: 'DELETE' }),
+    ]))
+  })
+
+  it('continues a bulk deletion after one selected conversation fails', async () => {
+    let sessions = [session('session-1', 'Chat 1'), session('session-2', 'Chat 2')]
+    const deleted: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.startsWith('/api/sessions?')) return jsonResponse(sessions)
+      if (url === '/api/sessions/session-1' && method === 'DELETE') {
+        deleted.push('session-1')
+        return jsonResponse({ code: 'session_has_cron_job', message: 'Delete the cron job first.' }, 409)
+      }
+      if (url === '/api/sessions/session-2' && method === 'DELETE') {
+        deleted.push('session-2')
+        sessions = sessions.filter((item) => item.id !== 'session-2')
+        return new Response(null, { status: 204 })
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    }))
+
+    renderApp('/chat')
+    const user = userEvent.setup()
+    await screen.findByRole('link', { name: /Chat 2/ })
+    await user.click(screen.getByRole('button', { name: 'Manage conversations' }))
+    expect(screen.getByRole('button', { name: 'Select all' })).toHaveFocus()
+    await user.click(screen.getByRole('checkbox', { name: 'Select Chat 1' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Select Chat 2' }))
+    await user.click(screen.getByRole('button', { name: 'Delete selected (2)' }))
+    let confirmDelete = screen.getByRole('button', { name: 'Confirm deletion of 2 conversations' })
+    expect(confirmDelete).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'Delete selected (2)' })).toHaveFocus()
+    await user.click(screen.getByRole('button', { name: 'Delete selected (2)' }))
+    confirmDelete = screen.getByRole('button', { name: 'Confirm deletion of 2 conversations' })
+    await user.click(confirmDelete)
+
+    await waitFor(() => expect(screen.queryByText('Chat 2')).not.toBeInTheDocument())
+    expect(screen.getByText('Chat 1')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('1 conversation could not be deleted')
+    expect(screen.getByRole('button', { name: 'Delete selected (1)' })).toHaveFocus()
+    expect(deleted).toEqual(['session-1', 'session-2'])
+  })
+
+  it('reconciles an ambiguous bulk delete from the refreshed session list', async () => {
+    let sessions = [session('session-1', 'Chat 1')]
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.startsWith('/api/sessions?')) return jsonResponse(sessions)
+      if (url === '/api/sessions/session-1' && method === 'DELETE') {
+        sessions = []
+        throw new TypeError('Connection closed before the response arrived')
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    }))
+
+    renderApp('/chat')
+    const user = userEvent.setup()
+    await screen.findByRole('link', { name: /Chat 1/ })
+    await user.click(screen.getByRole('button', { name: 'Manage conversations' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Select Chat 1' }))
+    await user.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm deletion of 1 conversation' }))
+
+    await waitFor(() => expect(screen.queryByText('Chat 1')).not.toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'New chat' })).toHaveFocus()
+  })
+
+  it('keeps a confirmed bulk deletion successful when the final refresh fails', async () => {
+    let deleted = false
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.startsWith('/api/sessions?')) {
+        if (deleted) throw new TypeError('Could not refresh conversations')
+        return jsonResponse([session('session-1', 'Chat 1')])
+      }
+      if (url === '/api/sessions/session-1' && method === 'DELETE') {
+        deleted = true
+        return new Response(null, { status: 204 })
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    }))
+
+    renderApp('/chat')
+    const user = userEvent.setup()
+    await screen.findByRole('link', { name: /Chat 1/ })
+    await user.click(screen.getByRole('button', { name: 'Manage conversations' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Select Chat 1' }))
+    await user.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm deletion of 1 conversation' }))
+
+    await waitFor(() => expect(screen.queryByText('Chat 1')).not.toBeInTheDocument())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'New chat' })).toHaveFocus()
   })
 
   it('shows admin navigation only for an admin returned by /api/me', async () => {
