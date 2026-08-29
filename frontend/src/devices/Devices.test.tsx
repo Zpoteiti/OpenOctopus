@@ -75,7 +75,9 @@ describe('device pages', () => {
     }))
 
     renderPage(<DeviceListPage />)
-    expect(await screen.findByRole('link', { name: /laptop-cn/ })).toBeInTheDocument()
+    const deviceLink = await screen.findByRole('link', { name: /laptop-cn/ })
+    expect(deviceLink).toBeInTheDocument()
+    expect(deviceLink.closest('.settings-stack')).not.toBeNull()
     expect(screen.getByText('Online')).toBeInTheDocument()
 
     const user = userEvent.setup()
@@ -117,6 +119,7 @@ describe('device pages', () => {
     )
     const user = userEvent.setup()
     expect(await screen.findByDisplayValue('~/openoctopus/workspace')).toBeInTheDocument()
+    expect(screen.getByText('Device information').closest('.card')?.parentElement).toHaveClass('settings-stack')
     const help = screen.getByRole('button', { name: 'View path examples for each operating system' })
     expect(help).toHaveAttribute('title', expect.stringContaining('Windows'))
     await user.clear(screen.getByLabelText('Maximum shell runtime (seconds)'))

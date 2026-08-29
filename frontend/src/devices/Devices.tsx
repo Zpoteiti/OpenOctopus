@@ -109,53 +109,55 @@ export function DeviceListPage(): ReactNode {
           </>
         )}
       />
-      {showDownload ? <p className="form-notice" role="status">{t('devices.downloadPlaceholder')}</p> : null}
-      {issuedToken ? (
-        <Card title={t('devices.tokenTitle', { name: issuedToken.name })} description={t('devices.tokenOnce')}>
-          <IssuedToken key={issuedToken.token} token={issuedToken.token} onDismiss={() => setIssuedToken(null)} />
-        </Card>
-      ) : null}
-      {showCreate ? (
-        <Card title={t('devices.addTitle')} description={t('devices.slugHelp')}>
-          <form className="form-grid" onSubmit={submit}>
-            <label>{t('devices.name')}<input name="name" required placeholder={t('devices.nameExample')} /></label>
-            <label>
-              {t('devices.workspacePath')}
-              <input name="workspace_path" defaultValue="~/openoctopus/workspace" required />
-            </label>
-            <label className="toggle-field">
-              <input name="restrict_to_workspace" type="checkbox" defaultChecked />
-              {t('devices.restrict')}
-            </label>
-            <p className="field-help full-row">{t('devices.guardrailHelp')}</p>
-            <ErrorNotice error={createDevice.error} />
-            <div className="form-actions full-row">
-              <button type="button" className="secondary-button" onClick={() => setShowCreate(false)}>{t('common.cancel')}</button>
-              <button className="primary-button" disabled={createDevice.isPending}>{t('devices.create')}</button>
-            </div>
-          </form>
-        </Card>
-      ) : null}
-      <ErrorNotice error={devices.error} />
-      <div className="card-grid">
-        {devices.data?.map((device) => (
-          <Link className="device-card" to={`/devices/${device.name}`} key={device.id}>
-            <div className="device-card-top">
-              <span className="device-glyph" aria-hidden="true">PC</span>
-              <StatusBadge tone={device.online ? 'success' : 'neutral'}>{device.online ? t('common.online') : t('common.offline')}</StatusBadge>
-            </div>
-            <h2>{device.name}</h2>
-            <p>{device.workspace_path}</p>
-            <dl className="compact-stats">
-              <div><dt>MCP</dt><dd>{device.mcp_config_count}</dd></div>
-              <div><dt>{t('devices.providerVisible')}</dt><dd>{device.mcp_provider_visible_capability_count}</dd></div>
-              <div><dt>{t('devices.configVersion')}</dt><dd>{device.config_revision}</dd></div>
-            </dl>
-          </Link>
-        ))}
+      <div className="settings-stack">
+        {showDownload ? <p className="form-notice" role="status">{t('devices.downloadPlaceholder')}</p> : null}
+        {issuedToken ? (
+          <Card title={t('devices.tokenTitle', { name: issuedToken.name })} description={t('devices.tokenOnce')}>
+            <IssuedToken key={issuedToken.token} token={issuedToken.token} onDismiss={() => setIssuedToken(null)} />
+          </Card>
+        ) : null}
+        {showCreate ? (
+          <Card title={t('devices.addTitle')} description={t('devices.slugHelp')}>
+            <form className="form-grid" onSubmit={submit}>
+              <label>{t('devices.name')}<input name="name" required placeholder={t('devices.nameExample')} /></label>
+              <label>
+                {t('devices.workspacePath')}
+                <input name="workspace_path" defaultValue="~/openoctopus/workspace" required />
+              </label>
+              <label className="toggle-field">
+                <input name="restrict_to_workspace" type="checkbox" defaultChecked />
+                {t('devices.restrict')}
+              </label>
+              <p className="field-help full-row">{t('devices.guardrailHelp')}</p>
+              <ErrorNotice error={createDevice.error} />
+              <div className="form-actions full-row">
+                <button type="button" className="secondary-button" onClick={() => setShowCreate(false)}>{t('common.cancel')}</button>
+                <button className="primary-button" disabled={createDevice.isPending}>{t('devices.create')}</button>
+              </div>
+            </form>
+          </Card>
+        ) : null}
+        <ErrorNotice error={devices.error} />
+        <div className="card-grid">
+          {devices.data?.map((device) => (
+            <Link className="device-card" to={`/devices/${device.name}`} key={device.id}>
+              <div className="device-card-top">
+                <span className="device-glyph" aria-hidden="true">PC</span>
+                <StatusBadge tone={device.online ? 'success' : 'neutral'}>{device.online ? t('common.online') : t('common.offline')}</StatusBadge>
+              </div>
+              <h2>{device.name}</h2>
+              <p>{device.workspace_path}</p>
+              <dl className="compact-stats">
+                <div><dt>MCP</dt><dd>{device.mcp_config_count}</dd></div>
+                <div><dt>{t('devices.providerVisible')}</dt><dd>{device.mcp_provider_visible_capability_count}</dd></div>
+                <div><dt>{t('devices.configVersion')}</dt><dd>{device.config_revision}</dd></div>
+              </dl>
+            </Link>
+          ))}
+        </div>
+        {devices.isPending ? <p className="empty-state">{t('devices.loading')}</p> : null}
+        {!devices.isPending && !devices.data?.length ? <p className="empty-state">{t('devices.empty')}</p> : null}
       </div>
-      {devices.isPending ? <p className="empty-state">{t('devices.loading')}</p> : null}
-      {!devices.isPending && !devices.data?.length ? <p className="empty-state">{t('devices.empty')}</p> : null}
     </div>
   )
 }
@@ -230,59 +232,61 @@ export function DeviceDetailPage(): ReactNode {
         description={t('devices.routeDescription')}
         actions={<StatusBadge tone={device.online ? 'success' : 'neutral'}>{device.online ? t('common.online') : t('common.offline')}</StatusBadge>}
       />
-      {issuedToken ? (
-        <Card title={t('devices.newToken')} description={t('devices.oldTokenInvalid')}>
-          <IssuedToken key={issuedToken} token={issuedToken} onDismiss={() => setIssuedToken(null)} />
+      <div className="settings-stack">
+        {issuedToken ? (
+          <Card title={t('devices.newToken')} description={t('devices.oldTokenInvalid')}>
+            <IssuedToken key={issuedToken} token={issuedToken} onDismiss={() => setIssuedToken(null)} />
+          </Card>
+        ) : null}
+        <Card title={t('devices.information')}>
+          <dl className="detail-grid">
+            <div><dt>{t('devices.tokenHint')}</dt><dd><code>{device.token_hint}</code></dd></div>
+            <div><dt>{t('devices.configVersion')}</dt><dd>{config.data?.device.config_revision ?? device.config_revision}</dd></div>
+            <div><dt>{t('devices.createdAt')}</dt><dd>{new Date(device.created_at).toLocaleString(i18n.language)}</dd></div>
+          </dl>
         </Card>
-      ) : null}
-      <Card title={t('devices.information')}>
-        <dl className="detail-grid">
-          <div><dt>{t('devices.tokenHint')}</dt><dd><code>{device.token_hint}</code></dd></div>
-          <div><dt>{t('devices.configVersion')}</dt><dd>{config.data?.device.config_revision ?? device.config_revision}</dd></div>
-          <div><dt>{t('devices.createdAt')}</dt><dd>{new Date(device.created_at).toLocaleString(i18n.language)}</dd></div>
-        </dl>
-      </Card>
-      <Card title={t('devices.workspaceExec')} description={t('devices.workspaceExecHelp')}>
-        <form key={policyRevision ?? device.config_revision} className="form-grid" onChange={markDirty} onFocusCapture={markDirty} onSubmit={submit}>
-          <label>{t('devices.name')}<input name="name" defaultValue={device.name} required /></label>
-          <label>
-            <span className="label-with-help">
-              {t('devices.workspacePath')}
-              <button type="button" className="info-button" aria-label={t('devices.pathExamples')} title={t('devices.pathExamplesTitle')}>i</button>
-            </span>
-            <input name="workspace_path" defaultValue={device.workspace_path} required />
-          </label>
-          <label className="toggle-field full-row"><input name="restrict_to_workspace" type="checkbox" defaultChecked={device.restrict_to_workspace} />{t('devices.restrictShort')}</label>
-          <label>{t('devices.shellTimeout')}<input name="shell_timeout_max" type="number" min="0" max="86400" defaultValue={device.shell_timeout_max} required /></label>
-          <label>{t('devices.inheritedEnv')}<textarea name="env_allowlist" rows={3} defaultValue={device.env_allowlist.join(', ')} /></label>
-          <label className="full-row">{t('devices.webFetchDenylist')}<textarea name="ssrf_denylist" rows={5} defaultValue={device.ssrf_denylist.join('\n')} /></label>
-          <p className="field-help full-row">{t('devices.networkHelp')}</p>
-          <ErrorNotice error={save.error} />
-          <div className="form-actions full-row"><button className="primary-button" disabled={save.isPending}>{t('devices.saveConfig')}</button></div>
-        </form>
-      </Card>
-      <Card
-        title={t('devices.mcpTitle')}
-        description={t('devices.mcpSummary', { configs: device.mcp_config_count, capabilities: device.mcp_provider_visible_capability_count })}
-        actions={<Link className="secondary-button" to={`/devices/${device.name}/mcp`}>{t('devices.manageMcp')}</Link>}
-      ><p className="field-help">{t('devices.mcpValidation')}</p></Card>
-      <Card title={t('devices.tokenAndDevice')} tone="danger">
-        <div className="danger-actions">
-          {confirmRegenerate ? (
-            <>
-              <span>{t('devices.regenerateWarning')}</span>
-              <button className="danger-button" onClick={() => regenerate.mutate()} disabled={regenerate.isPending}>{t('devices.confirmRegenerate')}</button>
-              <button className="secondary-button" onClick={() => setConfirmRegenerate(false)} disabled={regenerate.isPending}>{t('common.cancel')}</button>
-            </>
-          ) : (
-            <button className="secondary-button" onClick={() => setConfirmRegenerate(true)}>{t('devices.regenerateToken')}</button>
-          )}
-          {confirmDelete ? (
-            <><span>{t('devices.deleteWarning')}</span><button className="danger-button" onClick={() => remove.mutate()}>{t('devices.confirmDelete')}</button></>
-          ) : <button className="danger-button" onClick={() => setConfirmDelete(true)}>{t('devices.deleteDevice')}</button>}
-        </div>
-        <ErrorNotice error={regenerate.error ?? remove.error} />
-      </Card>
+        <Card title={t('devices.workspaceExec')} description={t('devices.workspaceExecHelp')}>
+          <form key={policyRevision ?? device.config_revision} className="form-grid" onChange={markDirty} onFocusCapture={markDirty} onSubmit={submit}>
+            <label>{t('devices.name')}<input name="name" defaultValue={device.name} required /></label>
+            <label>
+              <span className="label-with-help">
+                {t('devices.workspacePath')}
+                <button type="button" className="info-button" aria-label={t('devices.pathExamples')} title={t('devices.pathExamplesTitle')}>i</button>
+              </span>
+              <input name="workspace_path" defaultValue={device.workspace_path} required />
+            </label>
+            <label className="toggle-field full-row"><input name="restrict_to_workspace" type="checkbox" defaultChecked={device.restrict_to_workspace} />{t('devices.restrictShort')}</label>
+            <label>{t('devices.shellTimeout')}<input name="shell_timeout_max" type="number" min="0" max="86400" defaultValue={device.shell_timeout_max} required /></label>
+            <label>{t('devices.inheritedEnv')}<textarea name="env_allowlist" rows={3} defaultValue={device.env_allowlist.join(', ')} /></label>
+            <label className="full-row">{t('devices.webFetchDenylist')}<textarea name="ssrf_denylist" rows={5} defaultValue={device.ssrf_denylist.join('\n')} /></label>
+            <p className="field-help full-row">{t('devices.networkHelp')}</p>
+            <ErrorNotice error={save.error} />
+            <div className="form-actions full-row"><button className="primary-button" disabled={save.isPending}>{t('devices.saveConfig')}</button></div>
+          </form>
+        </Card>
+        <Card
+          title={t('devices.mcpTitle')}
+          description={t('devices.mcpSummary', { configs: device.mcp_config_count, capabilities: device.mcp_provider_visible_capability_count })}
+          actions={<Link className="secondary-button" to={`/devices/${device.name}/mcp`}>{t('devices.manageMcp')}</Link>}
+        ><p className="field-help">{t('devices.mcpValidation')}</p></Card>
+        <Card title={t('devices.tokenAndDevice')} tone="danger">
+          <div className="danger-actions">
+            {confirmRegenerate ? (
+              <>
+                <span>{t('devices.regenerateWarning')}</span>
+                <button className="danger-button" onClick={() => regenerate.mutate()} disabled={regenerate.isPending}>{t('devices.confirmRegenerate')}</button>
+                <button className="secondary-button" onClick={() => setConfirmRegenerate(false)} disabled={regenerate.isPending}>{t('common.cancel')}</button>
+              </>
+            ) : (
+              <button className="secondary-button" onClick={() => setConfirmRegenerate(true)}>{t('devices.regenerateToken')}</button>
+            )}
+            {confirmDelete ? (
+              <><span>{t('devices.deleteWarning')}</span><button className="danger-button" onClick={() => remove.mutate()}>{t('devices.confirmDelete')}</button></>
+            ) : <button className="danger-button" onClick={() => setConfirmDelete(true)}>{t('devices.deleteDevice')}</button>}
+          </div>
+          <ErrorNotice error={regenerate.error ?? remove.error} />
+        </Card>
+      </div>
     </div>
   )
 }
