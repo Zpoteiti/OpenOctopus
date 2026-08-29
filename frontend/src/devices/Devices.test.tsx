@@ -79,11 +79,15 @@ describe('device pages', () => {
     expect(screen.getByText('Online')).toBeInTheDocument()
 
     const user = userEvent.setup()
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText')
     await user.click(screen.getByRole('button', { name: 'Add device' }))
     await user.type(screen.getByLabelText('Device name'), 'Devbox')
     await user.click(screen.getByRole('button', { name: 'Create device' }))
 
     expect(await screen.findByText('openoctopus_dev_secret')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Copy token' }))
+    expect(writeText).toHaveBeenCalledWith('openoctopus_dev_secret')
+    expect(await screen.findByRole('button', { name: 'Token copied' })).toBeInTheDocument()
     const create = requests.find((request) => request.init?.method === 'POST')
     expect(JSON.parse(String(create?.init?.body))).toMatchObject({
       name: 'Devbox',

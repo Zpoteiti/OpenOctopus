@@ -160,6 +160,9 @@ export const en = {
       add: 'Add device',
       tokenTitle: '{{name}} Device Token',
       tokenOnce: 'This token is shown once. Configure the Client before dismissing it.',
+      copyToken: 'Copy token',
+      copiedToken: 'Token copied',
+      copyFailed: 'Copy failed',
       savedToken: 'I saved it',
       addTitle: 'Add a device',
       slugHelp: 'The saved device name is normalized to a lowercase slug.',
@@ -373,7 +376,7 @@ export const zhCN = {
       newFile: '新建文件', fileName: '文件名', createFile: '创建文件', invalidNewFile: '请输入 notes.md 这类不含路径分隔符的文本文件名。', createFileSuccess: '文件已创建。', deleteFile: '删除文件', confirmDeleteFile: '确认删除', deleteFileSuccess: '文件已删除。',
     },
     devices: {
-      eyebrow: '设备', title: '设备', description: '连接个人电脑，让 Agent 使用设备上的 Workspace、命令与 MCP。', add: '添加设备', tokenTitle: '{{name}} 的 Device Token', tokenOnce: 'Token 只显示这一次。请立即配置到 Client，再关闭此提示。', savedToken: '我已保存',
+      eyebrow: '设备', title: '设备', description: '连接个人电脑，让 Agent 使用设备上的 Workspace、命令与 MCP。', add: '添加设备', tokenTitle: '{{name}} 的 Device Token', tokenOnce: 'Token 只显示这一次。请立即配置到 Client，再关闭此提示。', copyToken: '复制 Token', copiedToken: '已复制', copyFailed: '复制失败', savedToken: '我已保存',
       addTitle: '添加设备', slugHelp: '设备名保存后会规范化为小写 slug。', name: '设备名称', nameExample: '例如：Laptop CN', workspacePath: 'Workspace 路径', restrict: '限制 OpenOctopus 解析的路径与初始工作目录',
       guardrailHelp: '这是路径护栏，不是操作系统沙箱，也不会限制 shell、MCP 或网络。', create: '创建设备', providerVisible: 'Provider 可见', configVersion: '配置版本', loading: '正在读取设备…', empty: '还没有设备。添加后即可启动 Client 连接。',
       downloadClient: '下载 Client', downloadPlaceholder: 'Client 下载尚未发布；后续会在这里提供 Release 链接和安装脚本。',

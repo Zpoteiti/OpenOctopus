@@ -40,6 +40,32 @@ function lines(value: FormDataEntryValue | null): string[] {
     .filter(Boolean)
 }
 
+function IssuedToken({ token, onDismiss }: { token: string; onDismiss: () => void }): ReactNode {
+  const { t } = useTranslation()
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+
+  const copy = async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(token)
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
+  }
+
+  return (
+    <div className="secret-once">
+      <code>{token}</code>
+      <div className="secret-actions">
+        <button type="button" className="secondary-button" aria-live="polite" onClick={() => void copy()}>
+          {copyState === 'copied' ? t('devices.copiedToken') : copyState === 'failed' ? t('devices.copyFailed') : t('devices.copyToken')}
+        </button>
+        <button type="button" className="secondary-button" onClick={onDismiss}>{t('devices.savedToken')}</button>
+      </div>
+    </div>
+  )
+}
+
 export function DeviceListPage(): ReactNode {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -86,10 +112,7 @@ export function DeviceListPage(): ReactNode {
       {showDownload ? <p className="form-notice" role="status">{t('devices.downloadPlaceholder')}</p> : null}
       {issuedToken ? (
         <Card title={t('devices.tokenTitle', { name: issuedToken.name })} description={t('devices.tokenOnce')}>
-          <div className="secret-once">
-            <code>{issuedToken.token}</code>
-            <button className="secondary-button" onClick={() => setIssuedToken(null)}>{t('devices.savedToken')}</button>
-          </div>
+          <IssuedToken key={issuedToken.token} token={issuedToken.token} onDismiss={() => setIssuedToken(null)} />
         </Card>
       ) : null}
       {showCreate ? (
@@ -209,7 +232,7 @@ export function DeviceDetailPage(): ReactNode {
       />
       {issuedToken ? (
         <Card title={t('devices.newToken')} description={t('devices.oldTokenInvalid')}>
-          <div className="secret-once"><code>{issuedToken}</code><button className="secondary-button" onClick={() => setIssuedToken(null)}>{t('devices.savedToken')}</button></div>
+          <IssuedToken key={issuedToken} token={issuedToken} onDismiss={() => setIssuedToken(null)} />
         </Card>
       ) : null}
       <Card title={t('devices.information')}>

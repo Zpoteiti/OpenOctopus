@@ -294,7 +294,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .compact-stats dt { color: var(--faint); font-size: 8px; }
 .compact-stats dd { font-size: 12px; font-weight: 750; margin: 4px 0 0; }
 .secret-once { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
-.secret-once code { background: var(--field); border: 1px solid var(--line); border-radius: 8px; display: block; font-size: 11px; overflow-wrap: anywhere; padding: 11px; }
+.secret-once code { background: var(--field); border: 1px solid var(--line); border-radius: 8px; display: block; flex: 1; font-size: 11px; min-width: 0; overflow-wrap: anywhere; padding: 11px; }
+.secret-actions { display: flex; flex-shrink: 0; gap: 8px; }
 .detail-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin: 0; }
 .detail-grid dt { color: var(--faint); font-size: 9px; }
 .detail-grid dd { font-size: 11px; margin: 5px 0 0; }
