@@ -8,6 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError
 from openctopus_server.tools.base import ToolContext, ToolResult
+from openctopus_server.tools.file_results import (
+    canonical_server_path,
+    file_mutation_result,
+    file_patch_result,
+)
 from openctopus_server.workspace.file_content import DocumentParser
 from openctopus_server.workspace.fs import DirectoryEntry
 from openctopus_server.workspace.notebook import CellType, EditMode, edit_notebook
@@ -44,7 +49,16 @@ class WorkspaceToolDispatcher:
                     data=cast(str, args["content"]).encode("utf-8"),
                 )
                 await db.commit()
-                return ToolResult(content=f"Wrote {args['path']} ({metadata.size} bytes).")
+                requested_path = cast(str, args["path"])
+                return ToolResult(
+                    content=file_mutation_result(
+                        "write_file",
+                        device="server",
+                        requested_path=requested_path,
+                        canonical_path=canonical_server_path(requested_path),
+                        bytes_written=metadata.size,
+                    )
+                )
             if name == "edit_file":
                 metadata, replacements = await self._service.edit_text(
                     db,
@@ -58,10 +72,15 @@ class WorkspaceToolDispatcher:
                     expected_replacements=cast(int | None, args["expected_replacements"]),
                 )
                 await db.commit()
+                requested_path = cast(str, args["path"])
                 return ToolResult(
-                    content=(
-                        f"Edited {args['path']}: {replacements} replacement(s), "
-                        f"{metadata.size} bytes."
+                    content=file_mutation_result(
+                        "edit_file",
+                        device="server",
+                        requested_path=requested_path,
+                        canonical_path=canonical_server_path(requested_path),
+                        replacements=replacements,
+                        size_bytes=metadata.size,
                     )
                 )
             if name == "apply_patch":
@@ -73,7 +92,15 @@ class WorkspaceToolDispatcher:
                     path=cast(str, args["path"]),
                 )
                 await db.commit()
-                return ToolResult(content=f"Deleted file {args['path']}.")
+                requested_path = cast(str, args["path"])
+                return ToolResult(
+                    content=file_mutation_result(
+                        "delete_file",
+                        device="server",
+                        requested_path=requested_path,
+                        canonical_path=canonical_server_path(requested_path),
+                    )
+                )
             if name == "delete_folder":
                 await self._service.delete_folder(
                     db,
@@ -81,7 +108,15 @@ class WorkspaceToolDispatcher:
                     path=cast(str, args["path"]),
                 )
                 await db.commit()
-                return ToolResult(content=f"Deleted folder {args['path']}.")
+                requested_path = cast(str, args["path"])
+                return ToolResult(
+                    content=file_mutation_result(
+                        "delete_folder",
+                        device="server",
+                        requested_path=requested_path,
+                        canonical_path=canonical_server_path(requested_path),
+                    )
+                )
             if name == "list_dir":
                 return await self._list_dir(db, args, ctx)
             if name == "find_files":
@@ -142,13 +177,22 @@ class WorkspaceToolDispatcher:
             dry_run=dry_run,
         )
         await db.commit()
-        verb = "Validated" if dry_run else "Applied"
-        lines = [f"{verb} {len(results)} workspace edit(s)."]
-        lines.extend(
-            f"- {item.action} {item.path}: {item.size} bytes, {item.replacements} replacement(s)"
-            for item in results
+        return ToolResult(
+            content=file_patch_result(
+                device="server",
+                dry_run=dry_run,
+                edits=[
+                    {
+                        "action": item.action,
+                        "requested_path": item.path,
+                        "canonical_path": canonical_server_path(item.path),
+                        "size_bytes": item.size,
+                        "replacements": item.replacements,
+                    }
+                    for item in results
+                ],
+            )
         )
-        return ToolResult(content="\n".join(lines))
 
     async def _list_dir(
         self,
@@ -291,7 +335,16 @@ class WorkspaceToolDispatcher:
             transform=transform,
         )
         await db.commit()
-        return ToolResult(content=f"Edited notebook {args['path']} ({metadata.size} bytes).")
+        requested_path = cast(str, args["path"])
+        return ToolResult(
+            content=file_mutation_result(
+                "notebook_edit",
+                device="server",
+                requested_path=requested_path,
+                canonical_path=canonical_server_path(requested_path),
+                size_bytes=metadata.size,
+            )
+        )
 
 
 def _virtual_path(request_path: str, relative_path: str) -> str:

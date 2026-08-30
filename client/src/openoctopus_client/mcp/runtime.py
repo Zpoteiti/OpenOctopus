@@ -671,7 +671,11 @@ class McpServerRuntime:
         return dict(routes)
 
     def mark_ready(self, generation: UUID) -> None:
-        if generation != self.generation or self.state is not McpRuntimeState.AWAITING_ACK:
+        if generation != self.generation:
+            raise RuntimeError("stale MCP registration acknowledgement")
+        if self.state is McpRuntimeState.READY:
+            return
+        if self.state is not McpRuntimeState.AWAITING_ACK:
             raise RuntimeError("stale MCP registration acknowledgement")
         if not self._routes and self._source_catalog is None:
             raise RuntimeError("MCP runtime has no discovered catalog")

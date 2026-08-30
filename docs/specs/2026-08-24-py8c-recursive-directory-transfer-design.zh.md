@@ -377,6 +377,10 @@ Agent tool 对两种 kind 都返回一段短文本，包含 source/destination�
 total bytes、digest 和 warnings。REST 返回上述 strict union。
 两者都不返回逐文件成功/失败数组。
 
+> 后续契约：当前 Agent tool success 已改为 `TOOLS.md` 定义的 JSON-as-text
+> envelope，并显式包含两端 device、requested path 与 canonical path。这里的 strict
+> aggregate 仍是内部 outcome 与 REST response；REST/wire DTO 未改变。
+
 ## 6. Directory manifest
 
 ### 6.1 Internal models

@@ -22,6 +22,17 @@ def _run(dispatcher: ClientToolDispatcher, name: str, **args: Any) -> ToolOutput
     return asyncio.run(dispatcher.execute(name, args))
 
 
+def _expected_canonical_path(path: Path) -> str:
+    resolved = path.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    try:
+        relative = resolved.relative_to(home)
+    except ValueError:
+        return str(resolved)
+    suffix = relative.as_posix()
+    return "~" if not suffix or suffix == "." else f"~/{suffix}"
+
+
 def _make_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -61,6 +72,15 @@ def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> N
         new_text="three\nfour",
     )
     assert edited.is_error is False
+    assert json.loads(cast(str, edited.content)) == {
+        "ok": True,
+        "operation": "edit_file",
+        "requested_path": "notes/a.txt",
+        "canonical_path": _expected_canonical_path(workspace / "notes/a.txt"),
+        "result": "edited",
+        "replacements": 1,
+        "size_bytes": len(b"three\nfour\n"),
+    }
     assert "three\nfour" in (workspace / "notes/a.txt").read_text()
 
     patched = _run(
@@ -69,7 +89,75 @@ def test_file_tools_are_workspace_confined_atomic_and_fuzzy(tmp_path: Path) -> N
         edits=[{"path": "notes/a.txt", "action": "add", "new_text": "five\n"}],
     )
     assert patched.is_error is False
+    patch_payload = json.loads(cast(str, patched.content))
+    assert patch_payload["operation"] == "apply_patch"
+    assert patch_payload["dry_run"] is False
+    assert patch_payload["edits"][0]["requested_path"] == "notes/a.txt"
+    assert patch_payload["edits"][0]["canonical_path"] == _expected_canonical_path(
+        workspace / "notes/a.txt"
+    )
     assert (workspace / "notes/a.txt").read_text().endswith("five\n")
+
+
+def test_file_mutation_result_returns_a_reusable_canonical_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
+
+    written = _run(tools, "write_file", path="notes/a.txt", content="hello")
+
+    assert isinstance(written.content, str)
+    assert json.loads(written.content) == {
+        "ok": True,
+        "operation": "write_file",
+        "requested_path": "notes/a.txt",
+        "canonical_path": _expected_canonical_path(workspace / "notes/a.txt"),
+        "bytes_written": 5,
+    }
+
+
+def test_patch_result_stays_valid_json_when_path_details_exceed_the_result_bound() -> None:
+    encoded = dispatcher_module._file_patch_result(
+        dry_run=False,
+        edits=[
+            {
+                "action": "add",
+                "requested_path": f"{index}-" + "\\" * 4090,
+                "canonical_path": f"C:\\workspace\\{index}-" + "\\" * 4090,
+                "size_bytes": 1,
+                "replacements": 0,
+            }
+            for index in range(20)
+        ],
+    )
+
+    payload = json.loads(encoded)
+    assert len(encoded) <= dispatcher_module._FILE_RESULT_JSON_MAX_CHARS
+    assert payload["total_edits"] == 20
+    assert payload["omitted_edits"] > 0
+    assert len(payload["edits"]) + payload["omitted_edits"] == 20
+
+
+def test_patch_result_can_omit_one_unrepresentable_path_detail() -> None:
+    path = "\x01" * 5000
+
+    encoded = dispatcher_module._file_patch_result(
+        dry_run=False,
+        edits=[
+            {
+                "action": "add",
+                "requested_path": path,
+                "canonical_path": path,
+                "size_bytes": 1,
+                "replacements": 0,
+            }
+        ],
+    )
+
+    payload = json.loads(encoded)
+    assert len(encoded) <= dispatcher_module._FILE_RESULT_JSON_MAX_CHARS
+    assert payload["edits"] == []
+    assert payload["omitted_edits"] == 1
 
 
 def test_repeated_read_file_returns_content_and_force_is_not_an_argument(tmp_path: Path) -> None:
@@ -129,6 +217,30 @@ def test_delete_folder_rejects_workspace_and_filesystem_roots(tmp_path: Path) ->
     assert (workspace / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
+def test_delete_results_identify_the_reusable_target_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "file.txt").write_text("data", encoding="utf-8")
+    (workspace / "folder").mkdir()
+    tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
+
+    deleted_file = _run(tools, "delete_file", path="file.txt")
+    deleted_folder = _run(tools, "delete_folder", path="folder")
+
+    assert json.loads(cast(str, deleted_file.content)) == {
+        "ok": True,
+        "operation": "delete_file",
+        "requested_path": "file.txt",
+        "canonical_path": _expected_canonical_path(workspace / "file.txt"),
+    }
+    assert json.loads(cast(str, deleted_folder.content)) == {
+        "ok": True,
+        "operation": "delete_folder",
+        "requested_path": "folder",
+        "canonical_path": _expected_canonical_path(workspace / "folder"),
+    }
+
+
 def test_discovery_grep_and_notebook_edit(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -152,6 +264,12 @@ def test_discovery_grep_and_notebook_edit(tmp_path: Path) -> None:
         new_source="x=2",
     )
     assert changed.is_error is False
+    changed_payload = json.loads(cast(str, changed.content))
+    assert changed_payload["operation"] == "notebook_edit"
+    assert changed_payload["requested_path"] == "book.ipynb"
+    assert changed_payload["canonical_path"] == _expected_canonical_path(
+        workspace / "book.ipynb"
+    )
     assert "x=2" in (workspace / "book.ipynb").read_text()
 
 

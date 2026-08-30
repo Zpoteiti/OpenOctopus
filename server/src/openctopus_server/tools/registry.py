@@ -54,6 +54,10 @@ from openctopus_server.tools.device_field import (
     DEVICE_FIELD_NAME,
     openoctopus_device_field,
 )
+from openctopus_server.tools.file_results import (
+    CLIENT_FILE_MUTATIONS,
+    attach_device_to_client_file_result,
+)
 from openctopus_server.tools.file_transfer import FileTransferTool
 from openctopus_server.tools.message import MessageTool
 from openctopus_server.tools.result import normalize_tool_result
@@ -1026,6 +1030,23 @@ async def _execute_on_device(
         if isinstance(raw.content, str)
         else [block.model_dump() for block in raw.content]
     )
+    if not raw.is_error and name in CLIENT_FILE_MUTATIONS:
+        if not isinstance(content, str):
+            return _normalized_error(
+                ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+                "Device file operation completed but returned an invalid result",
+            )
+        try:
+            content = attach_device_to_client_file_result(
+                name,
+                content,
+                device=device_name,
+            )
+        except (TypeError, ValueError):
+            return _normalized_error(
+                ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN,
+                "Device file operation completed but returned an invalid result",
+            )
     result_max_chars = max_output_chars
     if name in {"exec", "write_stdin"}:
         # The Client has already bounded the requested stdout/stderr/output.

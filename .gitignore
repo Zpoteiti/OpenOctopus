@@ -222,3 +222,7 @@ __marimo__/
 server/.env
 opencode.json
 .codegraph
+
+# Browser test artifacts
+frontend/playwright-report/
+frontend/test-results/

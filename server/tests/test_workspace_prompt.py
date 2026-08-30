@@ -8,7 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import openctopus_server.chat.prompt as prompt_module
 from openctopus_server.chat.prompt import _load_skills, _parse_skill_header, build_system_prompt
-from openctopus_server.db.models import Device, Session, User, Workspace, WorkspaceMember
+from openctopus_server.db.models import (
+    Device,
+    Session,
+    SystemConfig,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
 from openctopus_server.devices.protocol import ShellMetadata
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
@@ -155,6 +162,51 @@ async def test_prompt_loads_workspace_identity_memory_skills_and_shared_refs(pg_
     cached_skills = skills_cache.get(user.id)
     assert cached_skills is not None
     assert next(skill for skill in cached_skills if skill.name == "research").body == ""
+
+
+async def test_prompt_uses_admin_default_soul_until_personal_soul_exists(pg_engine) -> None:
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4()}@test.com",
+        password_hash="hash",
+        name="Alice",
+        is_admin=False,
+    )
+    session = Session(
+        id=uuid4(),
+        user_id=user.id,
+        session_key=f"web:{uuid4()}",
+        channel="web",
+        chat_id="chat-default-soul",
+        title="New chat",
+    )
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(user)
+        await db.flush()
+        db.add_all([
+            session,
+            SystemConfig(key="default_soul", value="You are the company assistant."),
+        ])
+        await db.commit()
+
+        fallback_prompt = await build_system_prompt(
+            db,
+            session=session,
+            user=user,
+            workspace_service=_PromptWorkspace({}),
+            skills_cache=SkillsCache(),
+        )
+        personal_prompt = await build_system_prompt(
+            db,
+            session=session,
+            user=user,
+            workspace_service=_PromptWorkspace({"SOUL.md": b"Be personal."}),
+            skills_cache=SkillsCache(),
+        )
+
+    assert "## SOUL\n\nYou are the company assistant." in fallback_prompt
+    assert "## SOUL\n\nBe personal." in personal_prompt
+    assert "You are the company assistant." not in personal_prompt
 
 
 async def test_prompt_describes_exec_for_every_paired_device(pg_engine) -> None:

@@ -286,8 +286,7 @@ def resolve_cwd(
         paths = WorkspacePaths(workspace, restrict_to_workspace=restrict_to_workspace)
         if value is None:
             return paths.root
-        supplied = Path(value).expanduser()
-        return paths.resolve(str(supplied), directory=True)
+        return paths.resolve(value, directory=True)
     except ToolFailure as exc:
         raise InvalidProcessArgumentsError("working_dir is invalid") from exc
 

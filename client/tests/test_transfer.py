@@ -3208,11 +3208,11 @@ def test_sender_failure_tombstone_accepts_matching_ack_and_rejects_conflict(
             await manager.handle_control(
                 TransferRequest(id=SLOT, purpose="file_transfer", src_path="missing", dst_path="x")
             )
-            await asyncio.sleep(0.02)
-            failure = next(
-                json.loads(item)
-                for item in socket.sent
-                if isinstance(item, str) and json.loads(item)["type"] == "transfer_end"
+            failure = await _wait_for_transfer_end(
+                socket,
+                SLOT,
+                ack=False,
+                ok=False,
             )
             assert failure["ack"] is False
             failure_code = failure["code"]
@@ -3228,6 +3228,7 @@ def test_sender_failure_tombstone_accepts_matching_ack_and_rejects_conflict(
                 await manager.handle_control(
                     matching_ack.model_copy(update={"code": "workspace_file_changed"})
                 )
+            await _wait_slot_closed(manager, SLOT)
             assert manager.active_count == 0
         finally:
             await _stop(manager, writer, writer_task)

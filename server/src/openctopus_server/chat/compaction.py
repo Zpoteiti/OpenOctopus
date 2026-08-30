@@ -114,6 +114,7 @@ async def commit_stage_one(
                     session_id=session_id,
                     message_kind="human",
                     content=[dict(block) for block in pending.content],
+                    attachment_refs=[dict(ref) for ref in (pending.attachment_refs or [])],
                     delivery_refs=[],
                     llm_fingerprint=None,
                     is_compacted=False,

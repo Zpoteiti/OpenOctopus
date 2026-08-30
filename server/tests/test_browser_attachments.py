@@ -8,9 +8,23 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.chat import attachments as attachment_module
-from openctopus_server.chat.attachments import expand_server_workspace_attachments
+from openctopus_server.chat.attachments import (
+    build_device_attachment_targets,
+    expand_server_workspace_attachments,
+    fence_owner_device_targets,
+)
+from openctopus_server.chat.device_snapshot import OwnerDeviceSnapshot
+from openctopus_server.chat.runner import _build_owner_tool_state
+from openctopus_server.devices.mcp_catalog import with_catalog_digest
+from openctopus_server.devices.mcp_models import (
+    PersistedMcpCatalog,
+    PersistedMcpCatalogEntry,
+    PersistedMcpServerCatalog,
+)
+from openctopus_server.devices.protocol import new_uuid7
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError, WorkspaceError
+from openctopus_server.tools.registry import build_py3_registry
 from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.storage import StoredObject
 
@@ -19,6 +33,141 @@ from openctopus_server.workspace.storage import StoredObject
 class _Attachment:
     openoctopus_device: str
     path: str
+
+
+@dataclass(slots=True)
+class _StoredAttachments:
+    attachment_refs: list[dict[str, object]]
+
+
+def test_device_attachment_targets_fence_a_same_name_replacement() -> None:
+    attached_id = uuid4()
+    replacement_id = uuid4()
+    rows = [
+        _StoredAttachments(
+            attachment_refs=[
+                {
+                    "openoctopus_device": "laptop-cn",
+                    "device_id": str(attached_id),
+                    "path": "documents/report.pdf",
+                },
+                {"openoctopus_device": "server", "path": "shared/report.pdf"},
+            ]
+        )
+    ]
+
+    attachment_targets = build_device_attachment_targets(rows)
+    targets, sites = fence_owner_device_targets(
+        {"laptop-cn": replacement_id},
+        attachment_targets,
+    )
+
+    assert attachment_targets == {"laptop-cn": attached_id}
+    assert targets == {"laptop-cn": attached_id}
+    assert sites == ("laptop-cn",)
+
+
+def test_device_attachment_targets_block_conflicting_same_name_generations() -> None:
+    rows = [
+        _StoredAttachments(
+            attachment_refs=[
+                {
+                    "openoctopus_device": "laptop-cn",
+                    "device_id": str(uuid4()),
+                    "path": "old.txt",
+                },
+                {
+                    "openoctopus_device": "laptop-cn",
+                    "device_id": str(uuid4()),
+                    "path": "new.txt",
+                },
+            ]
+        )
+    ]
+
+    targets, sites = fence_owner_device_targets(
+        {"laptop-cn": uuid4()},
+        build_device_attachment_targets(rows),
+    )
+
+    assert targets == {}
+    assert sites == ("laptop-cn",)
+
+
+@pytest.mark.parametrize(
+    ("attachment_target", "expected_targets", "mcp_visible"),
+    [
+        ("current", "current", True),
+        ("stale", "stale", False),
+        (None, None, False),
+    ],
+)
+def test_owner_tool_state_keeps_fenced_attachment_name_in_schema(
+    attachment_target: str | None,
+    expected_targets: str | None,
+    mcp_visible: bool,
+) -> None:
+    replacement_id = uuid4()
+    stale_id = uuid4()
+    device = OwnerDeviceSnapshot(
+        id=replacement_id,
+        name="laptop-cn",
+        workspace_path="~/workspace",
+        restrict_to_workspace=True,
+        shell_timeout_max=600,
+        config_revision=1,
+        mcp_catalog=with_catalog_digest(
+            PersistedMcpCatalog(
+                version=1,
+                digest="0" * 64,
+                servers=[
+                    PersistedMcpServerCatalog(
+                        name="demo",
+                        entries=[
+                            PersistedMcpCatalogEntry(
+                                entry_id=new_uuid7(),
+                                server="demo",
+                                surface="tool",
+                                raw_name="search",
+                                invocation_identity="search",
+                                final_name="mcp_demo_search",
+                                provider_description="Search with demo.",
+                                input_schema={
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                    "required": ["query"],
+                                    "additionalProperties": False,
+                                },
+                                enabled=True,
+                            )
+                        ],
+                    )
+                ],
+            )
+        ),
+    )
+    target = {
+        "current": replacement_id,
+        "stale": stale_id,
+        None: None,
+    }[attachment_target]
+
+    targets, _mcp_snapshot, schemas = _build_owner_tool_state(
+        [device],
+        tool_registry=build_py3_registry(),
+        attachment_targets={"laptop-cn": target},
+    )
+
+    assert targets == {
+        "current": {"laptop-cn": replacement_id},
+        "stale": {"laptop-cn": stale_id},
+        None: {},
+    }[expected_targets]
+    assert schemas[0]["input_schema"]["properties"]["openoctopus_device"]["enum"] == [
+        "server",
+        "laptop-cn",
+    ]
+    assert ("mcp_demo_search" in {schema["name"] for schema in schemas}) is mcp_visible
 
 
 def _workspace_service() -> AsyncMock:
@@ -255,7 +404,6 @@ async def test_aggregate_image_limit_counts_duplicate_snapshots(monkeypatch) -> 
 @pytest.mark.parametrize(
     "attachments",
     [
-        [_Attachment("laptop", "image.png")],
         [_Attachment("server", "")],
         [_Attachment("server", "x" * 4097)],
         [_Attachment("server", f"{index}.png") for index in range(11)],

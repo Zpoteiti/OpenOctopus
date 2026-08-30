@@ -1,7 +1,13 @@
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
 from openctopus_server.tools.base import ToolContext
+from openctopus_server.tools.file_results import (
+    FILE_RESULT_MAX_OUTPUT_CHARS,
+    canonical_server_path,
+    file_patch_result,
+)
 from openctopus_server.tools.workspace_backend import WorkspaceToolDispatcher
 from openctopus_server.workspace.service import PatchEditResult, ToolFileRead
 
@@ -70,7 +76,14 @@ async def test_backend_dispatches_write_through_workspace_service(pg_engine) -> 
     )
 
     assert result.is_error is False
-    assert result.content == "Wrote notes/a.txt (5 bytes)."
+    assert json.loads(str(result.content)) == {
+        "ok": True,
+        "operation": "write_file",
+        "device": "server",
+        "requested_path": "notes/a.txt",
+        "canonical_path": "~/notes/a.txt",
+        "bytes_written": 5,
+    }
     assert service.writes == [(ctx.user_id, "notes/a.txt", b"hello")]
 
 
@@ -108,3 +121,55 @@ async def test_backend_read_preserves_pdf_pages(pg_engine) -> None:
 def test_patch_result_type_stays_importable_for_backend_contract() -> None:
     result = PatchEditResult("a.txt", "add", 1, "etag", True, 0)
     assert result.path == "a.txt"
+
+
+def test_patch_result_omits_trailing_details_instead_of_truncating_json() -> None:
+    encoded = file_patch_result(
+        device="server",
+        dry_run=False,
+        edits=[
+            {
+                "action": "add",
+                "requested_path": f"{index}-" + "\\" * 4090,
+                "canonical_path": f"~/{index}-" + "\\" * 4090,
+                "size_bytes": 1,
+                "replacements": 0,
+            }
+            for index in range(20)
+        ],
+    )
+
+    payload = json.loads(encoded)
+    assert len(encoded) < FILE_RESULT_MAX_OUTPUT_CHARS
+    assert payload["total_edits"] == 20
+    assert payload["omitted_edits"] > 0
+    assert len(payload["edits"]) + payload["omitted_edits"] == 20
+
+
+def test_patch_result_can_omit_one_unrepresentable_path_detail() -> None:
+    path = "\x01" * 5000
+
+    encoded = file_patch_result(
+        device="server",
+        dry_run=False,
+        edits=[
+            {
+                "action": "add",
+                "requested_path": path,
+                "canonical_path": path,
+                "size_bytes": 1,
+                "replacements": 0,
+            }
+        ],
+    )
+
+    payload = json.loads(encoded)
+    assert len(encoded) <= FILE_RESULT_MAX_OUTPUT_CHARS
+    assert payload["edits"] == []
+    assert payload["omitted_edits"] == 1
+
+
+def test_server_home_alias_has_one_stable_canonical_form() -> None:
+    assert canonical_server_path("~//notes/a.txt") == "~/notes/a.txt"
+    assert canonical_server_path(r"~\\notes\a.txt") == "~/notes/a.txt"
+    assert canonical_server_path(r"notes\a.txt") == "~/notes/a.txt"

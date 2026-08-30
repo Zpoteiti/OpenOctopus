@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -23,6 +24,10 @@ from openctopus_server.devices.transfer import TransferError, TransferUnavailabl
 from openctopus_server.devices.workspace import FileSourceProbe
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext
+from openctopus_server.tools.file_results import (
+    FILE_RESULT_MAX_OUTPUT_CHARS,
+    file_transfer_result,
+)
 from openctopus_server.tools.file_transfer import (
     FileTransferOutcome,
     FileTransferRequest,
@@ -55,6 +60,12 @@ def test_file_transfer_schema_marks_both_device_fields() -> None:
         "dst_path",
     ]
     assert "regular file or directory tree" in schema["description"]
+    assert "Relative paths" in properties["src_path"]["description"]
+    assert "~/" in properties["src_path"]["description"]
+    assert "drive-absolute or UNC" in properties["dst_path"]["description"]
+    assert FileTransferTool(None, None, None, None).max_output_chars() == (
+        FILE_RESULT_MAX_OUTPUT_CHARS
+    )
 
 
 def test_file_transfer_outcome_validates_kind_count_and_normalizes_warnings() -> None:
@@ -124,7 +135,33 @@ def test_file_transfer_schema_accepts_every_install_site_combination(
             "openoctopus_dst_device": destination,
             "dst_path": "destination.txt",
         }
+        )
+
+
+def test_file_transfer_result_preserves_canonical_paths_with_bounded_json() -> None:
+    path = "\x01" * 4096
+
+    encoded = file_transfer_result(
+        mode="copy",
+        source_device="source",
+        source_path=path,
+        destination_device="destination",
+        destination_path=path,
+        kind="file",
+        files_transferred=1,
+        bytes_transferred=1,
+        sha256="a" * 64,
+        warnings=(),
     )
+
+    payload = json.loads(encoded)
+    assert len(encoded) <= FILE_RESULT_MAX_OUTPUT_CHARS
+    assert payload["source"]["canonical_path"] == path
+    assert payload["destination"]["canonical_path"] == path
+    assert payload["source"]["requested_path_omitted"] is True
+    assert payload["destination"]["requested_path_omitted"] is True
+    assert "requested_path" not in payload["source"]
+    assert "requested_path" not in payload["destination"]
 
 
 @pytest.mark.asyncio
@@ -167,8 +204,26 @@ async def test_distinct_clients_resolve_once_then_dispatch_one_bridge(
     )
 
     assert result.is_error is False
-    assert "file, 1 file" in str(result.content)
-    assert "12 bytes" in str(result.content)
+    assert json.loads(str(result.content)) == {
+        "ok": True,
+        "operation": "file_transfer",
+        "mode": "copy",
+        "source": {
+            "device": "laptop",
+            "requested_path": "a.txt",
+            "canonical_path": "a.txt",
+        },
+        "destination": {
+            "device": "phone",
+            "requested_path": "b.txt",
+            "canonical_path": "b.txt",
+        },
+        "kind": "file",
+        "files_transferred": 1,
+        "bytes_transferred": 12,
+        "sha256": "a" * 64,
+        "warnings": [],
+    }
     assert session.execute_calls == 1
     assert session.closed is True
     assert workspace.calls == []
@@ -371,7 +426,18 @@ async def test_same_client_dispatches_one_private_local_action_without_transfer_
     )
 
     assert result.is_error is False
-    assert "12 bytes" in str(result.content)
+    payload = json.loads(str(result.content))
+    assert payload["bytes_transferred"] == 12
+    assert payload["source"] == {
+        "device": "laptop",
+        "requested_path": "a.txt",
+        "canonical_path": "a.txt",
+    }
+    assert payload["destination"] == {
+        "device": "laptop",
+        "requested_path": "b.txt",
+        "canonical_path": "b.txt",
+    }
     assert registry.calls == [
         (
             device_id,
@@ -415,7 +481,18 @@ async def test_server_to_server_uses_workspace_transfer_without_device_registry(
     )
 
     assert result.is_error is False
-    assert "12 bytes" in str(result.content)
+    payload = json.loads(str(result.content))
+    assert payload["bytes_transferred"] == 12
+    assert payload["source"] == {
+        "device": "server",
+        "requested_path": "a.txt",
+        "canonical_path": "~/a.txt",
+    }
+    assert payload["destination"] == {
+        "device": "server",
+        "requested_path": "b.txt",
+        "canonical_path": "~/b.txt",
+    }
     assert workspace_fs.calls == [("a.txt", "b.txt", "move")]
     assert workspace.calls == [("b.txt", "temp", "validate")]
 

@@ -1,0 +1,94 @@
+name: openoctopus
+
+services:
+  postgres:
+    image: postgres:18.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openoctopus
+      POSTGRES_USER: openoctopus
+      POSTGRES_PASSWORD: ${OPENOCTOPUS_POSTGRES_PASSWORD:?Set OPENOCTOPUS_POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openoctopus -d openoctopus"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs@sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${OPENOCTOPUS_STORAGE_ACCESS_KEY:?Set OPENOCTOPUS_STORAGE_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${OPENOCTOPUS_STORAGE_SECRET_KEY:?Set OPENOCTOPUS_STORAGE_SECRET_KEY}
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  bucket-init:
+    image: ${OPENOCTOPUS_IMAGE:-ghcr.io/zpoteiti/openoctopus:v0.0.1}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: ["python", "-c"]
+    environment:
+      OPENOCTOPUS_STORAGE_ACCESS_KEY: ${OPENOCTOPUS_STORAGE_ACCESS_KEY:?Set OPENOCTOPUS_STORAGE_ACCESS_KEY}
+      OPENOCTOPUS_STORAGE_SECRET_KEY: ${OPENOCTOPUS_STORAGE_SECRET_KEY:?Set OPENOCTOPUS_STORAGE_SECRET_KEY}
+      OPENOCTOPUS_OBJECT_STORAGE_BUCKET: ${OPENOCTOPUS_OBJECT_STORAGE_BUCKET:-openoctopus}
+    command:
+      - >-
+        import os; from minio import Minio;
+        client = Minio('rustfs:9000',
+        access_key=os.environ['OPENOCTOPUS_STORAGE_ACCESS_KEY'],
+        secret_key=os.environ['OPENOCTOPUS_STORAGE_SECRET_KEY'],
+        secure=False);
+        bucket = os.environ['OPENOCTOPUS_OBJECT_STORAGE_BUCKET'];
+        client.bucket_exists(bucket) or client.make_bucket(bucket)
+
+  server:
+    image: ${OPENOCTOPUS_IMAGE:-ghcr.io/zpoteiti/openoctopus:v0.0.1}
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - ${OPENOCTOPUS_SERVER_ENV_FILE:-server/.env.example}
+    environment:
+      OPENOCTOPUS_HOST: 0.0.0.0
+      OPENOCTOPUS_DATABASE_URL: postgresql+asyncpg://openoctopus:${OPENOCTOPUS_POSTGRES_PASSWORD:?Set OPENOCTOPUS_POSTGRES_PASSWORD}@postgres:5432/openoctopus
+      OPENOCTOPUS_JWT_SECRET: ${OPENOCTOPUS_JWT_SECRET:?Set OPENOCTOPUS_JWT_SECRET}
+      OPENOCTOPUS_ADMIN_TOKEN: ${OPENOCTOPUS_ADMIN_TOKEN:?Set OPENOCTOPUS_ADMIN_TOKEN}
+      OPENOCTOPUS_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
+      OPENOCTOPUS_OBJECT_STORAGE_ACCESS_KEY: ${OPENOCTOPUS_STORAGE_ACCESS_KEY:?Set OPENOCTOPUS_STORAGE_ACCESS_KEY}
+      OPENOCTOPUS_OBJECT_STORAGE_SECRET_KEY: ${OPENOCTOPUS_STORAGE_SECRET_KEY:?Set OPENOCTOPUS_STORAGE_SECRET_KEY}
+      OPENOCTOPUS_OBJECT_STORAGE_BUCKET: ${OPENOCTOPUS_OBJECT_STORAGE_BUCKET:-openoctopus}
+    ports:
+      - ${OPENOCTOPUS_BIND_ADDRESS:-127.0.0.1}:${OPENOCTOPUS_PUBLIC_PORT:-8080}:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres-data:
+  rustfs-data:

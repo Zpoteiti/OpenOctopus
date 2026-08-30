@@ -33,6 +33,7 @@ async def accept_message(
     user: User,
     session_id: UUID,
     content: list[dict[str, Any]],
+    attachment_refs: list[dict[str, Any]] | None = None,
     effort: Effort | None,
     runner_instance_id: UUID,
 ) -> AcceptedMessage:
@@ -75,6 +76,7 @@ async def accept_message(
                 user_id=user.id,
                 session_key=session.session_key,
                 content=stored_content,
+                attachment_refs=[dict(ref) for ref in (attachment_refs or [])],
                 effort=effort.value if effort is not None else None,
                 received_at=now,
             )
@@ -727,6 +729,7 @@ async def _promote_pending_rows(
                 session_id=row.session_id,
                 message_kind="human",
                 content=row.content,
+                attachment_refs=[dict(ref) for ref in (row.attachment_refs or [])],
                 delivery_refs=[],
                 is_compacted=False,
                 created_at=promoted_at + timedelta(microseconds=index),

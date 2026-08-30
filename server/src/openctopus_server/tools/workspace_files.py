@@ -1,12 +1,16 @@
 import asyncio
 from copy import deepcopy
 from pathlib import PurePosixPath
-from typing import Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
+from openctopus_server.tools.file_results import (
+    CLIENT_FILE_MUTATIONS,
+    FILE_RESULT_MAX_OUTPUT_CHARS,
+)
 
 READ_FILE_MAX_OUTPUT_CHARS = 128_000
 
@@ -22,6 +26,25 @@ WORKSPACE_FILE_TOOL_TIMEOUT_SECONDS: dict[str, float] = {
     "grep": 60,
     "notebook_edit": 30,
 }
+
+_WORKSPACE_PATH_CONTRACT = (
+    "Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or "
+    "personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = "
+    "POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted "
+    "Clients normalize the path, reject symlink/reparse components, then check the target. "
+    "Server paths use virtual '/' separators and normalize backslashes to '/'."
+)
+
+_WorkspaceToolPath = Annotated[str, Field(min_length=1, max_length=4096)]
+
+
+def _path_schema(purpose: str) -> dict[str, Any]:
+    return {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": f"{purpose} {_WORKSPACE_PATH_CONTRACT}",
+    }
 
 
 def _input_schema(
@@ -52,7 +75,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {"type": "string", "description": "The file path to read"},
+                "path": _path_schema("File to read."),
                 "offset": {
                     "type": "integer",
                     "description": "Line number to start reading from (1-indexed, default 1)",
@@ -84,7 +107,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {"type": "string", "description": "The file path to write to"},
+                "path": _path_schema("File to write."),
                 "content": {"type": "string", "description": "The content to write"},
             },
             required=("path", "content"),
@@ -102,7 +125,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {"type": "string", "description": "The file path to edit"},
+                "path": _path_schema("File to edit."),
                 "old_text": {"type": "string", "description": "The text to find and replace"},
                 "new_text": {"type": "string", "description": "The text to replace with"},
                 "replace_all": {
@@ -138,7 +161,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": (
             "Default tool for code edits. Supports multi-file changes in a single call. "
             "Provide a list of structured edits, each specifying a file path, action "
-            "(replace/add), and the exact text to change. Paths must be relative. Set "
+            "(replace/add), and the exact text to change. Set "
             "dry_run=true to validate and preview without writing files. Use edit_file only "
             "for small exact replacements on a single file."
         ),
@@ -153,10 +176,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "maxItems": 20,
                     "items": _input_schema(
                         {
-                            "path": {
-                                "type": "string",
-                                "description": "Relative path to the file to edit.",
-                            },
+                            "path": _path_schema("File to edit."),
                             "action": {
                                 "type": "string",
                                 "enum": ["replace", "add"],
@@ -191,7 +211,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "name": "delete_file",
         "description": "Delete a single file. Use delete_folder for directories.",
         "input_schema": _input_schema(
-            {"path": {"type": "string", "description": "Absolute path to the file."}},
+            {"path": _path_schema("File to delete.")},
             required=("path",),
         ),
     },
@@ -202,7 +222,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "delete_file for individual files."
         ),
         "input_schema": _input_schema(
-            {"path": {"type": "string", "description": "Absolute path to the folder."}},
+            {"path": _path_schema("Folder to delete.")},
             required=("path",),
         ),
     },
@@ -215,7 +235,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {"type": "string", "description": "The directory path to list"},
+                "path": _path_schema("Directory to list."),
                 "recursive": {
                     "type": "boolean",
                     "description": "Recursively list all files (default false)",
@@ -240,10 +260,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {
-                    "type": "string",
-                    "description": "Directory or file to search in (default '.')",
-                },
+                "path": _path_schema("Directory or file to search in (default '.')."),
                 "query": {
                     "type": "string",
                     "description": (
@@ -299,10 +316,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": "Regex or plain text pattern to search for",
                     "minLength": 1,
                 },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory to search in (default '.')",
-                },
+                "path": _path_schema("File or directory to search in (default '.')."),
                 "glob": {
                     "type": "string",
                     "description": "Optional file filter, e.g. '*.py' or 'tests/**/test_*.py'",
@@ -382,10 +396,7 @@ WORKSPACE_FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "input_schema": _input_schema(
             {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the .ipynb notebook file",
-                },
+                "path": _path_schema("Notebook file to edit."),
                 "cell_index": {
                     "type": "integer",
                     "description": "0-based index of the cell to edit",
@@ -428,19 +439,19 @@ class _Args(BaseModel):
 
 
 class _ReadFileArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
     offset: int = Field(1, ge=1)
     limit: int = Field(2000, ge=1)
     pages: str | None = None
 
 
 class _WriteFileArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
     content: str
 
 
 class _EditFileArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
     old_text: str
     new_text: str
     replace_all: bool = False
@@ -459,7 +470,7 @@ class _EditFileArgs(_Args):
 
 
 class _PatchEdit(_Args):
-    path: str
+    path: _WorkspaceToolPath
     action: Literal["replace", "add"]
     old_text: str | None = None
     new_text: str | None = None
@@ -479,17 +490,17 @@ class _ApplyPatchArgs(_Args):
 
 
 class _PathArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
 
 
 class _ListDirArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
     recursive: bool = False
     max_entries: int = Field(200, ge=1, le=1000)
 
 
 class _FindFilesArgs(_Args):
-    path: str = "."
+    path: _WorkspaceToolPath = "."
     query: str | None = None
     glob: str | None = None
     type: str | None = None
@@ -501,7 +512,7 @@ class _FindFilesArgs(_Args):
 
 class _GrepArgs(_Args):
     pattern: str = Field(min_length=1)
-    path: str = "."
+    path: _WorkspaceToolPath = "."
     glob: str | None = None
     type: str | None = None
     case_insensitive: bool = False
@@ -516,7 +527,7 @@ class _GrepArgs(_Args):
 
 
 class _NotebookEditArgs(_Args):
-    path: str
+    path: _WorkspaceToolPath
     cell_index: int = Field(ge=0)
     new_source: str | None = None
     cell_type: Literal["code", "markdown"] = "code"
@@ -568,6 +579,8 @@ class WorkspaceFileTool(Tool):
     def max_output_chars(self) -> int:
         if self._name == "read_file":
             return READ_FILE_MAX_OUTPUT_CHARS
+        if self._name in CLIENT_FILE_MUTATIONS:
+            return FILE_RESULT_MAX_OUTPUT_CHARS
         return super().max_output_chars()
 
     async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:

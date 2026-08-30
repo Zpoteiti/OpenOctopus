@@ -45,10 +45,10 @@ This is a *design* document. Use it during implementation as the source of truth
 - **Every tool implements the `Tool` trait** (ADR-077): `name`, `schema`, `max_output_chars` (default 16k via the trait), `execute`.
 - **Default result cap is 16,000 characters** (ADR-076). Tools that need more override `max_output_chars`. Truncation is head-only with `\n... (truncated)` marker.
 - **Timeouts are per-tool** (ADR-075). No central dispatcher wrapper. Some tools expose `timeout` in their schema (agent-tunable); others enforce internal-only timeouts.
-- **Path policy** (ADR-043, ADR-108, ADR-123): relative paths are accepted and resolve to the **personal workspace on the target device**. On the server, `WorkspaceService` resolves the authenticated virtual path and `WorkspaceFS` maps it to the user's RustFS object prefix; on a client, it is the device's local `workspace_path`. Absolute paths are also accepted. **Shared workspaces always require absolute paths in the `name@suffix` form** (e.g. `/production-department@a4f7e2d1/sprint.md`) — they have no implicit relative base, and strict-mode resolution requires both name and suffix to match the workspace row exactly. Names are validated per ADR-109.
+- **Path policy** (ADR-043, ADR-108, ADR-123): relative paths resolve to the selected install site's Workspace — the authenticated personal Workspace on the Server or the configured `workspace_path` on a Client. `~`, `~/...`, and `~\...` mean the personal Server Workspace when `openoctopus_device="server"`, and the OS user's home on a Client. Server paths use a virtual `/` separator and normalize `\` input to `/`; shared Workspaces require the virtual absolute `/name@suffix/...` form. Client absolute paths use the target OS's native syntax: POSIX `/...`; Windows drive-absolute (`C:\...` / `C:/...`) or UNC (`\\server\share\...`). Windows rejects ambiguous `C:foo`, `\foo`, and `/foo` forms.
 - **Workspace writes funnel through `WorkspaceService`** server-side (ADR-045, ADR-123). Its internal `WorkspaceFS` owns object-key mapping, quota checks, mutation coordination, and RustFS/MinIO-SDK error normalization.
 - **Server workspace IO is bounded inside the workspace service** (ADR-122, ADR-123). Tool schemas do not expose object-storage concepts; the implementation owns a bounded RustFS client pool, paged metadata scans, workspace mutation locks, and bounded in-memory transforms. REST upload/download admission is separate and never consumes Agent file-tool permits. Document reads additionally use per-user/global conversion admission before downloading bytes and keep parsing inside a resource-limited child process.
-- **File policy is per target install site.** On Python-main server workspaces, `WorkspaceService` is the authorization boundary: paths are normalized and checked against the selected personal/shared workspace before internal mapping to RustFS keys. On clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) resolves paths through the target Device config. With `restrict_to_workspace=true` (default), resolved paths must stay under `workspace_path`; with false, absolute paths outside it are allowed. This is not an OS sandbox.
+- **File policy is per target install site.** On Python-main Server Workspaces, `WorkspaceService` is the authorization boundary: it resolves the authenticated virtual path before internal mapping to RustFS keys. On Clients, every shared file tool (`read_file`, `write_file`, `edit_file`, `apply_patch`, `delete_file`, `delete_folder`, `list_dir`, `find_files`, `grep`, `notebook_edit`) uses the same path resolver. With `restrict_to_workspace=true` (default), the Client expands `~`, resolves relative paths, normalizes the result, rejects symlink/reparse components, and then rejects a final path outside `workspace_path`; false permits paths outside the Workspace but keeps the same no-follow rule. This is not an OS sandbox.
 - **Every active tool result is wrapped** (ADR-095): provider-facing
   `tool_result.content` is normalized to a safe block array. The first block is
   a server-generated `[untrusted tool result]: ...` warning text block; raw
@@ -112,7 +112,8 @@ The Python-main Workspace Files REST API uses the same explicit-device
 contract. There is no REST default: every file route requires
 `openoctopus_device`. `openoctopus_device=server` routes to the authenticated user's
 server workspace view, where relative paths resolve to the personal workspace
-and absolute `/name@suffix/...` paths address shared workspaces. Paired device
+and `~` aliases the same root; absolute `/name@suffix/...` paths address shared
+workspaces. Client targets use the cross-platform grammar above. Paired device
 names route over `/ws/device`; offline paired devices return
 `tool_device_unreachable`. The `file_transfer` REST endpoint keeps its intrinsic
 fields `openoctopus_src_device` and `openoctopus_dst_device`, matching the tool schema.
@@ -139,7 +140,9 @@ returned as Anthropic `image` blocks.
     "properties": {
       "path": {
         "type": "string",
-        "description": "The file path to read"
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "File to read. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target."
       },
       "offset": {
         "type": "integer",
@@ -162,7 +165,7 @@ returned as Anthropic `image` blocks.
 ```
 
 **Mechanism:**
-- Path resolution follows ADR-043 and ADR-108: relative paths resolve to the target device's personal workspace root; absolute paths are used as-is. Server-side, absolute paths in the `name@suffix` form are required for shared workspaces.
+- Path resolution follows ADR-043 and ADR-108. Relative paths use the selected Workspace; home-relative and native absolute paths use the install-site grammar above. Server shared Workspaces require `/name@suffix/...`.
 - **Default text response:** `limit=2000` lines, output prefixed `LINE_NUM| <line>`. Tail includes `(Showing lines X-Y of Z. Use offset=X+1 to continue.)` — self-documenting pagination.
 - **128k char hard cap** applied on top of line-based limit; safety net for pathological line lengths.
 - **Blocked device paths** (nanobot pattern): `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/full`, `/dev/stdin/out/err`, `/dev/tty`, `/proc/<pid>/fd/[012]` — refused to avoid hangs.
@@ -220,7 +223,9 @@ or explain the failure.
     "properties": {
       "path": {
         "type": "string",
-        "description": "The file path to write to"
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "File to write. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target."
       },
       "content": {
         "type": "string",
@@ -240,7 +245,8 @@ or explain the failure.
 - **Client side:** subject to the target Device's `restrict_to_workspace`; true confines writes to its `workspace_path`.
 
 **Timeout:** 30s internal.
-**Result cap:** 16,000 characters (default — usually a brief success message).
+**Result cap:** 50,000 characters. Success uses the structured file-mutation
+result envelope described under [Untrusted tool result wrap](#untrusted-tool-result-wrap).
 **Errors:** `workspace_soft_locked`, `workspace_upload_too_large`,
 `workspace_invalid_skill_format`, `workspace_permission_denied`,
 `workspace_symlink_escape`.
@@ -266,7 +272,7 @@ or explain the failure.
   "input_schema": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "The file path to edit" },
+      "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "File to edit. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target." },
       "old_text": { "type": "string", "description": "The text to find and replace" },
       "new_text": { "type": "string", "description": "The text to replace with" },
       "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" },
@@ -306,7 +312,8 @@ or explain the failure.
 - **Skills cache invalidation:** same as write.
 
 **Timeout:** 30s internal.
-**Result cap:** 16,000 characters (typically a short confirmation + match locations).
+**Result cap:** 50,000 characters. Success uses the structured file-mutation
+result envelope and includes replacement count and final byte size.
 **Errors:** `tool_ambiguous_edit`, `tool_no_match`, `workspace_soft_locked`,
 `workspace_upload_too_large`, `workspace_invalid_skill_format`.
 **Related ADRs:** 042 (matcher), 045, 078, 082, 085.
@@ -327,7 +334,7 @@ or explain the failure.
 ```json
 {
   "name": "apply_patch",
-  "description": "Default tool for code edits. Supports multi-file changes in a single call. Provide a list of structured edits, each specifying a file path, action (replace/add), and the exact text to change. Paths must be relative. Set dry_run=true to validate and preview without writing files. Use edit_file only for small exact replacements on a single file.",
+  "description": "Default tool for code edits. Supports multi-file changes in a single call. Provide a list of structured edits, each specifying a file path, action (replace/add), and the exact text to change. Set dry_run=true to validate and preview without writing files. Use edit_file only for small exact replacements on a single file.",
   "input_schema": {
     "type": "object",
     "properties": {
@@ -341,7 +348,9 @@ or explain the failure.
           "properties": {
             "path": {
               "type": "string",
-              "description": "Relative path to the file to edit."
+              "minLength": 1,
+              "maxLength": 4096,
+              "description": "File to edit. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target."
             },
             "action": {
               "type": "string",
@@ -377,10 +386,11 @@ or explain the failure.
 - `dry_run=true` validates paths and replacement matches, then returns a summary without writing.
 - Server side writes through `WorkspaceService`, so authorization, quota, SKILL.md validation, skills-cache invalidation, object IO bounds, and path safety still apply.
 - Client side uses the Device's normal workspace resolver and `restrict_to_workspace`.
-- OpenOctopus path policy still applies after routing. Relative paths resolve to the selected personal workspace. Shared server workspace edits use the same `/name@suffix/...` absolute path form as other file tools.
+- OpenOctopus path policy still applies after routing. Relative and home-relative paths use the install-site grammar above. Shared Server Workspace edits use the same `/name@suffix/...` virtual absolute form as other file tools.
 
 **Timeout:** 30s internal.
-**Result cap:** 16,000 characters.
+**Result cap:** 50,000 characters. Oversized multi-file detail remains valid
+JSON and reports the number of omitted trailing edit records.
 **Errors:** `tool_no_match`, `workspace_soft_locked`,
 `workspace_upload_too_large`, `workspace_permission_denied`,
 `workspace_symlink_escape`.
@@ -406,7 +416,7 @@ or explain the failure.
   "input_schema": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "Absolute path to the file." }
+      "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "File to delete. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target." }
     },
     "required": ["path"],
     "additionalProperties": false
@@ -421,7 +431,7 @@ or explain the failure.
 - **Lock interaction:** delete is allowed even when current usage is greater than `quota_bytes` (ADR-078). Once usage drops back under, lock auto-lifts on next non-delete attempt.
 
 **Timeout:** 10s internal.
-**Result cap:** 16,000 characters.
+**Result cap:** 50,000 characters.
 **Errors:** `workspace_not_found`, `tool_is_directory`.
 **Related ADRs:** 078 (lock state), 045, 085.
 
@@ -445,7 +455,7 @@ or explain the failure.
   "input_schema": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "Absolute path to the folder." }
+      "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Folder to delete. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target." }
     },
     "required": ["path"],
     "additionalProperties": false
@@ -462,7 +472,7 @@ or explain the failure.
 - **Skills cache invalidation:** if the deleted path was `skills/` or under it, invalidate.
 
 **Timeout:** 60s internal — recursive delete on large trees can take meaningful time.
-**Result cap:** 16,000 characters.
+**Result cap:** 50,000 characters.
 **Errors:** `workspace_not_found`, `tool_is_file`.
 **Related ADRs:** 078, 086.
 
@@ -486,7 +496,7 @@ or explain the failure.
   "input_schema": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "The directory path to list" },
+      "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Directory to list. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target." },
       "recursive": { "type": "boolean", "description": "Recursively list all files (default false)" },
       "max_entries": { "type": "integer", "description": "Maximum entries to return (default 200, max 1000)", "minimum": 1, "maximum": 1000 }
     },
@@ -496,7 +506,7 @@ or explain the failure.
 ```
 
 **Mechanism:**
-- Path resolution per ADR-043.
+- Path resolution uses ADR-043's relative, home-relative, and native absolute grammar.
 - **Auto-ignored noise dirs** (mirror of nanobot's list): `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.coverage`, `htmlcov`.
 - **Non-recursive output:** entries with a `📁 ` / `📄 ` prefix per entry (visual, LLM-friendly).
 - **Recursive output:** flat list of relative paths, with trailing `/` for directories.
@@ -532,7 +542,9 @@ or explain the failure.
     "properties": {
       "path": {
         "type": "string",
-        "description": "Directory or file to search in (default '.')"
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "Directory or file to search in (default '.'). Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target."
       },
       "query": {
         "type": "string",
@@ -573,7 +585,7 @@ or explain the failure.
 ```
 
 **Mechanism:**
-- `path` defaults to `.` (which per ADR-043 means the target's personal workspace root).
+- `path` defaults to `.` (which per ADR-043 means the selected install site's Workspace root).
 - `query` performs case-insensitive path-fragment matching; whitespace-separated terms must all be present.
 - `glob` filters by glob pattern.
 - `type` filters by file type shorthand, e.g. `py`, `ts`, `md`, `json`.
@@ -614,7 +626,9 @@ or explain the failure.
       },
       "path": {
         "type": "string",
-        "description": "File or directory to search in (default '.')"
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "File or directory to search in (default '.'). Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target."
       },
       "glob": {
         "type": "string",
@@ -719,7 +733,7 @@ REST equivalent; frontend callers can still download or replace the raw
   "input_schema": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "Path to the .ipynb notebook file" },
+      "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Notebook file to edit. Path grammar: relative = selected Workspace; home-relative '~' = Client OS home or personal Server Workspace; Server shared = '/name@suffix/...'; Client absolute = POSIX '/...' or Windows drive/UNC (not 'C:foo', '\\foo', or '/foo'). Restricted Clients normalize the path, reject symlink/reparse components, then check the target." },
       "cell_index": { "type": "integer", "description": "0-based index of the cell to edit", "minimum": 0 },
       "new_source": { "type": "string", "description": "New source content for the cell" },
       "cell_type": { "type": "string", "description": "Cell type: 'code' or 'markdown' (default: code)", "enum": ["code", "markdown"] },
@@ -737,7 +751,7 @@ REST equivalent; frontend callers can still download or replace the raw
 - `edit_mode=delete`: removes cell at `cell_index`. `new_source` / `cell_type` ignored.
 
 **Timeout:** 30s internal.
-**Result cap:** 16,000 characters.
+**Result cap:** 50,000 characters.
 **Errors:** `workspace_not_found`, `tool_invalid_notebook`,
 `tool_cell_index_out_of_range`.
 **Related ADRs:** 043, 095.
@@ -952,14 +966,14 @@ exposing the tool to the model.
         "description": "Device where the source file or directory lives.",
         "x-openoctopus-device": true
       },
-      "src_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_src_device." },
+      "src_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Source path. Relative paths use the selected install site's Workspace. ~/ uses the OS user home on a Client and the authenticated user's personal Workspace on server. Absolute paths use the selected site's native namespace: /name@suffix/... on server, or a native absolute path on a Client. On Windows use a drive-absolute or UNC path." },
       "openoctopus_dst_device": {
         "type": "string",
         "enum": ["server"],
         "description": "Device where the file or directory should land.",
         "x-openoctopus-device": true
       },
-      "dst_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Path on openoctopus_dst_device. Must not already exist." },
+      "dst_path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Destination path; it must not already exist. Relative paths use the selected install site's Workspace. ~/ uses the OS user home on a Client and the authenticated user's personal Workspace on server. Absolute paths use the selected site's native namespace: /name@suffix/... on server, or a native absolute path on a Client. On Windows use a drive-absolute or UNC path." },
       "mode": {
         "type": "string",
         "enum": ["copy", "move"],
@@ -985,6 +999,10 @@ remain visible and return `tool_device_unreachable` at dispatch.
 - The source schema in `openctopus_server` declares
   `openoctopus_src_device` and `openoctopus_dst_device`; the merge step extends
   both enums with paired device names.
+- `src_path` and `dst_path` each use ADR-043 according to their own selected
+  install site. Relative paths use that site's Workspace; Server home-relative
+  paths use the personal Server Workspace; Client home-relative and native
+  absolute paths use the target OS grammar and restriction check above.
 - The source endpoint performs a no-follow probe. A regular file uses the
   existing single-file path. A directory produces a complete immutable
   manifest and is copied sequentially with at most one active child file slot.
@@ -1032,11 +1050,15 @@ remain visible and return `tool_device_unreachable` at dispatch.
   return bounded symbolic warnings (`transfer_ack_failed`,
   `source_delete_failed`, `source_changed_after_copy`, or
   `source_cleanup_incomplete`).
-- Success is one bounded aggregate: `kind` (`file` or `directory`),
-  `files_transferred`, `bytes_transferred`, canonical content `sha256`, and up
-  to eight deduplicated warnings. It never returns per-entry arrays. Directory
-  digest covers the mapped regular-file path/content set, not empty directories
-  or filesystem metadata.
+- Success is one bounded JSON-as-text aggregate. It reports `mode`; source and
+  destination objects containing trusted `device`, original `requested_path`,
+  and reusable `canonical_path`; plus `kind`, `files_transferred`,
+  `bytes_transferred`, canonical content `sha256`, and up to eight deduplicated
+  warnings. If JSON escaping alone would exceed the cap, the complete canonical
+  paths and warnings remain while duplicate requested paths are explicitly
+  marked omitted. It never returns per-entry arrays. Directory digest covers the
+  mapped regular-file path/content set, not empty directories or filesystem
+  metadata.
 - **Reject** if the destination root exists, the source is missing or has an
   unsupported kind, a source directory contains no regular files,
   source/destination physically overlap on one captured Device, a manifest
@@ -1053,7 +1075,7 @@ no-follow checks; platform-native and frozen tests are required for release,
 while unsupported atomic primitives fail explicitly.
 
 **Timeout:** Server-to-server path is normal workspace I/O. Device transfer stall detection belongs to the transfer-slot implementation.
-**Result cap:** short status text normalized as a normal tool result.
+**Result cap:** 50,000 characters; the structured JSON always remains valid.
 **Errors:** `tool_invalid_args` for malformed args;
 `tool_device_unreachable` for offline or stale device targets;
 `tool_device_busy` for bounded transfer admission; destination/path policy
@@ -1556,7 +1578,8 @@ cache.
 ### Result cap + truncation
 
 - Default cap: `16_000` chars (ADR-076).
-- Per-tool override via `max_output_chars()` — currently only `read_file` overrides (to 128k).
+- Per-tool override via `max_output_chars()` — `read_file` uses 128k;
+  file mutations and `file_transfer` use 50k so structured JSON is not cut mid-object.
 - Truncation is head-only with `\n... (truncated)` marker. Helper lives in `openctopus_server/tools/truncate.py`.
 
 ### Timeout enforcement
@@ -1570,7 +1593,28 @@ cache.
 
 ### Untrusted tool result wrap
 
-Every real tool result is normalized before the `tool_result` block reaches the LLM. Provider-facing `tool_result.content` is a safe block array. The first block is a server-generated `[untrusted tool result]: ...` warning text block; raw string results become the following text block, and raw safe block arrays are appended after the warning in their original order. If the result contains images, image bytes are never modified. Uniform across shared tools, server-only tools, client-only tools, and MCP-wrapped tools. The prefix intentionally does not vary by device; device provenance is already visible through the preceding `tool_use.input` and server/SSE metadata. Helper in `openctopus_server/tools/result.py`.
+Every real tool result is normalized before the `tool_result` block reaches the LLM. Provider-facing `tool_result.content` is a safe block array. The first block is a server-generated `[untrusted tool result]: ...` warning text block; raw string results become the following text block, and raw safe block arrays are appended after the warning in their original order. If the result contains images, image bytes are never modified. Uniform across shared tools, server-only tools, client-only tools, and MCP-wrapped tools. The prefix intentionally does not vary by device. Helper in `openctopus_server/tools/result.py`.
+
+Successful `write_file`, `edit_file`, `delete_file`, `delete_folder`, and
+`notebook_edit` calls return a JSON object in the second text block. It includes
+`ok`, `operation`, trusted `device`, the original `requested_path`, a
+`canonical_path` reusable with the same device, and operation-specific counts.
+`apply_patch` uses the same top-level fields and reports those path fields for
+each retained edit; bounded results report `omitted_edits` when trailing detail
+does not fit. A Client does not assert its own device identity: it returns the
+path data, and the Server validates the envelope and injects the captured route
+name before Provider delivery. For example:
+
+```json
+{
+  "ok": true,
+  "operation": "write_file",
+  "device": "laptop",
+  "requested_path": "hello_world.py",
+  "canonical_path": "~/openoctopus/workspace/hello_world.py",
+  "bytes_written": 83
+}
+```
 
 ```python
 # openctopus_server/tools/result.py

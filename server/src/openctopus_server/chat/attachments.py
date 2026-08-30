@@ -9,8 +9,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.db.models import Device
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.workspace.file_content import image_media_type
@@ -28,6 +30,126 @@ class BrowserAttachmentRef(Protocol):
 
     @property
     def path(self) -> str: ...
+
+
+class StoredAttachmentRefs(Protocol):
+    @property
+    def attachment_refs(self) -> Sequence[Mapping[str, Any]]: ...
+
+
+async def normalize_browser_attachment_refs(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    attachments: Sequence[BrowserAttachmentRef],
+) -> list[dict[str, Any]]:
+    """Validate attachment authority and return canonical JSON-safe refs."""
+    _validate_attachments(attachments)
+    client_refs = [
+        attachment
+        for attachment in attachments
+        if attachment.openoctopus_device != "server"
+    ]
+    if client_refs:
+        names = {attachment.openoctopus_device for attachment in client_refs}
+        owned = {
+            name: device_id
+            for name, device_id in (
+                await db.execute(
+                    select(Device.name, Device.id).where(
+                        Device.user_id == user_id,
+                        Device.name.in_(names),
+                    )
+                )
+            ).all()
+        }
+        if any(
+            owned.get(attachment.openoctopus_device)
+            != getattr(attachment, "device_id", None)
+            for attachment in client_refs
+        ):
+            raise ChatError(
+                ErrorCode.TOOL_DEVICE_UNREACHABLE,
+                "Attachment device is unavailable",
+            )
+
+    normalized: list[dict[str, Any]] = []
+    for attachment in attachments:
+        ref: dict[str, Any] = {
+            "openoctopus_device": attachment.openoctopus_device,
+            "path": attachment.path,
+        }
+        device_id = getattr(attachment, "device_id", None)
+        if device_id is not None:
+            ref["device_id"] = str(device_id)
+        normalized.append(ref)
+    return normalized
+
+
+def build_device_attachment_targets(
+    rows: Sequence[StoredAttachmentRefs],
+) -> dict[str, UUID | None]:
+    """Collect name-level UUID fences from provider-visible attachment refs."""
+    targets: dict[str, UUID | None] = {}
+    for row in rows:
+        for ref in row.attachment_refs or ():
+            name = ref.get("openoctopus_device")
+            if not isinstance(name, str) or name == "server":
+                continue
+            raw_device_id = ref.get("device_id")
+            try:
+                device_id = UUID(str(raw_device_id))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Stored Client attachment ref is invalid") from exc
+            previous = targets.get(name)
+            if name in targets and previous != device_id:
+                targets[name] = None
+            else:
+                targets[name] = device_id
+    return targets
+
+
+def fence_owner_device_targets(
+    current_targets: Mapping[str, UUID],
+    attachment_targets: Mapping[str, UUID | None],
+) -> tuple[dict[str, UUID], tuple[str, ...]]:
+    """Prefer accepted attachment generations and retain blocked schema sites."""
+    sites = tuple(dict.fromkeys((*current_targets, *attachment_targets)))
+    fenced = dict(current_targets)
+    for name, device_id in attachment_targets.items():
+        if device_id is None:
+            fenced.pop(name, None)
+        else:
+            fenced[name] = device_id
+    return fenced, sites
+
+
+def strip_provider_attachment_markers(
+    content: Sequence[Mapping[str, Any]],
+    attachment_refs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove exact provider-only marker blocks from the public projection."""
+    marker_counts: dict[str, int] = {}
+    for ref in attachment_refs:
+        device = ref.get("openoctopus_device")
+        path = ref.get("path")
+        if not isinstance(device, str) or not isinstance(path, str):
+            continue
+        marker = (
+            _attachment_marker(path)
+            if device == "server"
+            else _device_attachment_marker(device, path)
+        )["text"]
+        marker_counts[marker] = marker_counts.get(marker, 0) + 1
+
+    projected: list[dict[str, Any]] = []
+    for block in content:
+        text = block.get("text") if block.get("type") == "text" else None
+        if isinstance(text, str) and marker_counts.get(text, 0):
+            marker_counts[text] -= 1
+            continue
+        projected.append(dict(block))
+    return projected
 
 
 async def expand_server_workspace_attachments(
@@ -50,6 +172,9 @@ async def expand_server_workspace_attachments(
     image_bytes = 0
 
     for attachment in attachments:
+        if attachment.openoctopus_device != "server":
+            prefix.append(_device_attachment_marker(attachment.openoctopus_device, attachment.path))
+            continue
         marker = _attachment_marker(attachment.path)
         header = await workspace_service.read(
             db,
@@ -109,8 +234,6 @@ def _validate_attachments(attachments: Sequence[BrowserAttachmentRef]) -> None:
     if len(attachments) > MAX_BROWSER_ATTACHMENTS:
         raise _invalid(f"Browser messages accept at most {MAX_BROWSER_ATTACHMENTS} attachments")
     for attachment in attachments:
-        if attachment.openoctopus_device != "server":
-            raise _invalid("Browser attachments must target openoctopus_device='server'")
         if not isinstance(attachment.path, str) or not 1 <= len(attachment.path) <= 4096:
             raise _invalid("Browser attachment paths must contain 1 to 4096 characters")
 
@@ -147,6 +270,17 @@ def _attachment_marker(path: str) -> dict[str, str]:
     return {
         "type": "text",
         "text": f"User uploaded file to device='server', path={encoded_path}",
+    }
+
+
+def _device_attachment_marker(device: str, path: str) -> dict[str, str]:
+    encoded_path = json.dumps(path, ensure_ascii=False)
+    return {
+        "type": "text",
+        "text": (
+            f"User attached existing file from device='{device}', path={encoded_path}. "
+            "Use read_file on that device to inspect it."
+        ),
     }
 
 

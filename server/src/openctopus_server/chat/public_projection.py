@@ -1,5 +1,6 @@
 from typing import Any
 
+from openctopus_server.chat.attachments import strip_provider_attachment_markers
 from openctopus_server.chat.runtime_context import build_runtime_block, runtime_matches_session
 from openctopus_server.db.models import Message, PendingMessage, Session
 from openctopus_server.dto.message import MessageResponse, PendingMessageResponse
@@ -25,16 +26,18 @@ def public_content(
 
 
 def message_response(message: Message, *, session: Session) -> MessageResponse:
+    attachment_refs = [dict(item) for item in (message.attachment_refs or [])]
     return MessageResponse(
         id=message.id,
         session_id=message.session_id,
         role=provider_role(message.message_kind),
         message_kind=message.message_kind,
         content=public_content(
-            message.content,
+            strip_provider_attachment_markers(message.content, attachment_refs),
             session=session,
             human=message.message_kind == "human",
         ),
+        attachment_refs=attachment_refs,
         delivery_refs=[dict(item) for item in message.delivery_refs],
         is_compacted=message.is_compacted,
         created_at=message.created_at,
@@ -46,10 +49,16 @@ def pending_response(
     *,
     session: Session,
 ) -> PendingMessageResponse:
+    attachment_refs = [dict(item) for item in (pending.attachment_refs or [])]
     return PendingMessageResponse(
         id=pending.id,
         session_id=pending.session_id,
-        content=public_content(pending.content, session=session, human=True),
+        content=public_content(
+            strip_provider_attachment_markers(pending.content, attachment_refs),
+            session=session,
+            human=True,
+        ),
+        attachment_refs=attachment_refs,
         effort=pending.effort,
         received_at=pending.received_at,
     )

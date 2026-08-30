@@ -83,6 +83,34 @@ async def test_relative_path_resolves_to_authenticated_users_personal_workspace(
     assert resolved.quota_bytes == _PERSONAL_QUOTA
 
 
+@pytest.mark.parametrize(
+    ("path", "relative_path"),
+    [
+        ("~", ""),
+        ("~/notes/today.md", "notes/today.md"),
+        (r"~\notes\today.md", "notes/today.md"),
+        (r"notes\today.md", "notes/today.md"),
+    ],
+)
+async def test_home_alias_resolves_to_authenticated_users_personal_workspace(
+    pg_engine: AsyncEngine,
+    resolver: Any,
+    path: str,
+    relative_path: str,
+) -> None:
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        user = await _add_user(db, email=f"home-{len(path)}@test.com", name="Home")
+        db.add(SystemConfig(key="quota_bytes", value=_PERSONAL_QUOTA))
+        await db.commit()
+
+        resolved = await resolver.resolve(db, user_id=user.id, path=path)
+
+    assert resolved.target.kind == "personal"
+    assert resolved.target.id == user.id
+    assert resolved.relative_path == relative_path
+    assert resolved.quota_bytes == _PERSONAL_QUOTA
+
+
 async def test_explicit_own_uuid_path_resolves_to_personal_workspace(
     pg_engine: AsyncEngine,
     resolver: Any,

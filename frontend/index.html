@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="OpenOctopus · Your devices. One agent." />
+    <title>OpenOctopus</title>
+    <script>
+      (() => {
+        let mode = 'auto'
+        try {
+          const saved = window.localStorage.getItem('openoctopus-theme')
+          if (saved === 'light' || saved === 'dark') mode = saved
+        } catch {}
+        const systemDark = window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
+        document.documentElement.dataset.theme = mode === 'auto' ? (systemDark ? 'dark' : 'light') : mode
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

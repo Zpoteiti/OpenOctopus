@@ -109,6 +109,7 @@ async def test_app(pg_engine, monkeypatch):
     app = create_app()
     client = Mock()
     client.list_objects.return_value = []
+    client.put_object.return_value.etag = "test-etag"
     object_storage = ObjectStorage(client, "test", max_connections=1)
     object_storage.check_health = AsyncMock()  # type: ignore[method-assign]
     app.dependency_overrides[get_object_storage] = lambda: object_storage

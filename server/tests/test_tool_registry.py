@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -100,6 +101,26 @@ class _EchoTool(Tool):
 
 class _PureServerTool(_EchoTool):
     routing_mode = ToolRoutingMode.PURE_SERVER
+
+
+class _ClientWriteTool(_EchoTool):
+    def name(self) -> str:
+        return "write_file"
+
+    def schema(self) -> dict[str, Any]:
+        return {
+            "name": self.name(),
+            "description": "Write a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        }
 
 
 class _ReservedMcpPrefixTool(_EchoTool):
@@ -307,6 +328,99 @@ async def test_registry_dispatches_non_server_routing_to_captured_owned_device()
     tool = registry._tools["echo"]
     assert isinstance(tool, _EchoTool)
     assert tool.received_args is None
+
+
+async def test_registry_adds_trusted_device_to_client_file_mutation_result() -> None:
+    device_id = uuid4()
+    device_registry = _FakeDeviceRegistry(
+        ToolResultFrame(
+            id=new_uuid7(),
+            content=json.dumps(
+                {
+                    "ok": True,
+                    "operation": "write_file",
+                    "requested_path": "notes/a.txt",
+                    "canonical_path": "~/workspace/notes/a.txt",
+                    "bytes_written": 5,
+                    "device": "spoofed",
+                }
+            ),
+            is_error=False,
+        )
+    )
+    registry = ToolRegistry((_ClientWriteTool(),))
+
+    result = await registry.execute(
+        name="write_file",
+        args={
+            "path": "notes/a.txt",
+            "content": "hello",
+            DEVICE_FIELD_NAME: "laptop",
+        },
+        ctx=_ctx(),
+        device_targets={"laptop": device_id},
+        device_registry=device_registry,
+    )
+
+    assert isinstance(result.content, list)
+    assert json.loads(result.content[1]["text"]) == {
+        "ok": True,
+        "operation": "write_file",
+        "device": "laptop",
+        "requested_path": "notes/a.txt",
+        "canonical_path": "~/workspace/notes/a.txt",
+        "bytes_written": 5,
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Wrote notes/a.txt",
+        json.dumps(
+            {
+                "ok": True,
+                "operation": "delete_file",
+                "requested_path": "notes/a.txt",
+                "canonical_path": "~/notes/a.txt",
+            }
+        ),
+        json.dumps(
+            {
+                "ok": True,
+                "operation": "write_file",
+                "requested_path": "notes/a.txt",
+            }
+        ),
+        [{"type": "text", "text": "not a mutation envelope"}],
+    ],
+)
+async def test_registry_rejects_invalid_successful_client_file_mutation_result(
+    content: str | list[dict[str, str]],
+) -> None:
+    device_id = uuid4()
+    registry = ToolRegistry((_ClientWriteTool(),))
+
+    result = await registry.execute(
+        name="write_file",
+        args={
+            "path": "notes/a.txt",
+            "content": "hello",
+            DEVICE_FIELD_NAME: "laptop",
+        },
+        ctx=_ctx(),
+        device_targets={"laptop": device_id},
+        device_registry=_FakeDeviceRegistry(
+            ToolResultFrame(
+                id=new_uuid7(),
+                content=content,
+                is_error=False,
+            )
+        ),
+    )
+
+    assert result.is_error is True
+    assert result.code == ErrorCode.TOOL_EXECUTION_OUTCOME_UNKNOWN
 
 
 async def test_registry_rechecks_live_device_identity_before_ws_io() -> None:

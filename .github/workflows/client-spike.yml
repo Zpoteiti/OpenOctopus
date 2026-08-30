@@ -1,6 +1,7 @@
 name: Python Client CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
     paths:
@@ -20,6 +21,9 @@ on:
       - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/client-spike.yml"
 
+permissions:
+  contents: read
+
 jobs:
   frozen-smoke:
     name: linux-x64
@@ -30,6 +34,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -69,14 +75,24 @@ jobs:
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Upload bundle and metrics
+      - name: Package release-shaped bundle
+        run: |
+          mkdir -p release
+          tar -C dist -czf release/openoctopus-client-linux-x64.tar.gz openoctopus-client
+
+      - name: Upload release-shaped bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: openoctopus-client-linux-x64
+          path: client/release/openoctopus-client-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload smoke metrics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py8-client-linux-x64
-          path: |
-            client/dist/openoctopus-client
-            client/metrics
+          name: openoctopus-client-linux-x64-metrics
+          path: client/metrics
           if-no-files-found: warn
 
   macos-native:
@@ -98,6 +114,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -137,14 +155,24 @@ jobs:
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Upload native bundle and metrics
+      - name: Package native release-shaped bundle
+        run: |
+          mkdir -p release
+          tar -C dist -czf release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz openoctopus-client
+
+      - name: Upload native release-shaped bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: openoctopus-client-macos-${{ matrix.arch }}
+          path: client/release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload native smoke metrics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py8-client-macos-${{ matrix.arch }}
-          path: |
-            client/dist/openoctopus-client
-            client/metrics
+          name: openoctopus-client-macos-${{ matrix.arch }}-metrics
+          path: client/metrics
           if-no-files-found: warn
 
   windows-native:
@@ -158,6 +186,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -199,14 +229,24 @@ jobs:
           python tests/frozen_runtime_smoke.py | Tee-Object -FilePath metrics/frozen-runtime-smoke.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload native bundle and metrics
+      - name: Package native release-shaped bundle
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path dist/openoctopus-client -DestinationPath release/openoctopus-client-windows-x64.zip
+
+      - name: Upload native release-shaped bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: openoctopus-client-windows-x64
+          path: client/release/openoctopus-client-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Upload native smoke metrics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: py8-client-windows-x64
-          path: |
-            client/dist/openoctopus-client
-            client/metrics
+          name: openoctopus-client-windows-x64-metrics
+          path: client/metrics
           if-no-files-found: warn
 
   frozen-device-e2e:
@@ -234,6 +274,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -242,8 +284,13 @@ jobs:
       - name: Download frozen client bundle
         uses: actions/download-artifact@v7
         with:
-          name: py8-client-linux-x64
-          path: client
+          name: openoctopus-client-linux-x64
+          path: client/release
+
+      - name: Extract frozen client bundle
+        run: |
+          mkdir -p ../client/dist
+          tar -C ../client/dist -xzf ../client/release/openoctopus-client-linux-x64.tar.gz
 
       - name: Install server dependencies
         run: |

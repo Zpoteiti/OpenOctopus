@@ -48,6 +48,7 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_compaction_threshold_tokens"] is None
     assert body["llm_max_concurrent_requests"] is None
     assert body["llm_max_output_tokens"] == 16384
+    assert body["default_soul"] == "You are OpenOctopus, the user's personal AI partner."
     assert body["web_fetch_denylist"] == list(DEFAULT_SSRF_DENYLIST)
     assert set(body) == set(AdminConfig.model_fields)
 
@@ -160,6 +161,7 @@ async def test_invalid_web_fetch_denylist_entry_is_rejected(admin_client, entry)
         "llm_compaction_threshold_tokens",
         "llm_max_concurrent_requests",
         "llm_max_output_tokens",
+        "default_soul",
         "web_fetch_denylist",
     ],
 )
@@ -198,6 +200,30 @@ async def test_patch_omitted_fields_keep_existing_values(admin_client):
     assert updated.json()["quota_bytes"] == 3456
     assert updated.json()["shared_workspace_quota_bytes"] == 2345
     assert updated.json()["web_fetch_denylist"] == ["example.com"]
+
+
+async def test_patch_default_soul_is_hot_updated(admin_client):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"default_soul": "You are the company assistant."},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["default_soul"] == "You are the company assistant."
+    assert (await admin_client.get("/api/admin/config")).json()["default_soul"] == (
+        "You are the company assistant."
+    )
+
+
+@pytest.mark.parametrize("value", ["", "   ", "x" * 32_001])
+async def test_invalid_default_soul_is_rejected(admin_client, value):
+    response = await admin_client.patch(
+        "/api/admin/config",
+        json={"default_soul": value},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
 
 
 async def test_patch_config_llm_success(admin_client, monkeypatch):

@@ -8,6 +8,7 @@ import pytest
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import ToolContext, ToolResult
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
+from openctopus_server.tools.file_results import FILE_RESULT_MAX_OUTPUT_CHARS
 from openctopus_server.tools.registry import ToolRegistry, build_py4_registry
 from openctopus_server.tools.workspace_files import (
     WORKSPACE_FILE_TOOL_SCHEMAS,
@@ -90,6 +91,15 @@ def test_workspace_file_tool_schema_snapshot() -> None:
     ]
     assert by_name["edit_file"]["input_schema"]["properties"]["occurrence"]["minimum"] == 1
     assert by_name["apply_patch"]["input_schema"]["properties"]["edits"]["maxItems"] == 20
+    for name in set(EXPECTED_TOOL_NAMES) - {"apply_patch"}:
+        path = by_name[name]["input_schema"]["properties"]["path"]
+        assert path["minLength"] == 1
+        assert path["maxLength"] == 4096
+    patch_path = by_name["apply_patch"]["input_schema"]["properties"]["edits"]["items"][
+        "properties"
+    ]["path"]
+    assert patch_path["minLength"] == 1
+    assert patch_path["maxLength"] == 4096
     assert by_name["list_dir"]["input_schema"]["properties"]["max_entries"]["maximum"] == 1000
     assert by_name["find_files"]["input_schema"]["properties"]["sort"]["enum"] == [
         "path",
@@ -120,6 +130,20 @@ def test_workspace_file_tools_own_their_adr_075_timeouts() -> None:
         "grep": 60,
         "notebook_edit": 30,
     }
+
+
+def test_file_mutations_reserve_space_for_complete_structured_results() -> None:
+    tools = {tool.name(): tool for tool in build_workspace_file_tools(_RecordingDispatcher())}
+
+    for name in {
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "delete_file",
+        "delete_folder",
+        "notebook_edit",
+    }:
+        assert tools[name].max_output_chars() == FILE_RESULT_MAX_OUTPUT_CHARS
 
 
 async def test_workspace_file_tool_normalizes_its_internal_timeout(monkeypatch) -> None:
@@ -216,11 +240,17 @@ async def test_workspace_file_tool_rejects_unknown_or_invalid_arguments_before_d
         args={"path": "a.txt", "offset": 0, "openoctopus_device": "server"},
         ctx=_ctx(),
     )
+    too_long = await registry.execute(
+        name="delete_file",
+        args={"path": "a" * 4097, "openoctopus_device": "server"},
+        ctx=_ctx(),
+    )
 
     assert extra.is_error is True
     assert extra.code == ErrorCode.TOOL_INVALID_ARGS
     assert invalid.is_error is True
     assert invalid.code == ErrorCode.TOOL_INVALID_ARGS
+    assert too_long.code == ErrorCode.TOOL_INVALID_ARGS
     assert dispatcher.calls == []
 
 

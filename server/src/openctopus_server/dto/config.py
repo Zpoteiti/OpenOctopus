@@ -23,6 +23,7 @@ NonEmptyString = Annotated[str, Field(min_length=1)]
 CompactionThreshold = Annotated[int, Field(ge=4001)]
 ConcurrencyLimit = Annotated[int, Field(ge=0, le=1_000_000)]
 OutputTokenLimit = Annotated[int, Field(ge=1, le=1_000_000)]
+DefaultSoul = Annotated[str, Field(min_length=1, max_length=32_000, pattern=r".*\S.*")]
 
 
 class ConfigPatch(BaseModel):
@@ -73,6 +74,11 @@ class ConfigPatch(BaseModel):
         description="Provider output budget, including thinking tokens.",
         examples=[16_384],
     )
+    default_soul: DefaultSoul | SkipJsonSchema[None] = Field(
+        default=None,
+        description="Default agent identity used when a personal SOUL.md is absent.",
+        examples=["You are OpenOctopus, the user's personal AI partner."],
+    )
     web_fetch_denylist: WebFetchDenylist | SkipJsonSchema[None] = Field(
         default=None,
         description=(
@@ -121,6 +127,10 @@ class AdminConfig(BaseModel):
     llm_max_output_tokens: int = Field(
         description="Provider output budget, including thinking tokens.",
         examples=[16_384],
+    )
+    default_soul: str = Field(
+        description="Default agent identity used when a personal SOUL.md is absent.",
+        examples=["You are OpenOctopus, the user's personal AI partner."],
     )
     web_fetch_denylist: list[str] = Field(
         description=(

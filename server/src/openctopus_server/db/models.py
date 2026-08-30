@@ -117,6 +117,9 @@ class Message(Base):
     )
     message_kind: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    attachment_refs: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     delivery_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
@@ -150,6 +153,9 @@ class PendingMessage(Base):
     )
     session_key: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    attachment_refs: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     effort: Mapped[str | None] = mapped_column(Text)
     received_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()

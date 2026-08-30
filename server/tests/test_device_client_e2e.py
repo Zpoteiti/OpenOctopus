@@ -477,6 +477,14 @@ async def test_real_postgres_source_client_device_lifecycle(
                 expected_device_name=name,
             )
             assert write_result.is_error is False
+            assert isinstance(write_result.content, str)
+            assert json.loads(write_result.content) == {
+                "ok": True,
+                "operation": "write_file",
+                "requested_path": "written.txt",
+                "canonical_path": str(workspace / "written.txt"),
+                "bytes_written": 15,
+            }
             assert (workspace / "written.txt").read_text(encoding="utf-8") == "written by e2e\n"
 
             new_name = "e2e-renamed"
@@ -776,17 +784,22 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 }
             ]
             first_write_result = provider.calls[2]["messages"][-1]["content"]
-            assert first_write_result == [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "write-1",
-                    "content": [
-                        {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-                        {"type": "text", "text": "Wrote written.txt (17 bytes)."},
-                    ],
-                    "is_error": False,
-                }
-            ]
+            assert len(first_write_result) == 1
+            assert first_write_result[0]["type"] == "tool_result"
+            assert first_write_result[0]["tool_use_id"] == "write-1"
+            assert first_write_result[0]["is_error"] is False
+            assert first_write_result[0]["content"][0] == {
+                "type": "text",
+                "text": UNTRUSTED_TOOL_RESULT_WARNING,
+            }
+            assert json.loads(first_write_result[0]["content"][1]["text"]) == {
+                "ok": True,
+                "operation": "write_file",
+                "device": "owner-laptop",
+                "requested_path": "written.txt",
+                "canonical_path": str(owner_workspace / "written.txt"),
+                "bytes_written": 17,
+            }
             first_history = await owner_client.get(
                 f"/api/sessions/{session_id}/messages",
                 headers=owner_headers,

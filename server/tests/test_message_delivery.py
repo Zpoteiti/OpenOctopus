@@ -101,6 +101,7 @@ def test_message_response_rejects_incomplete_workspace_delivery_refs() -> None:
             role="assistant",
             message_kind="assistant",
             content=[],
+            attachment_refs=[],
             delivery_refs=[
                 {
                     "tool_use_id": "message-incomplete",
@@ -124,6 +125,7 @@ def test_message_response_accepts_device_delivery_ref_without_size() -> None:
         role="assistant",
         message_kind="assistant",
         content=[],
+        attachment_refs=[],
         delivery_refs=[
             {
                 "tool_use_id": "message-device",
@@ -151,6 +153,7 @@ def test_message_response_rejects_server_as_device_delivery_ref() -> None:
             role="assistant",
             message_kind="assistant",
             content=[],
+            attachment_refs=[],
             delivery_refs=[
                 {
                     "tool_use_id": "message-device",

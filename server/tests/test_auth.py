@@ -1,4 +1,7 @@
+from unittest.mock import AsyncMock, Mock
+
 from openctopus_server.auth.cookies import COOKIE_NAME
+from openctopus_server.workspace.service import get_workspace_service
 
 
 async def test_register_returns_201_and_sets_cookie(async_client):
@@ -14,6 +17,45 @@ async def test_register_returns_201_and_sets_cookie(async_client):
     assert "password_hash" not in body["user"]
     set_cookie = response.headers.get("set-cookie", "")
     assert COOKIE_NAME in set_cookie
+
+
+async def test_register_creates_personal_soul_and_memory_files(async_client, test_app):
+    workspace = Mock()
+    workspace.write = AsyncMock()
+    test_app.dependency_overrides[get_workspace_service] = lambda: workspace
+    admin = await async_client.post(
+        "/api/auth/register",
+        json={
+            "email": "seed-admin@test.com",
+            "password": "testpassword",
+            "name": "Seed Admin",
+            "admin_token": "dev-admin-token",
+        },
+    )
+    assert admin.status_code == 201
+    configured = await async_client.patch(
+        "/api/admin/config",
+        json={"default_soul": "# Company Agent\nBe clear and practical."},
+    )
+    assert configured.status_code == 200
+    workspace.write.reset_mock()
+
+    response = await async_client.post(
+        "/api/auth/register",
+        json={"email": "seeded@test.com", "password": "testpassword", "name": "Seeded"},
+    )
+    assert response.status_code == 201
+
+    assert workspace.write.await_count == 2
+    soul = workspace.write.await_args_list[0].kwargs
+    memory = workspace.write.await_args_list[1].kwargs
+    assert soul["path"] == "SOUL.md"
+    assert soul["data"] == b"# Company Agent\nBe clear and practical."
+    assert soul["if_none_match"] is True
+    assert memory["path"] == "MEMORY.md"
+    assert b"how they would like to be addressed" in memory["data"]
+    assert b"what they would like to call you" in memory["data"]
+    assert memory["if_none_match"] is True
 
 
 async def test_register_duplicate_email_returns_409(async_client):

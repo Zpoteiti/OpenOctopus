@@ -1,6 +1,7 @@
 name: Python Server CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
     paths:
@@ -19,6 +20,9 @@ on:
       - "tests/fixtures/directory_transfer_v1/**"
       - "tests/fixtures/protocol_v3/**"
       - ".github/workflows/py-server.yml"
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -50,6 +54,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6

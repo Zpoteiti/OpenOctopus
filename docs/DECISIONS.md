@@ -39,11 +39,11 @@ These supersede the historical ADR set in the previous Plexus codebase — most 
 **Decision:** One monorepo. `openoctopus/server/` is the Python server. `openoctopus/client/` will be a Go or Rust project (language decided at client milestone). No `openoctopus_common` Python package. Tool source schemas, error codes, identity validation, and merge logic all live in the server package. The client implements the wire protocol directly against `PROTOCOL.md` — it matches tool calls by name, executes them, and returns `tool_result` frames.
 **Consequences:** Server owns all tool schema definitions, normalization, and truncation. Client is a standalone binary — no Python runtime required on devices. Shared contract is documentation, not code.
 
-### ADR-002 · Frontend embedded in server binary (prod); Vite + proxy (dev)
+### ADR-002 · Same-origin React frontend in the Server image
 
-**Status:** accepted
-**Decision:** In release builds, the React frontend is compiled by `npm run build` and baked into the server binary via `rust-embed`. In dev, `npm run dev` runs Vite on `:5173` with a proxy for `/api/*` and `/ws/device` pointing to the running server on `:8080`.
-**Consequences:** Single artifact in prod (one `cargo build --release` produces a deployable binary). Fast dev loop (frontend HMR via Vite, server compiled separately).
+**Status:** accepted (revised for Python-main, 2026-08-26)
+**Decision:** The browser frontend lives in top-level `frontend/` and uses React, TypeScript, and Vite. Production uses a multi-stage Docker build and FastAPI serves the compiled SPA from the same origin after all API routes. Development runs Vite with `/api` and `/health` proxied to FastAPI on `:8080`. History API fallback never captures API, health, OpenAPI, documentation, or device WebSocket paths.
+**Consequences:** Browser auth remains HttpOnly-cookie based without CORS or client token storage. The production Server image contains one web application and API deployment unit, while frontend HMR and API-only source development remain independent.
 
 ### ADR-003 · Browser REST; devices use WebSocket
 
@@ -409,7 +409,7 @@ the actual model context window.
 **Decision:** When a channel adapter receives an inbound message with one or more attachment byte payloads, it writes those bytes to the server workspace and adds a text block per attachment: `"User uploaded file to device='server', path=\"<workspace path>\""`. This fires for **every** attachment regardless of MIME type:
 - **Images** — adapter adds the path-text block AND an Anthropic `image` block (base64 inline per ADR-059). After vision-strip retry, the path-text block remains so a non-VLM agent still knows the file exists.
 - **Non-image files** (PDFs, CSVs, audio, archives, anything else) — adapter adds the path-text block ONLY. M1f excludes `document` blocks and `/v1/files`, so non-image bytes never live inline in `messages.content`. The agent reaches them via `read_file` against the workspace path.
-- **Browser path correction** — M1d browser message attachments are refs to existing workspace files: the message API does not write or move bytes, but it still adds the marker for the referenced path and, for image refs, the base64 `image` block. M1f expands attachment refs to paired devices; offline device dereference fails with `device_unreachable`.
+- **Browser path correction** — browser message attachments are refs to existing files: the message API does not write or move Server Workspace bytes, but it still adds the marker for the referenced path and, for Server image refs, the base64 `image` block. ADR-135 expands refs to paired Devices without dereferencing Client bytes during POST; later `read_file` routing is fenced by the captured immutable Device identity.
 
 **Consequences:** Non-VLM agents can still reason about uploaded files structurally. VLM agents have redundancy on images (path + base64), which is fine. Non-image files have a single path of access (workspace `.attachments/`) — uniform model regardless of whether the LLM supports vision.
 
@@ -768,23 +768,27 @@ Server and Device routes are frozen together for each Provider iteration.
 **Decision:** Matcher levels: (1) exact substring, (2) line-trimmed sliding window (handles indentation drift), (3) smart-quote normalization. Multi-match uses nanobot's current selectors: `replace_all=true`, `occurrence`, or `line_hint`; `expected_replacements` guards the selected replacement count. Create-file shortcut: `old_text=""` + file doesn't exist → create with `new_text`.
 **Consequences:** Matcher lives in `openoctopus_server`. The client implements the same algorithm independently against the tool contract. Tool args mirror nanobot: `path`, `old_text`, `new_text`, `replace_all`, `occurrence`, `line_hint`, `expected_replacements`.
 
-### ADR-043 · Tool path policy — relative paths resolve to personal workspace; shared workspaces use `name@suffix` absolute form
+### ADR-043 · Tool path policy — relative, home-relative, and native absolute paths
 
-**Status:** accepted (revised — shared-workspace addressing pass per ADR-108)
+**Status:** accepted (revised — home-relative and cross-platform absolute-path semantics)
 **Py7 clarification (ADR-133):** In the historical Client clauses below,
 `sandbox_mode` reads as `restrict_to_workspace`. The field limits structured
 paths only and does not create a trusted/untrusted process profile.
-**Context:** Original decision required absolute paths in all tool args for unambiguity. Matching nanobot's tool surface (its schemas don't distinguish relative/absolute at the schema level) and removing friction for the common case (reading `MEMORY.md`) motivated relaxing this. A second revision (ADR-108) replaces the bare-name form for shared workspaces with `name@suffix` to support same-named workspaces and rename without breaking identifiers.
+**Context:** Original decision required absolute paths in all tool args for unambiguity. Matching nanobot's tool surface (its schemas don't distinguish relative/absolute at the schema level) and removing friction for the common case (reading `MEMORY.md`) motivated relaxing this. A second revision (ADR-108) replaces the bare-name form for shared workspaces with `name@suffix` to support same-named workspaces and rename without breaking identifiers. The Client's configured `workspace_path` is useful context but is not a path prefix the agent should copy into later calls, so the tool contract also needs one stable grammar for relative, home-relative, and absolute paths.
 **Decision:**
 
-- **`openoctopus_device="server"` + relative path** → resolved against the caller's personal workspace view. Python-main maps that virtual path to the user's RustFS object prefix (ADR-123); it is not a server disk directory. Example: `read_file(openoctopus_device="server", path="MEMORY.md")` reads the user's `MEMORY.md`.
+- **`openoctopus_device="server"` + relative path** → resolved against the caller's personal workspace view. Python-main maps that virtual path to the user's RustFS object prefix (ADR-123); it is not a server disk directory. Server paths use a virtual `/` separator; `\` input is normalized to `/`. Example: `read_file(openoctopus_device="server", path="MEMORY.md")` reads the user's `MEMORY.md`.
+- **`openoctopus_device="server"` + `~` or home-relative path** → `~`, `~/...`, and `~\...` are aliases for that same personal Server Workspace. They never address the Server process account's home directory. The resolver strips the alias and normalizes the virtual separators before workspace authorization.
 - **`openoctopus_device="server"` + absolute path with the user's own UUID as leading segment** → explicit personal access. Example: `read_file(openoctopus_device="server", path="/{user_id}/skills/foo/SKILL.md")`. Rare; relative form is preferred.
 - **`openoctopus_device="server"` + absolute path with `<name>@<suffix>` leading segment** → shared workspace access (ADR-108). Example: `read_file(openoctopus_device="server", path="/production-department@a4f7e2d1/sprint.md")`. Both `name` and `suffix` must match the workspace row exactly (strict mode); the server does not silently rebind on rename.
-- **`openoctopus_device="<client>"` + any path** → resolved against the device's `workspace_path` when relative; absolute paths are accepted and, under `sandbox_mode=true`, must still resolve inside `workspace_path`. Clients are single-workspace, so the distinction is cosmetic.
+- **`openoctopus_device="<client>"` + relative path** → resolved against the device's configured `workspace_path`.
+- **`openoctopus_device="<client>"` + `~` or home-relative path** → `~`, `~/...`, and `~\...` resolve against the OS account running the Client (`$HOME` on Linux/macOS, the user profile on Windows). This is independent of the configured Workspace root.
+- **`openoctopus_device="<client>"` + native absolute path** → POSIX accepts `/...`; Windows accepts drive-absolute paths such as `C:\work\file.txt` / `C:/work/file.txt` and UNC paths such as `\\server\share\file.txt`. Windows rejects ambiguous drive-relative or root-relative forms: `C:foo`, `\foo`, and `/foo`.
+- **`restrict_to_workspace=true`** → the Client first expands home-relative input, resolves relative input, and normalizes the path. It rejects symlink/reparse components, then rejects any final target outside `workspace_path`. With `restrict_to_workspace=false`, accepted native paths may leave the Workspace, but the same no-follow rule still applies. This is a structured-path guardrail, not an OS sandbox.
 
-**Frontend REST endpoints** mirror the shared file tools with a required `openoctopus_device` query parameter. There is no default; missing file targets return `400 Bad Request`. With `openoctopus_device="server"`, path resolution follows the same personal/shared workspace rules above. With `openoctopus_device="<client>"`, the server routes over the device WebSocket and the client applies its `workspace_path` and `sandbox_mode`; paired-but-offline devices stay addressable and fail with `device_unreachable`. JWT supplies the user_id scope.
+**Frontend REST endpoints** mirror the shared file tools with a required `openoctopus_device` query parameter. There is no default; missing file targets return `400 Bad Request`. With `openoctopus_device="server"`, path resolution follows the same personal/shared workspace rules above. With `openoctopus_device="<client>"`, the server routes over the device WebSocket and the Client applies the same grammar and `restrict_to_workspace` check; paired-but-offline devices stay addressable and fail with `device_unreachable`. JWT supplies the user_id scope.
 
-**Consequences:** Agent can reach for `MEMORY.md`, `SOUL.md`, `skills/...` without knowing its own user_id. Shared-workspace access uses one stable identifier (`name@suffix`) that the agent learns from the system prompt — same form for tool paths, REST URLs, and frontend display. Strict matching means a rename invalidates stored paths immediately and surfaces as a 404, which the agent recovers from on the next turn by re-reading the system prompt. Relative paths always mean personal — no "which workspace did they mean?" ambiguity.
+**Consequences:** Agent can reuse canonical tool paths without copying a configured Workspace prefix into them. Relative paths always mean the selected target's Workspace; on the Server that is the caller's personal Workspace. `~` has an explicit install-site meaning and never leaks the Server container's home directory into the contract. Shared-workspace access uses one stable identifier (`name@suffix`) for tool paths, REST URLs, and frontend display. Strict matching means a rename invalidates stored paths immediately and surfaces as a 404. Client restriction is checked after normalization and no-follow component validation, so spelling variants cannot bypass it.
 
 ### ADR-044 · Workspace is the canonical file store; no parallel file cache
 
@@ -2181,8 +2185,10 @@ Voice notes save to workspace as-is. Users wire their own transcription by runni
 ### ADR-065 · Last admin is protected
 Admin users can delete ordinary users, other admins, and themselves, but deletion is rejected when it would remove the last remaining admin. Re-bootstrapping through direct DB access is avoidable product friction even for self-hosted deployments, so the admin API returns `409 Conflict` with code `last_admin_required` instead.
 
-### ADR-066 · No frontend test harness (Vitest/RTL/Playwright)
-Manual smoke testing in v1. Wire up later if frontend complexity grows.
+### ADR-066 · Frontend contract and browser test harness
+**Status:** accepted (revised, 2026-08-26)
+**Decision:** Generate TypeScript API types from `docs/API.yaml`; test frontend state and components with Vitest/Testing Library and core real-service flows with Playwright Chromium on Linux. CI also runs strict TypeScript, lint, generated-contract drift, and a production build. Pixel snapshots and duplicate Windows/macOS browser jobs are outside the gate.
+**Consequences:** Browser streaming recovery, auth visibility, workspace edits, one-time secrets, and API drift receive automated coverage without adding a cross-platform browser matrix.
 
 ### ADR-067 · No bulk file operations / file rename endpoint
 **Status:** superseded by ADR-087. Originally "single-file ops only; delete + re-upload for rename." `file_transfer` now handles one file or one bounded recursive source directory. A qualifying same-Client move uses a native exclusive rename; Server object-prefix moves remain copy-then-conditional-delete. There is still no arbitrary bulk-item mutation API.
@@ -2273,30 +2279,15 @@ provider validation described above; those keys are now accepted only after the
 
 ## 13. Distribution
 
-### ADR-102 · Distribution targets — Linux-only server (musl), all-three-OS client; GitHub Releases as the sole channel
+### ADR-102 · Distribution targets — Linux Server image and all-three-OS Client artifacts
 
-**Status:** accepted
-**Context:** OpenOctopus serves a heterogeneous user base — Linux dev-ops boxes, macOS leadership, Windows engineers — but the production server is overwhelmingly Linux. We need a release strategy that ships single-binary artifacts for the realistic deployment matrix without taking on distro-packaging or container-distribution burden.
-**Decision:**
+**Status:** accepted (revised for Python-main, 2026-08-26)
+**Context:** The Python Server depends on PostgreSQL, RustFS and document-conversion libraries, while the Python Client must run directly on heterogeneous user devices. Their deployment units are intentionally different.
+**Decision:** Production Server releases are Linux Docker images for `linux/amd64` and `linux/arm64`; the image includes the FastAPI application and compiled frontend from ADR-002. Source installs remain a development path, not the primary production artifact. Client releases remain frozen GitHub Release artifacts for Linux, macOS and Windows on the architectures covered by their native test matrix. No APT/YUM/Homebrew channel is introduced.
 
-**Targets:**
+The frontend does not invent download URLs or expose a Client download panel until a versioned release-manifest API exists. Device pairing continues to show the one-time token and the documented environment-variable startup command.
 
-| Crate | Targets | Linkage |
-|---|---|---|
-| **openoctopus_server** | `linux-x86_64`, `linux-aarch64` | musl static |
-| **openoctopus_client** | `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, `windows-x86_64.exe` | musl on Linux; native libc on macOS/Windows |
-
-The server's macOS/Windows targets are deliberately omitted in v1 — production deployment is overwhelmingly Linux, and supporting Windows server adds non-trivial code complexity (UNC path normalization for `messages.content` path-text markers, Windows symlink + junction handling in `workspace_fs` per ADR-045, ACL semantics for `skills/` validation). Admins who want to run the server on macOS/Windows can `cargo build --release` and accept untested status. Revisit post-M3 if real demand emerges.
-
-**Linux uses musl.** All OpenOctopus dependencies are pure Rust (sqlx, rustls, axum, tungstenite, rmcp), so musl-static linking produces one binary per architecture that runs on every distro from ancient CentOS to current Alpine without modification. No need for Debian/CentOS/RHEL-specific builds. Trade-offs (slower musl malloc, historically funky DNS resolver) are negligible for a network-bound service.
-
-**Naming:** `openoctopus-{server,client}-v{X.Y.Z}-{os}-{arch}[.exe]`. Server tarball includes the embedded frontend bundle (per ADR-002). Client is a single static binary.
-
-**Channel:** **GitHub Releases only**, tagged per version. No Docker images in v1 (revisit when there's first-real-deployment demand). No APT/YUM repos. No Homebrew tap. A source install from `github.com/<owner>/OpenOctopus` can remain a fallback for users who want to track main.
-
-**M3 frontend integration:** the **Settings → Devices** tab surfaces a download link section. Frontend reads the deployed server's `GET /api/version` and renders direct links to the GitHub Release assets pinned to that exact version (so a deployment running v0.3.4 doesn't push users a v0.4.0 client that may not handshake against the older protocol). User-agent detection picks the matching binary as the primary CTA; the other targets sit behind a "Other platforms" disclosure.
-
-**Consequences:** One channel to maintain (GitHub Releases). One binary per (crate × target). Linux distro-independence comes for free via musl. Frontend's download UX is version-correct by construction. Future container/distro-package channels add zero ADR debt because GitHub Releases is just "the artifact store" — anything else is a republishing layer over it.
+**Consequences:** Server dependencies and browser assets ship as one reproducible Linux deployment unit. Client artifacts remain native to the machine that executes tools. Registry publication, signing and release-manifest details require their own release slice; the current Dockerfile and CI build are merge gates rather than a promise that an image has been published.
 
 ### ADR-104 · openoctopus_client CLI surface, env vars, and failure semantics
 
@@ -2861,6 +2852,9 @@ stale `online: true` after its failed push cleaned the registry.
 **Python-main clarification:** ADR-126 removes the stored `messages.role`
 column. `message_kind` remains authoritative and provider projection derives
 the Anthropic wire role.
+**Attachment revision:** ADR-135 supersedes M1f's synchronous paired-Device
+attachment read. Only Server Workspace images expand during POST; Client refs
+remain live identity-fenced paths for a later `read_file` call.
 **Context:** M1f adds the full agent execution loop, device-routed tool
 execution, and multimodal `read_file`. The OpenAI chat-completions bootstrap
 shape cannot represent Anthropic `thinking` / `redacted_thinking` cleanly and
@@ -2885,10 +2879,10 @@ not have.
 - Device wire `tool_result.content` accepts raw `string | blocks[]`; block
   arrays are limited to `text` and `image`. Persisted/provider-facing tool
   results normalize to block arrays with the ADR-095 warning first.
-- Remote image attachment expansion is synchronous in `POST /messages` and uses
-  the fixed `read_file` timeout budget. Structural validation rejects before
-  persistence, but runtime remote-read failures for known devices insert a
-  sanitized unavailable-marker text block instead of rejecting the user message.
+- Server Workspace image attachment expansion is synchronous in
+  `POST /messages`. ADR-135 replaces paired-Device expansion with a live
+  provider-visible path marker plus provider-hidden immutable identity; POST
+  never reads, copies, or snapshots Client bytes.
 - `file_transfer` remains in M1f scope after the core execution loop and must
   cover the documented copy/move success path plus disconnect failure path.
   Slot lifecycle and binary framing stay in `docs/PROTOCOL.md`; M1f adds no new
@@ -3008,8 +3002,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
-| **Py12** | Frontend | React/Vite SPA with static assets; dev proxy to server; workspace/files, sessions, devices, system config management UIs | — | — |
-| **Py13** | Packaging + scale-out | Docker images, pip distribution, deployment docs; multi-worker scale-out (future ADR) | Py12 | — |
+| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Accepted design: `2026-08-26-browser-frontend-design.zh.md`; implementation and real browser gate pending |
+| **Py13** | Release + scale-out | Publish/sign Docker and Client artifacts, deployment docs; multi-worker scale-out remains a future ADR | Frontend | — |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
 
 ### Parallel tracks (post-Py3)
@@ -3878,6 +3872,61 @@ one recursive-directory child at a time; it adds no second byte pump or public
 wire surface. Cross-user routing fails closed before transfer frames. Resume,
 range, compression, durable directory jobs, and cross-worker bridge routing
 remain out of scope.
+
+---
+
+### ADR-135 · Browser attachments preserve three source identities and fence live Device reads
+
+**Status:** accepted (2026-08-28)
+
+**Context:** The browser can attach a file from its own operating-system picker,
+an existing Server/shared Workspace, or a connected Client. Browser-local bytes
+must finish uploading before a message is accepted. Existing Workspace files
+should not be copied, and a Client file should stay on the user's computer so
+the Agent reads it through that Client. A mutable Device name alone cannot
+distinguish the selected device from a later same-name replacement.
+
+**Decision:**
+
+- Browser-local files are uploaded first to the user's personal Server
+  Workspace `.attachments/uploads/...` path, then referenced as
+  `{openoctopus_device: "server", path}`. Existing personal/shared Workspace
+  paths use the same ref without a copy.
+- A Client ref is `{openoctopus_device, device_id, path}`. POST validates that
+  the exact name and UUID identify one Device owned by the caller, persists the
+  normalized ref, and adds a provider-visible path marker. It does not open the
+  Device connection, fetch bytes, inspect MIME, copy to RustFS, or retry a
+  future read.
+- `pending_messages.attachment_refs` moves unchanged to
+  `messages.attachment_refs` at the safe boundary. Both public pending/history
+  responses return this provider-hidden sidecar. It is distinct from
+  `delivery_refs`, which describes files produced by the Agent's `message`
+  tool. The marker inside stored `content` remains provider-visible so the Agent
+  knows which Device/path to pass to `read_file`, while public pending/history
+  projections omit that exact internal marker and render the sidecar instead.
+- Each Provider iteration aggregates Client attachment refs from all active
+  Message rows plus its captured Pending prefix into a name-level UUID fence.
+  One captured UUID overrides the current same-name Device target; multiple
+  captured UUIDs for one name remove that target while retaining the name in
+  fixed built-in tool schemas, so a call fails unavailable rather than reaching
+  a replacement. System-prompt Device metadata and Device MCP authority are
+  filtered by the same fence and never describe or expose the replacement.
+  This conservative rule intentionally may block a newly paired same-name Device
+  until the stale source is compacted.
+- A compacted source Message retains its sidecar for canonical history, while
+  the generated compaction summary receives no attachment refs. A summary is
+  ordinary text, not an inherited live capability; once source rows leave
+  Provider replay they no longer contribute to the routing fence.
+- Remote file browsing sends the optional `openoctopus_device_id` with
+  `GET /api/workspace/list/{path}`. The Server verifies name and UUID before any
+  WebSocket I/O, matching the existing fenced download route.
+
+**Consequences:** A queued message and a Server restart retain enough identity
+to prevent same-name replacement from redirecting Agent reads. Client content
+remains live and may legitimately become unavailable if the Device disconnects,
+renames, is deleted, or its file changes. OpenOctopus does not snapshot Client
+bytes, promise historical replay of those bytes, or attempt cross-platform path
+canonicalization on the Server.
 
 ---
 

@@ -146,7 +146,7 @@ class _FakeRuntime:
 
     def mark_ready(self, generation: UUID) -> None:
         assert generation == self.generation
-        assert self.state is McpRuntimeState.AWAITING_ACK
+        assert self.state in {McpRuntimeState.AWAITING_ACK, McpRuntimeState.READY}
         self.state = McpRuntimeState.READY
 
     async def invoke(
@@ -290,6 +290,87 @@ def test_registration_is_single_flight_and_stale_ack_cannot_reopen_runtime() -> 
             )
         )
         assert runtime.state.value == McpRuntimeState.READY.value
+        await supervisor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_full_registration_reaccepts_an_already_ready_runtime() -> None:
+    async def exercise() -> None:
+        factory = _RuntimeFactory()
+        supervisor = McpSupervisor(runtime_factory=factory)
+        supervisor.attach_connection()
+        await supervisor.activate_authoritative(
+            revision=1,
+            config=_device_config(_config("first"), _config("second")),
+            catalog=_catalog(
+                _persisted("first", new_uuid7()),
+                _persisted("second", new_uuid7()),
+            ),
+        )
+        first_runtime, second_runtime = factory.created
+        await asyncio.gather(first_runtime.started.wait(), second_runtime.started.wait())
+
+        first_runtime.allow_start.set()
+        for _attempt in range(20):
+            if first_runtime.state is McpRuntimeState.AWAITING_ACK:
+                break
+            await asyncio.sleep(0)
+        assert first_runtime.state is McpRuntimeState.AWAITING_ACK
+        first_registration = supervisor.next_registration()
+        assert first_registration is not None
+        first_snapshots = {item.name: item for item in first_registration.servers}
+        supervisor.accept_registration(
+            RegisterMcpAck(
+                id=first_registration.id,
+                config_revision=1,
+                catalog_digest="a" * 64,
+                results=[
+                    AcceptedMcpRegistration(
+                        name="first",
+                        runtime_generation=first_snapshots["first"].runtime_generation,
+                        accepted=True,
+                        code=None,
+                    ),
+                    RejectedMcpRegistration(
+                        name="second",
+                        runtime_generation=first_snapshots["second"].runtime_generation,
+                        accepted=False,
+                        code="mcp_starting",
+                    ),
+                ],
+            )
+        )
+        assert first_runtime.state.value == McpRuntimeState.READY.value
+
+        second_runtime.allow_start.set()
+        for _attempt in range(20):
+            if second_runtime.state is McpRuntimeState.AWAITING_ACK:
+                break
+            await asyncio.sleep(0)
+        assert second_runtime.state is McpRuntimeState.AWAITING_ACK
+        second_registration = supervisor.next_registration()
+        assert second_registration is not None
+        second_snapshots = {item.name: item for item in second_registration.servers}
+        supervisor.accept_registration(
+            RegisterMcpAck(
+                id=second_registration.id,
+                config_revision=1,
+                catalog_digest="a" * 64,
+                results=[
+                    AcceptedMcpRegistration(
+                        name=name,
+                        runtime_generation=snapshot.runtime_generation,
+                        accepted=True,
+                        code=None,
+                    )
+                    for name, snapshot in second_snapshots.items()
+                ],
+            )
+        )
+
+        assert first_runtime.state.value == McpRuntimeState.READY.value
+        assert second_runtime.state.value == McpRuntimeState.READY.value
         await supervisor.shutdown()
 
     asyncio.run(exercise())
