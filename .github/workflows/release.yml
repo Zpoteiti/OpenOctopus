@@ -201,7 +201,7 @@ jobs:
   server-verify:
     name: server-${{ matrix.arch }}-verify
     needs: [server-acceptance, frontend-acceptance, client-acceptance]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     permissions:
       contents: read
@@ -209,14 +209,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
