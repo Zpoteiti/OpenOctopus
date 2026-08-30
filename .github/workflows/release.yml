@@ -428,5 +428,6 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
               --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              --prerelease \
               --title "OpenOctopus $GITHUB_REF_NAME"
           fi

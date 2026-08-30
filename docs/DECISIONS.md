@@ -2285,7 +2285,7 @@ provider validation described above; those keys are now accepted only after the
 **Context:** The Python Server depends on PostgreSQL, RustFS and document-conversion libraries, while the Python Client must run directly on heterogeneous user devices. Their deployment units are intentionally different.
 **Decision:** Production Server releases are Linux Docker images for `linux/amd64` and `linux/arm64`; the image includes the FastAPI application and compiled frontend from ADR-002. Source installs remain a development path, not the primary production artifact. Client releases remain frozen GitHub Release artifacts for Linux, macOS and Windows on the architectures covered by their native test matrix. No APT/YUM/Homebrew channel is introduced.
 
-The frontend does not invent download URLs or expose a Client download panel until a versioned release-manifest API exists. Device pairing continues to show the one-time token and the documented environment-variable startup command.
+The frontend does not invent versioned asset URLs or platform auto-detection until a release-manifest API exists. Once releases are published, Device pairing may link to the repository-wide GitHub Releases page; direct platform-specific downloads remain deferred. Device pairing continues to show the one-time token and the documented environment-variable startup command.
 
 **Consequences:** Server dependencies and browser assets ship as one reproducible Linux deployment unit. Client artifacts remain native to the machine that executes tools. Registry publication, signing and release-manifest details require their own release slice; the current Dockerfile and CI build are merge gates rather than a promise that an image has been published.
 
@@ -3002,8 +3002,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
-| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Accepted design: `2026-08-26-browser-frontend-design.zh.md`; implementation and real browser gate pending |
-| **Py13** | Release + scale-out | Publish/sign Docker and Client artifacts, deployment docs; multi-worker scale-out remains a future ADR | Frontend | — |
+| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Complete: accepted design `2026-08-26-browser-frontend-design.zh.md`, implementation, real browser gate, and cross-platform release CI |
+| **Py13** | Release publication | Publish the unsigned alpha Server image and Client artifacts with deployment docs; signing, installers, and multi-worker scale-out remain future ADRs | Frontend | `v0.0.1` prerelease contains the amd64/arm64 Server image, four native Client bundles, checksums, and published-artifact acceptance evidence |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
 
 ### Parallel tracks (post-Py3)

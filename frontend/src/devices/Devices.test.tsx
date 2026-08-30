@@ -47,19 +47,17 @@ beforeEach(async () => {
 })
 
 describe('device pages', () => {
-  it('shows a clear placeholder instead of a fake Client download link', async () => {
+  it('links Client downloads to the published GitHub releases', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
       if (url === '/api/devices') return json([])
       throw new Error(`Unexpected request: ${url}`)
     }))
-    const user = userEvent.setup()
 
     renderPage(<DeviceListPage />)
-    await user.click(await screen.findByRole('button', { name: 'Download Client' }))
-
-    expect(screen.getByText('Client downloads are not published yet. Release links and setup scripts will appear here.')).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Download Client' })).not.toBeInTheDocument()
+    const download = await screen.findByRole('link', { name: 'Download Client' })
+    expect(download).toHaveAttribute('href', 'https://github.com/Zpoteiti/OpenOctopus/releases')
+    expect(download).toHaveAttribute('target', '_blank')
   })
 
   it('lists real device fields and reveals a newly issued token once', async () => {
