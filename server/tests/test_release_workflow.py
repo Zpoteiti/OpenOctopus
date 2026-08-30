@@ -16,3 +16,12 @@ def test_server_release_images_are_verified_on_native_runners() -> None:
     assert all(
         step.get("uses") != "docker/setup-qemu-action@v3" for step in job["steps"]
     )
+
+
+def test_server_ci_runs_when_the_release_workflow_changes() -> None:
+    workflow_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "py-server.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow[True])
+
+    assert ".github/workflows/release.yml" in triggers["push"]["paths"]
+    assert ".github/workflows/release.yml" in triggers["pull_request"]["paths"]
