@@ -71,7 +71,6 @@ export function DeviceListPage(): ReactNode {
   const client = useQueryClient()
   const devices = useQuery(deviceListQuery())
   const [showCreate, setShowCreate] = useState(false)
-  const [showDownload, setShowDownload] = useState(false)
   const [issuedToken, setIssuedToken] = useState<{ name: string; token: string } | null>(null)
   const createDevice = useMutation({
     mutationFn: (body: Record<string, unknown>) => apiJson<{ token: string; device: Device }>('/api/devices', {
@@ -103,14 +102,13 @@ export function DeviceListPage(): ReactNode {
         description={t('devices.description')}
         actions={(
           <>
-            <button type="button" className="secondary-button" onClick={() => setShowDownload((current) => !current)}>{t('devices.downloadClient')}</button>
+            <a className="secondary-button" href="https://github.com/Zpoteiti/OpenOctopus/releases" target="_blank" rel="noreferrer">{t('devices.downloadClient')}</a>
             <button className="secondary-button" data-testid="devices-refresh" onClick={() => void devices.refetch()}>{t('common.refresh')}</button>
             <button className="primary-button" aria-label={t('devices.add')} onClick={() => setShowCreate(true)}>＋ {t('devices.add')}</button>
           </>
         )}
       />
       <div className="settings-stack">
-        {showDownload ? <p className="form-notice" role="status">{t('devices.downloadPlaceholder')}</p> : null}
         {issuedToken ? (
           <Card title={t('devices.tokenTitle', { name: issuedToken.name })} description={t('devices.tokenOnce')}>
             <IssuedToken key={issuedToken.token} token={issuedToken.token} onDismiss={() => setIssuedToken(null)} />

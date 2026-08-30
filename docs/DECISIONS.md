@@ -2285,7 +2285,7 @@ provider validation described above; those keys are now accepted only after the
 **Context:** The Python Server depends on PostgreSQL, RustFS and document-conversion libraries, while the Python Client must run directly on heterogeneous user devices. Their deployment units are intentionally different.
 **Decision:** Production Server releases are Linux Docker images for `linux/amd64` and `linux/arm64`; the image includes the FastAPI application and compiled frontend from ADR-002. Source installs remain a development path, not the primary production artifact. Client releases remain frozen GitHub Release artifacts for Linux, macOS and Windows on the architectures covered by their native test matrix. No APT/YUM/Homebrew channel is introduced.
 
-The frontend does not invent download URLs or expose a Client download panel until a versioned release-manifest API exists. Device pairing continues to show the one-time token and the documented environment-variable startup command.
+The frontend does not invent versioned asset URLs or platform auto-detection until a release-manifest API exists. Once releases are published, Device pairing may link to the repository-wide GitHub Releases page; direct platform-specific downloads remain deferred. Device pairing continues to show the one-time token and the documented environment-variable startup command.
 
 **Consequences:** Server dependencies and browser assets ship as one reproducible Linux deployment unit. Client artifacts remain native to the machine that executes tools. Registry publication, signing and release-manifest details require their own release slice; the current Dockerfile and CI build are merge gates rather than a promise that an image has been published.
 
@@ -2459,7 +2459,7 @@ Client behavior:
 2. **Exit with code `78`** (`EX_CONFIG` from sysexits.h convention — "configuration error, don't bother restarting"). systemd users who want to suppress restart spam can add `RestartPreventExitStatus=78` to their unit file. We don't ship the unit file in v1 (per ADR-102) but document the suggestion in the README.
 3. **Do NOT enter the reconnect loop.** This is the only WS close code that breaks the retry-forever rule. WS code 4401 (token revoked) is the same pattern — exit, don't retry — and is part of ADR-104's auth failure semantics.
 
-This pairs with ADR-102's M3 frontend integration: Settings → Devices in the web UI shows a download link pinned to the deployed server's version, so the user's "fix it" path is one click after they see the stderr message.
+This pairs with ADR-102's M3 frontend integration: Settings → Devices in the web UI links to the repository Releases page. The protocol-mismatch payload and stderr message keep their exact-version `upgrade_url`; the generic Devices link remains stable until a version-aware release manifest exists.
 
 **Consequences:**
 - Single startup contract: two env vars + one subcommand. Documents in 30 seconds.
@@ -2508,7 +2508,7 @@ This means a stale-but-not-too-stale client (e.g. binary `v0.3.0` speaking proto
 
 #### What goes where
 
-- **Binary version** (`0.m.x`): GitHub release tag, `Cargo.toml` `version`, `openoctopus_client version` output, frontend Settings → Devices download links pinned to it.
+- **Binary version** (`0.m.x`): GitHub release tag, `Cargo.toml` `version`, and `openoctopus_client version` output. Frontend Settings → Devices links to the repository Releases page until a version-aware release manifest exists.
 - **Protocol version** (`"1"`, `"2"`, …): hardcoded constant in `openoctopus_server`, sent in `hello`, checked server-side at handshake. Server may accept multiple protocol versions during a transition window if the breaking change has a graceful migration path.
 - **`4409` close payload** carries both, plus `client_minimum` and `upgrade_url`, so the client can render an actionable error message (per ADR-104).
 
@@ -3002,8 +3002,8 @@ does not count as production code. Numbered implementation milestones start at
 | **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
 | **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
-| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Accepted design: `2026-08-26-browser-frontend-design.zh.md`; implementation and real browser gate pending |
-| **Py13** | Release + scale-out | Publish/sign Docker and Client artifacts, deployment docs; multi-worker scale-out remains a future ADR | Frontend | — |
+| **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Complete: accepted design `2026-08-26-browser-frontend-design.zh.md`, implementation, real browser gate, and cross-platform release CI |
+| **Py13** | Release publication | Publish the unsigned alpha Server image and Client artifacts with deployment docs; signing, installers, and multi-worker scale-out remain future ADRs | Frontend | `v0.0.1` prerelease contains the amd64/arm64 Server image, four native Client bundles, checksums, and published-artifact acceptance evidence |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
 
 ### Parallel tracks (post-Py3)
