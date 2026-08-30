@@ -2418,7 +2418,7 @@ async def test_unconsumed_authorization_and_ready_job_expire_in_background(
     source = tmp_path / "source"
     source.mkdir()
     (source / "file").write_bytes(b"x")
-    manager = _manager(tmp_path, idle_timeout_seconds=0.05)
+    manager = _manager(tmp_path, idle_timeout_seconds=0.25)
     operation_id = _operation_id()
     try:
         manifest, digest = await _probe_directory(manager, operation_id, "source")
@@ -2442,10 +2442,9 @@ async def test_unconsumed_authorization_and_ready_job_expire_in_background(
                 "fingerprint": manifest.entries[0].fingerprint,
             },
         )
-        await asyncio.sleep(0.12)
+        status = await _source_status(manager, operation_id, digest, {"failed"})
         with pytest.raises(ToolFailure):
             await manager.consume_source_authorization(UUID(transfer_uuid), source / "file")
-        status = await _source_status(manager, operation_id, digest, {"failed"})
         assert status.terminal_error.code == "workspace_transfer_timeout"
     finally:
         await manager.aclose()
