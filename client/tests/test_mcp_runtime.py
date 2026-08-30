@@ -650,6 +650,28 @@ async def test_runtime_binds_exact_entries_and_invokes_all_four_surfaces() -> No
 
 
 @pytest.mark.asyncio
+async def test_runtime_ready_ack_is_idempotent_for_same_generation() -> None:
+    runtime = McpServerRuntime(
+        _config(),
+        client_factory=_FakeBuilder(lambda _name: _FakeClient(_FakeSession())),
+    )
+    generation = runtime.generation
+    with pytest.raises(RuntimeError, match="stale MCP registration acknowledgement"):
+        runtime.mark_ready(generation)
+
+    await runtime.start()
+    runtime.bind_persisted(_persisted_server())
+
+    runtime.mark_ready(generation)
+    runtime.mark_ready(generation)
+
+    assert runtime.state is McpRuntimeState.READY
+    with pytest.raises(RuntimeError, match="stale MCP registration acknowledgement"):
+        runtime.mark_ready(new_uuid7())
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_applies_call_result_credit_inside_the_mapper() -> None:
     class LargeToolSession(_FakeSession):
         async def send_request(
