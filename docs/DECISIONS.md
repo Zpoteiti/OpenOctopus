@@ -2459,7 +2459,7 @@ Client behavior:
 2. **Exit with code `78`** (`EX_CONFIG` from sysexits.h convention — "configuration error, don't bother restarting"). systemd users who want to suppress restart spam can add `RestartPreventExitStatus=78` to their unit file. We don't ship the unit file in v1 (per ADR-102) but document the suggestion in the README.
 3. **Do NOT enter the reconnect loop.** This is the only WS close code that breaks the retry-forever rule. WS code 4401 (token revoked) is the same pattern — exit, don't retry — and is part of ADR-104's auth failure semantics.
 
-This pairs with ADR-102's M3 frontend integration: Settings → Devices in the web UI shows a download link pinned to the deployed server's version, so the user's "fix it" path is one click after they see the stderr message.
+This pairs with ADR-102's M3 frontend integration: Settings → Devices in the web UI links to the repository Releases page. The protocol-mismatch payload and stderr message keep their exact-version `upgrade_url`; the generic Devices link remains stable until a version-aware release manifest exists.
 
 **Consequences:**
 - Single startup contract: two env vars + one subcommand. Documents in 30 seconds.
@@ -2508,7 +2508,7 @@ This means a stale-but-not-too-stale client (e.g. binary `v0.3.0` speaking proto
 
 #### What goes where
 
-- **Binary version** (`0.m.x`): GitHub release tag, `Cargo.toml` `version`, `openoctopus_client version` output, frontend Settings → Devices download links pinned to it.
+- **Binary version** (`0.m.x`): GitHub release tag, `Cargo.toml` `version`, and `openoctopus_client version` output. Frontend Settings → Devices links to the repository Releases page until a version-aware release manifest exists.
 - **Protocol version** (`"1"`, `"2"`, …): hardcoded constant in `openoctopus_server`, sent in `hello`, checked server-side at handshake. Server may accept multiple protocol versions during a transition window if the breaking change has a graceful migration path.
 - **`4409` close payload** carries both, plus `client_minimum` and `upgrade_url`, so the client can render an actionable error message (per ADR-104).
 
