@@ -2,9 +2,9 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131, 134). When the implementation drifts from this doc, fix one or the other.
 
-**Py8 milestone:** the fixed surface is the eleven shared tools plus
-server-orchestrated `file_transfer` and the three client-only shell tools
-(`exec`, `write_stdin`, `list_exec_sessions`). `file_transfer` automatically
+**Py9 milestone:** the fixed surface is the eleven shared tools plus
+server-side `message` and `cron`, server-orchestrated `file_transfer`, and the
+three client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). `file_transfer` automatically
 handles one regular file or one recursive directory between any two install
 sites owned by the same user, including two distinct online Clients. Device
 and admin shared-service Server MCP add dynamic tools from four surfaces.
@@ -75,16 +75,15 @@ This is a *design* document. Use it during implementation as the source of truth
 | `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — Server admin denylist and independent per-Device Client denylist |
 | `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
 | `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `directory_transfer.py`/site backends + `openoctopus_client/transfer.py` | Copy or move one regular file or recursive directory between any two same-owner install sites |
-| `cron` | future placeholder | — | — | Not registered in the current tool registry |
+| `cron` | server-only | `openctopus_server/tools/cron.py` | `openctopus_server/tools/cron.py` + `openctopus_server/services/cron.py` | Add, list, or remove scheduled Agent jobs |
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
 | `write_stdin` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Poll or operate a chat-owned exec session |
 | `list_exec_sessions` | client-only | `openoctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | List sessions owned by the current chat |
 | `mcp_<server>_<alias>` | dynamic Server or Device MCP | persisted last-good catalog | `openctopus_server/mcp/` or `openoctopus_client/mcp/` | Tool, static resource, resource template, or prompt; install site and surface are hidden route metadata |
 
-The fixed registry contains sixteen first-class tools: eleven shared
-tools, `message`, `file_transfer`, and the three client-only exec tools. `cron`
-remains outside the active contract; enabled Server and Device MCP catalog
-entries are added dynamically.
+The fixed registry contains seventeen first-class tools: eleven shared tools,
+`message`, `cron`, `file_transfer`, and the three client-only exec tools.
+Enabled Server and Device MCP catalog entries are added dynamically.
 
 Schemas below are the **source** schemas (what gets written in code). The agent sees these plus the merger's additions per ADR-071 (`openoctopus_device` property on routing-only tools, enum extension on intrinsic-device tools).
 
@@ -1089,12 +1088,10 @@ result cannot be established.
 
 ---
 
-### `cron` (future placeholder; not a Py7 contract)
+### `cron`
 
-This section is historical only; no `cron` module or registry entry exists in
-Py7.
-
-**Implementation:** none in Py7; the future module location is intentionally TBD.
+**Implementation:** `openctopus_server/tools/cron.py`, using the same
+`openctopus_server/services/cron.py` write/projection service as the REST API.
 
 **Purpose:** Schedule reminders and recurring tasks. A single tool with an `action` enum — add, list, or remove jobs. Each firing injects a synthesized user message into a dedicated cron session per ADR-053.
 
@@ -1102,59 +1099,84 @@ Py7.
 ```json
 {
   "name": "cron",
-  "description": "Schedule reminders and recurring tasks. Actions: add, list, remove. If tz is omitted, cron expressions and naive ISO times default to UTC.",
+  "description": "Create, list, or remove recurring and one-time Agent jobs.",
   "input_schema": {
     "type": "object",
+    "additionalProperties": false,
     "properties": {
       "action": {
         "type": "string",
-        "description": "Action to perform",
+        "description": "Operation to perform.",
         "enum": ["add", "list", "remove"]
       },
       "name": {
         "type": "string",
-        "description": "Optional short human-readable label for the job (e.g., 'weather-monitor', 'daily-standup'). Defaults to first 30 chars of message."
+        "minLength": 1,
+        "maxLength": 120
       },
       "message": {
         "type": "string",
-        "description": "REQUIRED when action='add'. Instruction for the agent to execute when the job triggers (e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). Not used for action='list' or action='remove'."
+        "minLength": 1,
+        "maxLength": 32000,
+        "description": "Task to run when the job fires."
       },
       "every_seconds": {
         "type": "integer",
-        "description": "Interval in seconds (for recurring tasks)"
+        "minimum": 60,
+        "maximum": 31536000
       },
       "cron_expr": {
         "type": "string",
-        "description": "Cron expression like '0 9 * * *' (for scheduled tasks)"
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "Standard five-field cron expression."
       },
       "tz": {
         "type": "string",
-        "description": "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). When omitted with cron_expr, the tool's default timezone applies."
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "IANA timezone for cron or one-time local time."
       },
       "at": {
         "type": "string",
-        "description": "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). Naive values use the tool's default timezone."
+        "description": "RFC 3339 instant or local date-time for a one-time job."
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0
       },
       "job_id": {
         "type": "string",
-        "description": "REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."
+        "format": "uuid"
       }
     },
-    "required": ["action"],
-    "description": "Action-specific parameters: add requires a non-empty message plus one schedule (every_seconds, cron_expr, or at); remove requires job_id; list only needs action. Per-action requirements are enforced at runtime (see field descriptions) so the top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that reject oneOf/anyOf/allOf/enum/not at the root of function parameters."
+    "required": ["action"]
   }
 }
 ```
 
 **Mechanism:**
-- **`action="add"`** — requires `message` plus exactly one of `every_seconds`, `cron_expr`, or `at`. Calls the shared cron write helper, which validates the schedule, computes a future `next_fire_at`, creates a dedicated cron session with `session_key="cron:<job_id>"`, inserts a row in `cron_jobs` with `user_id`, `session_id`, the schedule parameters, `message`, `name`, and `tz`, and wakes the cron ticker. Returns the created row's `job_id` and a human-readable confirmation.
-- **`action="list"`** — returns a summary of the user's cron jobs: `job_id`, `name`, schedule (as stored), next-fire estimate, `last_fired_at`.
-- **`action="remove"`** — requires `job_id`. Calls the shared cron write helper to delete the row, cancel pending fires, and wake the cron ticker.
-- A single server-side ticker scans `cron_jobs` across all users, fires due jobs by synthesizing an `InboundMessage` with `session_key_override = "cron:<job_id>"` (ADR-010, ADR-012). The synthesized message's `content` is the job's `message` field. If the job has `at` (one-shot), the row is deleted after firing; otherwise `last_fired_at` updates and `next_fire_at` advances to the next future occurrence.
+- **`action="add"`** — requires a non-empty `message` plus exactly one of
+  `every_seconds`, `cron_expr`, or `at`; `tz` is valid only with cron/at. The
+  shared service validates the schedule, persists the job, computes a strictly
+  future `next_fire_at`, and wakes the ticker. Omitted timezone inherits the
+  owner's saved timezone where required. Returns `{"job": <CronJobResponse>}`.
+- **`action="list"`** — accepts only optional `offset`; pages at 20 rows and
+  returns `{items, next_offset}`. Summaries exclude the job message and expose a
+  nullable `session_id` so the Agent can distinguish jobs with no history.
+- **`action="remove"`** — requires UUID `job_id`. Deletes only the job row and
+  wakes the ticker. The result states that future triggers stopped and existing
+  history was retained; an already accepted turn is not cancelled.
+- A single server-side ticker scans `cron_jobs` across all users. An accepted
+  firing JIT creates/validates the stable `cron:<job_id>` Session, writes the
+  synthetic pending message and turn reservation, and advances/deletes the job
+  in one transaction. One-shot rows are deleted after durable acceptance.
 - The ticker sleeps until the earliest `next_fire_at`, capped at 60s, and also wakes immediately when the shared write helper sends its process-local notify signal. Missed recurring fires are silently skipped on restart; expired one-shots are dropped rather than delivered late.
-- Each firing continues the dedicated cron session. The final response is recorded there; user-visible notifications happen only if the agent explicitly calls the normal `message` tool as part of the cron task.
+- If the stable Session is running or pending, that occurrence is skipped with
+  no durable backlog. Each accepted firing continues the dedicated read-only
+  Session; Py9 records the response there and does not add external delivery.
 
-**Timeout:** 10s — DB write ops, fast.
+**Timeout:** no Agent-settable timeout; operations are bounded DB service calls.
 **Result cap:** 16,000 characters.
 **Errors:** `tool_invalid_schedule`, `tool_missing_required_field`,
 `tool_db_error`, `tool_cron_job_not_found`.

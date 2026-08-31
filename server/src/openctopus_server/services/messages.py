@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
@@ -12,12 +12,18 @@ from openctopus_server.chat.public_projection import message_response, pending_r
 from openctopus_server.chat.repair import synthetic_tool_result
 from openctopus_server.chat.runtime_context import build_runtime_block
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
-from openctopus_server.db.models import Message, PendingMessage, Session, TurnRun, User
+from openctopus_server.db.advisory import lock_uuid_identity
+from openctopus_server.db.models import CronJob, Message, PendingMessage, Session, TurnRun, User
 from openctopus_server.dto.message import MessagesResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.provider.config import load_provider_config
 from openctopus_server.provider.wire_types import Effort
+from openctopus_server.services.inbound import (
+    InboundMessage,
+    lock_inbound_identity,
+    web_inbound,
+)
 
 _CANCEL_TEXT = "[user cancelled: tool was not executed because the user pressed stop]"
 _OUTCOME_UNKNOWN_TEXT = (
@@ -37,91 +43,141 @@ async def accept_message(
     effort: Effort | None,
     runner_instance_id: UUID,
 ) -> AcceptedMessage:
-    now = datetime.now(UTC)
-    message_id = uuid.uuid4()
-    created_session = False
+    inbound = web_inbound(
+        owner_user_id=user.id,
+        session_id=session_id,
+        content=content,
+        attachment_refs=attachment_refs,
+        effort=effort,
+    )
     try:
-        await _advisory_lock(db, session_id)
-        await load_provider_config(db)
-        session = (
-            await db.execute(select(Session).where(Session.id == session_id).with_for_update())
-        ).scalar_one_or_none()
-        if session is None:
-            session = Session(
-                id=session_id,
-                user_id=user.id,
-                session_key=f"web:{session_id}",
-                channel="web",
-                chat_id=str(session_id),
-                title="New chat",
-                last_inbound_at=now,
-                created_at=now,
-            )
-            db.add(session)
-            await db.flush()
-            created_session = True
-        elif not _is_writable_web_session(session, user_id=user.id):
+        if await lock_inbound_identity(db, inbound) is None:
             raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
-        else:
-            session.last_inbound_at = now
-
-        stored_content = [
-            build_runtime_block(timestamp=now.isoformat(), session=session, user_id=user.id),
-            *content,
-        ]
-        db.add(
-            PendingMessage(
-                id=message_id,
-                session_id=session_id,
-                user_id=user.id,
-                session_key=session.session_key,
-                content=stored_content,
-                attachment_refs=[dict(ref) for ref in (attachment_refs or [])],
-                effort=effort.value if effort is not None else None,
-                received_at=now,
-            )
-        )
-        await db.flush()
-
-        running = (
-            await db.execute(
-                select(TurnRun)
-                .where(TurnRun.session_id == session_id, TurnRun.status == "running")
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if running is not None:
-            await db.commit()
-            return AcceptedMessage(
-                session_id=session_id,
-                message_id=message_id,
-                accepted_at=now,
-                disposition="queued",
-                created_session=created_session,
-                turn=None,
-            )
-
-        pending_rows = await _pending_rows(db, session_id=session_id, for_update=True)
-        turn = _create_turn(
+        await _require_writable_web_target(
             db,
+            user_id=user.id,
             session_id=session_id,
+        )
+        await load_provider_config(db)
+        accepted = await publish_inbound_locked(
+            db,
+            inbound=inbound,
+            title="New chat",
             runner_instance_id=runner_instance_id,
-            message_ids=tuple(row.id for row in pending_rows),
-            effort=_effort_from_pending(pending_rows[-1]),
-            started_at=now,
+            queue_if_busy=True,
         )
+        assert accepted is not None
         await db.commit()
-        return AcceptedMessage(
-            session_id=session_id,
-            message_id=message_id,
-            accepted_at=now,
-            disposition="started",
-            created_session=created_session,
-            turn=turn,
-        )
+        return accepted
     except Exception:
         await db.rollback()
         raise
+
+
+async def publish_inbound_locked(
+    db: AsyncSession,
+    *,
+    inbound: InboundMessage,
+    title: str,
+    runner_instance_id: UUID,
+    queue_if_busy: bool,
+) -> AcceptedMessage | None:
+    """Publish after the caller acquired identity and owner locks; never commit."""
+    now = datetime.now(UTC)
+    session = await db.scalar(
+        select(Session).where(Session.id == inbound.session_id).with_for_update()
+    )
+    created_session = False
+    if session is None:
+        if inbound.channel == "web" and await _identity_is_reserved(
+            db, inbound.session_id
+        ):
+            raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
+        session = Session(
+            id=inbound.session_id,
+            user_id=inbound.owner_user_id,
+            session_key=inbound.session_key,
+            channel=inbound.channel,
+            chat_id=inbound.chat_id,
+            title=title,
+            last_inbound_at=now,
+            created_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        created_session = True
+    elif not _session_matches_inbound(session, inbound=inbound):
+        raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
+
+    running = await db.scalar(
+        select(TurnRun)
+        .where(
+            TurnRun.session_id == inbound.session_id,
+            TurnRun.status == "running",
+        )
+        .with_for_update()
+    )
+    pending_rows = await _pending_rows(
+        db,
+        session_id=inbound.session_id,
+        for_update=True,
+    )
+    if not queue_if_busy and (running is not None or pending_rows):
+        return None
+
+    session.last_inbound_at = now
+    db.add(
+        PendingMessage(
+            id=inbound.message_id,
+            session_id=inbound.session_id,
+            user_id=inbound.owner_user_id,
+            session_key=inbound.session_key,
+            content=[
+                build_runtime_block(
+                    timestamp=now.isoformat(),
+                    session=session,
+                    user_id=inbound.owner_user_id,
+                ),
+                *(dict(block) for block in inbound.content),
+            ],
+            attachment_refs=[dict(ref) for ref in inbound.attachment_refs],
+            effort=inbound.effort.value if inbound.effort is not None else None,
+            received_at=now,
+        )
+    )
+    await db.flush()
+
+    if running is not None:
+        return AcceptedMessage(
+            session_id=inbound.session_id,
+            message_id=inbound.message_id,
+            accepted_at=now,
+            disposition="queued",
+            created_session=created_session,
+            turn=None,
+        )
+
+    pending_rows = await _pending_rows(
+        db,
+        session_id=inbound.session_id,
+        for_update=True,
+    )
+    turn = _create_turn(
+        db,
+        session_id=inbound.session_id,
+        runner_instance_id=runner_instance_id,
+        message_ids=tuple(row.id for row in pending_rows),
+        effort=_effort_from_pending(pending_rows[-1]),
+        started_at=now,
+    )
+    return AcceptedMessage(
+        session_id=inbound.session_id,
+        message_id=inbound.message_id,
+        accepted_at=now,
+        disposition="started",
+        created_session=created_session,
+        turn=turn,
+    )
 
 
 async def preflight_message_target(
@@ -131,9 +187,25 @@ async def preflight_message_target(
     session_id: UUID,
 ) -> None:
     """Reject unusable message targets before resolving browser attachments."""
+    await _require_writable_web_target(
+        db,
+        user_id=user_id,
+        session_id=session_id,
+    )
     await load_provider_config(db)
+
+
+async def _require_writable_web_target(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    session_id: UUID,
+) -> None:
     session = await db.scalar(select(Session).where(Session.id == session_id))
-    if session is not None and not _is_writable_web_session(session, user_id=user_id):
+    if session is None:
+        if await _identity_is_reserved(db, session_id):
+            raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
+    elif not _is_writable_web_session(session, user_id=user_id):
         raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
 
 
@@ -144,7 +216,7 @@ async def reserve_pending_turn(
     runner_instance_id: UUID,
 ) -> TurnStart | None:
     try:
-        await _advisory_lock(db, session_id)
+        await lock_uuid_identity(db, session_id)
         running = (
             await db.execute(
                 select(TurnRun)
@@ -197,7 +269,7 @@ async def capture_pending_for_turn(
 ) -> TurnStart:
     """Capture one pending boundary for an otherwise empty continuation turn."""
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         await _running_turn(db, turn.turn_id)
         if turn.message_ids:
             await db.commit()
@@ -225,7 +297,7 @@ async def promote_pending_for_turn(
     turn: TurnStart,
 ) -> TurnStart:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         await _running_turn(db, turn.turn_id)
         captured_ids = turn.message_ids
         if not captured_ids:
@@ -268,7 +340,7 @@ async def persist_assistant(
     failed: bool = False,
 ) -> Message:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
         now = datetime.now(UTC)
         message = Message(
@@ -310,7 +382,7 @@ async def persist_tool_result(
         raise ValueError("synthetic tool results cannot attach delivery refs")
 
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         await _running_turn(db, turn.turn_id)
         updated_assistant: Message | None = None
         if assistant_message_id is not None:
@@ -374,7 +446,7 @@ async def persist_human_marker(
     text_content: str,
 ) -> Message:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         await _running_turn(db, turn.turn_id)
         message = Message(
             id=uuid.uuid4(),
@@ -395,7 +467,7 @@ async def persist_human_marker(
 
 async def finish_final_turn(db: AsyncSession, *, turn: TurnStart) -> None:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
         run.status = "completed"
         run.finished_at = datetime.now(UTC)
@@ -415,7 +487,7 @@ async def finish_tool_batch_and_continue(
     runner_instance_id: UUID,
 ) -> TurnStart:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
         now = datetime.now(UTC)
         run.status = "completed"
@@ -445,7 +517,7 @@ async def cancel_tool_batch(
     cancelled_tool_ids: list[str],
 ) -> tuple[list[Message], Message]:
     try:
-        await _advisory_lock(db, turn.session_id)
+        await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
         now = datetime.now(UTC)
         result_rows: list[Message] = []
@@ -531,7 +603,7 @@ async def _request_cancel_transition(
     session_id: UUID,
 ) -> bool:
     try:
-        await _advisory_lock(db, session_id)
+        await lock_uuid_identity(db, session_id)
         session = (
             await db.execute(
                 select(Session)
@@ -593,7 +665,7 @@ async def get_messages_response(
 ) -> MessagesResponse:
     if before is not None and after is not None:
         raise ChatError(ErrorCode.INVALID_CURSOR, "before and after are mutually exclusive")
-    await _advisory_lock(db, session_id, shared=True)
+    await lock_uuid_identity(db, session_id, shared=True)
     session = await _owned_session(db, user_id=user_id, session_id=session_id)
     anchor_id = before if before is not None else after
     anchor: Message | None = None
@@ -701,6 +773,28 @@ def _is_writable_web_session(session: Session, *, user_id: UUID) -> bool:
     )
 
 
+def _session_matches_inbound(
+    session: Session,
+    *,
+    inbound: InboundMessage,
+) -> bool:
+    return (
+        session.user_id == inbound.owner_user_id
+        and session.session_key == inbound.session_key
+        and session.channel == inbound.channel
+        and session.chat_id == inbound.chat_id
+    )
+
+
+async def _identity_is_reserved(db: AsyncSession, session_id: UUID) -> bool:
+    if await db.scalar(select(User.id).where(User.id == session_id)) is not None:
+        return True
+    return (
+        await db.scalar(select(CronJob.id).where(CronJob.id == session_id))
+        is not None
+    )
+
+
 async def _pending_rows(
     db: AsyncSession,
     *,
@@ -777,21 +871,6 @@ async def _running_turn(db: AsyncSession, turn_id: UUID) -> TurnRun:
 
 def _effort_from_pending(row: PendingMessage) -> Effort | None:
     return Effort(row.effort) if row.effort is not None else None
-
-
-async def _advisory_lock(
-    db: AsyncSession,
-    session_id: UUID,
-    *,
-    shared: bool = False,
-) -> None:
-    key = session_id.int & ((1 << 63) - 1)
-    statement = (
-        "SELECT pg_advisory_xact_lock_shared(:key)"
-        if shared
-        else "SELECT pg_advisory_xact_lock(:key)"
-    )
-    await db.execute(text(statement), {"key": key})
 
 
 def _is_before_anchor(anchor: Message) -> Any:

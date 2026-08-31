@@ -35,7 +35,7 @@ info:
     | `grep` | `GET /api/workspace/grep` | Query: required `openoctopus_device`, pattern, path, mode, context_before/after, limit/offset |
     | `notebook_edit` | — | Agent-only in Py6; no REST equivalent |
     | `file_transfer` | `POST /api/workspace/transfer` | Body matches tool args; any two same-owner install sites; REST requires explicit `mode` |
-    | `cron` | `POST /api/cron` + CRUD | REST uses verbs (POST/GET/DELETE); tool uses single action-enum (nanobot-aligned) |
+    | `cron` | `POST /api/cron` + CRUD | REST supports create/list/get/edit/delete; tool supports add/list/remove |
     | `web_fetch` | — | No REST parallel (browser fetches directly). Tool is shared (server + client sites) per ADR-052. |
     | `message` | — | No REST parallel (browser composes via chat) |
     | `exec` | — | Client-only Py6 tool; routed over device WebSocket, no REST |
@@ -262,7 +262,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
     patch:
       tags: [Me]
-      summary: Update profile (name, email, password)
+      summary: Update profile (name, email, password, timezone)
       requestBody:
         content:
           application/json:
@@ -272,6 +272,11 @@ paths:
                 name: { type: string }
                 email: { type: string, format: email }
                 password: { type: string, minLength: 8 }
+                timezone:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  description: Valid IANA timezone name. Explicit null is invalid.
       responses:
         '200':
           description: OK
@@ -390,10 +395,11 @@ paths:
       description: |
         Hard-deletes sessions owned by the authenticated user. Existing
         sessions owned by another user return `404` without revealing whether
-        the id exists. Active cron sessions are rejected; delete the cron job
-        through `/api/cron/{id}` so the job row and its history stay consistent.
-        Completed one-shot cron sessions with no remaining `cron_jobs` row may
-        be deleted here like other history.
+        the id exists. Deleting a Cron or Heartbeat session clears its history
+        but does not delete/disable the corresponding automation. A later
+        accepted trigger recreates the same stable session UUID and route.
+        Deleting a Cron job is a separate `/api/cron/{job_id}` operation that
+        stops future triggers while preserving any existing history.
 
         Deletion is a hard stop, not a safe-boundary cancel. The server first
         quiesces the in-memory runner, then deletes the `sessions` row.
@@ -409,7 +415,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Active cron session; delete the cron job through `/api/cron/{id}` first.
+          description: Session state changed while the hard-delete was being coordinated.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /api/sessions/{session_id}/messages:
@@ -491,7 +497,10 @@ paths:
         `chat_id={session_id}`, `session_key=web:{session_id}`, and `title="New chat"`. If
         `{session_id}` already exists, the server verifies ownership before accepting
         the message. Existing sessions owned by another user return `404`
-        without revealing whether the id exists.
+        without revealing whether the id exists. A missing UUID reserved by any
+        Cron job or existing user (the stable Heartbeat identity) also returns
+        the same `404`, so browser input cannot claim an automation route while
+        its history Session is absent.
 
         In Py2, if no runner is active and no durable pending rows remain, the
         message is written directly to provider-visible `messages`; active-run
@@ -1658,126 +1667,93 @@ paths:
   # --- Cron ---
   #
   /api/cron:
-    description: Py9 cron management route.
+    description: Timezone-aware scheduled Agent jobs owned by the authenticated user.
     get:
       tags: [Cron]
       summary: List the user's cron jobs
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/CronJob' }
+              schema: { $ref: '#/components/schemas/CronJobsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
     post:
       tags: [Cron]
       summary: Create a cron job (mirrors `cron` tool, ADR-053)
       description: |
-        Py9 cron route.
+        REST and the agent tool use one write service. A job receives a stable
+        UUID but no empty Session is created. The first accepted fire creates
+        `cron:{job_id}` just in time; subsequent fires reuse it. Cron sessions
+        do not inherit the creator chat and reject human message POSTs.
 
-        REST-created and agent-created jobs use the same shared write helper.
-        The helper creates a dedicated cron session with
-        `session_key="cron:{job_id}"`; the job's `message` is injected into
-        that session as a synthesized user message when the schedule fires.
-        Cron sessions do not inherit the creator session's chat history and
-        are not writable through `POST /api/sessions/{session_id}/messages`.
-
-        The shared helper validates the schedule before storing it:
-        exactly one of `every_seconds`, `cron_expr`, or `at`; positive
-        intervals; valid cron expressions; known IANA timezone when `tz`
-        is present; and a future `next_fire_at`.
+        Exactly one timing form is required. `every_seconds` is 60..31536000;
+        `cron_expr` is a standard five-field expression; `at` is a future ISO
+        datetime. `tz` is a validated IANA name allowed only with cron/at.
+        When omitted, cron and naive at values use the user's saved timezone;
+        an aware at value without tz is projected in UTC.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [message]
-              properties:
-                name:
-                  type: string
-                  description: Optional short human-readable label. Defaults to the first 30 characters of message.
-                message:
-                  type: string
-                  description: Becomes the synthesized user message at firing time.
-                every_seconds:
-                  type: integer
-                  minimum: 1
-                  description: Interval in seconds for recurring jobs. Mutually exclusive with cron_expr and at.
-                cron_expr:
-                  type: string
-                  description: Cron expression like "0 9 * * *". Mutually exclusive with every_seconds and at.
-                tz:
-                  type: string
-                  description: Optional IANA timezone for cron_expr and naive at timestamps.
-                at:
-                  type: string
-                  format: date-time
-                  description: One-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
+            schema: { $ref: '#/components/schemas/CronCreateRequest' }
       responses:
         '201':
           description: Created.
-          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJobResponse' } } }
         '400': { $ref: '#/components/responses/BadRequest' }
 
-  /api/cron/{id}:
-    description: Py9 cron management route.
+  /api/cron/{job_id}:
+    description: One user-owned Cron job. Cross-user/missing IDs return 404.
     parameters:
-      - name: id
+      - name: job_id
         in: path
         required: true
-        schema: { type: string }
+        schema: { type: string, format: uuid }
     get:
       tags: [Cron]
       summary: Get a cron job
       responses:
         '200':
           description: OK
-          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJobResponse' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Cron]
       summary: Update a cron job's schedule, label, or message
       description: |
-        Py9 cron route.
-
-        Uses the same shared cron write helper as create/delete, so schedule
-        updates are validated and the cron ticker is notified after the row
-        changes. There is no `enabled` flag and no pause/resume endpoint;
-        delete jobs that should stop firing.
+        Name/message may be changed without changing the schedule. Once any
+        timing field is supplied, the request must include one complete timing
+        form; `tz` cannot be patched by itself. Schedule changes recompute a
+        strictly future next fire and wake the process-local ticker. There is
+        no pause/resume or run-now state.
       requestBody:
+        required: true
         content:
           application/json:
-            schema:
-              type: object
-              properties:
-                name: { type: string }
-                message: { type: string }
-                every_seconds:
-                  type: integer
-                  minimum: 1
-                  description: Replaces the schedule with an interval schedule. Mutually exclusive with cron_expr and at.
-                cron_expr:
-                  type: string
-                  description: Replaces the schedule with a cron expression. Mutually exclusive with every_seconds and at.
-                tz:
-                  type: string
-                  description: Optional IANA timezone for cron_expr and naive at timestamps.
-                at:
-                  type: string
-                  format: date-time
-                  description: Replaces the schedule with a one-shot future execution time. Mutually exclusive with every_seconds and cron_expr.
+            schema: { $ref: '#/components/schemas/CronPatchRequest' }
       responses:
         '200':
           description: OK
-          content: { application/json: { schema: { $ref: '#/components/schemas/CronJob' } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/CronJobResponse' } } }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
     delete:
       tags: [Cron]
       summary: Delete a cron job
-      description: Deletes the cron job and its dedicated cron session/history through the shared cron write helper.
+      description: Stops future triggers. Existing Session/history and an already accepted running turn remain intact.
       responses:
-        '204': { description: Deleted. }
+        '204': { description: Future triggers stopped. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   #
   # --- Admin ---
@@ -2155,7 +2131,7 @@ components:
             `network_ssrf_blocked`, `tool_ambiguous_edit`,
             `tool_no_match`, `tool_invalid_schedule`, `auth_last_admin_required`,
             `invalid_request`, `session_invalid_request`,
-            `session_has_cron_job`,
+            `cron_invalid_schedule`, `cron_job_not_found`, `timezone_invalid`,
             `tool_content_conversion_busy`,
             `tool_content_conversion_resource_exceeded`, and
             `tool_content_conversion_failed`. Admin/Device MCP mutation codes
@@ -2166,11 +2142,16 @@ components:
 
     User:
       type: object
-      required: [id, email, name, is_admin, created_at]
+      required: [id, email, name, timezone, is_admin, created_at]
       properties:
-        id: { type: string, description: UUID v4. }
+        id: { type: string, format: uuid }
         email: { type: string, format: email }
         name: { type: string }
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Saved IANA timezone; defaults to UTC.
         is_admin: { type: boolean }
         created_at: { type: string, format: date-time }
 
@@ -2246,11 +2227,15 @@ components:
 
     AdminUser:
       type: object
-      required: [id, email, name, is_admin, created_at, quota_bytes, bytes_used, locked]
+      required: [id, email, name, timezone, is_admin, created_at, quota_bytes, bytes_used, locked]
       properties:
         id: { type: string, format: uuid }
         email: { type: string, format: email }
         name: { type: string }
+        timezone:
+          type: string
+          minLength: 1
+          maxLength: 64
         is_admin: { type: boolean }
         created_at: { type: string, format: date-time }
         quota_bytes:
@@ -2971,31 +2956,147 @@ components:
           items: { type: string }
           description: Whole-array replacement. Entries get schema/length validation only.
 
-    CronJob:
+    CronCreateRequest:
       type: object
-      required: [id, user_id, session_id, name, schedule, message, next_fire_at, created_at]
+      additionalProperties: false
+      required: [message]
       properties:
-        id: { type: string }
-        user_id: { type: string }
-        session_id:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 120
+          description: Optional label; omission defaults to the first 30 code points of message.
+        message:
           type: string
-          description: Dedicated cron session id; its session_key is `cron:{job_id}`.
+          minLength: 1
+          maxLength: 32000
+        every_seconds:
+          type: [integer, "null"]
+          minimum: 60
+          maximum: 31536000
+        cron_expr:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+        at:
+          type: [string, "null"]
+          description: Future ISO 8601 datetime; may be aware or local/naive.
+        tz:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 64
+          description: IANA timezone allowed only with cron_expr or at.
+
+    CronPatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: [string, "null"], minLength: 1, maxLength: 120 }
+        message: { type: [string, "null"], minLength: 1, maxLength: 32000 }
+        every_seconds:
+          type: [integer, "null"]
+          minimum: 60
+          maximum: 31536000
+        cron_expr: { type: [string, "null"], minLength: 1, maxLength: 256 }
+        at:
+          type: [string, "null"]
+          description: Future ISO 8601 datetime; may be aware or local/naive.
+        tz: { type: [string, "null"], minLength: 1, maxLength: 64 }
+
+    EverySchedule:
+      type: object
+      additionalProperties: false
+      required: [type, every_seconds]
+      properties:
+        type: { type: string, const: every }
+        every_seconds: { type: integer, minimum: 60, maximum: 31536000 }
+
+    CronSchedule:
+      type: object
+      additionalProperties: false
+      required: [type, cron_expr, tz]
+      properties:
+        type: { type: string, const: cron }
+        cron_expr: { type: string }
+        tz: { type: string, description: Effective IANA timezone. }
+
+    AtSchedule:
+      type: object
+      additionalProperties: false
+      required: [type, at, tz]
+      properties:
+        type: { type: string, const: at }
+        at: { type: string, format: date-time, description: Canonical UTC instant. }
+        tz: { type: string, description: Effective IANA timezone used for projection. }
+
+    CronJobSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name, schedule, session_id, last_fired_at, next_fire_at, created_at]
+      properties:
+        id: { type: string, format: uuid }
         name:
           type: string
           description: Short user-facing label.
         schedule:
-          type: string
-          description: Canonical schedule string after server-side parsing.
-        tz:
+          oneOf:
+            - $ref: '#/components/schemas/EverySchedule'
+            - $ref: '#/components/schemas/CronSchedule'
+            - $ref: '#/components/schemas/AtSchedule'
+          discriminator:
+            propertyName: type
+            mapping:
+              every: '#/components/schemas/EverySchedule'
+              cron: '#/components/schemas/CronSchedule'
+              at: '#/components/schemas/AtSchedule'
+        session_id:
           type: [string, "null"]
-          description: IANA timezone used for cron expressions or naive one-shot timestamps.
-        message:
-          type: string
-          description: Synthesized user message injected into the cron session when the job fires.
-        one_shot: { type: boolean }
+          format: uuid
+          description: Stable job UUID when its history Session exists; null before first run or after history deletion.
         last_fired_at: { type: [string, "null"], format: date-time }
         next_fire_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+
+    CronJobResponse:
+      type: object
+      additionalProperties: false
+      required: [id, name, schedule, session_id, last_fired_at, next_fire_at, created_at, message]
+      properties:
+        id: { type: string, format: uuid }
+        name:
+          type: string
+          description: Short user-facing label.
+        schedule:
+          oneOf:
+            - $ref: '#/components/schemas/EverySchedule'
+            - $ref: '#/components/schemas/CronSchedule'
+            - $ref: '#/components/schemas/AtSchedule'
+          discriminator:
+            propertyName: type
+            mapping:
+              every: '#/components/schemas/EverySchedule'
+              cron: '#/components/schemas/CronSchedule'
+              at: '#/components/schemas/AtSchedule'
+        session_id:
+          type: [string, "null"]
+          format: uuid
+          description: Stable job UUID when its history Session exists; null before first run or after history deletion.
+        last_fired_at: { type: [string, "null"], format: date-time }
+        next_fire_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        message:
+          type: string
+          description: Instruction synthesized when the job is accepted for execution.
+
+    CronJobsResponse:
+      type: object
+      additionalProperties: false
+      required: [items, next_offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CronJobSummary' }
+        next_offset: { type: [integer, "null"], minimum: 0 }
 
     TransferRequest:
       type: object

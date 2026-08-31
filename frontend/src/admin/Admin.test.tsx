@@ -14,6 +14,7 @@ function json(body: unknown, status = 200): Response {
 
 const currentAdmin = {
   id: 'user-1', email: 'admin@example.com', name: 'Admin', is_admin: true,
+  timezone: 'UTC',
   created_at: '2026-08-26T12:00:00Z',
 }
 

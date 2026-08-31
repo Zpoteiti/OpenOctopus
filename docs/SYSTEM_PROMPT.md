@@ -33,7 +33,11 @@ The cacheable system configuration snapshot is assembled in this order:
 
 Rationale for this order: identity feeds channel handling (put them adjacent); skills live inside the personal workspace (put them adjacent to the workspaces section).
 
-Per ADR-023, mode branching is absent — cron, heartbeat, and any future autonomous flows see the same system prompt shape, just with different user-message content.
+Per ADR-023, mode branching is absent — Web, Cron, and Heartbeat Phase 2 see the
+same system prompt shape and owner tool list. Their authoritative runtime block
+identifies the real `channel`/`chat_id`: Cron uses the job UUID and Heartbeat
+uses the user UUID. Heartbeat Phase 1 is a separate forced-decision Provider
+call and never builds this Agent prompt.
 
 ---
 
@@ -221,7 +225,10 @@ Current connectivity is checked at tool execution time.
   send files (media), inline buttons, or reach a different
   channel. Do NOT use read_file to "send" files — it only lets
   YOU see the content.
-- **Long work.** Prefer `cron` over keeping a turn alive.
+- **Automation.** Use `cron` for work that must begin at a future or recurring
+  time. Each job runs in its own read-only history; removing the job stops future
+  triggers and retains that history. Cron does not make the current command run
+  longer and does not add external delivery by itself.
 ```
 
 ### Runtime context block — lives on the USER message, NOT in the system prompt
@@ -231,7 +238,7 @@ prepended as a server-generated text block on the user-role message, not
 appended to the system prompt. This preserves a long reusable prefix without
 pretending that user configuration is immutable.
 
-The Py2 browser runtime block uses this deterministic form:
+The Web runtime block uses this deterministic form:
 
 ```
 <runtime>
@@ -242,6 +249,14 @@ sender: partner:a4f7e2d1-e29b-41d4-a716-446655440000
 trust: partner
 </runtime>
 ```
+
+Cron and Heartbeat Phase 2 use the same five-field codec rather than a special
+prompt mode. For example, an accepted Cron fire has `channel: cron`, the job
+UUID as `chat_id`, and `sender: partner:<owner UUID>`; Heartbeat uses
+`channel: heartbeat` and the owner UUID as `chat_id`. Their server-authored
+synthetic user content describes the scheduled occurrence or selected tasks.
+It does not inherit the creating Web chat, attachments, effort, or external
+delivery target.
 
 Py3 keeps exactly these five values: time, channel, chat ID, partner sender ID,
 and trust. Later ingress adapters may extend the authoritative codec when a
@@ -368,7 +383,7 @@ the public DTO layer does not own a second grammar.
 - **No explicit tool listing** — the agent's tool schemas already enumerate which tools exist and their `device` enum tells the agent which devices each tool can target.
 
 ### Operating Notes
-- Meta rules: path conventions, privacy boundaries, cron preference for long-running work.
+- Meta rules: path conventions, privacy boundaries, and Cron's future/recurring scheduling semantics.
 - Short. Everything actionable is elsewhere.
 
 ---

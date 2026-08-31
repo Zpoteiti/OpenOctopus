@@ -59,3 +59,22 @@ async def lock_server_mcp_config_write(db: AsyncSession) -> None:
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": _SERVER_MCP_CONFIG_LOCK_KEY},
     )
+
+
+async def lock_uuid_identity(
+    db: AsyncSession,
+    value: UUID,
+    *,
+    shared: bool = False,
+) -> None:
+    """Serialize all transitions that reserve one stable public UUID."""
+    key = value.int & ((1 << 63) - 1)
+    statement = (
+        "SELECT pg_advisory_xact_lock_shared(:key)"
+        if shared
+        else "SELECT pg_advisory_xact_lock(:key)"
+    )
+    await db.execute(
+        text(statement),
+        {"key": key},
+    )

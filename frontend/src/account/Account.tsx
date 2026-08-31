@@ -15,6 +15,8 @@ export function AccountPage({ user }: { user: User }): ReactNode {
   const navigate = useNavigate()
   const passwordRef = useRef<HTMLInputElement>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [timezone, setTimezone] = useState(() => userTimezone(user))
+  const [detectedTimezone] = useState(detectTimezone)
   const update = useMutation({
     mutationFn: (body: Record<string, string>) => apiJson<User>('/api/me', { method: 'PATCH', body: JSON.stringify(body) }),
     onSuccess: (result) => {
@@ -27,6 +29,16 @@ export function AccountPage({ user }: { user: User }): ReactNode {
     onSuccess: () => {
       client.clear()
       navigate('/login', { replace: true })
+    },
+  })
+  const updateTimezone = useMutation({
+    mutationFn: (value: string) => apiJson<User>('/api/me', {
+      method: 'PATCH',
+      body: JSON.stringify({ timezone: value }),
+    }),
+    onSuccess: (result) => {
+      client.setQueryData(['current-user'], result)
+      setTimezone(userTimezone(result))
     },
   })
   const remove = useMutation({
@@ -50,7 +62,7 @@ export function AccountPage({ user }: { user: User }): ReactNode {
   return (
     <div className="page-scroll">
       <PageHeader eyebrow={t('account.eyebrow')} title={t('account.title')} description={t('account.description')} />
-      <ErrorNotice error={update.error ?? logout.error ?? remove.error} />
+      <ErrorNotice error={update.error ?? updateTimezone.error ?? logout.error ?? remove.error} />
       <div className="settings-stack">
         <Card title={t('account.profile')}>
           <form className="form-grid" onSubmit={submit}>
@@ -76,6 +88,35 @@ export function AccountPage({ user }: { user: User }): ReactNode {
               </div>
               <ThemeToggle />
             </div>
+            <div className="preference-setting preference-timezone">
+              <div className="preference-setting-copy">
+                <strong>{t('account.timezone')}</strong>
+                <small>{t('account.timezoneDescription')}</small>
+              </div>
+              <form onSubmit={(event) => {
+                event.preventDefault()
+                updateTimezone.mutate(timezone)
+              }}>
+                <label>
+                  <span className="sr-only">{t('account.timezone')}</span>
+                  <input
+                    aria-label={t('account.timezone')}
+                    value={timezone}
+                    maxLength={64}
+                    required
+                    onChange={(event) => setTimezone(event.target.value)}
+                  />
+                </label>
+                {detectedTimezone && detectedTimezone !== timezone ? (
+                  <button type="button" className="text-button" onClick={() => setTimezone(detectedTimezone)}>
+                    {t('account.useDetectedTimezone', { timezone: detectedTimezone })}
+                  </button>
+                ) : null}
+                <button type="submit" className="secondary-button" disabled={updateTimezone.isPending}>
+                  {t('account.saveTimezone')}
+                </button>
+              </form>
+            </div>
           </div>
         </Card>
         <Card title={t('account.agentFiles')} description={t('account.agentFilesDescription')}>
@@ -91,4 +132,16 @@ export function AccountPage({ user }: { user: User }): ReactNode {
       </div>
     </div>
   )
+}
+
+function detectTimezone(): string | null {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null
+  } catch {
+    return null
+  }
+}
+
+function userTimezone(user: User): string {
+  return user.timezone
 }

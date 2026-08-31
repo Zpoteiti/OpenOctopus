@@ -10,6 +10,7 @@ class UserResponse(BaseModel):
     id: UUID
     email: str
     name: str
+    timezone: str
     is_admin: bool
     created_at: datetime
 

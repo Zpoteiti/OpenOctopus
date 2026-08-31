@@ -268,7 +268,7 @@ async def test_patch_validation_uses_session_error_contract(user_client):
         }
 
 
-async def test_delete_rejects_foreign_and_cron_before_stopping_runtime(
+async def test_delete_rejects_foreign_but_removes_cron_history_only(
     user_client,
     test_app,
     pg_engine,
@@ -300,12 +300,12 @@ async def test_delete_rejects_foreign_and_cron_before_stopping_runtime(
         await db.flush()
         db.add(
             CronJob(
-                id=uuid4(),
+                id=cron.id,
                 user_id=owner.id,
-                session_id=cron.id,
                 name="active",
-                schedule="every:60",
-                one_shot=False,
+                schedule_kind="every",
+                schedule_value="60",
+                timezone=None,
                 message="run",
                 next_fire_at=now + timedelta(minutes=1),
             )
@@ -316,9 +316,11 @@ async def test_delete_rejects_foreign_and_cron_before_stopping_runtime(
     cron_response = await user_client.delete(f"/api/sessions/{cron.id}")
 
     assert foreign_response.status_code == 404
-    assert cron_response.status_code == 409
-    assert cron_response.json()["code"] == "session_has_cron_job"
-    assert stopped == []
+    assert cron_response.status_code == 204
+    assert stopped == [cron.id]
+    async with AsyncSession(pg_engine) as db:
+        assert await db.get(Session, cron.id) is None
+        assert await db.get(CronJob, cron.id) is not None
     await runtime.close()
 
 

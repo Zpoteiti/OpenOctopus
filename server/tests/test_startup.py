@@ -34,6 +34,12 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ready_generations=Mock(return_value={}),
         dispatch_server_mcp=AsyncMock(),
     )
+    scheduler = SimpleNamespace(
+        start=AsyncMock(),
+        stop=AsyncMock(),
+        wake=Mock(),
+    )
+    pulse = SimpleNamespace(start=Mock(), close=AsyncMock())
     monkeypatch.setattr("openctopus_server.main.initialize_token_estimator", Mock())
     monkeypatch.setattr("openctopus_server.main.get_content_converter", lambda: converter)
     monkeypatch.setattr(
@@ -44,7 +50,20 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "openctopus_server.main._load_server_mcp_authority",
         AsyncMock(return_value=empty_server_mcp_envelope()),
     )
-    return SimpleNamespace(probe=converter.probe, supervisor=supervisor)
+    monkeypatch.setattr(
+        "openctopus_server.main.CronScheduler",
+        Mock(return_value=scheduler),
+    )
+    monkeypatch.setattr(
+        "openctopus_server.main.HeartbeatPulse",
+        Mock(return_value=pulse),
+    )
+    return SimpleNamespace(
+        probe=converter.probe,
+        supervisor=supervisor,
+        scheduler=scheduler,
+        pulse=pulse,
+    )
 
 
 def _app_with_runtime() -> tuple[FastAPI, SimpleNamespace]:
@@ -87,6 +106,12 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
     async def begin_shutdown() -> None:
         events.append("mcp-begin")
 
+    async def stop_scheduler() -> None:
+        events.append("cron-stop")
+
+    async def close_pulse() -> None:
+        events.append("heartbeat-close")
+
     async def close_runtime() -> None:
         events.append("chat-close")
 
@@ -94,6 +119,8 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
         events.append("mcp-close")
 
     _startup_dependencies.supervisor.begin_shutdown.side_effect = begin_shutdown
+    _startup_dependencies.scheduler.stop.side_effect = stop_scheduler
+    _startup_dependencies.pulse.close.side_effect = close_pulse
     runtime.close.side_effect = close_runtime
     _startup_dependencies.supervisor.shutdown.side_effect = shutdown
     engine, connection = _engine()
@@ -121,11 +148,22 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
             assert app.state.server_mcp_supervisor is (
                 _startup_dependencies.supervisor
             )
+            assert app.state.cron_scheduler is _startup_dependencies.scheduler
+            assert app.state.heartbeat_pulse is _startup_dependencies.pulse
+
+    _startup_dependencies.scheduler.start.assert_awaited_once()
+    _startup_dependencies.pulse.start.assert_called_once_with()
 
     assert connection.execute.await_count == 2
     connection.run_sync.assert_awaited_once()
     runtime.close.assert_awaited_once()
-    assert events == ["mcp-begin", "chat-close", "mcp-close"]
+    assert events == [
+        "heartbeat-close",
+        "cron-stop",
+        "mcp-begin",
+        "chat-close",
+        "mcp-close",
+    ]
     _startup_dependencies.supervisor.shutdown.assert_awaited_once()
     runtime.device_registry.close.assert_awaited_once()
     storage.close.assert_awaited_once()

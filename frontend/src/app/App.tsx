@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 
 import { AccountPage } from '../account/Account'
 import { AdminMcpPage, AdminSettingsPage, AdminUsersPage } from '../admin/Admin'
+import { AutomationsPage } from '../automations/Automations'
 import { AuthPage, RequireAdmin, RequireAuth } from '../auth/auth'
 import { useAuthenticatedUser } from '../auth/context'
 import { DeviceDetailPage, DeviceListPage, DeviceMcpPage } from '../devices/Devices'
@@ -27,6 +28,7 @@ export function AppRoutes(): ReactNode {
             <Route path="/devices" element={<DeviceListPage />} />
             <Route path="/devices/:name" element={<DeviceDetailPage />} />
             <Route path="/devices/:name/mcp" element={<DeviceMcpPage />} />
+            <Route path="/automations" element={<AutomationsRoute />} />
             <Route path="/account" element={<AccountRoute />} />
             <Route element={<RequireAdmin />}>
               <Route path="/admin/settings" element={<AdminSettingsPage />} />
@@ -43,4 +45,8 @@ export function AppRoutes(): ReactNode {
 
 function AccountRoute(): ReactNode {
   return <AccountPage user={useAuthenticatedUser()} />
+}
+
+function AutomationsRoute(): ReactNode {
+  return <AutomationsPage user={useAuthenticatedUser()} />
 }

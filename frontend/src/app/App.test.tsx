@@ -94,7 +94,30 @@ describe('application routes', () => {
     expect(screen.getByRole('link', { name: 'Chat' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Workspace' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Devices' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Automations' })).toHaveAttribute('href', '/automations')
     expect(screen.queryByRole('link', { name: 'Admin settings' })).not.toBeInTheDocument()
+  })
+
+  it('routes an authenticated user to Automations', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url === '/api/cron?limit=50&offset=0') return jsonResponse({ items: [], next_offset: null })
+      if (url === '/api/workspace/files/HEARTBEAT.md?openoctopus_device=server') {
+        return jsonResponse({ code: 'workspace_not_found', message: 'missing' }, 404)
+      }
+      if (url === `/api/sessions/${regularUser.id}/messages?limit=1`) {
+        return jsonResponse({ code: 'session_not_found', message: 'missing' }, 404)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderApp('/automations')
+
+    expect(await screen.findByRole('heading', { name: 'Automations' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Automations' })).toHaveAttribute('aria-current', 'page')
   })
 
   it('keeps every returned conversation reachable from the sidebar', async () => {

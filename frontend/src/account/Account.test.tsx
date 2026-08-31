@@ -12,20 +12,53 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
 
 beforeEach(async () => {
   await i18n.changeLanguage('en')
 })
 
 describe('AccountPage', () => {
+  it('requires an explicit choice and save before persisting the detected timezone', async () => {
+    const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions
+    vi.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockImplementation(function () {
+      return { ...originalResolvedOptions.call(this), timeZone: 'Asia/Shanghai' }
+    })
+    const patches: unknown[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      patches.push(JSON.parse(String(init?.body)))
+      return json({ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, timezone: 'Asia/Shanghai', created_at: '2026-08-26T12:00:00Z' })
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <ThemeProvider>
+          <MemoryRouter>
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, timezone: 'UTC', created_at: '2026-08-26T12:00:00Z' }} />
+          </MemoryRouter>
+        </ThemeProvider>
+      </QueryClientProvider>,
+    )
+    const actor = userEvent.setup()
+
+    expect(screen.getByLabelText('Timezone')).toHaveValue('UTC')
+    await actor.click(screen.getByRole('button', { name: 'Use detected timezone: Asia/Shanghai' }))
+    expect(screen.getByLabelText('Timezone')).toHaveValue('Asia/Shanghai')
+    expect(patches).toHaveLength(0)
+    await actor.click(screen.getByRole('button', { name: 'Save timezone' }))
+    await waitFor(() => expect(patches).toEqual([{ timezone: 'Asia/Shanghai' }]))
+  })
+
   it('links directly to the personal SOUL and MEMORY files', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
     const { container } = render(
       <QueryClientProvider client={client}>
         <ThemeProvider>
           <MemoryRouter>
-            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, timezone: 'UTC', created_at: '2026-08-26T12:00:00Z' }} />
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>,
@@ -51,7 +84,7 @@ describe('AccountPage', () => {
       <QueryClientProvider client={client}>
         <ThemeProvider>
           <MemoryRouter>
-            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'Old Name', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'Old Name', is_admin: false, timezone: 'UTC', created_at: '2026-08-26T12:00:00Z' }} />
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>,
@@ -75,7 +108,7 @@ describe('AccountPage', () => {
       <QueryClientProvider client={client}>
         <ThemeProvider>
           <MemoryRouter>
-            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, created_at: '2026-08-26T12:00:00Z' }} />
+            <AccountPage user={{ id: 'u1', email: 'user@example.com', name: 'User', is_admin: false, timezone: 'UTC', created_at: '2026-08-26T12:00:00Z' }} />
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>,

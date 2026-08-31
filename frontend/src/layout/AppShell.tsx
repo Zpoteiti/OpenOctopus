@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { to: '/chat', icon: 'C', labelKey: 'nav.chat' },
   { to: '/workspace', icon: 'W', labelKey: 'nav.workspace' },
   { to: '/devices', icon: 'D', labelKey: 'nav.devices' },
+  { to: '/automations', icon: 'A', labelKey: 'nav.automations' },
 ] as const
 
 export function AppShell(): ReactNode {
@@ -398,7 +399,12 @@ function SessionCopy({
 }): ReactNode {
   return (
     <span className="session-copy">
-      <strong className="session-title">{session.title}</strong>
+      <span className="session-title-line">
+        <strong className="session-title">{session.title}</strong>
+        {session.channel === 'cron' || session.channel === 'heartbeat' ? (
+          <small className="session-source-badge">{t(`automations.${session.channel}`)}</small>
+        ) : null}
+      </span>
       <small className="session-meta">{formatSessionTime(session.last_inbound_at, language, t)}</small>
     </span>
   )

@@ -66,7 +66,9 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.INVALID_CURSOR: 400,
     ErrorCode.INVALID_REQUEST: 400,
     ErrorCode.SESSION_INVALID_REQUEST: 400,
-    ErrorCode.SESSION_HAS_CRON_JOB: 409,
+    ErrorCode.CRON_INVALID_SCHEDULE: 400,
+    ErrorCode.CRON_JOB_NOT_FOUND: 404,
+    ErrorCode.TIMEZONE_INVALID: 400,
     ErrorCode.PROVIDER_NOT_CONFIGURED: 503,
     ErrorCode.PROVIDER_UNAVAILABLE: 503,
     ErrorCode.PROVIDER_PROTOCOL_ERROR: 502,
@@ -138,6 +140,29 @@ async def message_validation_handler(
     exc: Exception,
 ) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    if request.method == "PATCH" and request.url.path == "/api/me":
+        errors = exc.errors()
+        if errors and all(
+            len(error["loc"]) >= 2
+            and error["loc"][0] == "body"
+            and error["loc"][1] == "timezone"
+            for error in errors
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "code": ErrorCode.TIMEZONE_INVALID.value,
+                    "message": "Timezone must be a valid IANA name",
+                },
+            )
+    if request.url.path == "/api/cron" or request.url.path.startswith("/api/cron/"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": ErrorCode.CRON_INVALID_SCHEDULE.value,
+                "message": "Cron schedule is invalid",
+            },
+        )
     if request.url.path == "/api/admin/config":
         return JSONResponse(
             status_code=400,

@@ -18,6 +18,7 @@ const currentUser = {
   email: 'yucheng@example.com',
   name: 'Yucheng',
   is_admin: true,
+  timezone: 'UTC',
   created_at: '2026-08-26T00:00:00Z',
 }
 

@@ -8,8 +8,11 @@ test('admin can configure and use the browser application', async ({ page }) => 
   const deviceName = `e2e-laptop-${runId}`
   const filename = `e2e-note-${runId}.txt`
   const attachmentName = `e2e-context-${runId}.txt`
+  const cronName = `Future check ${runId}`
+  const updatedCronName = `Updated future check ${runId}`
   const initialContents = 'Created by the OpenOctopus browser smoke test.\n'
   const editedContents = `${initialContents}Edited through the Workspace UI.\n`
+  const heartbeatContents = `# Heartbeat\n\n## Active Tasks\n\n- Review browser smoke ${runId}.\n`
 
   await page.goto('/register')
 
@@ -37,6 +40,15 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await expect(page.locator('.page-scroll').getByRole('button', { name: 'Theme: System' })).toBeVisible()
   await expect(page.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
   await expect(page.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+  await page.getByLabel('Timezone').fill('Asia/Shanghai')
+  const timezoneSaved = page.waitForResponse((response) => (
+    response.url().endsWith('/api/me')
+      && response.request().method() === 'PATCH'
+  ))
+  await page.getByRole('button', { name: 'Save timezone' }).click()
+  const timezoneResponse = await timezoneSaved
+  expect(timezoneResponse.status()).toBe(200)
+  await expect(timezoneResponse.json()).resolves.toMatchObject({ timezone: 'Asia/Shanghai' })
   await page.setViewportSize({ width: 390, height: 844 })
   await expect(page.getByRole('link', { name: 'Account' })).toBeVisible()
   await page.setViewportSize({ width: 1280, height: 720 })
@@ -72,6 +84,56 @@ test('admin can configure and use the browser application', async ({ page }) => 
     llm_model: 'openoctopus-e2e-model',
   })
   await expect(page.getByLabel('API Base URL')).toHaveValue('http://127.0.0.1:18080')
+
+  await page.getByRole('link', { name: 'Automations' }).click()
+  await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible()
+  await expectSinglePaneToFillWorkspace(page)
+  await expect(page.getByText('Account timezone: Asia/Shanghai')).toBeVisible()
+
+  const heartbeat = page.getByLabel('HEARTBEAT.md')
+  await heartbeat.fill(heartbeatContents)
+  const heartbeatSaved = page.waitForResponse((response) => (
+    response.url().includes('/api/workspace/files/HEARTBEAT.md?')
+      && response.request().method() === 'PUT'
+  ))
+  await page.getByRole('button', { name: 'Save HEARTBEAT.md' }).click()
+  expect((await heartbeatSaved).status()).toBe(200)
+  await page.reload()
+  await expect(page.getByLabel('HEARTBEAT.md')).toHaveValue(heartbeatContents)
+
+  await page.getByRole('button', { name: 'Create automation' }).click()
+  await page.getByLabel('Name').fill(cronName)
+  await page.getByLabel('Task', { exact: true }).fill('Run a future browser smoke check.')
+  await page.getByLabel('Schedule type').selectOption('at')
+  await page.getByLabel('Run at').fill('2099-01-01T09:00:00+08:00')
+  const cronCreated = page.waitForResponse((response) => (
+    response.url().endsWith('/api/cron')
+      && response.request().method() === 'POST'
+  ))
+  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  expect((await cronCreated).status()).toBe(201)
+  const cronRow = page.locator('.automation-row').filter({ hasText: cronName })
+  await expect(cronRow).toBeVisible()
+  await expect(cronRow.getByText('No runs yet')).toBeVisible()
+
+  await page.getByRole('button', { name: `Edit ${cronName}` }).click()
+  await page.getByLabel('Name').fill(updatedCronName)
+  const cronUpdated = page.waitForResponse((response) => (
+    response.url().includes('/api/cron/')
+      && response.request().method() === 'PATCH'
+  ))
+  await page.getByRole('button', { name: 'Save changes' }).click()
+  expect((await cronUpdated).status()).toBe(200)
+  await expect(page.getByText(updatedCronName)).toBeVisible()
+
+  await page.getByRole('button', { name: `Delete ${updatedCronName}` }).click()
+  const cronDeleted = page.waitForResponse((response) => (
+    response.url().includes('/api/cron/')
+      && response.request().method() === 'DELETE'
+  ))
+  await page.getByRole('button', { name: 'Confirm deletion' }).click()
+  expect((await cronDeleted).status()).toBe(204)
+  await expect(page.getByText(updatedCronName)).toHaveCount(0)
 
   await page.getByRole('link', { name: 'Devices' }).click()
   await expect(page.getByRole('heading', { name: 'Devices' })).toBeVisible()

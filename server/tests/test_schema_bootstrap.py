@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 
 EXPECTED_COLUMNS = {
     "system_config": 3,
-    "users": 6,
+    "users": 7,
     "discord_configs": 5,
     "telegram_configs": 5,
     "sessions": 10,
@@ -17,7 +17,7 @@ EXPECTED_COLUMNS = {
     "workspaces": 6,
     "workspace_members": 3,
     "workspace_deletions": 3,
-    "cron_jobs": 11,
+    "cron_jobs": 10,
 }
 
 EXPECTED_INDEXES = {

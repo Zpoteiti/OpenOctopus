@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import anthropic
@@ -184,6 +185,78 @@ async def test_provider_does_not_expose_a_count_tokens_route():
 
     assert not hasattr(provider, "count_tokens")
     await provider.close()
+
+
+async def test_forced_tool_choice_is_forwarded_to_the_anthropic_request():
+    captured: dict[str, Any] = {}
+
+    class FakeStream:
+        current_message_snapshot = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="tool_use",
+                    id="toolu_heartbeat",
+                    name="heartbeat_decision",
+                    input={"action": "skip", "tasks": []},
+                )
+            ]
+        )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        def __aiter__(self):
+            async def events():
+                if False:
+                    yield None
+
+            return events()
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FakeStream()
+
+    config = ProviderConfig(
+        endpoint="http://fake.test",
+        api_key="fake-key",
+        model="fake-model",
+        max_output_tokens=16384,
+        max_concurrent_requests=0,
+        max_context_tokens=None,
+    )
+    provider = AnthropicProvider(config, client=SimpleNamespace(messages=FakeMessages()))  # type: ignore[arg-type]
+    tool = {
+        "name": "heartbeat_decision",
+        "input_schema": {"type": "object"},
+    }
+    choice = {"type": "tool", "name": "heartbeat_decision"}
+
+    result = await provider.stream_turn(
+        config=config,
+        system="heartbeat",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "rules"}]}],
+        effort=None,
+        limiter=ProviderLimiter(),
+        on_delta=lambda channel, text: _noop_delta(),
+        tools=[tool],
+        tool_choice=choice,
+    )
+
+    assert captured["max_tokens"] == config.max_output_tokens
+    assert captured["tools"] == [tool]
+    assert captured["tool_choice"] == choice
+    assert result.content == [
+        {
+            "type": "tool_use",
+            "id": "toolu_heartbeat",
+            "name": "heartbeat_decision",
+            "input": {"action": "skip", "tasks": []},
+        }
+    ]
 
 
 async def test_transient_retry_stops_after_first_delta(monkeypatch):

@@ -214,10 +214,12 @@ async def cancel_session(
     session_id: UUID,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    runtime: ChatRuntime = Depends(get_chat_runtime),
 ) -> dict[str, bool]:
-    cancel_requested = await messages.request_cancel(
-        db,
-        user_id=user.id,
-        session_id=session_id,
-    )
+    async with runtime.session_operation(session_id):
+        cancel_requested = await messages.request_cancel(
+            db,
+            user_id=user.id,
+            session_id=session_id,
+        )
     return {"cancel_requested": cancel_requested}

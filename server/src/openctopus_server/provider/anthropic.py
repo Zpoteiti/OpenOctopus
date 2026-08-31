@@ -13,6 +13,7 @@ from openctopus_server.provider.wire_types import Effort
 
 DeltaChannel = Literal["text", "thinking"]
 DeltaCallback = Callable[[DeltaChannel, str], Awaitable[None]]
+ToolChoice = dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,7 @@ class Provider(Protocol):
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: ToolChoice | None = None,
     ) -> ProviderResult: ...
 
     async def close(self) -> None: ...
@@ -76,6 +78,7 @@ class AnthropicProvider:
         limiter: ProviderLimiter,
         on_delta: DeltaCallback,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: ToolChoice | None = None,
     ) -> ProviderResult:
         await limiter.configure(config.max_concurrent_requests)
         projected_messages = messages
@@ -98,6 +101,7 @@ class AnthropicProvider:
                             system=system,
                             messages=projected_messages,
                             tools=tools or [],
+                            tool_choice=tool_choice,
                             effort=effort,
                             on_delta=emit,
                         )
@@ -141,6 +145,7 @@ class AnthropicProvider:
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        tool_choice: ToolChoice | None,
         effort: Effort | None,
         on_delta: DeltaCallback,
     ) -> list[dict[str, Any]]:
@@ -153,6 +158,8 @@ class AnthropicProvider:
         }
         if tools:
             request["tools"] = tools
+        if tool_choice is not None:
+            request["tool_choice"] = tool_choice
         request.update(_thinking_controls(effort))
 
         stream_method: Any = self._client.messages.stream

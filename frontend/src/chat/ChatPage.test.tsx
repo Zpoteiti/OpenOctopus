@@ -91,6 +91,95 @@ afterEach(async () => {
 })
 
 describe('ChatPage', () => {
+  it('shows automation history without rendering a composer and keeps polling while running', async () => {
+    await i18n.changeLanguage('en')
+    const automationSession = {
+      ...baseSession,
+      session_key: `cron:${baseSession.id}`,
+      channel: 'cron',
+      title: 'Cron · Morning report',
+    }
+    let historyReads = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([automationSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes(`/api/sessions/${baseSession.id}/messages?`)) {
+        historyReads += 1
+        return jsonResponse(history({
+          status: historyReads === 1 ? 'running' : 'idle',
+          active_turn_id: historyReads === 1 ? 'turn-1' : null,
+        }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat(`/chat/${baseSession.id}?automation=cron`, 5)
+
+    expect(await screen.findByText('Cron')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Back to Automations' })).toHaveAttribute('href', '/automations')
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    await waitFor(() => expect(historyReads).toBeGreaterThan(1))
+  })
+
+  it('uses the stable Heartbeat URL directly even when the session list does not contain it', async () => {
+    await i18n.changeLanguage('en')
+    let historyRequested = false
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/api/sessions/user-1/messages?')) {
+        historyRequested = true
+        return jsonResponse({ code: 'session_not_found', message: 'missing' }, 404)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat('/chat/user-1?automation=heartbeat')
+
+    expect(await screen.findByText('Heartbeat')).toBeInTheDocument()
+    await waitFor(() => expect(historyRequested).toBe(true))
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('missing')
+  })
+
+  it('returns to Automations after deleting an automation history session', async () => {
+    await i18n.changeLanguage('en')
+    const automationSession = {
+      ...baseSession,
+      session_key: `cron:${baseSession.id}`,
+      channel: 'cron',
+      title: 'Cron · Morning report',
+    }
+    let deleted = false
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse(deleted ? [] : [automationSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes(`/api/sessions/${baseSession.id}/messages?`)) return jsonResponse(history())
+      if (url === `/api/sessions/${baseSession.id}` && init?.method === 'DELETE') {
+        deleted = true
+        return new Response(null, { status: 204 })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    const router = createMemoryRouter([
+      { path: '/chat/:sessionId', element: <ChatPage pollIntervalMs={5} /> },
+      { path: '/automations', element: <p>Automations destination</p> },
+    ], { initialEntries: [`/chat/${baseSession.id}?automation=cron`] })
+    render(<QueryClientProvider client={queryClient}><RouterProvider router={router} /></QueryClientProvider>)
+    const actor = userEvent.setup()
+
+    await screen.findByText('Cron')
+    await actor.click(screen.getByRole('button', { name: 'Delete' }))
+    await actor.click(screen.getByRole('button', { name: 'Confirm deletion' }))
+
+    expect(await screen.findByText('Automations destination')).toBeInTheDocument()
+    expect(router.state.location.pathname).toBe('/automations')
+  })
+
   it('uses English chat copy by default', async () => {
     await i18n.changeLanguage('en')
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {

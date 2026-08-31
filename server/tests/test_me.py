@@ -28,6 +28,7 @@ async def test_get_me_returns_user(async_client):
     response = await async_client.get("/api/me")
     assert response.status_code == 200
     assert response.json()["email"] == "me@test.com"
+    assert response.json()["timezone"] == "UTC"
 
 
 async def test_get_me_without_token_returns_401(async_client):
@@ -48,6 +49,64 @@ async def test_patch_me_name(async_client):
     response = await async_client.patch("/api/me", json={"name": "New Name"})
     assert response.status_code == 200
     assert response.json()["name"] == "New Name"
+
+
+async def test_patch_me_timezone_is_persistent(async_client):
+    await async_client.post(
+        "/api/auth/register",
+        json={"email": "me@test.com", "password": "testpassword", "name": "Me User"},
+    )
+    await async_client.post(
+        "/api/auth/login",
+        json={"email": "me@test.com", "password": "testpassword"},
+    )
+
+    response = await async_client.patch(
+        "/api/me",
+        json={"timezone": "Asia/Shanghai"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["timezone"] == "Asia/Shanghai"
+    assert (await async_client.get("/api/me")).json()["timezone"] == "Asia/Shanghai"
+
+
+async def test_patch_me_rejects_invalid_timezone_atomically(async_client):
+    await async_client.post(
+        "/api/auth/register",
+        json={"email": "me@test.com", "password": "testpassword", "name": "Me User"},
+    )
+    await async_client.post(
+        "/api/auth/login",
+        json={"email": "me@test.com", "password": "testpassword"},
+    )
+
+    response = await async_client.patch(
+        "/api/me",
+        json={"name": "Must not persist", "timezone": "GMT+8"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "timezone_invalid"
+    me = (await async_client.get("/api/me")).json()
+    assert me["name"] == "Me User"
+    assert me["timezone"] == "UTC"
+
+
+async def test_patch_me_rejects_null_timezone(async_client):
+    await async_client.post(
+        "/api/auth/register",
+        json={"email": "me@test.com", "password": "testpassword", "name": "Me User"},
+    )
+    await async_client.post(
+        "/api/auth/login",
+        json={"email": "me@test.com", "password": "testpassword"},
+    )
+
+    response = await async_client.patch("/api/me", json={"timezone": None})
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "timezone_invalid"
 
 
 async def test_patch_me_email_taken_returns_409(async_client):
