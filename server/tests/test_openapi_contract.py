@@ -12,11 +12,6 @@ _DEFERRED_OPERATIONS = {
     ("/api/channels", "get"),
     ("/api/channels/{channel}", "delete"),
     ("/api/channels/{channel}", "patch"),
-    ("/api/cron", "get"),
-    ("/api/cron", "post"),
-    ("/api/cron/{id}", "delete"),
-    ("/api/cron/{id}", "get"),
-    ("/api/cron/{id}", "patch"),
 }
 
 

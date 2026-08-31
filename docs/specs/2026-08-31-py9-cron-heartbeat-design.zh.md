@@ -1,6 +1,6 @@
 # Py9 Cron / Heartbeat 自动化设计
 
-**状态：** proposed，待用户 review
+**状态：** approved（已批准）
 
 **Milestone：** Py9 Cron / Heartbeat
 

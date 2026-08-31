@@ -9,6 +9,8 @@ from openctopus_server.db.session import get_db
 from openctopus_server.devices.dependencies import get_device_registry
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.dto.user import UserResponse
+from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import OpenOctopusError
 from openctopus_server.services import users
 from openctopus_server.workspace.fs import WorkspaceFS, get_workspace_fs
 
@@ -19,6 +21,7 @@ class PatchMeRequest(BaseModel):
     name: str | None = None
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=8)
+    timezone: str | None = None
 
 
 @router.get("", response_model=UserResponse)
@@ -32,8 +35,18 @@ async def patch_me(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
+    if "timezone" in body.model_fields_set and body.timezone is None:
+        raise OpenOctopusError(
+            ErrorCode.TIMEZONE_INVALID,
+            "Timezone must be a valid IANA name",
+        )
     updated = await users.update_user(
-        db, user, name=body.name, email=body.email, password=body.password
+        db,
+        user,
+        name=body.name,
+        email=body.email,
+        password=body.password,
+        timezone=body.timezone,
     )
     return UserResponse.model_validate(updated)
 

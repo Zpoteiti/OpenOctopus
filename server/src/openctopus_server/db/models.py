@@ -39,9 +39,19 @@ class User(Base):
     email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    timezone: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'UTC'")
+    )
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(timezone) BETWEEN 1 AND 64",
+            name="check_user_timezone_length",
+        ),
     )
 
 
@@ -331,18 +341,27 @@ class CronJob(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False
-    )
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    schedule: Mapped[str] = mapped_column(Text, nullable=False)
-    tz: Mapped[str | None] = mapped_column(Text)
-    one_shot: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    schedule_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule_value: Mapped[str] = mapped_column(Text, nullable=False)
+    timezone: Mapped[str | None] = mapped_column(Text)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     next_fire_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "schedule_kind IN ('every', 'cron', 'at')",
+            name="check_cron_schedule_kind",
+        ),
+        CheckConstraint(
+            "(schedule_kind = 'every' AND timezone IS NULL) "
+            "OR (schedule_kind IN ('cron', 'at') AND timezone IS NOT NULL)",
+            name="check_cron_schedule_timezone",
+        ),
     )
 
 
@@ -379,5 +398,5 @@ Index("idx_cron_jobs_user_id", CronJob.user_id)
 Index(
     "idx_cron_jobs_next_fire",
     CronJob.next_fire_at,
-    postgresql_where=text("next_fire_at IS NOT NULL"),
+    CronJob.id,
 )

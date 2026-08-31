@@ -181,7 +181,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .session-bulk-toolbar { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 8px 7px; }
 .session-action-error { color: var(--danger); font-size: 9px; line-height: 1.4; margin: 0 9px 7px; }
 .session-copy { min-width: 0; }
+.session-title-line { align-items: center; display: flex; gap: 5px; min-width: 0; }
 .session-title { color: var(--ink); display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-title-line .session-title { min-width: 0; }
+.session-source-badge { background: var(--accent-soft); border-radius: 999px; color: var(--accent-strong); flex: 0 0 auto; font-size: 7px; font-weight: 750; padding: 2px 5px; }
 .session-meta { color: var(--faint); display: block; font-size: 9px; margin-top: 3px; }
 .session-dot { background: var(--accent); border-radius: 50%; height: 6px; width: 6px; }
 .empty-sidebar { color: var(--faint); font-size: 10px; margin: 8px 10px; }
@@ -264,6 +267,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .preference-setting-copy { display: grid; gap: 4px; }
 .preference-setting-copy strong { font-size: 11px; }
 .preference-setting-copy small { color: var(--faint); font-size: 9px; line-height: 1.55; }
+.preference-timezone form { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.preference-timezone input { background: var(--field); border: 1px solid var(--line-strong); border-radius: 8px; min-height: 35px; padding: 0 10px; width: min(260px, 100%); }
 .secondary-button, .danger-button {
   align-items: center;
   background: var(--panel);
@@ -323,6 +328,30 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .detail-grid dt { color: var(--faint); font-size: 9px; }
 .detail-grid dd { font-size: 11px; margin: 5px 0 0; }
 .danger-actions, .mcp-summary { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; }
+.automation-form { border-bottom: 1px solid var(--line); margin-bottom: 4px; padding-bottom: 20px; }
+.automation-list { display: grid; }
+.automation-row { align-items: center; display: flex; gap: 24px; justify-content: space-between; padding: 17px 0; }
+.automation-row + .automation-row { border-top: 1px solid var(--line); }
+.automation-row-main { display: grid; gap: 6px; min-width: 0; }
+.automation-row-main h3 { font-size: 13px; margin: 0; }
+.automation-row-main > p { color: var(--muted); font: 10px ui-monospace, monospace; margin: 0; overflow-wrap: anywhere; }
+.automation-times { display: flex; flex-wrap: wrap; gap: 18px; margin: 4px 0 0; }
+.automation-times div { display: flex; gap: 5px; }
+.automation-times dt { color: var(--faint); font-size: 9px; }
+.automation-times dd { font-size: 9px; margin: 0; }
+.automation-row-actions { align-items: center; display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 7px; }
+.automation-load-more { border-top: 1px solid var(--line); padding-top: 16px; }
+.empty-card-copy { color: var(--muted); font-size: 11px; margin: 0; }
+.heartbeat-meta { align-items: center; display: flex; flex-wrap: wrap; font-size: 10px; gap: 12px; margin-bottom: 8px; }
+.heartbeat-meta a { color: var(--accent-strong); font-weight: 700; }
+.heartbeat-editor { display: grid; gap: 14px; margin-top: 14px; }
+.heartbeat-editor label { display: grid; font-size: 11px; font-weight: 700; gap: 7px; }
+.heartbeat-editor textarea { background: var(--field); border: 1px solid var(--line-strong); border-radius: 9px; line-height: 1.5; padding: 11px; resize: vertical; width: 100%; }
+.chat-automation-back { color: var(--accent-strong); font-size: 10px; font-weight: 700; margin-left: 5px; }
+.modal-backdrop { align-items: center; background: rgba(7, 12, 22, .54); display: flex; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 20; }
+.modal-card { background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--radius); box-shadow: var(--shadow); max-width: 440px; padding: 22px; width: 100%; }
+.modal-card h2 { font-size: 17px; margin: 0 0 9px; }
+.modal-card p { color: var(--muted); font-size: 11px; line-height: 1.55; margin: 0 0 20px; }
 .mcp-summary code { background: var(--field); border-radius: 6px; color: var(--muted); font-size: 10px; padding: 5px 7px; }
 .mcp-summary > span:last-child { color: var(--muted); font-size: 10px; margin-left: auto; }
 .inline-tabs { align-items: center; display: flex; flex-wrap: wrap; gap: 4px; }
@@ -372,6 +401,10 @@ td small { color: var(--muted); margin-top: 3px; }
   .form-grid { grid-template-columns: 1fr; }
   .full-row { grid-column: 1; }
   .preference-setting { align-items: flex-start; flex-direction: column; }
+  .preference-timezone form { align-items: stretch; flex-direction: column; justify-content: flex-start; width: 100%; }
+  .preference-timezone input { width: 100%; }
+  .automation-row { align-items: stretch; flex-direction: column; }
+  .automation-row-actions { justify-content: flex-start; }
   .secret-once { align-items: stretch; flex-direction: column; }
 }
 

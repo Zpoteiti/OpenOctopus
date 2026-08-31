@@ -2,13 +2,14 @@ import asyncio
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import exists, or_, select, text, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.chat.runner import ChatRuntime, DetachedSession
-from openctopus_server.db.models import CronJob, Message, Session, TurnRun
+from openctopus_server.db.advisory import lock_uuid_identity
+from openctopus_server.db.models import Message, Session, TurnRun
 from openctopus_server.dto.session import SessionPatchRequest, SessionResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
@@ -46,7 +47,7 @@ async def patch_owned(
     patch: SessionPatchRequest,
 ) -> SessionResponse:
     try:
-        await _lock_session(db, session_id)
+        await lock_uuid_identity(db, session_id)
         session = await _owned_session_for_update(
             db,
             user_id=user_id,
@@ -110,20 +111,12 @@ async def _delete_owned_transition(
     async with runtime.session_operation(session_id):
         detached: DetachedSession | None = None
         try:
-            await _lock_session(db, session_id)
+            await lock_uuid_identity(db, session_id)
             session = await _owned_session_for_update(
                 db,
                 user_id=user_id,
                 session_id=session_id,
             )
-            cron_job_id = await db.scalar(
-                select(CronJob.id).where(CronJob.session_id == session_id).limit(1)
-            )
-            if cron_job_id is not None:
-                raise ChatError(
-                    ErrorCode.SESSION_HAS_CRON_JOB,
-                    "Delete the cron job before deleting its session",
-                )
             detached = await runtime.detach_session(session_id)
             await db.delete(session)
             await db.commit()
@@ -211,8 +204,3 @@ def _response(session: Session, *, unread: bool) -> SessionResponse:
         cancel_requested=session.cancel_requested,
         created_at=session.created_at,
     )
-
-
-async def _lock_session(db: AsyncSession, session_id: UUID) -> None:
-    key = session_id.int & ((1 << 63) - 1)
-    await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})

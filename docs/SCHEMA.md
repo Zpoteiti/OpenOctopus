@@ -120,12 +120,19 @@ CREATE TABLE IF NOT EXISTS users (
     email          TEXT         NOT NULL UNIQUE,
     password_hash  TEXT         NOT NULL,
     name           TEXT         NOT NULL,
+    timezone       TEXT         NOT NULL DEFAULT 'UTC'
+                                 CHECK (char_length(timezone) BETWEEN 1 AND 64),
     is_admin       BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 ```
 
 - `password_hash` — argon2 (or bcrypt — implementer's choice within reason). Never returned by any API.
+- `timezone` — canonical IANA zone name used as the default when a Cron request
+  omits `tz` and to render Heartbeat Phase 1 local time. The application
+  validates it with the pinned `zoneinfo`/`tzdata` database; the SQL length
+  check is only a storage invariant. Existing jobs keep their stored effective
+  timezone when this profile value changes.
 - `is_admin` — true for any user who registered with the `OPENOCTOPUS_ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
 - **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
 - **No inline channel fields** — Discord/Telegram live in their own tables (ADR-090).
@@ -202,14 +209,23 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user_id, session_key);
 ```
 
-- `session_key` is the composite identity from ADR-006 — `{channel}:{chat_id}` for external channels, an override (`cron:{job_id}`, `heartbeat:{user_id}`, `web:{id}`) for internal/web sessions. It is unique per user, not globally unique.
+- `session_key` is the composite route identity: `{channel}:{chat_id}` for
+  channel adapters and the deterministic `web:{id}`, `cron:{job_id}`, or
+  `heartbeat:{user_id}` routes for current Web/internal constructors. It is
+  unique per user, not globally unique.
 - `id` is the internal UUID used as FK target by `messages.session_id` and the browser REST path identifier. Most internal code uses `id`; channel adapters may look up by `(user_id, session_key)`.
 - Browser web session rows are created implicitly by `POST /api/sessions/{id}/messages` when the client-generated UUID does not yet exist. Python-main has no separate `POST /api/sessions` create route.
 - `title` is the human-facing mutable session name. It defaults to `"New chat"` and never affects `id`, `chat_id`, or `session_key`.
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
 - `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true. If an in-flight provider request returns a final response with no tools, normal completion wins and clears the flag without a stop marker (ADR-129).
-- `DELETE /api/sessions/{id}` removes session rows after terminating any in-memory runner/streams. `ON DELETE CASCADE` removes that session's `turn_runs`, `messages`, and `pending_messages`; channel configuration rows are not tied to session deletion. Active cron sessions are rejected by the FK from `cron_jobs.session_id`; delete the cron job through `/api/cron/{id}` so the job row and its dedicated history stay consistent. Completed one-shot cron sessions with no remaining `cron_jobs` row can be deleted as normal history.
+- `DELETE /api/sessions/{id}` removes session rows after terminating any
+  in-memory runner/streams. `ON DELETE CASCADE` removes that session's
+  `turn_runs`, `messages`, and `pending_messages`; channel configuration and
+  Cron job rows are not tied to Session deletion. A later accepted Cron fire or
+  Heartbeat Phase 2 recreates its route with the same stable UUID and empty
+  history. Deleting a Cron job is a separate operation that stops future
+  triggers while preserving any existing Session/history.
 
 ---
 
@@ -497,30 +513,48 @@ CREATE TABLE IF NOT EXISTS workspace_deletions (
 CREATE TABLE IF NOT EXISTS cron_jobs (
     id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    session_id      UUID         NOT NULL REFERENCES sessions(id),
     name            TEXT         NOT NULL,
-    schedule        TEXT         NOT NULL,
-    tz              TEXT,
-    one_shot        BOOLEAN      NOT NULL DEFAULT FALSE,
+    schedule_kind   TEXT         NOT NULL
+                                 CHECK (schedule_kind IN ('every', 'cron', 'at')),
+    schedule_value  TEXT         NOT NULL,
+    timezone        TEXT,
     message         TEXT         NOT NULL,
     last_fired_at   TIMESTAMPTZ,
     next_fire_at    TIMESTAMPTZ  NOT NULL,
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (
+        (schedule_kind = 'every' AND timezone IS NULL)
+        OR (schedule_kind IN ('cron', 'at') AND timezone IS NOT NULL)
+    )
 );
 
-CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id    ON cron_jobs(user_id);
-CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
-    WHERE next_fire_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
+    ON cron_jobs(next_fire_at, id);
 ```
 
-- `schedule` — normalized cron expression (server parses agent-supplied `every_seconds` / `cron_expr` / `at` into a single canonical form at insert time).
 - `name` — short user-facing label. The cron tool defaults it from the first 30 characters of the message; REST callers may provide it explicitly.
-- `session_id` — dedicated cron session created by the shared cron write helper. The session uses `channel='cron'`, `chat_id=<job_id>`, and `session_key='cron:<job_id>'`.
-- `tz` — optional IANA timezone used when parsing cron expressions or naive one-shot timestamps.
-- `one_shot` — true when the agent created the job from a `cron(action="add", at=...)` call (one-time future trigger). Once fired, the row is deleted and the dedicated cron session remains as normal session history.
+- `schedule_kind` — one of `every`, `cron`, or `at`; it also determines
+  whether an accepted fire advances the row or deletes it as a one-shot.
+- `schedule_value` — canonical decimal seconds, canonical five-field Cron
+  expression, or UTC RFC3339 instant respectively.
+- `timezone` — `NULL` for `every`; otherwise the effective validated IANA zone
+  used to interpret/project `cron` and `at` schedules. Aware one-shots without
+  an explicit zone store `UTC`.
 - `message` — the agent-facing instruction the scheduler injects into the cron session as a synthesized user message when the job fires.
-- `next_fire_at` — denormalized for the scheduler index. Recomputed each time the job fires.
-- Cron writes must validate the schedule before insert/update: exactly one timing form, positive intervals, known timezone, valid cron expression, and a future `next_fire_at`. Past one-shots and unrunnable schedules are rejected rather than stored.
+- `next_fire_at` — authoritative UTC instant for the scheduler index. The
+  shared write service computes it before commit; recurring fires and busy
+  skips advance it to a strictly future boundary without duration drift.
+- Job UUID is also the stable Cron Session UUID, but there is deliberately no
+  Session FK. The Session uses `channel='cron'`, `chat_id=<job UUID>`, and
+  `session_key='cron:<job UUID>'`, and is created only on an accepted fire.
+- Creating/updating validates exactly one timing form, `every_seconds` in
+  `60..31536000`, a standard five-field Cron expression, timezone/DST rules,
+  and a future one-shot. Invalid schedules never enter the table.
+- An accepted fire updates/deletes this row and writes its synthetic
+  PendingMessage/TurnRun in one transaction. Deleting a job preserves any
+  Session/history; deleting the Session preserves the job and permits later
+  JIT recreation with the same UUID.
 - **No `kind` column** — heartbeat is a tick loop, not a cron row, and Dream is deferred (ADR-055, ADR-092).
 
 ---
@@ -555,7 +589,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire  ON cron_jobs(next_fire_at)
 | `workspace_members_pkey` | workspace_members (PK on `(workspace_id, user_id)`) | Membership lookup at workspace-fs entry. |
 | `idx_workspace_members_user` | workspace_members | Per-user "list my workspaces" for system-prompt rebuild. |
 | `idx_cron_jobs_user_id` | cron_jobs | List user's cron jobs. |
-| `idx_cron_jobs_next_fire` | cron_jobs (`next_fire_at`) | Scheduler poll. |
+| `idx_cron_jobs_next_fire` | cron_jobs (`next_fire_at, id`) | Stable scheduler due scan. |
 
 ---
 

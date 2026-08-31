@@ -3,7 +3,7 @@ import type { ClipboardEvent, FormEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { useTranslation } from 'react-i18next'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import remarkGfm from 'remark-gfm'
 
 import { ApiError, apiJson } from '../api/client'
@@ -66,6 +66,7 @@ export function ChatPage({
 }: ChatPageProps): ReactNode {
   const { t } = useTranslation()
   const { sessionId } = useParams<{ sessionId: string }>()
+  const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const sessions = useQuery({
@@ -79,6 +80,8 @@ export function ChatPage({
     staleTime: 15_000,
   })
   const session = sessions.data?.find((candidate) => candidate.id === sessionId)
+  const requestedAutomation = automationChannel(searchParams.get('automation'))
+  const source = automationChannel(session?.channel) ?? (!session ? requestedAutomation : null)
   const [locallyCreatedSessionId, setLocallyCreatedSessionId] = useState<string | null>(null)
   const [historyVersion, setHistoryVersion] = useState(0)
   const { history, historyError, updateHistory } = useRecoveredHistory(
@@ -588,11 +591,11 @@ export function ChatPage({
     try {
       await deleteSession(targetSessionId)
       await refreshSessions()
-      if (activeViewSession.current === targetSessionId) navigate('/chat', { replace: true })
+      if (activeViewSession.current === targetSessionId) navigate(source ? '/automations' : '/chat', { replace: true })
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         await refreshSessions()
-        if (activeViewSession.current === targetSessionId) navigate('/chat', { replace: true })
+        if (activeViewSession.current === targetSessionId) navigate(source ? '/automations' : '/chat', { replace: true })
         return
       }
       setNotice({
@@ -620,7 +623,13 @@ export function ChatPage({
   return (
     <>
       <header className="workspace-header chat-workspace-header">
-        <div className="breadcrumbs"><span>{t('nav.chat')}</span><span aria-hidden="true">/</span><strong>{title}</strong></div>
+        <div className="breadcrumbs">
+          {source ? <Link to="/automations">{t('nav.automations')}</Link> : <span>{t('nav.chat')}</span>}
+          <span aria-hidden="true">/</span>
+          {source ? <span className="status-badge">{t(`automations.${source}`)}</span> : null}
+          <strong>{title}</strong>
+          {source ? <Link className="chat-automation-back" to="/automations">{t('automations.back')}</Link> : null}
+        </div>
         <div className="chat-header-actions">
           <DeviceMenu devices={devices.data ?? []} />
           {sessionId ? (
@@ -1224,4 +1233,8 @@ function chatErrorMessage(error: unknown, fallback: string): string {
     return error.message.includes(codeSuffix) ? error.message : `${error.message} ${codeSuffix}`
   }
   return error instanceof Error ? error.message : fallback
+}
+
+function automationChannel(value: string | null | undefined): 'cron' | 'heartbeat' | null {
+  return value === 'cron' || value === 'heartbeat' ? value : null
 }

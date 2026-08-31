@@ -85,26 +85,42 @@ idle or failed.
 
 **Status:** accepted
 **Context:** Prior OpenOctopus had `InboundEvent { kind: EventKind::{UserTurn, Cron, Dream, Heartbeat} }`. This `kind` leaked into rate limiting, publish_final branching, and (via a separate `PromptMode` enum) the system prompt builder. One concept, three enums.
-**Decision:**
-```rust
-pub struct InboundMessage {
-    channel: String,                        // "discord" | "telegram" | "browser"
-    chat_id: String,                        // channel-scoped identifier
-    user_id: String,                        // OpenOctopus account this message belongs to (stamped at ingress)
-    content: String,                        // already wrapped for non-partner senders
-    timestamp: DateTime<Utc>,
-    media: Vec<String>,                     // workspace paths
-    metadata: serde_json::Value,            // channel-specific escape hatch
-    session_key_override: Option<String>,   // "cron:{job_id}", "heartbeat:{user_id}", etc.
-}
+**Python-main decision:** Internal ingress uses one immutable Python envelope:
+```python
+@dataclass(frozen=True, slots=True)
+class InboundMessage:
+    message_id: UUID
+    owner_user_id: UUID
+    session_id: UUID
+    session_key: str
+    channel: str
+    chat_id: str
+    content: tuple[dict[str, object], ...]
+    attachment_refs: tuple[dict[str, object], ...] = ()
+    effort: Effort | None = None
 ```
-**Consequences:** No `kind`. No `EventKind`. No `PromptMode` branches downstream. Autonomous events are represented as injected user messages into dedicated sessions (ADR-010, ADR-011). One type, one path.
+Callers do not freely assemble route fields. Small constructors produce the
+only Py9 routes: `web:{session_id}`, `cron:{job_id}`, and
+`heartbeat:{user_id}`. The publish transition assigns the authoritative
+receive time, prepends the runtime block through the single codec, and writes
+the pending message plus turn reservation. There is no generic metadata escape
+hatch, caller timestamp, event kind, prompt mode, or public JSON parser.
+**Consequences:** Autonomous events are normal owner messages injected into
+dedicated sessions through the same durable pending/runner path as Web input.
+Authorization remains out of band; runtime text is not an authorization source.
 
-### ADR-006 · `session_key` = override ∨ `{channel}:{chat_id}`
+### ADR-006 · Deterministic `session_key` per ingress route
 
 **Status:** accepted
-**Decision:** Session identity is computed from the InboundMessage. If `session_key_override` is set (cron/heartbeat/API), use it verbatim. Otherwise compose `format!("{channel}:{chat_id}")`. Browser-created sessions use the generated session UUID as `chat_id`, so their key is `web:{session.id}`. Discord examples: `discord:dm:{user_id}` and `discord:guild:{guild_id}:channel:{channel_id}`.
-**Consequences:** External channel messages get natural per-conversation sessions. Internal synthesizers can route history to isolated sessions while still targeting the original channel for delivery. The internal UUID `sessions.id` remains the public REST path identifier for browser APIs; `session_key` remains the channel-routing identity.
+**Decision:** Each ingress adapter/constructor computes its complete route before
+the shared publish transition. Py9 constructors use `web:{session_id}`,
+`cron:{job_id}`, and `heartbeat:{user_id}`. Future external adapters use their
+own deterministic per-conversation key (for example a Discord DM or guild
+channel identity). There is no caller-controlled override field on the
+Python-main inbound envelope.
+**Consequences:** Internal automation history stays isolated, while the
+internal UUID `sessions.id` remains the browser REST path identifier and
+`session_key` remains the unique per-user route identity.
 
 ### ADR-007 · No `is_partner` field; wrap baked into content at adapter
 
@@ -118,19 +134,24 @@ pub struct InboundMessage {
 **Decision:** `sender_id` is adapter-internal only — the adapter uses it to compare against `partner_id` for the wrap decision, then discards. Not carried on the message. No downstream consumer uses it (no subagent dispatch, no per-sender moderation in v1).
 **Consequences:** Smaller struct. If a future feature (moderation, cross-channel identity, subagent dispatch) needs persisted sender identity, it can be added to the DB message row or to `metadata` at that time. "No caller = delete it."
 
-### ADR-009 · `user_id` stamped at ingress (not lazily derived)
+### ADR-009 · Owner identity stamped at ingress (not lazily derived)
 
 **Status:** accepted
 **Context:** Earlier draft considered omitting `user_id` and deriving from `{channel}:{chat_id}` at session-creation time. But every ingress point already has user_id in scope (bot identity for Discord/Telegram, JWT claims for REST, job row for cron/heartbeat). Derivation is strictly more code for zero benefit.
-**Decision:** InboundMessage carries `user_id`, stamped by whichever adapter/synthesizer built the message.
+**Decision:** Python-main `InboundMessage` carries `owner_user_id`, stamped by
+the authenticated ingress constructor or internal owner synthesizer.
 **Consequences:** No per-message lookup. No failure mode ("what if the config row was just deleted?"). Clear self-documentation.
 
 ### ADR-010 · Autonomous flows = user-message injection into dedicated sessions
 
 **Status:** accepted
-**Context:** Nanobot pattern. Cron fires → synthesize InboundMessage with `session_key_override="cron:{job_id}"`. Heartbeat Phase 2 → synthesize InboundMessage with `session_key_override="heartbeat:{user_id}"`. Both flow through the normal agent loop as if a user had typed the content.
+**Context:** Nanobot pattern. A Cron fire constructs the stable
+`cron:{job_id}` route; Heartbeat Phase 2 constructs
+`heartbeat:{user_id}`. Both publish through the normal durable inbound path.
 **Decision:** There is no "autonomous path" in the agent loop. There are only user messages, some of which happen to have been synthesized by an internal service.
-**Consequences:** One code path. No `EventKind` branches. No `PromptMode` branches. The agent cannot distinguish "user said X" from "cron synthesized X" — by design.
+**Consequences:** One Agent path, with no `EventKind` or `PromptMode` branch.
+The normal runtime block truthfully identifies `web`, `cron`, or `heartbeat`;
+that provenance does not alter prompt composition or Server-side authorization.
 
 ### ADR-011 · Per-session async lock + pending queue for mid-turn follow-ups
 
@@ -158,10 +179,16 @@ backdating timestamps.
 ### ADR-012 · Three external ingress sources + two internal synthesizers
 
 **Status:** accepted
-**Decision:**
-- **External:** REST (`POST /api/sessions/{id}/messages`), Discord adapter, Telegram adapter. No `session_key_override`.
-- **Internal:** cron fire, heartbeat fire. `session_key_override` always set.
-**Consequences:** No distinction between "browser" and "direct API" — they're both REST consumers with JWT auth. Internal synthesizers are the only callers that use `session_key_override`.
+**Python-main Py9 decision:**
+- **Current external:** authenticated REST
+  (`POST /api/sessions/{id}/messages`) through the Web constructor.
+- **Current internal:** Cron fire and Heartbeat Phase 2 through their dedicated
+  constructors.
+- Discord and DingTalk adapters are Py10 scope and must normalize into this
+  envelope rather than adding another Agent path.
+**Consequences:** Browser and direct API callers share one JWT-authenticated Web
+route. Internal synthesizers cannot forge arbitrary route tuples, and Py10 has
+one explicit adapter seam to extend.
 
 ### ADR-013 · Fire-and-forget ingress; HTTP caller does not wait on agent
 
@@ -1635,16 +1662,38 @@ same env var name.
 ### ADR-053 · Cron: per-job dedicated isolated session
 
 **Status:** accepted
-**Decision:** Every cron job owns a dedicated session with `session_key = "cron:{job_id}"`. Cron does not inherit the creating chat's history, `channel`, or `chat_id`, and the cron row does not store delivery routing fields. When the schedule fires, the scheduler injects the row's `message` into that session as a synthesized user message. Users cannot write to cron sessions through `POST /api/sessions/{id}/messages`; jobs are created, updated, and deleted only through `/api/cron` or the agent `cron` tool.
-**Consequences:** Cron is a durable trigger for normal agent work, not a delivery router. Each cron job has an auditable conversation history independent of other jobs and the chat that created it. If a job should notify a user through Telegram, Discord, web, or another channel, that instruction belongs in the cron message and the agent sends it with the normal `message` tool.
+**Decision:** Every cron job has a stable dedicated route: Session UUID equals
+job UUID and `session_key = "cron:{job_id}"`. The Session is created just in
+time on the first accepted fire and recreated with the same identity after the
+user deletes its history. Cron does not inherit the creating chat's history,
+channel, chat ID, effort, or attachments. Users cannot write to cron sessions
+through `POST /api/sessions/{id}/messages`; jobs are created/edited through
+`/api/cron`, while the `cron` tool supports add/list/remove.
+**Consequences:** Deleting a job stops future triggers but preserves its Session
+and history. Deleting the Session removes history without deleting the job; a
+later accepted fire recreates it. A one-shot job row is deleted after durable
+acceptance, while its history remains. Cron is a durable trigger for normal
+agent work, not a delivery router; Py9 does not add external-channel delivery.
 
 ### ADR-054 · Heartbeat: 2-phase, only Phase 2 goes through the bus
 
 **Status:** accepted
 **Decision:**
-- **Phase 1**: a standalone LLM call (not through the bus) with a small decision tool. Inputs: `HEARTBEAT.md` + current time. Output: `action: "skip" | "run"` + `tasks` summary.
-- **Phase 2** (only if action=run): synthesize InboundMessage with `session_key_override = "heartbeat:{user_id}"`, inject into bus. Normal agent loop runs in the heartbeat session.
-**Consequences:** No `PromptMode::Heartbeat` branch — Phase 2 sees the standard system prompt. Heartbeat has its own read-only session per user, so it doesn't pollute chat history and the user cannot directly write into the autonomous heartbeat stream.
+- A deterministic preflight requires a non-empty, bounded, strict UTF-8
+  `HEARTBEAT.md` with a real `## Active Tasks` section before any Provider call.
+- **Phase 1** is a standalone, lifecycle-owned Provider call, not an Agent
+  turn. It receives only the bounded file plus UTC/local time and the user's
+  IANA timezone, and must call the sole forced `heartbeat_decision` tool exactly
+  once. Invalid/missing/multiple calls, invalid task payloads, context overflow,
+  or Provider failure fail closed to `skip` without persistence.
+- **Phase 2** occurs only for a strict `run`: selected tasks are synthesized into
+  the stable `heartbeat:{user_id}` Session (whose UUID is the user UUID) through
+  the normal pending-message/turn path. It does not copy the whole heartbeat
+  file into history.
+**Consequences:** No `PromptMode::Heartbeat` branch: Phase 2 uses the standard
+owner system prompt and full tool list. Phase 1 creates no Session or decision
+row. The read-only Heartbeat Session may be deleted and is recreated with the
+same UUID only by a later real Phase 2.
 
 ### ADR-055 · Dream deferred for v1
 
@@ -1656,11 +1705,10 @@ same env var name.
 ### ADR-112 · Cron ticker mechanics
 
 **Status:** accepted
-**Python-main clarification:** Single in-process ticker carries forward,
-implemented as an asyncio event loop task. Sleeps until earliest
-`next_fire_at` (capped at 60s), with per-write `asyncio.Event` wake. Missed
-recurring fires silently skipped; expired one-shots dropped. Write-time
-schedule validation is shared between REST cron API and agent `cron` tool.
+**Python-main clarification:** One asyncio ticker runs in the supported
+single-worker process. It sleeps until the earliest `next_fire_at` (capped at
+60s), with process-local `asyncio.Event` wake after writes. REST and the agent
+tool share the same schedule parser and write service.
 **Context:** Nanobot stores cron jobs in a single-user JSON store and re-arms an asyncio timer after each write. OpenOctopus is multi-user and DB-backed, but the mental model stays the same: cron is a durable trigger that injects a message when a validated future time arrives.
 **Decision:**
 - There is one in-process cron ticker per OpenOctopus server process, not one ticker per user. It scans the shared `cron_jobs` table by `next_fire_at`.
@@ -1669,27 +1717,43 @@ schedule validation is shared between REST cron API and agent `cron` tool.
 - The same helper notifies the ticker after create/update/delete. The notify is a process-local wake signal, not persisted state.
 - The ticker sleeps until the earliest known `next_fire_at`, capped at 60 seconds. `Notify` gives low-latency wakeups on normal writes; the 60-second cap is the fallback global re-scan if a notify is missed, a future write path forgets it, rows are changed by admin tooling, or the clock shifts.
 - Missed recurring fires are silently skipped, matching nanobot. On restart the scheduler advances recurring jobs to the next future occurrence rather than catching up. Expired one-shots are dropped rather than delivered late.
+- Each accepted fire advances/deletes its schedule, JIT creates/validates the
+  stable Session, writes `pending_messages`, and reserves the `turn_runs` row in
+  one PostgreSQL transaction. Commit-before-handoff is recovered at startup.
+- If that job already has a running turn or pending message, the occurrence is
+  skipped without creating chat rows or updating `last_fired_at`; recurring
+  schedules advance to the next future boundary and one-shots are deleted.
+- The ticker processes due rows in stable `(next_fire_at, id)` batches of 100
+  and never waits for Agent completion. Different jobs may run concurrently;
+  one job never accumulates overlapping fires.
 
 **Consequences:** Cron remains simple and globally coordinated within the single-process deployment model. The DB work is one indexed scheduler check per minute at worst when idle. Write-time validation keeps bad schedules out of the table instead of relying on drift handling later.
 
 ### ADR-113 · Heartbeat fanout and read-only session
 
 **Status:** accepted
-**Python-main clarification:** Stateless per-process pulse carries forward,
-implemented as an asyncio periodic task. 30-minute interval, concurrent
-Phase 1 fanout via `asyncio.gather()`. Missing/empty `HEARTBEAT.md` users
-are skipped without LLM calls. Phase 2 writes to `heartbeat:{user_id}`
-session; users cannot post directly into heartbeat sessions. Provider
-concurrency is bounded by `llm_max_concurrent_requests`.
+**Python-main clarification:** The stateless per-process pulse aligns to UTC
+wall-clock `xx:00` and `xx:30`, waits for the next strictly future boundary on
+startup, and never catches up missed boundaries. A scan cannot overlap itself.
 **Context:** Nanobot heartbeat is a single-user, stateless pulse over `HEARTBEAT.md`. OpenOctopus keeps that property but must handle thousands of users. Adding heartbeat rows or per-user cursors would violate ADR-092.
 **Decision:**
-- Heartbeat is a stateless per-process pulse. Every 30 minutes, the server enumerates users, reads `{ROOT}/{user_id}/HEARTBEAT.md`, and skips users whose file is missing or empty without making an LLM call.
-- Eligible users fan out concurrently. OpenOctopus does not add a heartbeat-specific semaphore in v1. If 2,000 users have non-empty `HEARTBEAT.md`, the pulse may put 2,000 Phase 1 LLM requests in flight.
+- Heartbeat is a stateless per-process pulse. It keyset-pages users in batches
+  of 100, stages work through a queue of 64, and uses 32 fixed workers. New
+  users past the scan's initial upper bound wait for the next pulse.
+- A user whose stable Heartbeat Session is running or pending is skipped before
+  file IO and the Provider call. Missing, oversized, unreadable, invalid UTF-8,
+  or deterministically inactive `HEARTBEAT.md` files are also skipped without a
+  Provider call.
 - Provider capacity is an admin responsibility. Deployments with weaker providers can configure the shared LLM-provider concurrency cap in `system_config.llm_max_concurrent_requests` or place a gateway such as LiteLLM in front of OpenOctopus.
-- Phase 2 output is persisted to `heartbeat:{user_id}`. The Web UI may display this as a dedicated Heartbeat session, but users cannot post directly into it. Users change heartbeat behavior by editing `HEARTBEAT.md` through normal sessions and file tools.
+- Phase 2 output is persisted to `heartbeat:{user_id}`. The Web UI displays this
+  as a dedicated read-only Heartbeat Session; users change behavior by editing
+  `HEARTBEAT.md` through the Workspace API/UI or file tools.
 - Heartbeat does not automatically deliver to Discord, Telegram, or the latest active channel in v1. If the agent needs to contact the user externally, it must deliberately use the normal `message` tool.
 
-**Consequences:** Users can inspect heartbeat history from the Web UI without autonomous output appearing unexpectedly in external chats. Large deployments can run high-concurrency heartbeat pulses when their LLM provider supports it, while smaller deployments can cap concurrency at the shared provider layer.
+**Consequences:** Users can inspect heartbeat history without autonomous output
+appearing unexpectedly in external chats. The fixed worker/queue bounds protect
+DB, object-storage, and memory staging; the existing shared Provider limiter
+remains the only configurable LLM concurrency bound.
 
 ### ADR-056 · No rate limiting in v1
 
@@ -1860,7 +1924,14 @@ introduced. If a future milestone adds multiple workers, heartbeat coordination
 must be redesigned at that point.
 **Context:** Heartbeat Phase 1 (ADR-054) runs each tick and decides skip-or-run based on current time and `HEARTBEAT.md`. A "last Phase 1 decision" column or table was considered to let admins audit tick behavior.
 **Decision:** No persisted heartbeat state. No `users.last_heartbeat_phase1_at`, no `heartbeat_state` table. Phase 1 is stateless — each tick reads current context and decides fresh.
-**Consequences:** Restart doesn't carry heartbeat baggage. If Phase 1 fires Phase 2, the only persistence is the resulting heartbeat-session message history (via the normal message-bus path, ADR-010). Admin audit of Phase 1 behavior must come from logs, not DB queries. Acceptable: heartbeats are infrequent and user-scoped, not a compliance surface.
+The pulse is aligned to UTC `:00`/`:30`; startup waits for the next strictly
+future boundary, and missed boundaries are not replayed. A previous scan still
+running at a boundary causes that boundary to be skipped.
+**Consequences:** Restart carries no heartbeat cursor or decision baggage. If
+Phase 1 selects work, the only persistence is the resulting Heartbeat Session
+history. Phase 1 outcomes remain bounded lifecycle logs rather than DB audit
+rows. Multiple ASGI workers require a future distributed leader mechanism and
+are outside Py9's supported deployment contract.
 
 ### ADR-093 · Per-session chat SSE stream is historical
 
@@ -1991,7 +2062,12 @@ server/SSE metadata.
 ### ADR-098 · Browser REST writes use session UUIDs and only web sessions are writable
 
 **Status:** accepted
-**Context:** Session keys follow `{channel}:{chat_id}` or an override (ADR-006). Internal synthesizers use overrides like `cron:{job_id}` and `heartbeat:{user_id}`. A user with valid auth must not be able to forge messages into cron, heartbeat, Discord, or Telegram histories. Earlier drafts described browser writes as `/api/sessions/{key}/messages`, but the API uses UUID routes.
+**Context:** Session keys are deterministic ingress routes (ADR-006): Web uses
+`web:{session_id}`, Cron uses `cron:{job_id}`, and Heartbeat uses
+`heartbeat:{user_id}`. A user with valid auth must not be able to forge
+messages into automation or external-channel histories. Earlier drafts
+described browser writes as `/api/sessions/{key}/messages`, but the API uses
+UUID routes.
 **Decision:** Browser REST routes use the internal UUID path:
 `POST /api/sessions/{id}/messages`, `GET /api/sessions/{id}/messages`, and
 `PATCH/DELETE /api/sessions/{id}`. Frontends generate a UUID before first send.
@@ -2017,6 +2093,11 @@ session's in-memory runner and live/queued POST streams, then deletes the
 because the transcript is intentionally removed. Deleting a channel session
 removes that conversation history only; it does not remove Discord/Telegram
 configuration, so a later inbound channel message may create a fresh session.
+Deleting a Cron Session likewise does not delete its job, and deleting a
+Heartbeat Session does not disable heartbeat. The next accepted trigger
+recreates the corresponding stable UUID and route with empty history. Deleting
+the Cron job is separate: it stops future triggers and preserves any existing
+Session/history.
 
 **Python-main session list metadata:** `GET /api/sessions` returns a derived
 `unread` boolean for each session, including web, Discord, Telegram, cron, and
@@ -2999,25 +3080,23 @@ does not count as production code. Numbered implementation milestones start at
 | **Py8a** | Server MCP security boundary + shared runtime | Admin whole-list CAS API and last-good catalog; FastMCP 3.4.7 stdio/Streamable HTTP/SSE; four surfaces; one shared runtime per name; Server-first namespace/capacity; bounded fair queue and degraded recovery; trusted same-UID stdio with no OS sandbox | Py7 | Three-transport fake MCP contract; Server-first shadow/capacity and Device mutation races; bounded/fair queue; degraded MCP leaves `/health` healthy; clean runtime shutdown |
 | **Py8b** | Distinct-Client regular-file transfer | Same-owner Client A→Client B pure relay over one captured Protocol v3 slot; bounded admission; conditional move cleanup; no Server byte staging | Py7 | Five regular-file topologies share one public tool/REST shape; route, integrity, cancellation, late-frame, warning, and no-inner-admission contracts |
 | **Py8c** | Recursive directory transfer | Automatic file/directory dispatch; bounded immutable manifests; five topologies; sequential child slots; exact cleanup; same-Client atomic rename; Skills prevalidation | Py8b | 10,000-entry/5 MiB bounds; no-overwrite/empty/link/drift/cleanup contracts; bounded aggregate result; unchanged Protocol v3 |
-| **Py9** | Cron / Heartbeat | **Parallel track** (branches from Py3). Cron dedicated session + shared write helper + ticker; heartbeat 2-phase + stateless per-process pulse; `cron_jobs` table + `/api/cron` REST + `cron` tool | Py3 | Cron injects into creator session; heartbeat injects into read-only session; both reuse normal session/agent paths |
-| **Py10** | Channels | **Parallel track** (branches from Py3, lands after Py9). Discord / Telegram / Feishu / Slack-like adapters + per-channel config tables + generic `/api/channels` + channel-level event aggregation | Py3 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
+| **Py9** | Cron / Heartbeat | Stable per-job/per-user automation Sessions; shared atomic inbound publish; timezone-aware schedule service; `/api/cron` + `cron` tool; wall-clock Heartbeat preflight/forced-decision/Phase 2; Account + Automations UI | Py8c + Frontend | Cron and Heartbeat reuse normal pending/Agent paths; busy occurrences never backlog; delete/recreate and restart recovery are deterministic; real Provider + Docker acceptance |
+| **Py10** | Channels | Extensible channel adapter layer and per-channel configuration, built on the normalized inbound transition | Py9 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
 | **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
 | **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Complete: accepted design `2026-08-26-browser-frontend-design.zh.md`, implementation, real browser gate, and cross-platform release CI |
 | **Py13** | Release publication | Publish the unsigned alpha Server image and Client artifacts with deployment docs; signing, installers, and multi-worker scale-out remain future ADRs | Frontend | `v0.0.1` prerelease contains the amd64/arm64 Server image, four native Client bundles, checksums, and published-artifact acceptance evidence |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
 
-### Parallel tracks (post-Py3)
+### Python milestone sequence
 
 ```
-Py3 ──────────┬── Py4a → Py4 → Py5 → Py6 → Py7 → Py8a → Py8b → Py8c
-               │
-               ├── Py9 (cron/heartbeat)
-               │
-               └── Py10 (channels)
+Py3 → Py4a → Py4 → Py5 → Py6 → Py7 → Py8a → Py8b → Py8c
+    → Frontend → Py9 (cron/heartbeat) → Py10 (channels)
 ```
 
-Py9 and Py10 depend only on Py3 and can develop concurrently with the
-Py4–Py8c line.
+Py9 is implemented against the current Browser Frontend, Workspace, message
+runtime, Client and MCP contracts. Py10 starts after Py9 so channel adapters can
+reuse its normalized inbound transition rather than defining a competing one.
 
 Server milestones use first-party async application code and a OpenOctopus-owned
 Anthropic Messages adapter built on the Anthropic Python SDK where the SDK fits

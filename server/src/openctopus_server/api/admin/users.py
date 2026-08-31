@@ -29,6 +29,7 @@ class _UserSnapshot:
     id: UUID
     email: str
     name: str
+    timezone: str
     is_admin: bool
     created_at: datetime
 
@@ -52,6 +53,7 @@ async def list_users(
             id=row.id,
             email=row.email,
             name=row.name,
+            timezone=row.timezone,
             is_admin=row.is_admin,
             created_at=row.created_at,
         )
@@ -65,6 +67,7 @@ async def list_users(
             id=row.id,
             email=row.email,
             name=row.name,
+            timezone=row.timezone,
             is_admin=row.is_admin,
             created_at=row.created_at,
             quota_bytes=quota_bytes,

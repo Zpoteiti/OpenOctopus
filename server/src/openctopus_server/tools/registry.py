@@ -49,6 +49,7 @@ from openctopus_server.services.devices import parse_stored_mcp_catalog
 from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
 from openctopus_server.services.system_config import load_web_fetch_policy
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
+from openctopus_server.tools.cron import CronTool
 from openctopus_server.tools.device_field import (
     DEVICE_FIELD_MARKER,
     DEVICE_FIELD_NAME,
@@ -480,6 +481,7 @@ def build_py4_registry(
     device_registry: DeviceRegistry | None = None,
     server_mcp_dispatcher: ServerMcpDispatcher | None = None,
     server_mcp_authority: ServerMcpAuthorityFence | None = None,
+    cron_wake: Callable[[], None] | None = None,
 ) -> ToolRegistry:
     settings = get_settings()
     converter = content_converter or get_content_converter()
@@ -498,6 +500,7 @@ def build_py4_registry(
                 policy_loader=_web_fetch_policy_loader(engine),
             ),
             MessageTool(engine, workspace_service),
+            CronTool(engine, wake=cron_wake),
             FileTransferTool(
                 engine,
                 workspace_service,

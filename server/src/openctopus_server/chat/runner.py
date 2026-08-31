@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
@@ -15,6 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.automations.heartbeat import (
+    HEARTBEAT_DECISION_SYSTEM,
+    HEARTBEAT_DECISION_TOOL,
+    HEARTBEAT_TOOL_CHOICE,
+    HeartbeatEvaluation,
+    heartbeat_decision_messages,
+    parse_heartbeat_decision,
+)
 from openctopus_server.chat.attachments import (
     build_device_attachment_targets,
     fence_owner_device_targets,
@@ -282,6 +291,52 @@ class ChatRuntime:
         if self._providers:
             raise RuntimeError("Cannot replace provider factory after provider use")
         self._provider_factory = factory
+
+    async def evaluate_heartbeat_decision(
+        self,
+        *,
+        document: str,
+        now_utc: datetime,
+        timezone: str,
+    ) -> HeartbeatEvaluation:
+        """Run the fail-closed Heartbeat Phase 1 through shared Provider resources."""
+        try:
+            messages = heartbeat_decision_messages(
+                document=document,
+                now_utc=now_utc,
+                timezone=timezone,
+            )
+            tools = [HEARTBEAT_DECISION_TOOL]
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                config = await load_provider_config(db)
+            input_tokens = await self._estimate_tokens(
+                system=HEARTBEAT_DECISION_SYSTEM,
+                messages=messages,
+                tools=tools,
+            )
+            if (
+                config.max_context_tokens is not None
+                and input_tokens + config.max_output_tokens > config.max_context_tokens
+            ):
+                return HeartbeatEvaluation(decision=None, reason="context_limit")
+            provider = await self._provider_for(config)
+
+            async def discard_delta(channel: str, text: str) -> None:
+                del channel, text
+
+            result = await provider.stream_turn(
+                config=config,
+                system=HEARTBEAT_DECISION_SYSTEM,
+                messages=messages,
+                effort=None,
+                limiter=self.limiter,
+                on_delta=discard_delta,
+                tools=tools,
+                tool_choice=HEARTBEAT_TOOL_CHOICE,
+            )
+        except Exception:
+            return HeartbeatEvaluation(decision=None, reason="provider_error")
+        return parse_heartbeat_decision(result.content)
 
     async def schedule(self, accepted: AcceptedMessage) -> None:
         if accepted.turn is None:

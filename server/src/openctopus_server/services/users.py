@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import uuid
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -7,11 +8,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.auth.password import hash_password
+from openctopus_server.automations.schedule import (
+    InvalidTimezoneError,
+    validate_timezone_name,
+)
 from openctopus_server.config import get_settings
-from openctopus_server.db.models import Device, User, Workspace, WorkspaceMember
+from openctopus_server.db.advisory import lock_uuid_identity
+from openctopus_server.db.models import (
+    CronJob,
+    Device,
+    Session,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import AuthError
+from openctopus_server.errors.exceptions import AuthError, OpenOctopusError
 from openctopus_server.services.workspace_deletions import (
     WorkspaceLifecycle,
     reactivate_if_deletion_rolled_back,
@@ -38,7 +51,19 @@ async def create_user(
         settings = get_settings()
         is_admin = hmac.compare_digest(admin_token, settings.admin_token)
 
+    user_id = uuid.uuid4()
+    await lock_uuid_identity(db, user_id)
+    collision = await db.scalar(
+        select(Session.id)
+        .where(Session.id == user_id)
+        .union_all(select(CronJob.id).where(CronJob.id == user_id))
+        .limit(1)
+    )
+    if collision is not None:
+        raise RuntimeError("Generated user identity is already reserved")
+
     user = User(
+        id=user_id,
         email=email,
         password_hash=hash_password(password),
         name=name,
@@ -74,7 +99,16 @@ async def update_user(
     name: str | None = None,
     email: str | None = None,
     password: str | None = None,
+    timezone: str | None = None,
 ) -> User:
+    if timezone is not None:
+        try:
+            timezone = validate_timezone_name(timezone)
+        except InvalidTimezoneError as exc:
+            raise OpenOctopusError(
+                ErrorCode.TIMEZONE_INVALID,
+                "Timezone must be a valid IANA name",
+            ) from exc
     if email is not None and email != user.email:
         existing = await db.execute(select(User).where(User.email == email))
         if existing.scalar_one_or_none() is not None:
@@ -84,6 +118,8 @@ async def update_user(
         user.name = name
     if password is not None:
         user.password_hash = hash_password(password)
+    if timezone is not None:
+        user.timezone = timezone
     await db.commit()
     await db.refresh(user)
     return user

@@ -10,6 +10,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.api.router import router as api_router
+from openctopus_server.automations.cron import CronScheduler
+from openctopus_server.automations.heartbeat import HeartbeatPulse
 from openctopus_server.chat.runner import ChatRuntime, get_context_admission
 from openctopus_server.chat.token_estimator import initialize_token_estimator
 from openctopus_server.config import get_settings
@@ -23,6 +25,7 @@ from openctopus_server.frontend import FRONTEND_BUILD_DIR, install_frontend
 from openctopus_server.mcp.authority import ServerMcpAuthorityFence
 from openctopus_server.mcp.models import ServerMcpEnvelope, empty_server_mcp_envelope
 from openctopus_server.mcp.supervisor import ServerMcpSupervisor
+from openctopus_server.services.heartbeat import publish_heartbeat_phase_two
 from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
 from openctopus_server.services.turn_runs import abandon_running_turns
 from openctopus_server.services.workspace_deletions import (
@@ -111,6 +114,8 @@ def _is_generated_validation_response(response: object) -> bool:
 
 async def _close_lifespan_resources(
     *,
+    heartbeat_pulse: HeartbeatPulse | None,
+    cron_scheduler: CronScheduler | None,
     server_mcp_supervisor: ServerMcpSupervisor | None,
     runtime: ChatRuntime | None,
     device_registry: DeviceRegistry | None,
@@ -119,31 +124,39 @@ async def _close_lifespan_resources(
     engine: AsyncEngine | None,
 ) -> None:
     try:
-        if server_mcp_supervisor is not None:
-            await server_mcp_supervisor.begin_shutdown()
+        if heartbeat_pulse is not None:
+            await heartbeat_pulse.close()
     finally:
         try:
-            if runtime is not None:
-                await runtime.close()
+            if cron_scheduler is not None:
+                await cron_scheduler.stop()
         finally:
             try:
                 if server_mcp_supervisor is not None:
-                    await server_mcp_supervisor.shutdown()
+                    await server_mcp_supervisor.begin_shutdown()
             finally:
                 try:
-                    if device_registry is not None:
-                        await device_registry.close()
+                    if runtime is not None:
+                        await runtime.close()
                 finally:
                     try:
-                        if deletion_worker is not None:
-                            await deletion_worker.close()
+                        if server_mcp_supervisor is not None:
+                            await server_mcp_supervisor.shutdown()
                     finally:
                         try:
-                            if object_storage is not None:
-                                await object_storage.close()
+                            if device_registry is not None:
+                                await device_registry.close()
                         finally:
-                            if engine is not None:
-                                await engine.dispose()
+                            try:
+                                if deletion_worker is not None:
+                                    await deletion_worker.close()
+                            finally:
+                                try:
+                                    if object_storage is not None:
+                                        await object_storage.close()
+                                finally:
+                                    if engine is not None:
+                                        await engine.dispose()
 
 
 async def _load_server_mcp_authority(engine: AsyncEngine) -> ServerMcpEnvelope:
@@ -178,6 +191,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         print(f"Database bootstrap failed: {exc}", file=sys.stderr)
         await _close_lifespan_resources(
+            heartbeat_pulse=None,
+            cron_scheduler=None,
             server_mcp_supervisor=None,
             runtime=None,
             device_registry=None,
@@ -225,12 +240,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     deletion_worker: WorkspaceDeletionWorker | None = None
     server_mcp_supervisor: ServerMcpSupervisor | None = None
+    cron_scheduler: CronScheduler | None = None
+    heartbeat_pulse: HeartbeatPulse | None = None
     server_mcp_authority = getattr(app.state, "server_mcp_authority", None)
     if server_mcp_authority is None:
         server_mcp_authority = ServerMcpAuthorityFence(empty_server_mcp_envelope())
         app.state.server_mcp_authority = server_mcp_authority
     runtime = getattr(app.state, "chat_runtime", None)
     device_registry = getattr(runtime, "device_registry", None)
+    cron_wake_event = asyncio.Event()
     try:
         deletion_worker = WorkspaceDeletionWorker(
             engine,
@@ -253,8 +271,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await server_mcp_supervisor.start(envelope)
             app.state.server_mcp_supervisor = server_mcp_supervisor
 
+        workspace_service = WorkspaceService(workspace_fs)
         if runtime is None:
-            workspace_service = WorkspaceService(workspace_fs)
             device_registry = get_device_registry()
             runtime = ChatRuntime(
                 engine,
@@ -268,6 +286,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     device_registry=device_registry,
                     server_mcp_dispatcher=server_mcp_supervisor,
                     server_mcp_authority=server_mcp_authority,
+                    cron_wake=cron_wake_event.set,
                 ),
                 context_admission=get_context_admission(),
                 device_registry=device_registry,
@@ -280,8 +299,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             engine,
             runner_instance_id=runtime.runner_instance_id,
         )
+        cron_scheduler = CronScheduler(
+            engine,
+            runtime,
+            wake_event=cron_wake_event,
+        )
+        await cron_scheduler.start()
+        app.state.cron_scheduler = cron_scheduler
+        heartbeat_pulse = HeartbeatPulse(
+            engine=engine,
+            runtime=runtime,
+            workspace_service=workspace_service,
+            publish_phase_two=lambda request: publish_heartbeat_phase_two(
+                engine,
+                runtime,
+                request,
+            ),
+        )
+        heartbeat_pulse.start()
+        app.state.heartbeat_pulse = heartbeat_pulse
     except BaseException:
         await _close_lifespan_resources(
+            heartbeat_pulse=heartbeat_pulse,
+            cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,
             device_registry=device_registry,
@@ -295,6 +335,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await _close_lifespan_resources(
+            heartbeat_pulse=heartbeat_pulse,
+            cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,
             device_registry=device_registry,

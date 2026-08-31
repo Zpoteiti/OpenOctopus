@@ -30,6 +30,8 @@ dependencies = [
     "pypdf>=5.0",
     "tiktoken==0.13.0",
     "uritemplate==4.2.0",
+    "croniter==6.2.4",
+    "tzdata==2026.3",
 ]
 
 [project.optional-dependencies]
