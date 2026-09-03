@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     Text,
     UniqueConstraint,
@@ -64,30 +65,104 @@ class DiscordConfig(Base):
         primary_key=True,
     )
     bot_token: Mapped[str] = mapped_column(Text, nullable=False)
-    partner_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    application_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    bot_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    bot_display_name: Mapped[str | None] = mapped_column(Text)
+    bot_avatar_url: Mapped[str | None] = mapped_column(Text)
+    binding_generation: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("1")
+    )
+    owner_platform_user_id: Mapped[str | None] = mapped_column(Text)
+    owner_dm_chat_id: Mapped[str | None] = mapped_column(Text)
+    paired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     allow_list: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    pairing_code_hash: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    pairing_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="check_discord_config_revision"),
+        CheckConstraint(
+            "jsonb_typeof(allow_list) = 'array'",
+            name="check_discord_allow_list_array",
+        ),
+        CheckConstraint(
+            "pairing_code_hash IS NULL OR octet_length(pairing_code_hash) = 32",
+            name="check_discord_pairing_hash_length",
+        ),
+        CheckConstraint(
+            "(owner_platform_user_id IS NULL AND owner_dm_chat_id IS NULL AND paired_at IS NULL) "
+            "OR (owner_platform_user_id IS NOT NULL AND owner_dm_chat_id IS NOT NULL "
+            "AND paired_at IS NOT NULL)",
+            name="check_discord_pairing_identity",
+        ),
+        CheckConstraint(
+            "(pairing_code_hash IS NULL) = (pairing_expires_at IS NULL)",
+            name="check_discord_pairing_code_state",
+        ),
+    )
 
 
-class TelegramConfig(Base):
-    __tablename__ = "telegram_configs"
+class DingTalkConfig(Base):
+    __tablename__ = "dingtalk_configs"
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    bot_token: Mapped[str] = mapped_column(Text, nullable=False)
-    partner_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    client_secret: Mapped[str] = mapped_column(Text, nullable=False)
+    bot_user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    bot_display_name: Mapped[str | None] = mapped_column(Text)
+    bot_avatar_url: Mapped[str | None] = mapped_column(Text)
+    binding_generation: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("1")
+    )
+    owner_platform_user_id: Mapped[str | None] = mapped_column(Text)
+    owner_dm_chat_id: Mapped[str | None] = mapped_column(Text)
+    paired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     allow_list: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    pairing_code_hash: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    pairing_expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="check_dingtalk_config_revision"),
+        CheckConstraint(
+            "jsonb_typeof(allow_list) = 'array'",
+            name="check_dingtalk_allow_list_array",
+        ),
+        CheckConstraint(
+            "pairing_code_hash IS NULL OR octet_length(pairing_code_hash) = 32",
+            name="check_dingtalk_pairing_hash_length",
+        ),
+        CheckConstraint(
+            "(owner_platform_user_id IS NULL AND owner_dm_chat_id IS NULL AND paired_at IS NULL) "
+            "OR (owner_platform_user_id IS NOT NULL AND owner_dm_chat_id IS NOT NULL "
+            "AND paired_at IS NOT NULL)",
+            name="check_dingtalk_pairing_identity",
+        ),
+        CheckConstraint(
+            "(pairing_code_hash IS NULL) = (pairing_expires_at IS NULL)",
+            name="check_dingtalk_pairing_code_state",
+        ),
     )
 
 
@@ -133,6 +208,15 @@ class Message(Base):
     delivery_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    sender_id: Mapped[str | None] = mapped_column(Text)
+    sender_display_name: Mapped[str | None] = mapped_column(Text)
+    sender_classification: Mapped[str | None] = mapped_column(Text)
+    ingress_tool_profile: Mapped[str | None] = mapped_column(Text)
+    source_message_id: Mapped[str | None] = mapped_column(Text)
+    channel_binding_generation: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    channel_context: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     llm_fingerprint: Mapped[str | None] = mapped_column(Text)
     is_compacted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("FALSE")
@@ -145,6 +229,43 @@ class Message(Base):
         CheckConstraint(
             "message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary')",
             name="check_message_kind",
+        ),
+        CheckConstraint(
+            "sender_classification IS NULL "
+            "OR sender_classification IN ('owner','allowed_non_owner','internal')",
+            name="check_message_sender_classification",
+        ),
+        CheckConstraint(
+            "ingress_tool_profile IS NULL "
+            "OR ingress_tool_profile IN ('owner_full','message_only')",
+            name="check_message_ingress_tool_profile",
+        ),
+        CheckConstraint(
+            "message_kind <> 'human' "
+            "OR (sender_id IS NOT NULL AND sender_classification IS NOT NULL "
+            "AND ingress_tool_profile IS NOT NULL)",
+            name="check_human_message_authority_present",
+        ),
+        CheckConstraint(
+            "message_kind = 'human' "
+            "OR (sender_id IS NULL AND sender_display_name IS NULL "
+            "AND sender_classification IS NULL AND ingress_tool_profile IS NULL "
+            "AND source_message_id IS NULL AND channel_binding_generation IS NULL "
+            "AND channel_context = '[]'::jsonb)",
+            name="check_nonhuman_message_authority_absent",
+        ),
+        CheckConstraint(
+            "sender_classification IS NULL "
+            "OR (sender_classification = 'owner' "
+            "AND ingress_tool_profile = 'owner_full') "
+            "OR (sender_classification = 'allowed_non_owner' "
+            "AND ingress_tool_profile = 'message_only') "
+            "OR sender_classification = 'internal'",
+            name="check_message_authority_profile",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(channel_context) = 'array'",
+            name="check_message_channel_context_array",
         ),
     )
 
@@ -166,6 +287,15 @@ class PendingMessage(Base):
     attachment_refs: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    sender_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sender_display_name: Mapped[str | None] = mapped_column(Text)
+    sender_classification: Mapped[str] = mapped_column(Text, nullable=False)
+    ingress_tool_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    source_message_id: Mapped[str | None] = mapped_column(Text)
+    channel_binding_generation: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    channel_context: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     effort: Mapped[str | None] = mapped_column(Text)
     received_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -175,6 +305,25 @@ class PendingMessage(Base):
         CheckConstraint(
             "effort IS NULL OR effort IN ('off','low','medium','high','xhigh','max')",
             name="check_pending_message_effort",
+        ),
+        CheckConstraint(
+            "sender_classification IN ('owner','allowed_non_owner','internal')",
+            name="check_pending_sender_classification",
+        ),
+        CheckConstraint(
+            "ingress_tool_profile IN ('owner_full','message_only')",
+            name="check_pending_ingress_tool_profile",
+        ),
+        CheckConstraint(
+            "(sender_classification IN ('owner','internal') "
+            "AND ingress_tool_profile = 'owner_full') "
+            "OR (sender_classification = 'allowed_non_owner' "
+            "AND ingress_tool_profile = 'message_only')",
+            name="check_pending_authority_profile",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(channel_context) = 'array'",
+            name="check_pending_channel_context_array",
         ),
     )
 
@@ -190,6 +339,13 @@ class TurnRun(Base):
     )
     runner_instance_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    input_message_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    failed_delivery_targets: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -199,6 +355,163 @@ class TurnRun(Base):
         CheckConstraint(
             "status IN ('running','completed','failed','abandoned','cancelled')",
             name="check_turn_run_status",
+        ),
+        CheckConstraint(
+            "tool_profile IN ('owner_full','message_only')",
+            name="check_turn_run_tool_profile",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(input_message_ids) = 'array'",
+            name="check_turn_run_input_message_ids_array",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(failed_delivery_targets) = 'array'",
+            name="check_turn_run_failed_delivery_targets_array",
+        ),
+    )
+
+
+class ChannelMessageReceipt(Base):
+    __tablename__ = "channel_message_receipts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="SET NULL")
+    )
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    binding_generation: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    source_message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    disposition: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "channel",
+            "binding_generation",
+            "chat_id",
+            "source_message_id",
+            name="uq_channel_receipt_source",
+        ),
+        CheckConstraint(
+            "channel IN ('discord','dingtalk')",
+            name="check_channel_receipt_channel",
+        ),
+        CheckConstraint(
+            "disposition IN ('context','context_omitted','trigger','attachment_rejected')",
+            name="check_channel_receipt_disposition",
+        ),
+    )
+
+
+class ChannelDelivery(Base):
+    __tablename__ = "channel_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE")
+    )
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("turn_runs.id", ondelete="SET NULL")
+    )
+    assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL")
+    )
+    tool_use_id: Mapped[str | None] = mapped_column(Text)
+    delivery_key: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    binding_generation: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    total_actions: Mapped[int] = mapped_column(Integer, nullable=False)
+    visible_sent_actions: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    last_error_code: Mapped[str | None] = mapped_column(Text)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "delivery_key", name="uq_channel_delivery_key"),
+        CheckConstraint(
+            "origin IN ('final','message_tool','policy_notice','pairing_confirmation')",
+            name="check_channel_delivery_origin",
+        ),
+        CheckConstraint(
+            "channel IN ('discord','dingtalk')",
+            name="check_channel_delivery_channel",
+        ),
+        CheckConstraint(
+            "status IN ('prepared','attempting','sent','partial','failed','unknown')",
+            name="check_channel_delivery_status",
+        ),
+        CheckConstraint(
+            "total_actions >= 0 AND total_actions <= 32",
+            name="check_channel_delivery_total_actions",
+        ),
+        CheckConstraint(
+            "visible_sent_actions >= 0 AND visible_sent_actions <= total_actions",
+            name="check_channel_delivery_visible_actions",
+        ),
+    )
+
+
+class ChannelDeliveryAction(Base):
+    __tablename__ = "channel_delivery_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    delivery_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("channel_deliveries.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    action_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    action_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    visible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    platform_message_id: Mapped[str | None] = mapped_column(Text)
+    last_error_code: Mapped[str | None] = mapped_column(Text)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "delivery_id",
+            "action_index",
+            name="uq_channel_delivery_action_index",
+        ),
+        CheckConstraint(
+            "action_index >= 0 AND action_index < 32",
+            name="check_channel_delivery_action_index",
+        ),
+        CheckConstraint(
+            "action_kind IN ('text_message','file_upload','file_message')",
+            name="check_channel_delivery_action_kind",
+        ),
+        CheckConstraint(
+            "status IN ('prepared','attempting','sent','failed','unknown','skipped')",
+            name="check_channel_delivery_action_status",
         ),
     )
 
@@ -392,6 +705,7 @@ Index(
     TurnRun.started_at.desc(),
     TurnRun.id.desc(),
 )
+Index("idx_channel_deliveries_status", ChannelDelivery.status)
 Index("idx_devices_user_id", Device.user_id)
 Index("idx_workspace_members_user", WorkspaceMember.user_id)
 Index("idx_cron_jobs_user_id", CronJob.user_id)

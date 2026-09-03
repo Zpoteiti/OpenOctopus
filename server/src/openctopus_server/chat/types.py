@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
+from openctopus_server.channels.types import ToolProfile
 from openctopus_server.provider.wire_types import Effort
 
 
@@ -11,6 +12,7 @@ class TurnStart:
     turn_id: UUID
     message_ids: tuple[UUID, ...]
     effort: Effort | None
+    tool_profile: ToolProfile = "owner_full"
 
 
 @dataclass(frozen=True, slots=True)

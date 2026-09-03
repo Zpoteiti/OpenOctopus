@@ -27,8 +27,11 @@ import {
   mergeHistory,
   upsertMessage,
   type ChatMessage,
+  type ChannelContext,
+  type ChannelDelivery,
   type ContentBlock,
   type MessageHistory,
+  type MessageSender,
 } from './model'
 import './ChatPage.css'
 
@@ -82,12 +85,17 @@ export function ChatPage({
   const session = sessions.data?.find((candidate) => candidate.id === sessionId)
   const requestedAutomation = automationChannel(searchParams.get('automation'))
   const source = automationChannel(session?.channel) ?? (!session ? requestedAutomation : null)
+  const externalSource = externalChannel(session?.channel)
   const [locallyCreatedSessionId, setLocallyCreatedSessionId] = useState<string | null>(null)
-  const [historyVersion, setHistoryVersion] = useState(0)
+  const [historyReload, setHistoryReload] = useState({ version: 0, fromStart: true })
+  const requestHistoryReload = useCallback((fromStart: boolean) => {
+    setHistoryReload((current) => ({ version: current.version + 1, fromStart }))
+  }, [])
   const { history, historyError, updateHistory } = useRecoveredHistory(
     sessionId,
     pollIntervalMs,
-    historyVersion,
+    historyReload.version,
+    historyReload.fromStart,
   )
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<DraftAttachment[]>([])
@@ -188,12 +196,12 @@ export function ChatPage({
   useEffect(() => {
     const recoverWhenVisible = (): void => {
       if (document.visibilityState === 'visible' && sessionId) {
-        setHistoryVersion((current) => current + 1)
+        requestHistoryReload(true)
       }
     }
     document.addEventListener('visibilitychange', recoverWhenVisible)
     return () => document.removeEventListener('visibilitychange', recoverWhenVisible)
-  }, [sessionId])
+  }, [requestHistoryReload, sessionId])
 
   useEffect(() => {
     const marker = latestMessageMarker.current
@@ -221,7 +229,7 @@ export function ChatPage({
     }).then(refreshSessions).catch(() => {
       if (lastReadRequest.current === requestKey) lastReadRequest.current = null
     })
-  }, [historyVersion, refreshSessions, renderedLastMessageId, session?.unread, sessionId, visibleLatestKey])
+  }, [historyReload.version, refreshSessions, renderedLastMessageId, session?.unread, sessionId, visibleLatestKey])
 
   const processEvent = useCallback((
     event: StreamEvent,
@@ -534,7 +542,7 @@ export function ChatPage({
         setSending(false)
         setStreamSessionId(null)
         if (shouldRecover && activeViewSession.current === targetSessionId) {
-          setHistoryVersion((current) => current + 1)
+          requestHistoryReload(false)
         }
       }
       await refreshSessions()
@@ -573,7 +581,7 @@ export function ChatPage({
           ? t('chat.cancelRequested', { defaultValue: 'A stop was requested at the next supported stop point.' })
           : t('chat.nothingRunning', { defaultValue: 'No task is currently running.' }),
       })
-      setHistoryVersion((current) => current + 1)
+      requestHistoryReload(false)
       await refreshSessions()
     } catch (error) {
       setNotice({
@@ -624,9 +632,14 @@ export function ChatPage({
     <>
       <header className="workspace-header chat-workspace-header">
         <div className="breadcrumbs">
-          {source ? <Link to="/automations">{t('nav.automations')}</Link> : <span>{t('nav.chat')}</span>}
+          {source
+            ? <Link to="/automations">{t('nav.automations')}</Link>
+            : externalSource
+              ? <Link to="/channels">{t('nav.channels')}</Link>
+              : <span>{t('nav.chat')}</span>}
           <span aria-hidden="true">/</span>
           {source ? <span className="status-badge">{t(`automations.${source}`)}</span> : null}
+          {externalSource ? <span className="status-badge">{t(`channels.platform.${externalSource}`)}</span> : null}
           <strong>{title}</strong>
           {source ? <Link className="chat-automation-back" to="/automations">{t('automations.back')}</Link> : null}
         </div>
@@ -636,8 +649,8 @@ export function ChatPage({
             <div className="chat-session-controls">
             <button
               type="button"
-              className="chat-secondary-button"
-              onClick={() => setHistoryVersion((current) => current + 1)}
+              className="chat-secondary-button chat-session-control-optional"
+              onClick={() => requestHistoryReload(true)}
             >{t('common.refresh')}</button>
             {history?.status === 'running' || session?.cancel_requested ? (
               <button type="button" className="chat-secondary-button" onClick={() => void handleCancel()}>
@@ -646,7 +659,7 @@ export function ChatPage({
             ) : null}
             <button
               type="button"
-              className="chat-secondary-button"
+              className="chat-secondary-button chat-session-control-optional"
               onClick={() => {
                 setTitleDraft(title)
                 setRenaming(true)
@@ -703,11 +716,12 @@ export function ChatPage({
             {history?.pending_messages.map((message) => (
               <article key={message.id} className="chat-message chat-message-user chat-message-pending">
                 <header>
-                  <strong>{t('chat.you', { defaultValue: 'You' })}</strong>
+                  <MessageAuthor sender={message.sender} fallback={t('chat.you', { defaultValue: 'You' })} />
                   <span>{t('chat.pending', { defaultValue: 'Pending' })}</span>
                 </header>
                 <ContentBlocks blocks={message.content} />
                 <AttachmentRefs refs={message.attachment_refs} />
+                <ChannelContextDetails context={message.channel_context} />
               </article>
             ))}
             {showingStream && (liveThinking || liveText) ? (
@@ -852,6 +866,7 @@ function useRecoveredHistory(
   sessionId: string | undefined,
   pollIntervalMs: number,
   version: number,
+  fromStart: boolean,
 ): {
   history: MessageHistory | null
   historyError: string | null
@@ -866,7 +881,11 @@ function useRecoveredHistory(
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
 
-    const load = async (after: string | null, pollCount: number): Promise<void> => {
+    const load = async (
+      after: string | null,
+      pollCount: number,
+      terminalSnapshot = false,
+    ): Promise<void> => {
       try {
         const incoming = await loadMessageHistory(sessionId, after)
         if (disposed) return
@@ -879,6 +898,10 @@ function useRecoveredHistory(
         recoveryCursor.current = { sessionId, messageId: pageCursor }
         const caughtUp = incoming.last_message_id === null || pageCursor === incoming.last_message_id
         const hasRecoveryWork = incoming.status === 'running' || incoming.pending_count > 0 || !caughtUp
+        if (!hasRecoveryWork && after !== null && !terminalSnapshot) {
+          await load(null, pollCount, true)
+          return
+        }
         if (hasRecoveryWork && pollCount < MAX_RECOVERY_POLLS) {
           timer = setTimeout(() => {
             void load(pageCursor, pollCount + 1)
@@ -906,7 +929,7 @@ function useRecoveredHistory(
     }
 
     const cursor = recoveryCursor.current
-    const resumeAfter = cursor?.sessionId === sessionId
+    const resumeAfter = !fromStart && cursor?.sessionId === sessionId
       ? cursor.messageId
       : null
     void load(resumeAfter, 0)
@@ -914,7 +937,7 @@ function useRecoveredHistory(
       disposed = true
       if (timer) clearTimeout(timer)
     }
-  }, [pollIntervalMs, sessionId, t, version])
+  }, [fromStart, pollIntervalMs, sessionId, t, version])
 
   const updateHistory = useCallback((targetSessionId: string, updater: (history: MessageHistory) => MessageHistory) => {
     setState((current) => ({
@@ -988,21 +1011,22 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
   const { i18n, t } = useTranslation()
   const isHuman = message.message_kind === 'human'
   const isToolResult = message.message_kind === 'tool_result' || message.message_kind === 'synthetic_tool_result'
-  const label = isHuman
-    ? t('chat.you', { defaultValue: 'You' })
-    : isToolResult
-      ? t('chat.toolResult', { defaultValue: 'Tool result' })
+  const label = isToolResult
+    ? t('chat.toolResult', { defaultValue: 'Tool result' })
+    : isHuman
+      ? t('chat.you', { defaultValue: 'You' })
       : 'OpenOctopus'
   return (
     <article className={`chat-message chat-message-${isHuman ? 'user' : 'assistant'}${message.is_compacted ? ' chat-message-compacted' : ''}`}>
       <header>
-        <strong>{label}</strong>
+        <MessageAuthor sender={isHuman ? message.sender : null} fallback={label} />
         <span>{message.message_kind === 'compaction_summary'
           ? t('chat.compactionSummary', { defaultValue: 'Context summary' })
           : formatTime(message.created_at, i18n.resolvedLanguage)}</span>
       </header>
       <ContentBlocks blocks={message.content} />
       <AttachmentRefs refs={message.attachment_refs} />
+      <ChannelContextDetails context={message.channel_context} />
       {message.delivery_refs.length ? (
         <ul className="chat-deliveries">
           {message.delivery_refs.map((delivery, index) => (
@@ -1015,8 +1039,108 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
           ))}
         </ul>
       ) : null}
+      <ChannelDeliveries deliveries={message.deliveries} />
     </article>
   )
+}
+
+function MessageAuthor({
+  sender,
+  fallback,
+}: {
+  sender: MessageSender | null | undefined
+  fallback: string
+}): ReactNode {
+  const { t } = useTranslation()
+  if (!sender || sender.classification === 'internal') return <strong>{fallback}</strong>
+  return (
+    <span className="chat-message-author">
+      <strong>{sender.display_name || sender.id}</strong>
+      <small className="chat-sender-badge">
+        {sender.classification === 'owner' ? t('chat.senderOwner') : t('chat.senderAllowed')}
+      </small>
+      <code title={t('chat.senderId', { id: sender.id })}>{sender.id}</code>
+    </span>
+  )
+}
+
+function ChannelContextDetails({ context }: { context: ChannelContext | null | undefined }): ReactNode {
+  const { i18n, t } = useTranslation()
+  if (!context || (context.included_count === 0 && context.omitted_count === 0)) return null
+  if (context.included_count === 0) {
+    return (
+      <p className="chat-channel-context chat-channel-context-omitted">
+        {t('chat.omittedContext', { count: context.omitted_count })}
+      </p>
+    )
+  }
+  return (
+    <details
+      className="chat-channel-context"
+      aria-label={t('chat.channelContext', { count: context.included_count })}
+    >
+      <summary>{t('chat.channelContext', { count: context.included_count })}</summary>
+      <div className="chat-channel-context-body">
+        <strong>{t('chat.untrustedContext')}</strong>
+        <ul>
+          {context.entries.map((entry, index) => (
+            <li key={`${entry.source_message_id ?? 'context'}:${index}`}>
+              <header>
+                <strong>{entry.sender_display_name || entry.sender_id || '—'}</strong>
+                {entry.sent_at ? <span>{formatTime(entry.sent_at, i18n.resolvedLanguage)}</span> : null}
+              </header>
+              <p>{entry.text}</p>
+              {entry.attachment_summaries.length ? (
+                <small>{t('chat.contextAttachments', { attachments: entry.attachment_summaries.join(', ') })}</small>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+        {context.omitted_count ? <p>{t('chat.omittedContext', { count: context.omitted_count })}</p> : null}
+      </div>
+    </details>
+  )
+}
+
+function ChannelDeliveries({ deliveries }: { deliveries: ChannelDelivery[] | undefined }): ReactNode {
+  const { t } = useTranslation()
+  if (!deliveries?.length) return null
+  return (
+    <ul className="chat-channel-deliveries" aria-label={t('chat.deliveryTitle')}>
+      {deliveries.map((delivery, index) => {
+        const platform = t(`channels.platform.${delivery.channel}`)
+        const needsNewMessage = delivery.status === 'partial'
+          || delivery.status === 'failed'
+          || delivery.status === 'unknown'
+        return (
+          <li key={`${delivery.channel}:${delivery.chat_id}:${delivery.created_at}:${index}`}>
+            <div>
+              <strong>{platform}</strong>
+              <span className={`status-badge status-${deliveryTone(delivery.status)}`}>
+                {t(`chat.delivery${capitalize(delivery.status)}`)}
+              </span>
+              <small>{t('chat.deliveryProgress', {
+                sent: delivery.visible_sent_actions,
+                total: delivery.total_actions,
+              })}</small>
+            </div>
+            {needsNewMessage ? <p>{t('chat.deliveryRetry', { channel: platform })}</p> : null}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+function deliveryTone(status: ChannelDelivery['status']): 'neutral' | 'success' | 'warning' | 'danger' {
+  if (status === 'sent') return 'success'
+  if (status === 'partial' || status === 'unknown' || status === 'attempting') return 'warning'
+  if (status === 'failed') return 'danger'
+  return 'neutral'
+}
+
+function capitalize(value: string): string {
+  return `${value.slice(0, 1).toUpperCase()}${value.slice(1)}`
 }
 
 function AttachmentRefs({ refs }: { refs: MessageAttachmentRef[] }): ReactNode {
@@ -1237,4 +1361,8 @@ function chatErrorMessage(error: unknown, fallback: string): string {
 
 function automationChannel(value: string | null | undefined): 'cron' | 'heartbeat' | null {
   return value === 'cron' || value === 'heartbeat' ? value : null
+}
+
+function externalChannel(value: string | null | undefined): 'discord' | 'dingtalk' | null {
+  return value === 'discord' || value === 'dingtalk' ? value : null
 }

@@ -40,8 +40,8 @@ def test_runtime_codec_round_trips_the_exact_server_grammar() -> None:
             f"time: {timestamp}\n"
             "channel: web\n"
             f"chat_id: {session.chat_id}\n"
-            f"sender: partner:{sender_id}\n"
-            "trust: partner\n"
+            f"sender: web:{sender_id}\n"
+            "trust: owner\n"
             "</runtime>"
         ),
     }
@@ -49,8 +49,9 @@ def test_runtime_codec_round_trips_the_exact_server_grammar() -> None:
         time=timestamp,
         channel="web",
         chat_id=session.chat_id,
-        sender_id=sender_id,
-        trust="partner",
+        sender_namespace="web",
+        sender_id=str(sender_id),
+        trust="owner",
     )
     assert runtime_matches_session(block, session=session) is True
 
@@ -59,11 +60,11 @@ def test_runtime_codec_round_trips_the_exact_server_grammar() -> None:
     "mutation",
     [
         lambda text: f"{text}\n",
-        lambda text: text.replace("trust: partner", "trust: untrusted"),
+        lambda text: text.replace("trust: owner", "trust: untrusted"),
         lambda text: text.replace("channel: web", "channel: Web"),
         lambda text: text.replace(
-            "42b31c27-7a70-42b0-83f8-af37e9bd64ce",
-            "------------------------------------",
+            "web:42b31c27-7a70-42b0-83f8-af37e9bd64ce",
+            "web:",
         ),
         lambda text: text.replace("time:", "timestamp:"),
     ],

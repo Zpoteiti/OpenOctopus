@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.admission import KeyedAdmission
+from openctopus_server.channels.types import ToolProfile
 from openctopus_server.config import get_settings
 from openctopus_server.db.models import Device
 from openctopus_server.devices.dependencies import get_device_registry
@@ -60,7 +61,11 @@ from openctopus_server.tools.file_results import (
     attach_device_to_client_file_result,
 )
 from openctopus_server.tools.file_transfer import FileTransferTool
-from openctopus_server.tools.message import MessageTool
+from openctopus_server.tools.message import (
+    MessageDeliveryRouter,
+    MessageTargetResolver,
+    MessageTool,
+)
 from openctopus_server.tools.result import normalize_tool_result
 from openctopus_server.tools.truncate import truncate_head
 from openctopus_server.tools.web_fetch import (
@@ -217,7 +222,9 @@ class ToolRegistry:
         self._server_mcp_dispatcher = server_mcp_dispatcher
         self._server_mcp_authority = server_mcp_authority
         self._tools: dict[str, Tool] = {}
-        self._provider_schema_cache_key: tuple[tuple[str, ...], str | None] | None = None
+        self._provider_schema_cache_key: (
+            tuple[ToolProfile, tuple[str, ...], str | None] | None
+        ) = None
         self._provider_schema_cache: tuple[dict[str, Any], ...] = ()
         for tool in tools:
             name = tool.name()
@@ -237,11 +244,13 @@ class ToolRegistry:
     def get_tool_schemas(
         self,
         *,
+        tool_profile: ToolProfile = "owner_full",
         device_names: Iterable[str] = (),
         mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         device_sites = tuple(device_names)
         cache_key = (
+            tool_profile,
             device_sites,
             mcp_snapshot.shape_key if mcp_snapshot is not None else None,
         )
@@ -249,18 +258,27 @@ class ToolRegistry:
             return list(self._provider_schema_cache)
         schemas: list[dict[str, Any]] = []
         for tool in self._tools.values():
+            source_schema = tool.schema_for_profile(tool_profile)
+            if source_schema is None:
+                continue
             if tool.routing_mode is ToolRoutingMode.CLIENT_ONLY:
                 if not device_sites:
                     continue
-                schema = inject_device_routing(tool.schema(), sites=device_sites)
+                schema = inject_device_routing(source_schema, sites=device_sites)
             elif tool.routing_mode is ToolRoutingMode.ROUTING_ONLY:
-                schema = inject_device_routing(tool.schema(), sites=("server", *device_sites))
+                schema = inject_device_routing(
+                    source_schema,
+                    sites=("server", *device_sites),
+                )
             elif tool.routing_mode is ToolRoutingMode.INTRINSIC_DEVICE:
-                schema = extend_openoctopus_device_enums(tool.schema(), extra=device_sites)
+                schema = extend_openoctopus_device_enums(
+                    source_schema,
+                    extra=device_sites,
+                )
             else:
-                schema = deepcopy(tool.schema())
+                schema = deepcopy(source_schema)
             schemas.append(schema)
-        if mcp_snapshot is not None:
+        if tool_profile == "owner_full" and mcp_snapshot is not None:
             schemas.extend(
                 schema.model_dump(mode="json", exclude_none=True)
                 for schema in mcp_snapshot.schemas
@@ -280,6 +298,10 @@ class ToolRegistry:
         device_registry: DeviceToolDispatcher | None = None,
         on_issued: Callable[[], None] | None = None,
     ) -> ToolResult:
+        profile_error = _profile_gate(ctx.tool_profile, name=name, args=args)
+        if profile_error is not None:
+            return profile_error
+
         tool = self._tools.get(name)
         if tool is None:
             try:
@@ -482,8 +504,11 @@ def build_py4_registry(
     server_mcp_dispatcher: ServerMcpDispatcher | None = None,
     server_mcp_authority: ServerMcpAuthorityFence | None = None,
     cron_wake: Callable[[], None] | None = None,
+    message_target_resolver: MessageTargetResolver | None = None,
+    message_delivery_router: MessageDeliveryRouter | None = None,
 ) -> ToolRegistry:
     settings = get_settings()
+    devices = device_registry or get_device_registry()
     converter = content_converter or get_content_converter()
     backend = WorkspaceToolDispatcher(
         engine,
@@ -499,12 +524,18 @@ def build_py4_registry(
                 transport=transport,
                 policy_loader=_web_fetch_policy_loader(engine),
             ),
-            MessageTool(engine, workspace_service),
+            MessageTool(
+                engine,
+                workspace_service,
+                target_resolver=message_target_resolver,
+                delivery_router=message_delivery_router,
+                device_registry=devices,
+            ),
             CronTool(engine, wake=cron_wake),
             FileTransferTool(
                 engine,
                 workspace_service,
-                device_registry or get_device_registry(),
+                devices,
                 workspace_fs,
             ),
             _ClientOnlyTool("exec", _EXEC_SCHEMA),
@@ -810,6 +841,24 @@ def _selection_error_code(
         return ErrorCode(exc.code)
     except ValueError:
         return ErrorCode.TOOL_INVALID_ARGS
+
+
+def _profile_gate(
+    tool_profile: ToolProfile,
+    *,
+    name: str,
+    args: Mapping[str, Any],
+) -> ToolResult | None:
+    if tool_profile == "owner_full":
+        return None
+    if tool_profile == "message_only":
+        allowed_message_args = frozenset({"content", "channel", "chat_id"})
+        if name == "message" and args.keys() <= allowed_message_args:
+            return None
+    return _normalized_error(
+        ErrorCode.TOOL_NOT_ALLOWED,
+        "Tool is not allowed for this turn",
+    )
 
 
 def _normalized_error(code: ErrorCode, message: str) -> ToolResult:

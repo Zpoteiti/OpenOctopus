@@ -31,6 +31,8 @@ dependencies = [
     "tiktoken==0.13.0",
     "uritemplate==4.2.0",
     "croniter==6.2.4",
+    "discord.py==2.7.1",
+    "dingtalk-stream==0.24.4b1",
     "tzdata==2026.3",
 ]
 

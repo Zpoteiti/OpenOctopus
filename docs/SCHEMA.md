@@ -6,7 +6,7 @@ semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
 `create_all()`; Alembic or equivalent migration framework is deferred until
 production launch after frontend completion (ADR-057, ADR-069).
 
-**Thirteen tables.** Account deletion fences affected workspaces, then commits
+**Sixteen tables.** Account deletion fences affected workspaces, then commits
 the user deletion and durable object-cleanup intents together. RustFS purge is
 idempotent and may finish after that logical deletion. Every user-referencing
 FK has `ON DELETE CASCADE` defined inline (ADR-058), with one explicit exception
@@ -73,6 +73,11 @@ endpoint. Object storage is deployment
 infrastructure config supplied through environment / deployment secrets, not
 `system_config`.
 
+The Provider identity and API key are deployment-wide administrator
+configuration. Channel owners do not supply a separate LLM credential: all
+Web, Discord, DingTalk, Cron, and Heartbeat turns use the administrator's
+Provider account, so the administrator bears their Provider usage and cost.
+
 `system_config.server_mcp` stores one strict JSONB envelope:
 
 ```json
@@ -135,7 +140,8 @@ CREATE TABLE IF NOT EXISTS users (
   timezone when this profile value changes.
 - `is_admin` — true for any user who registered with the `OPENOCTOPUS_ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
 - **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
-- **No inline channel fields** — Discord/Telegram live in their own tables (ADR-090).
+- **No inline channel fields** — Discord and DingTalk live in their own tables
+  (ADR-090, ADR-136).
 - **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing paged RustFS object metadata under the workspace prefix.
 
 ---
@@ -144,48 +150,92 @@ CREATE TABLE IF NOT EXISTS users (
 
 ```sql
 CREATE TABLE IF NOT EXISTS discord_configs (
-    user_id          UUID         PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    bot_token        TEXT         NOT NULL,
-    partner_chat_id  TEXT         NOT NULL,
-    allow_list       JSONB        NOT NULL DEFAULT '[]'::jsonb,
-    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    user_id                 UUID         PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    bot_token               TEXT         NOT NULL,
+    application_id          TEXT         NOT NULL UNIQUE,
+    bot_user_id             TEXT         NOT NULL,
+    bot_display_name        TEXT,
+    bot_avatar_url          TEXT,
+    binding_generation      UUID         NOT NULL,
+    revision                BIGINT       NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    owner_platform_user_id  TEXT,
+    owner_dm_chat_id        TEXT,
+    paired_at               TIMESTAMPTZ,
+    allow_list              JSONB        NOT NULL DEFAULT '[]'::jsonb
+                                          CHECK (jsonb_typeof(allow_list) = 'array'),
+    pairing_code_hash       BYTEA        CHECK (
+                                          pairing_code_hash IS NULL
+                                          OR octet_length(pairing_code_hash) = 32
+                                      ),
+    pairing_expires_at      TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (
+        (owner_platform_user_id IS NULL AND owner_dm_chat_id IS NULL AND paired_at IS NULL)
+        OR (owner_platform_user_id IS NOT NULL AND owner_dm_chat_id IS NOT NULL
+            AND paired_at IS NOT NULL)
+    ),
+    CHECK ((pairing_code_hash IS NULL) = (pairing_expires_at IS NULL))
 );
 ```
 
 - `user_id` is both PK and FK — at most one Discord config per user.
-- `bot_token` is the Discord bot's secret. API never returns it; `GET /api/channels` returns only `bot_token_hint`, computed from the first/last visible characters by the shared secret-redaction helper. The hint is display-only and is never accepted for authentication, lookup, or update.
-- `partner_chat_id` is the partner human's Discord user ID. Messages from this ID are *not* wrapped (`[untrusted message from <name>]:`); messages from anyone else are (ADR-007).
-- `allow_list` — JSONB array of heterogeneous Discord identifiers the partner has authorized to also reach the bot. Each entry is one of:
-    - **User ID** (e.g. `"123456789012345678"`) — the named user is allowed to DM the bot or @-mention it in any channel.
-    - **Channel ID** — every member of that channel can @-mention the bot in that channel.
-    - **Guild ID** — every member of that guild can @-mention the bot in any of its channels.
-  Inbound message is allowed if its sender_id matches a User ID entry **OR** its message-context (channel, guild) matches a Channel/Guild ID entry. Allowed messages still get the `[untrusted message from <name>]:` wrap (ADR-007); only the partner is unwrapped. Agent treats allow-list senders as non-partner allowed users (see ADR-074 trust model). Format is positional — entries are stored verbatim as Discord-snowflake-shaped strings; the adapter classifies (user/channel/guild) by API lookup at receive time, not by string form.
+- `bot_token` is a write-only secret. The API returns only the non-secret
+  `credential_hint="Configured"`; omitting the secret on update keeps it.
+- Credential validation resolves and stores the unique Discord application and
+  Bot identity before commit. Replacing the application creates a new
+  `binding_generation`, clears owner pairing, and fences callbacks and
+  deliveries from the old Bot. `revision` fences concurrent config updates.
+- The owner is never hand-entered. A human sends the hash-only, ten-minute
+  one-time code in a Bot direct message; successful confirmation atomically
+  fills `owner_platform_user_id`, `owner_dm_chat_id`, and `paired_at`.
+- `allow_list` is a whole-array replacement containing only exact platform
+  **user IDs** manually entered by the owner (at most 256). It never contains a
+  guild, channel, group, or role ID. Matching senders receive the persisted
+  `allowed_non_owner` / `message_only` authority profile.
 
 ---
 
-## 4. `telegram_configs` — per-user Telegram bot integration
+## 4. `dingtalk_configs` — per-user DingTalk bot integration
 
 ```sql
-CREATE TABLE IF NOT EXISTS telegram_configs (
-    user_id          UUID         PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    bot_token        TEXT         NOT NULL,
-    partner_chat_id  TEXT         NOT NULL,
-    allow_list       JSONB        NOT NULL DEFAULT '[]'::jsonb,
-    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS dingtalk_configs (
+    user_id                 UUID         PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    client_id               TEXT         NOT NULL UNIQUE,
+    client_secret           TEXT         NOT NULL,
+    bot_user_id             TEXT         NOT NULL,
+    bot_display_name        TEXT,
+    bot_avatar_url          TEXT,
+    binding_generation      UUID         NOT NULL,
+    revision                BIGINT       NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    owner_platform_user_id  TEXT,
+    owner_dm_chat_id        TEXT,
+    paired_at               TIMESTAMPTZ,
+    allow_list              JSONB        NOT NULL DEFAULT '[]'::jsonb
+                                          CHECK (jsonb_typeof(allow_list) = 'array'),
+    pairing_code_hash       BYTEA        CHECK (
+                                          pairing_code_hash IS NULL
+                                          OR octet_length(pairing_code_hash) = 32
+                                      ),
+    pairing_expires_at      TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (
+        (owner_platform_user_id IS NULL AND owner_dm_chat_id IS NULL AND paired_at IS NULL)
+        OR (owner_platform_user_id IS NOT NULL AND owner_dm_chat_id IS NOT NULL
+            AND paired_at IS NOT NULL)
+    ),
+    CHECK ((pairing_code_hash IS NULL) = (pairing_expires_at IS NULL))
 );
 ```
 
-Symmetric to `discord_configs`: at most one Telegram config per user, and config
-existence means enabled. `GET /api/channels` returns `bot_token_hint`, never the
-raw `bot_token`. `allow_list` follows the same heterogeneous-identifier rule
-(Telegram terminology):
-- **User ID** — the named user can DM the bot.
-- **Chat ID** of a group — every member of that group can @-mention the bot in the group.
-- **Channel ID** — broadcast-channel admins can post; allowed bot interactions follow Telegram's bot-in-channel API rules.
-
-Match logic identical to Discord — sender_id ∪ chat-context-id checked against the list; allowed messages get the untrusted wrap.
-
-Adding a future channel = adding a `<channel>_configs` table; no `users` migration (ADR-090).
+The pairing, exact-user-ID allow list, generation, and revision contracts match
+Discord. `client_secret` is write-only. DingTalk's configured `client_id` is
+also the active-message `robotCode` and the unique stored Bot identity. The
+token and Stream handshakes do not expose a platform Bot name, avatar, or
+chatbot user ID, so validation stores `bot_user_id=client_id` and leaves
+`bot_display_name` / `bot_avatar_url` null. The API and UI preserve that unknown
+state instead of inventing platform profile data.
 
 ---
 
@@ -215,14 +265,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
   unique per user, not globally unique.
 - `id` is the internal UUID used as FK target by `messages.session_id` and the browser REST path identifier. Most internal code uses `id`; channel adapters may look up by `(user_id, session_key)`.
 - Browser web session rows are created implicitly by `POST /api/sessions/{id}/messages` when the client-generated UUID does not yet exist. Python-main has no separate `POST /api/sessions` create route.
+- Discord and DingTalk sessions are created only by accepted adapter ingress.
+  Their history is visible in the browser, including sender, source context, and
+  delivery state, but has no browser message composer. Message POST remains
+  restricted to Web sessions; the owner may still rename/read-mark, cancel a
+  running Turn, or delete an external Session and its history.
 - `title` is the human-facing mutable session name. It defaults to `"New chat"` and never affects `id`, `chat_id`, or `session_key`.
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
 - `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true. If an in-flight provider request returns a final response with no tools, normal completion wins and clears the flag without a stop marker (ADR-129).
 - `DELETE /api/sessions/{id}` removes session rows after terminating any
   in-memory runner/streams. `ON DELETE CASCADE` removes that session's
-  `turn_runs`, `messages`, and `pending_messages`; channel configuration and
-  Cron job rows are not tied to Session deletion. A later accepted Cron fire or
+  `turn_runs`, `messages`, `pending_messages`, channel deliveries, and their
+  actions. Channel receipts retain their source idempotency key with
+  `session_id=NULL`; channel configuration and Cron job rows are not tied to
+  Session deletion. A later accepted Cron fire or
   Heartbeat Phase 2 recreates its route with the same stable UUID and empty
   history. Deleting a Cron job is a separate operation that stops future
   triggers while preserving any existing Session/history.
@@ -246,9 +303,41 @@ CREATE TABLE IF NOT EXISTS messages (
     content                  JSONB        NOT NULL,
     attachment_refs          JSONB        NOT NULL DEFAULT '[]'::jsonb,
     delivery_refs            JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    sender_id                TEXT,
+    sender_display_name      TEXT,
+    sender_classification    TEXT         CHECK (
+                                 sender_classification IS NULL OR
+                                 sender_classification IN ('owner', 'allowed_non_owner', 'internal')
+                             ),
+    ingress_tool_profile     TEXT         CHECK (
+                                 ingress_tool_profile IS NULL OR
+                                 ingress_tool_profile IN ('owner_full', 'message_only')
+                             ),
+    source_message_id        TEXT,
+    channel_binding_generation UUID,
+    channel_context          JSONB        NOT NULL DEFAULT '[]'::jsonb
+                                          CHECK (jsonb_typeof(channel_context) = 'array'),
     llm_fingerprint          TEXT,
     is_compacted             BOOLEAN      NOT NULL DEFAULT FALSE,
-    created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (
+        message_kind <> 'human' OR
+        (sender_id IS NOT NULL AND sender_classification IS NOT NULL
+         AND ingress_tool_profile IS NOT NULL)
+    ),
+    CHECK (
+        message_kind = 'human' OR
+        (sender_id IS NULL AND sender_display_name IS NULL
+         AND sender_classification IS NULL AND ingress_tool_profile IS NULL
+         AND source_message_id IS NULL AND channel_binding_generation IS NULL
+         AND channel_context = '[]'::jsonb)
+    ),
+    CHECK (
+        sender_classification IS NULL OR
+        (sender_classification = 'owner' AND ingress_tool_profile = 'owner_full') OR
+        (sender_classification = 'allowed_non_owner' AND ingress_tool_profile = 'message_only') OR
+        sender_classification = 'internal'
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session_created
@@ -258,6 +347,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
 - `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection, except optional OpenOctopus `tool_result.code` metadata is retained for storage/public diagnostics and stripped from the strict provider request. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) stay at their referenced Workspace or Client location; the DB carries provider-visible path-text markers and the agent reaches bytes via `read_file`. A later Client read failure is persisted as the normal tool-result error; message acceptance does not invent a remote-read failure marker.
 - `attachment_refs` — provider-hidden JSONB sidecar for normalized browser attachment identities (ADR-135). Server refs retain the virtual Workspace path. Client refs retain `(device name, immutable device UUID, path)` without reading or copying Client bytes during message acceptance. Active human rows plus the captured pending prefix provide a conservative name-level UUID fence for device tool routing, Device MCP authority, and System-prompt Device metadata; conflicting UUIDs for one name disable that target while leaving its name in fixed built-in Provider schemas. A compacted source row keeps its historical sidecar, but the generated summary receives `[]` and does not preserve an actionable attachment capability.
 - `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. The web `message(media=...)` tool uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Each ref links to its generating `tool_use_id`. Server workspace refs are durable and retain the virtual path plus immutable workspace ID/workspace-relative path so a frontend can recover from a shared-workspace rename. Device refs are online-only pointers to immutable `(device_id, captured device name, path)` identity; a later relay must reject rename/delete/name-reuse drift instead of reading from another device. Device refs do not cause a device read or RustFS write when the message is sent.
+- Human rows persist their authoritative sender identity, classification, and
+  ingress tool profile. Owners and internal synthesizers use `owner_full`;
+  exact-ID allow-listed non-owners use `message_only`. That association is
+  data, not runtime text, and survives queueing, restart, compaction, and
+  Provider retries. Non-human rows must leave every authority field empty.
+- `source_message_id` plus `channel_binding_generation` retain the external
+  event and Bot-binding identity. `channel_context` is a bounded, structured
+  read-only background snapshot; Provider projection wraps it as untrusted
+  context, and it cannot grant tools or change the persisted profile.
 - `llm_fingerprint` — nullable model/provider fingerprint for assistant rows that contain opaque thinking state. Provider replay may use raw `thinking` / `redacted_thinking` blocks only when this matches the current compatible model segment.
 - `message_kind` — stored OpenOctopus semantic discriminator: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. Provider projection derives `role='user'` for `human`, `tool_result`, and `synthetic_tool_result`; it derives `role='assistant'` for the other three kinds. This avoids JSONB inspection and prevents invalid stored role/kind pairs (ADR-089, ADR-126).
 - `is_compacted` — provider/compaction context membership. `FALSE` means the row participates in normal provider replay and may be input to a later compaction. `TRUE` means the row remains available for canonical history/audit but is excluded from both. A `compaction_summary` begins `FALSE` and may later become `TRUE` when absorbed into a newer summary.
@@ -280,11 +378,31 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     session_key       TEXT         NOT NULL,
     content           JSONB        NOT NULL,
     attachment_refs   JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    sender_id         TEXT         NOT NULL,
+    sender_display_name TEXT,
+    sender_classification TEXT      NOT NULL CHECK (
+                                      sender_classification IN
+                                      ('owner', 'allowed_non_owner', 'internal')
+                                  ),
+    ingress_tool_profile TEXT       NOT NULL CHECK (
+                                      ingress_tool_profile IN
+                                      ('owner_full', 'message_only')
+                                  ),
+    source_message_id TEXT,
+    channel_binding_generation UUID,
+    channel_context   JSONB        NOT NULL DEFAULT '[]'::jsonb
+                                   CHECK (jsonb_typeof(channel_context) = 'array'),
     effort            TEXT         CHECK (
                           effort IS NULL
                           OR effort IN ('off', 'low', 'medium', 'high', 'xhigh', 'max')
                       ),
-    received_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    received_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (
+        (sender_classification IN ('owner', 'internal')
+         AND ingress_tool_profile = 'owner_full') OR
+        (sender_classification = 'allowed_non_owner'
+         AND ingress_tool_profile = 'message_only')
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_messages_session_received
@@ -293,7 +411,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
     ON pending_messages(session_key, received_at, id);
 ```
 
-- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Py2 uses it for messages arriving while a worker is active. Beginning with Py3, every inbound user message is staged here first so Stage 1 compaction can place its replacement summary before the new user batch (ADR-126). Before preflight, a continuation with no captured input fixes the current ordered pending IDs as its boundary; token counting and promotion consume only that prefix, while later arrivals remain pending for the following provider call. Browser HTTP stream ownership is not stored here: queued subscribers remain bound in memory by message ID until a boundary is captured, then the newest subscriber within that captured batch becomes its live preview owner. Older subscribers from that batch can close with `stream_replaced` while their rows remain durable; subscribers for later arrivals remain queued. A delayed registration attaches only when its message ID still belongs to the active preview batch; otherwise the transient stream closes and recovers through the canonical GET surface. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Every row carries the same sender/profile/source/binding/context authority fields that will be copied into its canonical human row. Before preflight, a continuation captures only the oldest consecutive prefix with one `ingress_tool_profile`; a later row with a different profile stays pending for a separate Turn. This prevents an owner row and an allow-listed non-owner row from sharing one Provider/tool authority boundary. Browser HTTP stream ownership remains process-local and keyed to captured message IDs. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
 - `attachment_refs` is copied unchanged into the promoted human `messages` row. It is returned in pending/history APIs but excluded from Provider messages; its separately persisted path marker is sent to the Provider and omitted from public `content` projections.
 - `session_key` is stored alongside `session_id` so channel/session routing can recover pending work without recomputing the key.
 - At the safe boundary, the worker captures the current rows for the session
@@ -346,6 +464,13 @@ CREATE TABLE IF NOT EXISTS turn_runs (
                                           'cancelled'
                                       )
                                   ),
+    tool_profile        TEXT         NOT NULL CHECK (
+                                      tool_profile IN ('owner_full', 'message_only')
+                                  ),
+    input_message_ids   JSONB        NOT NULL DEFAULT '[]'::jsonb
+                                      CHECK (jsonb_typeof(input_message_ids) = 'array'),
+    failed_delivery_targets JSONB    NOT NULL DEFAULT '[]'::jsonb
+                                      CHECK (jsonb_typeof(failed_delivery_targets) = 'array'),
     started_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     finished_at         TIMESTAMPTZ
 );
@@ -360,6 +485,12 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_session_started
 
 - `id` is the `turn_id` emitted by `turn_started`, `token_delta`,
   `message_persisted`, and `turn_finished`.
+- `tool_profile` and the ordered `input_message_ids` freeze the authority of
+  the captured Pending prefix for the whole ReAct chain. The Provider sees the
+  full owner tool catalog for `owner_full` and only the restricted text
+  `message` projection for `message_only`; dispatch repeats the same gate before
+  any side effect. `failed_delivery_targets` prevents another platform issue to
+  the same target in that Turn after a failed or unknown delivery.
 - A runner inserts `status='running'` before each normal agent-loop provider
   call and `turn_started`. The same row covers persistence of that call's
   complete assistant response and, when it contains `tool_use`, the complete
@@ -384,7 +515,136 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_session_started
 
 ---
 
-## 9. `devices` — per-user client devices
+## 9. `channel_message_receipts` — external event idempotency
+
+```sql
+CREATE TABLE IF NOT EXISTS channel_message_receipts (
+    id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id          UUID         REFERENCES sessions(id) ON DELETE SET NULL,
+    channel             TEXT         NOT NULL CHECK (channel IN ('discord', 'dingtalk')),
+    binding_generation  UUID         NOT NULL,
+    chat_id             TEXT         NOT NULL,
+    source_message_id   TEXT         NOT NULL,
+    disposition         TEXT         NOT NULL CHECK (
+                                     disposition IN (
+                                         'context', 'context_omitted', 'trigger',
+                                         'attachment_rejected'
+                                     )
+                                 ),
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_channel_receipt_source UNIQUE (
+        user_id, channel, binding_generation, chat_id, source_message_id
+    )
+);
+```
+
+The unique source identity makes repeated Gateway/Stream callbacks
+idempotent across process restarts and distinguishes events received through a
+replacement Bot binding. Trigger and selected/omitted history rows commit with
+the Pending handoff. A non-owner attachment-only rejection also records one
+receipt before its one policy delivery. Session deletion preserves the receipt
+with `session_id=NULL`, so the same platform event cannot recreate a deleted
+conversation by redelivery.
+
+---
+
+## 10. `channel_deliveries` — durable logical delivery outcomes
+
+```sql
+CREATE TABLE IF NOT EXISTS channel_deliveries (
+    id                    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id               UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id            UUID         REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id               UUID         REFERENCES turn_runs(id) ON DELETE SET NULL,
+    assistant_message_id  UUID         REFERENCES messages(id) ON DELETE SET NULL,
+    tool_use_id           TEXT,
+    delivery_key          TEXT         NOT NULL,
+    origin                TEXT         NOT NULL CHECK (
+                                       origin IN (
+                                           'final', 'message_tool', 'policy_notice',
+                                           'pairing_confirmation'
+                                       )
+                                   ),
+    channel               TEXT         NOT NULL CHECK (channel IN ('discord', 'dingtalk')),
+    chat_id               TEXT         NOT NULL,
+    binding_generation    UUID         NOT NULL,
+    status                TEXT         NOT NULL CHECK (
+                                       status IN (
+                                           'prepared', 'attempting', 'sent', 'partial',
+                                           'failed', 'unknown'
+                                       )
+                                   ),
+    total_actions         INTEGER      NOT NULL CHECK (
+                                       total_actions >= 0 AND total_actions <= 32
+                                   ),
+    visible_sent_actions  INTEGER      NOT NULL DEFAULT 0 CHECK (
+                                       visible_sent_actions >= 0
+                                       AND visible_sent_actions <= total_actions
+                                   ),
+    last_error_code       TEXT,
+    last_error_message    TEXT,
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    started_at            TIMESTAMPTZ,
+    finished_at           TIMESTAMPTZ,
+    CONSTRAINT uq_channel_delivery_key UNIQUE (user_id, delivery_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_deliveries_status
+    ON channel_deliveries(status);
+```
+
+`delivery_key` is the stable logical idempotency key for a complete final,
+`message` tool result, policy notice, or pairing confirmation. The Router first
+persists `prepared`, commits each action as `attempting` before platform issue,
+then records the terminal aggregate. `partial` means at least one visible action
+was sent before a later action failed or became unknown. A process restart
+closes leftover `prepared` as `failed` and leftover `attempting` as `unknown`;
+neither state is replayed. Failed/unknown targets are fenced for the rest of the
+same Turn, and only a new inbound user Turn may make another delivery attempt.
+
+---
+
+## 11. `channel_delivery_actions` — ordered platform issue facts
+
+```sql
+CREATE TABLE IF NOT EXISTS channel_delivery_actions (
+    id                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    delivery_id          UUID         NOT NULL REFERENCES channel_deliveries(id)
+                                      ON DELETE CASCADE,
+    action_index         INTEGER      NOT NULL CHECK (
+                                      action_index >= 0 AND action_index < 32
+                                  ),
+    action_kind          TEXT         NOT NULL CHECK (
+                                      action_kind IN (
+                                          'text_message', 'file_upload', 'file_message'
+                                      )
+                                  ),
+    visible              BOOLEAN      NOT NULL,
+    status               TEXT         NOT NULL CHECK (
+                                      status IN (
+                                          'prepared', 'attempting', 'sent', 'failed',
+                                          'unknown', 'skipped'
+                                      )
+                                  ),
+    platform_message_id  TEXT,
+    last_error_code      TEXT,
+    last_error_message   TEXT,
+    started_at           TIMESTAMPTZ,
+    finished_at          TIMESTAMPTZ,
+    CONSTRAINT uq_channel_delivery_action_index UNIQUE (delivery_id, action_index)
+);
+```
+
+Adapters receive the complete logical reply and create at most 32 ordered
+actions using their platform text/file limits. Actions execute serially; the
+first `failed` or `unknown` action makes every remaining action `skipped`.
+There is no delivery worker or automatic retry loop. The browser projects the
+logical and per-action states into external read-only history.
+
+---
+
+## 12. `devices` — per-user client devices
 
 ```sql
 CREATE TABLE IF NOT EXISTS devices (
@@ -439,7 +699,7 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 
 ---
 
-## 10. `workspaces` — shared workspace registry (ADR-108)
+## 13. `workspaces` — shared workspace registry (ADR-108)
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -466,7 +726,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 
 ---
 
-## 11. `workspace_members` — shared workspace allow-list (ADR-108)
+## 14. `workspace_members` — shared workspace allow-list (ADR-108)
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspace_members (
@@ -485,7 +745,7 @@ CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_
 
 ---
 
-## 12. `workspace_deletions` — durable RustFS cleanup intents
+## 15. `workspace_deletions` — durable RustFS cleanup intents
 
 ```sql
 CREATE TABLE IF NOT EXISTS workspace_deletions (
@@ -507,7 +767,7 @@ CREATE TABLE IF NOT EXISTS workspace_deletions (
 
 ---
 
-## 13. `cron_jobs` — scheduled agent invocations
+## 16. `cron_jobs` — scheduled agent invocations
 
 ```sql
 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -563,8 +823,13 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
 
 - Every user-referencing FK has `ON DELETE CASCADE` (ADR-058). Account deletion
   is an application transaction because it also records durable RustFS cleanup
-  intents. **Sole FK exception:** `workspaces.created_by` uses `ON DELETE SET
-  NULL` per ADR-108 so a workspace persists for its remaining members.
+  intents. **Sole user-FK exception:** `workspaces.created_by` uses `ON DELETE
+  SET NULL` per ADR-108 so a workspace persists for its remaining members.
+- Channel receipts use `sessions.id ON DELETE SET NULL` to preserve external
+  event idempotency after history deletion. Delivery `turn_id` and
+  `assistant_message_id` also use `SET NULL` so their terminal transport facts
+  survive narrower transcript cleanup; a delivery tied directly to a deleted
+  Session and all of its action rows cascade.
 - No surrogate "is_active" / "deleted_at" columns — deletes are hard, undo lives in admin's backup strategy.
 - No migration framework before production launch (ADR-069). Schema changes
   during the development rebuild require resetting the development database;
@@ -584,6 +849,10 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
 | `idx_pending_messages_session_key_received` | pending_messages (`session_key, received_at, id`) | Recovery and channel-key lookup for queued inbound. |
 | `idx_turn_runs_one_running_per_session` | turn_runs (partial UNIQUE on `session_id WHERE status='running'`) | Durable one-active provider-call/tool-batch invariant. |
 | `idx_turn_runs_session_started` | turn_runs (`session_id, started_at DESC, id DESC`) | Latest run status for GET recovery. |
+| `uq_channel_receipt_source` | channel_message_receipts (UNIQUE on source identity) | Deduplicate one external event within one Bot binding. |
+| `uq_channel_delivery_key` | channel_deliveries (UNIQUE on `(user_id, delivery_key)`) | Durable logical-delivery at-most-once identity. |
+| `idx_channel_deliveries_status` | channel_deliveries (`status`) | Startup reconciliation of incomplete delivery rows. |
+| `uq_channel_delivery_action_index` | channel_delivery_actions (UNIQUE on `(delivery_id, action_index)`) | One ordered outcome row per planned action. |
 | `idx_devices_user_id` | devices | List user's devices. |
 | `devices_user_id_name_key` | devices (UNIQUE on `(user_id, name)`) | URL resolution `/api/devices/{name}`. |
 | `workspace_members_pkey` | workspace_members (PK on `(workspace_id, user_id)`) | Membership lookup at workspace-fs entry. |

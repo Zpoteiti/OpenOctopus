@@ -19,6 +19,8 @@ macOS, and Windows computers.
 - Runs pipe commands and line-oriented PTY/ConPTY sessions on paired Clients.
 - Connects admin-managed Server MCP and per-device MCP over `stdio`,
   Streamable HTTP, or SSE, including tools, resources, templates, and prompts.
+- Connects one Discord Bot and one DingTalk Bot per user to the same durable
+  conversation and Agent loop as the browser.
 - Uses an Anthropic-compatible Messages API as the LLM Provider.
 
 New accounts receive editable `SOUL.md` and `MEMORY.md` files in their personal
@@ -35,6 +37,8 @@ OpenOctopus Server (one ASGI worker)
   |-- PostgreSQL: users, conversations, configuration, MCP catalogs
   |-- RustFS: Server Workspaces and uploaded attachments
   |-- Anthropic-compatible LLM Provider
+  |-- Discord Gateway + REST adapter
+  |-- DingTalk Stream + OpenAPI adapter
   |-- Server-owned MCP connections and stdio child processes
   `-- Protocol v3 WebSocket
         `-- OpenOctopus Client
@@ -93,6 +97,10 @@ Anthropic-compatible `/v1/messages` endpoint. A Provider running on the Docker
 host must be addressed by an address reachable from the Server container;
 `localhost` inside the container refers to the container itself.
 
+The administrator owns this shared Provider configuration and API key, and
+therefore bears Provider usage and cost for browser, channel, Cron, and
+Heartbeat turns from every account on the deployment.
+
 ### Stop or remove the stack
 
 Stop containers while preserving data:
@@ -144,6 +152,32 @@ $env:OPENOCTOPUS_DEVICE_TOKEN = 'openoctopus_dev_...'
 fragment. Use HTTPS/WSS for a remote Server. See [client/README.md](client/README.md)
 for artifact names, source installation, lifecycle, and Client policy details.
 
+## Connect Discord or DingTalk
+
+Open **Channels** in the browser and configure the Bot credential for Discord
+or the Client ID and Client Secret for DingTalk. Secrets are write-only. The
+DingTalk Client ID is also its `robotCode`; the current API verifies that
+identity but does not expose a platform Bot name or avatar, so OpenOctopus
+leaves those profile fields unknown instead of inventing platform metadata.
+
+For Discord, enable **Message Content Intent** and grant the Bot **View
+Channels**, **Read Message History**, **Send Messages**, **Send Messages in
+Threads**, and **Attach Files**. The Channels page shows the same setup list.
+
+The account owner proves their channel identity by sending the one-time pairing
+code to the Bot in a direct message. Other people are admitted only when the
+owner manually enters their exact platform user IDs in the allow list, one ID
+per line. An allow-listed non-owner gets text-only `message` access to the
+current conversation or the paired owner's direct message; there is no
+agent-to-agent channel protocol.
+
+External channel history is visible in the browser as read-only history. The
+Server persists a complete Agent reply before the platform adapter splits it
+into bounded Discord or DingTalk messages. Each platform action is issued at
+most once and its outcome is stored; partial, failed, or unknown delivery is
+not retried automatically. Send a new message in the original channel to start
+a new Agent turn and try again.
+
 ## Security and current boundaries
 
 - `restrict_to_workspace=true` confines OpenOctopus-resolved file paths and an
@@ -158,6 +192,11 @@ for artifact names, source installation, lifecycle, and Client policy details.
   PostgreSQL as reversible plaintext and redacted from API responses. Remote
   MCP headers require an HTTPS endpoint; sending secret-bearing Device MCP
   configuration to a Client also requires WSS.
+- Attachments from allow-listed non-owners are rejected before any byte
+  download, so they cannot reach the owner's Workspace or Client. Attachments
+  sent by the paired owner may enter the owner's Workspace as authorized data;
+  they are not executed automatically and OpenOctopus does not claim antivirus
+  scanning.
 - The current Server uses one ASGI worker and process-local coordination. Do
   not run multiple workers or multiple Server replicas against one deployment.
 - The release bundles are unsigned, platform-native one-folder applications;

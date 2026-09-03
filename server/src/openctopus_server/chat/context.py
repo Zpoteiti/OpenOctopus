@@ -1,10 +1,11 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.chat.channel_projection import project_channel_human_content
 from openctopus_server.chat.device_snapshot import OwnerDeviceSnapshot
 from openctopus_server.chat.prompt import build_system_prompt
 from openctopus_server.chat.public_projection import provider_role
@@ -41,6 +42,7 @@ async def build_provider_context(
     skills_cache: SkillsCache | None = None,
     device_registry: DeviceRegistry | None = None,
     device_snapshot: Sequence[OwnerDeviceSnapshot] | None = None,
+    channel_context_limits: Mapping[UUID, int] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     session = await db.get(Session, session_id)
     if session is None:
@@ -81,6 +83,7 @@ async def build_provider_context(
         current_fingerprint=provider_fingerprint(config),
         pending_rows=pending_rows,
         add_compaction_continuation=add_compaction_continuation,
+        channel_context_limits=channel_context_limits,
     )
 
     system = await build_system_prompt(
@@ -101,10 +104,25 @@ def project_provider_messages(
     current_fingerprint: str,
     pending_rows: Sequence[PendingMessage] = (),
     add_compaction_continuation: bool = True,
+    channel_context_limits: Mapping[UUID, int] | None = None,
 ) -> list[dict[str, Any]]:
-    projected = project_message_rows(rows, current_fingerprint=current_fingerprint)
+    projected = project_message_rows(
+        rows,
+        current_fingerprint=current_fingerprint,
+        channel_context_limits=channel_context_limits,
+    )
     projected.extend(
-        {"role": "user", "content": [dict(block) for block in row.content]} for row in pending_rows
+        {
+            "role": "user",
+            "content": project_channel_human_content(
+                row,
+                channel_context_limit=_row_context_limit(
+                    row,
+                    channel_context_limits,
+                ),
+            ),
+        }
+        for row in pending_rows
     )
     if (
         add_compaction_continuation
@@ -125,13 +143,24 @@ def project_message_rows(
     rows: Sequence[Message],
     *,
     current_fingerprint: str,
+    channel_context_limits: Mapping[UUID, int] | None = None,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     unresolved_tool_ids: list[str] = []
     previous_was_tool_result = False
 
     for row in rows:
-        content = [_provider_block(block) for block in row.content]
+        content = (
+            project_channel_human_content(
+                row,
+                channel_context_limit=_row_context_limit(
+                    row,
+                    channel_context_limits,
+                ),
+            )
+            if row.message_kind == "human"
+            else [_provider_block(block) for block in row.content]
+        )
         role = provider_role(row.message_kind)
         if role == "assistant" and row.llm_fingerprint != current_fingerprint:
             content = [
@@ -191,6 +220,13 @@ def project_message_rows(
     if unresolved_tool_ids:
         _invalid_history("assistant tool-use batch is missing persisted results")
     return projected
+
+
+def _row_context_limit(
+    row: Message | PendingMessage,
+    limits: Mapping[UUID, int] | None,
+) -> int | None:
+    return limits.get(row.id) if limits is not None else None
 
 
 def _provider_block(block: dict[str, Any]) -> dict[str, Any]:

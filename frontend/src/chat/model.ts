@@ -21,6 +21,10 @@ export interface ChatMessage {
   content: ContentBlock[]
   attachment_refs: MessageAttachmentRef[]
   delivery_refs: Record<string, unknown>[]
+  sender?: MessageSender | null
+  source_message_id?: string | null
+  channel_context?: ChannelContext | null
+  deliveries?: ChannelDelivery[]
   is_compacted: boolean
   created_at: string
 }
@@ -30,8 +34,44 @@ export interface PendingMessage {
   session_id: string
   content: ContentBlock[]
   attachment_refs: MessageAttachmentRef[]
+  sender?: MessageSender | null
+  source_message_id?: string | null
+  channel_context?: ChannelContext | null
   effort: string | null
   received_at: string
+}
+
+export interface MessageSender {
+  id: string
+  display_name: string | null
+  classification: 'owner' | 'allowed_non_owner' | 'internal'
+}
+
+export interface ChannelContextEntry {
+  source_message_id: string | null
+  sender_id: string | null
+  sender_display_name: string | null
+  sent_at: string | null
+  text: string
+  attachment_summaries: string[]
+}
+
+export interface ChannelContext {
+  entries: ChannelContextEntry[]
+  included_count: number
+  omitted_count: number
+}
+
+export interface ChannelDelivery {
+  channel: 'discord' | 'dingtalk'
+  chat_id: string
+  origin: 'final' | 'message_tool' | 'policy_notice' | 'pairing_confirmation'
+  status: 'prepared' | 'attempting' | 'sent' | 'partial' | 'failed' | 'unknown'
+  total_actions: number
+  visible_sent_actions: number
+  error_code: string | null
+  error_message: string | null
+  created_at: string
 }
 
 export interface MessageHistory {

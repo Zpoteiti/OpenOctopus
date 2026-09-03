@@ -58,6 +58,7 @@ async def _running_message_turn(pg_engine) -> tuple[TurnStart, Message]:
                     session_id=session_id,
                     runner_instance_id=uuid4(),
                     status="running",
+                    tool_profile="owner_full",
                     started_at=datetime.now(UTC),
                 ),
                 assistant,

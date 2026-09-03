@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
-from typing import Any
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from sqlalchemy import select
@@ -24,9 +24,15 @@ from openctopus_server.automations.heartbeat import (
     heartbeat_decision_messages,
     parse_heartbeat_decision,
 )
+from openctopus_server.channels.types import ChannelName, ToolProfile
 from openctopus_server.chat.attachments import (
     build_device_attachment_targets,
     fence_owner_device_targets,
+)
+from openctopus_server.chat.channel_projection import (
+    ChannelHumanRow,
+    channel_context_entry_count,
+    project_channel_human_content,
 )
 from openctopus_server.chat.compaction import (
     StaleCompactionSelectionError,
@@ -104,6 +110,23 @@ RequestTokenEstimator = Callable[..., int | Awaitable[int]]
 ServerMcpGenerationResolver = Callable[
     [ServerMcpEnvelope], Mapping[str, UUID | None]
 ]
+ChannelContextProjector = Callable[
+    [Mapping[UUID, int]],
+    list[dict[str, Any]],
+]
+
+
+class ChannelFinalDelivery(Protocol):
+    async def deliver_final(
+        self,
+        *,
+        turn: TurnStart,
+        assistant: Message,
+        user_id: UUID,
+        channel: ChannelName,
+        chat_id: str,
+        binding_generation: UUID | None,
+    ) -> None: ...
 
 _MAX_ITERATIONS = 200
 _MCP_AUTHORITY_SNAPSHOT_ATTEMPTS = 3
@@ -160,6 +183,9 @@ class _PreparedTurn:
     user_id: UUID
     device_targets: dict[str, UUID]
     mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
+    current_channel: ChannelName
+    current_chat_id: str
+    current_binding_generation: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +195,9 @@ class _CompletedProviderTurn:
     user_id: UUID
     device_targets: dict[str, UUID]
     mcp_snapshot: OwnerMcpSnapshot | CompositeMcpSnapshot
+    current_channel: ChannelName
+    current_chat_id: str
+    current_binding_generation: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +228,7 @@ def _build_owner_tool_state(
     devices: Sequence[OwnerDeviceSnapshot],
     *,
     tool_registry: ToolRegistry,
+    tool_profile: ToolProfile = "owner_full",
     attachment_targets: Mapping[str, UUID | None] | None = None,
     server_envelope: ServerMcpEnvelope | None = None,
     runtime_generations: Mapping[str, UUID | None] | None = None,
@@ -235,6 +265,7 @@ def _build_owner_tool_state(
             runtime_generations=runtime_generations,
         )
     registry_schemas = tool_registry.get_tool_schemas(
+        tool_profile=tool_profile,
         device_names=device_sites,
         mcp_snapshot=mcp_snapshot,
     )
@@ -268,6 +299,7 @@ class ChatRuntime:
         context_admission: KeyedAdmission | None = None,
         request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
         server_mcp_generation_resolver: ServerMcpGenerationResolver | None = None,
+        channel_final_delivery: ChannelFinalDelivery | None = None,
     ) -> None:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
@@ -278,6 +310,7 @@ class ChatRuntime:
         self.context_admission = context_admission or get_context_admission()
         self._estimate_request_tokens = request_token_estimator
         self._server_mcp_generation_resolver = server_mcp_generation_resolver
+        self._channel_final_delivery = channel_final_delivery
         self.skills_cache = get_skills_cache()
         self._provider_factory = provider_factory or AnthropicProvider
         self._providers: dict[tuple[str, str], Provider] = {}
@@ -663,6 +696,20 @@ class ChatRuntime:
 
             tool_uses = [block for block in assistant.content if block.get("type") == "tool_use"]
             if not tool_uses:
+                if self._channel_final_delivery is not None:
+                    try:
+                        await self._channel_final_delivery.deliver_final(
+                            turn=turn,
+                            assistant=assistant,
+                            user_id=completed.user_id,
+                            channel=completed.current_channel,
+                            chat_id=completed.current_chat_id,
+                            binding_generation=completed.current_binding_generation,
+                        )
+                    except Exception:
+                        # The assistant result is already durable. Channel delivery
+                        # owns its own terminal record and must not rewrite the turn.
+                        pass
                 async with AsyncSession(self.engine, expire_on_commit=False) as db:
                     await finish_final_turn(db, turn=turn)
                 await self._publish_turn_finished(
@@ -725,6 +772,15 @@ class ChatRuntime:
                             ctx=ToolContext(
                                 user_id=completed.user_id,
                                 session_id=turn.session_id,
+                                turn_id=turn.turn_id,
+                                tool_use_id=tool_id,
+                                assistant_message_id=assistant.id,
+                                tool_profile=turn.tool_profile,
+                                current_channel=completed.current_channel,
+                                current_chat_id=completed.current_chat_id,
+                                current_binding_generation=(
+                                    completed.current_binding_generation
+                                ),
                             ),
                             device_targets=completed.device_targets,
                             mcp_snapshot=completed.mcp_snapshot,
@@ -942,6 +998,11 @@ class ChatRuntime:
                     prepared_user_id = prepared.user_id
                     prepared_device_targets = prepared.device_targets
                     prepared_mcp_snapshot = prepared.mcp_snapshot
+                    prepared_current_channel = prepared.current_channel
+                    prepared_current_chat_id = prepared.current_chat_id
+                    prepared_current_binding_generation = (
+                        prepared.current_binding_generation
+                    )
                     del prepared, provider, result
                 except Exception as exc:
                     try:
@@ -974,6 +1035,9 @@ class ChatRuntime:
             user_id=prepared_user_id,
             device_targets=prepared_device_targets,
             mcp_snapshot=prepared_mcp_snapshot,
+            current_channel=prepared_current_channel,
+            current_chat_id=prepared_current_chat_id,
+            current_binding_generation=prepared_current_binding_generation,
         )
 
     async def _session_owner_id(self, session_id: UUID) -> UUID:
@@ -1044,6 +1108,17 @@ class ChatRuntime:
                 raise StaleCompactionSelectionError(
                     "Captured pending rows changed before preflight"
                 )
+            binding_generations = [
+                row.channel_binding_generation for row in active_rows
+            ] + [row.channel_binding_generation for row in pending_rows]
+            current_binding_generation = next(
+                (
+                    generation
+                    for generation in reversed(binding_generations)
+                    if generation is not None
+                ),
+                None,
+            )
             attachment_targets = build_device_attachment_targets(
                 [*active_rows, *pending_rows]
             )
@@ -1063,18 +1138,20 @@ class ChatRuntime:
             prospective_messages.extend(
                 {
                     "role": "user",
-                    "content": [dict(block) for block in row.content],
+                    "content": project_channel_human_content(row),
                 }
                 for row in pending_rows
             )
+            current_fingerprint = provider_fingerprint(config)
             active_messages = project_provider_messages(
                 active_rows,
-                current_fingerprint=provider_fingerprint(config),
+                current_fingerprint=current_fingerprint,
                 add_compaction_continuation=False,
             )
         device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
             owner_devices,
             tool_registry=self.tool_registry,
+            tool_profile=turn.tool_profile,
             attachment_targets=attachment_targets,
             server_envelope=server_envelope,
             runtime_generations=(
@@ -1084,25 +1161,66 @@ class ChatRuntime:
             ),
         )
 
+        prospective_context_rows: list[ChannelHumanRow] = [
+            *[row for row in active_rows if row.message_kind == "human"],
+            *pending_rows,
+        ]
+        prospective_messages, prospective_input_tokens = (
+            await self._admit_channel_context(
+                rows=prospective_context_rows,
+                full_messages=prospective_messages,
+                project_messages=lambda limits: project_provider_messages(
+                    active_rows,
+                    current_fingerprint=current_fingerprint,
+                    pending_rows=pending_rows,
+                    add_compaction_continuation=not pending_rows,
+                    channel_context_limits=limits,
+                ),
+                system=system,
+                tools=registry_schemas,
+                max_context_tokens=config.max_context_tokens,
+                max_output_tokens=config.max_output_tokens,
+            )
+        )
         should_compact = False
         if config.max_context_tokens is not None and config.compaction_threshold_tokens is not None:
-            input_tokens = await self._estimate_tokens(
-                system=system,
-                messages=prospective_messages,
-                tools=registry_schemas,
-            )
+            if prospective_input_tokens is None:
+                prospective_input_tokens = await self._estimate_tokens(
+                    system=system,
+                    messages=prospective_messages,
+                    tools=registry_schemas,
+                )
             should_compact = compaction_required(
-                input_tokens=input_tokens,
+                input_tokens=prospective_input_tokens,
                 max_context_tokens=config.max_context_tokens,
                 threshold_tokens=config.compaction_threshold_tokens,
             )
 
         if should_compact and pending_rows and active_rows:
+            threshold_tokens = config.compaction_threshold_tokens
+            assert threshold_tokens is not None
             provider = await self._provider_for(config)
+            summary_messages = _compaction_request_messages(active_messages)
+            summary_messages, _ = await self._admit_channel_context(
+                rows=[row for row in active_rows if row.message_kind == "human"],
+                full_messages=summary_messages,
+                project_messages=lambda limits: _compaction_request_messages(
+                    project_provider_messages(
+                        active_rows,
+                        current_fingerprint=current_fingerprint,
+                        add_compaction_continuation=False,
+                        channel_context_limits=limits,
+                    )
+                ),
+                system=_COMPACTION_SYSTEM,
+                tools=[],
+                max_context_tokens=config.max_context_tokens,
+                max_output_tokens=compaction_max_output_tokens(threshold_tokens),
+            )
             summary_content = await self._generate_summary(
                 provider=provider,
                 config=config,
-                messages=active_messages,
+                messages=summary_messages,
             )
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 _, promoted_ids, latest_effort = await commit_stage_one(
@@ -1125,12 +1243,14 @@ class ChatRuntime:
                 source_set = set(source_ids)
                 tail_messages = project_message_rows(
                     [row for row in active_rows if row.id in source_set],
-                    current_fingerprint=provider_fingerprint(config),
+                    current_fingerprint=current_fingerprint,
                 )
                 summary_content = await self._generate_summary(
                     provider=provider,
                     config=config,
-                    messages=_stage_two_summary_messages(tail_messages),
+                    messages=_compaction_request_messages(
+                        _stage_two_summary_messages(tail_messages)
+                    ),
                 )
                 async with AsyncSession(self.engine, expire_on_commit=False) as db:
                     await commit_stage_two(
@@ -1181,9 +1301,11 @@ class ChatRuntime:
                         attachment_targets,
                     ),
                 )
+            current_fingerprint = provider_fingerprint(config)
             device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
                 owner_devices,
                 tool_registry=self.tool_registry,
+                tool_profile=turn.tool_profile,
                 attachment_targets=attachment_targets,
                 server_envelope=server_envelope,
                 runtime_generations=(
@@ -1192,10 +1314,29 @@ class ChatRuntime:
                     else {}
                 ),
             )
-            await self._estimate_tokens(
+            final_input_tokens = await self._estimate_tokens(
                 system=system,
                 messages=provider_messages,
                 tools=registry_schemas,
+            )
+            final_context_rows: list[ChannelHumanRow] = [
+                row
+                for row in provider_visible_rows
+                if row.message_kind == "human"
+            ]
+            provider_messages, _ = await self._admit_channel_context(
+                rows=final_context_rows,
+                full_messages=provider_messages,
+                project_messages=lambda limits: project_provider_messages(
+                    provider_visible_rows,
+                    current_fingerprint=current_fingerprint,
+                    channel_context_limits=limits,
+                ),
+                system=system,
+                tools=registry_schemas,
+                max_context_tokens=config.max_context_tokens,
+                max_output_tokens=config.max_output_tokens,
+                full_input_tokens=final_input_tokens,
             )
         return _PreparedTurn(
             turn=turn,
@@ -1206,7 +1347,74 @@ class ChatRuntime:
             user_id=user_id,
             device_targets=device_targets,
             mcp_snapshot=mcp_snapshot,
+            current_channel=cast(ChannelName, session.channel),
+            current_chat_id=session.chat_id,
+            current_binding_generation=current_binding_generation,
         )
+
+    async def _admit_channel_context(
+        self,
+        *,
+        rows: Sequence[ChannelHumanRow],
+        full_messages: list[dict[str, Any]],
+        project_messages: ChannelContextProjector,
+        system: str,
+        tools: list[dict[str, Any]],
+        max_context_tokens: int | None,
+        max_output_tokens: int,
+        full_input_tokens: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        context_counts: list[tuple[UUID, int]] = []
+        for row in rows:
+            count = channel_context_entry_count(row)
+            if count:
+                context_counts.append((row.id, count))
+        if not context_counts or max_context_tokens is None:
+            return full_messages, full_input_tokens
+
+        if full_input_tokens is None:
+            full_input_tokens = await self._estimate_tokens(
+                system=system,
+                messages=full_messages,
+                tools=tools,
+            )
+        if full_input_tokens + max_output_tokens <= max_context_tokens:
+            return full_messages, full_input_tokens
+
+        total_entries = sum(count for _, count in context_counts)
+        estimates: dict[int, tuple[list[dict[str, Any]], int]] = {
+            total_entries: (full_messages, full_input_tokens)
+        }
+
+        async def estimate_kept(keep: int) -> tuple[list[dict[str, Any]], int]:
+            cached = estimates.get(keep)
+            if cached is not None:
+                return cached
+            limits = _newest_channel_context_limits(context_counts, keep=keep)
+            messages = project_messages(limits)
+            input_tokens = await self._estimate_tokens(
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
+            result = (messages, input_tokens)
+            estimates[keep] = result
+            return result
+
+        zero_messages, zero_tokens = await estimate_kept(0)
+        if zero_tokens + max_output_tokens > max_context_tokens:
+            return zero_messages, zero_tokens
+
+        lower = 0
+        upper = total_entries
+        while lower + 1 < upper:
+            candidate = (lower + upper) // 2
+            _, candidate_tokens = await estimate_kept(candidate)
+            if candidate_tokens + max_output_tokens <= max_context_tokens:
+                lower = candidate
+            else:
+                upper = candidate
+        return await estimate_kept(lower)
 
     async def _estimate_tokens(
         self,
@@ -1255,13 +1463,7 @@ class ChatRuntime:
         result = await provider.stream_turn(
             config=summary_config,
             system=_COMPACTION_SYSTEM,
-            messages=[
-                *messages,
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _COMPACTION_REQUEST}],
-                },
-            ],
+            messages=messages,
             effort=Effort.OFF,
             limiter=self.limiter,
             on_delta=ignore_delta,
@@ -1363,21 +1565,22 @@ class ChatRuntime:
 
     async def _running_turn_for_session(self, session_id: UUID) -> TurnStart | None:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
-            turn_id = (
+            run = (
                 await db.execute(
-                    select(TurnRun.id).where(
+                    select(TurnRun).where(
                         TurnRun.session_id == session_id,
                         TurnRun.status == "running",
                     )
                 )
             ).scalar_one_or_none()
-        if turn_id is None:
+        if run is None:
             return None
         return TurnStart(
             session_id=session_id,
-            turn_id=turn_id,
-            message_ids=(),
+            turn_id=run.id,
+            message_ids=tuple(UUID(message_id) for message_id in run.input_message_ids),
             effort=None,
+            tool_profile=cast(ToolProfile, run.tool_profile),
         )
 
     async def _fail_iteration_limit(
@@ -1700,6 +1903,34 @@ def _synthetic_error_content(*, error: ProviderInvocationError | None) -> dict[s
             else "The model provider could not complete this response. Please try again."
         )
     return {"type": "text", "text": f"[{code.value}] {message}"}
+
+
+def _newest_channel_context_limits(
+    context_counts: Sequence[tuple[UUID, int]],
+    *,
+    keep: int,
+) -> dict[UUID, int]:
+    if keep < 0 or keep > sum(count for _, count in context_counts):
+        raise ValueError("keep is outside the channel context range")
+    remaining = keep
+    limits: dict[UUID, int] = {}
+    for row_id, count in reversed(context_counts):
+        retained = min(count, remaining)
+        limits[row_id] = retained
+        remaining -= retained
+    return limits
+
+
+def _compaction_request_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        *messages,
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": _COMPACTION_REQUEST}],
+        },
+    ]
 
 
 def _stage_two_summary_messages(

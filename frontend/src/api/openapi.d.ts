@@ -263,7 +263,7 @@ export interface paths {
          *     failure does not turn the logical deletion into an error: cleanup is
          *     retried by the running process and during startup (ADR-058, ADR-123).
          *     Database cascades remove devices, sessions, messages, cron_jobs,
-         *     discord_configs, and telegram_configs.
+         *     discord_configs, and dingtalk_configs.
          *     Shared workspace memberships are removed; shared workspaces the user
          *     was in persist for other members.
          */
@@ -450,7 +450,7 @@ export interface paths {
         /**
          * Update session title or browser read marker
          * @description Updates user-owned session metadata. `title` renames the human-facing
-         *     title for any owned session, including web, Discord, Telegram, cron, and
+         *     title for any owned session, including web, Discord, DingTalk, cron, and
          *     heartbeat sessions. `read_through_message_id` marks canonical messages
          *     up to that message's `created_at` as read for the browser inbox.
          *
@@ -649,7 +649,7 @@ export interface paths {
          *
          *     **Browser write allow-list (ADR-098).** `{session_id}` is `sessions.id`, not
          *     `session_key`. The server accepts writes only when `channel == "web"`
-         *     and `session_key` starts with `web:`. Discord/Telegram/cron/heartbeat
+         *     and `session_key` starts with `web:`. Discord/DingTalk/cron/heartbeat
          *     sessions are read-only through browser REST and receive messages
          *     exclusively from their own pipelines.
          */
@@ -2503,12 +2503,10 @@ export interface paths {
         };
         /**
          * List all supported channel configs
-         * @description Returns every channel type supported by this server, including
+         * @description Returns Discord and DingTalk entries in a stable order, including
          *     unconfigured entries. There is no separate
          *     `GET /api/channels/{channel}` route; frontends can filter this list.
-         *     Secret fields are never returned. Configured bot channels return
-         *     platform-specific config field names such as `bot_token_hint`,
-         *     `partner_chat_id`, and `allow_list`.
+         *     Bot credentials are write-only and never returned.
          */
         get: {
             parameters: {
@@ -2525,7 +2523,7 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["ChannelConfigView"][];
+                        "application/json": components["schemas"]["ChannelConfigResponse"][];
                     };
                 };
             };
@@ -2543,8 +2541,8 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
-                /** @description Supported channel type. Unknown values fail with `unknown_channel`. */
-                channel: "discord" | "telegram";
+                /** @description Supported channel type. Unknown values fail with `channel_not_supported`. */
+                channel: components["schemas"]["ExternalChannel"];
             };
             cookie?: never;
         };
@@ -2553,17 +2551,16 @@ export interface paths {
         post?: never;
         /**
          * Delete a channel config
-         * @description Deletes the user's config row for this channel. The channel is disabled
-         *     because config existence is the enablement state. Py10 hot reload stops
-         *     the affected adapter after successful deletion.
+         * @description Deletes the user's config row, immediately invalidates the binding, and
+         *     stops the affected adapter. Config existence is the enablement state.
          */
         delete: {
             parameters: {
                 query?: never;
                 header?: never;
                 path: {
-                    /** @description Supported channel type. Unknown values fail with `unknown_channel`. */
-                    channel: "discord" | "telegram";
+                    /** @description Supported channel type. Unknown values fail with `channel_not_supported`. */
+                    channel: components["schemas"]["ExternalChannel"];
                 };
                 cookie?: never;
             };
@@ -2576,7 +2573,7 @@ export interface paths {
                     };
                     content?: never;
                 };
-                /** @description Unknown channel. */
+                /** @description Unsupported channel. */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -2591,36 +2588,35 @@ export interface paths {
         head?: never;
         /**
          * Create or partially update a channel config
-         * @description Partial top-level update. Omitted fields remain unchanged. Platform
-         *     payloads keep platform-specific field names instead of abstracting
-         *     everything into a generic config map.
+         * @description Partial top-level update; omitted fields remain unchanged and explicit
+         *     null values are rejected. Creating Discord requires `bot_token`.
+         *     Creating DingTalk requires `client_id` and `client_secret`. Credential
+         *     changes are validated against the platform before persistence.
          *
-         *     Config existence means enabled; there is no `enabled` flag. `DELETE`
-         *     disables a channel by deleting its config row. `allow_list`, when
-         *     present, replaces the whole list. Sending `bot_token: "<redacted>"` is
-         *     rejected; omit `bot_token` to keep the existing secret. A `bot_token`
-         *     change is validated against the platform before persistence. A
-         *     `partner_chat_id` change is validated by sending a pairing/success
-         *     message to that target before persistence. `allow_list` gets schema
-         *     validation only; adapters resolve and classify entries at receive time.
+         *     `allow_list`, when present, replaces the whole ordered list. Every
+         *     value must be a stable platform user ID copied manually by the owner;
+         *     channel, guild, group, display-name, or lookup-based entries are not
+         *     accepted. The paired owner is established only by the separate DM
+         *     pairing flow and is not configured through this list.
          *
-         *     Runtime hot reload is a Py10 contract: after a successful DB write, the
-         *     ChannelManager reloads or starts the affected user's adapter. Py-Prep
-         *     only fixes the API/storage contract.
+         *     A successful write hot-reloads the affected adapter. New configs and
+         *     bot-identity changes return a one-time pairing code in `pairing.code`.
+         *     Stored credentials are never returned; omit them to retain their
+         *     current values.
          */
         patch: {
             parameters: {
                 query?: never;
                 header?: never;
                 path: {
-                    /** @description Supported channel type. Unknown values fail with `unknown_channel`. */
-                    channel: "discord" | "telegram";
+                    /** @description Supported channel type. Unknown values fail with `channel_not_supported`. */
+                    channel: components["schemas"]["ExternalChannel"];
                 };
                 cookie?: never;
             };
             requestBody: {
                 content: {
-                    "application/json": components["schemas"]["ChannelConfigPatch"];
+                    "application/json": components["schemas"]["ChannelConfigPatchRequest"];
                 };
             };
             responses: {
@@ -2630,10 +2626,10 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["ChannelConfigView"];
+                        "application/json": components["schemas"]["ChannelConfigResponse"];
                     };
                 };
-                /** @description Malformed payload, unknown channel, or `"<redacted>"` sent as a secret value. */
+                /** @description Malformed payload, unsupported channel, invalid platform-specific fields, or invalid credentials. */
                 400: {
                     headers: {
                         [name: string]: unknown;
@@ -2642,7 +2638,88 @@ export interface paths {
                         "application/json": components["schemas"]["Error"];
                     };
                 };
-                /** @description Platform validation failed, pairing message failed, or runtime config could not be applied. */
+                /** @description The Bot identity is already bound to another user. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Credential validity could not be established because the platform is unavailable. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/api/channels/{channel}/pairing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Supported channel type. Unknown values fail with `channel_not_supported`. */
+                channel: components["schemas"]["ExternalChannel"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate a new owner pairing code
+         * @description Invalidates the previous code for an unpaired config and returns the
+         *     replacement exactly once in `pairing.code`. The owner pairs by sending
+         *     that exact code from their human account in a direct message to the
+         *     configured Bot. Already-paired configs must be deleted and recreated
+         *     before a different owner can pair.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Supported channel type. Unknown values fail with `channel_not_supported`. */
+                    channel: components["schemas"]["ExternalChannel"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Pairing code rotated. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ChannelConfigResponse"];
+                    };
+                };
+                /** @description Unsupported channel. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Channel configuration does not exist. */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description The channel is already paired. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -2653,6 +2730,10 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/cron": {
@@ -3503,6 +3584,22 @@ export interface components {
              *     `message` tool. These refs are not part of provider replay.
              */
             delivery_refs: components["schemas"]["MessageDeliveryRef"][];
+            /**
+             * @description Authenticated sender projection for human/channel messages. Null
+             *     for messages without sender provenance. Display names are labels,
+             *     never authorization identities.
+             */
+            sender?: components["schemas"]["MessageSenderResponse"] | null;
+            /** @description Stable source-platform message ID, or null outside channel ingress. */
+            source_message_id?: string | null;
+            /** @description Sanitized reply/background context captured for this turn. */
+            channel_context?: components["schemas"]["ChannelContextResponse"];
+            /**
+             * @description Durable logical Discord/DingTalk delivery aggregates associated
+             *     with this message. Per-action details and raw platform errors are
+             *     not exposed.
+             */
+            deliveries?: components["schemas"]["ChannelDeliveryResponse"][];
             /** Format: date-time */
             created_at: string;
         };
@@ -3530,10 +3627,61 @@ export interface components {
              *     canonical human Message at the next safe-boundary promotion.
              */
             attachment_refs: components["schemas"]["MessageAttachmentRef"][];
+            /** @description Authenticated sender and trust classification captured at ingress. */
+            sender: components["schemas"]["MessageSenderResponse"];
+            /** @description Stable source-platform message ID, or null outside channel ingress. */
+            source_message_id?: string | null;
+            /** @description Sanitized reply/background context captured for the pending turn. */
+            channel_context?: components["schemas"]["ChannelContextResponse"];
             /** @description Pending per-turn thinking effort, if supplied. */
             effort?: components["schemas"]["Effort"] | null;
             /** Format: date-time */
             received_at: string;
+        };
+        MessageSenderResponse: {
+            /** @description Stable authenticated platform identity or internal sender identity. */
+            id: string;
+            /** @description Sanitized display label; never used for authorization. */
+            display_name: string | null;
+            /** @enum {string} */
+            classification: "owner" | "allowed_non_owner" | "internal";
+        };
+        ChannelContextEntryResponse: {
+            source_message_id: string | null;
+            sender_id: string | null;
+            /** @description Sanitized display label; never used for authorization. */
+            sender_display_name: string | null;
+            /** @description Platform-provided timestamp string when available. */
+            sent_at: string | null;
+            text: string;
+            /** @description Sanitized metadata only; attachment URLs and bytes are absent. */
+            attachment_summaries?: string[];
+        };
+        ChannelContextResponse: {
+            entries?: components["schemas"]["ChannelContextEntryResponse"][];
+            /** @default 0 */
+            included_count: number;
+            /** @default 0 */
+            omitted_count: number;
+        };
+        ChannelDeliveryResponse: {
+            channel: components["schemas"]["ExternalChannel"];
+            chat_id: string;
+            /** @enum {string} */
+            origin: "final" | "message_tool" | "policy_notice" | "pairing_confirmation";
+            /**
+             * @description Durable aggregate outcome. Failed, partial, and unknown deliveries
+             *     are not retried automatically; the user starts a new Agent turn.
+             * @enum {string}
+             */
+            status: "prepared" | "attempting" | "sent" | "partial" | "failed" | "unknown";
+            total_actions: number;
+            visible_sent_actions: number;
+            error_code: string | null;
+            /** @description Sanitized error; raw platform payloads are not returned. */
+            error_message: string | null;
+            /** Format: date-time */
+            created_at: string;
         };
         /**
          * @description Canonical PostgreSQL-backed chat state. This response never includes
@@ -3800,9 +3948,9 @@ export interface components {
             mime: string;
             /**
              * Format: int64
-             * @description Optional client-supplied metadata; message delivery does not open the file to discover it.
+             * @description Byte length frozen by the generation-fenced Client source preflight before delivery.
              */
-            size?: number;
+            size: number;
             /** @enum {boolean} */
             online_only: true;
         };
@@ -3927,65 +4075,65 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
-        ChannelConfigView: {
-            /** @enum {string} */
-            channel: "discord" | "telegram";
-            /** @description True when the user's per-platform config row exists. */
+        /** @enum {string} */
+        ExternalChannel: "discord" | "dingtalk";
+        /** @enum {string} */
+        ChannelState: "stopped" | "connecting" | "awaiting_pairing" | "ready" | "degraded";
+        ChannelConfigPatchRequest: {
+            /** @description Discord Bot token. Omit on update to retain the stored value. */
+            bot_token?: string;
+            /** @description DingTalk application client ID. Omit on update to retain the stored value. */
+            client_id?: string;
+            /** @description DingTalk application client secret. Omit on update to retain the stored value. */
+            client_secret?: string;
+            /**
+             * @description Whole-list replacement of stable platform user IDs entered
+             *     manually. Discord accepts decimal user snowflakes; DingTalk IDs are
+             *     scoped to the current enterprise/application. Channel, guild,
+             *     group, and display-name entries are invalid.
+             */
+            allow_list?: string[];
+        };
+        ChannelConfigResponse: {
+            channel: components["schemas"]["ExternalChannel"];
+            /** @description True when the authenticated user has a stored config for this channel. */
             configured: boolean;
-            /** @description Platform-specific config view, or null when not configured. */
-            config: components["schemas"]["DiscordConfig"] | components["schemas"]["TelegramConfig"] | null;
-        };
-        /**
-         * @description Platform-specific partial update body. The path parameter chooses which
-         *     platform parser is used; this oneOf documents the supported shapes.
-         */
-        ChannelConfigPatch: components["schemas"]["DiscordConfigPatch"] | components["schemas"]["TelegramConfigPatch"];
-        DiscordConfig: {
-            /** @description Display-only secret hint, e.g. first visible chars + `...` + last visible chars. Never accepted for authentication or update. */
-            bot_token_hint: string;
-            partner_chat_id: string;
-            /**
-             * @description Heterogeneous list of Discord-snowflake-shaped strings. An entry can
-             *     be a User ID (the user is allowed to DM/@-mention), a Channel ID
-             *     (every member of that channel can @-mention the bot in that channel),
-             *     or a Guild ID (every member of that guild can @-mention the bot
-             *     anywhere in the guild). The adapter classifies each entry by Discord
-             *     API lookup at receive time. Inbound is allowed if sender_id matches
-             *     a User entry OR the message-context (channel/guild) matches a
-             *     Channel/Guild entry. Allowed messages still get the
-             *     `[untrusted message from <name>]:` wrap (ADR-007); only the partner
-             *     is unwrapped.
-             */
+            state: components["schemas"]["ChannelState"];
+            bot: components["schemas"]["ChannelBotResponse"] | null;
+            /** @description Paired human platform identity; null until owner DM pairing succeeds. */
+            owner: components["schemas"]["ChannelOwnerResponse"] | null;
+            /** @description Manually configured non-owner platform user IDs. */
             allow_list: string[];
-        };
-        DiscordConfigPatch: {
-            /** @description New Discord bot token. Omit to keep the current token; `"<redacted>"` is rejected. */
-            bot_token?: string;
-            /** @description Partner Discord user/chat id. Changing it triggers a pairing message before persistence. */
-            partner_chat_id?: string;
-            /** @description Whole-array replacement. Entries get schema/length validation only. */
-            allow_list?: string[];
-        };
-        TelegramConfig: {
-            /** @description Display-only secret hint, e.g. first visible chars + `...` + last visible chars. Never accepted for authentication or update. */
-            bot_token_hint: string;
-            partner_chat_id: string;
             /**
-             * @description Heterogeneous list of Telegram identifiers. An entry can be a User ID
-             *     (DM allowed), a group Chat ID (every group member can @-mention the
-             *     bot in the group), or a broadcast Channel ID (per Telegram's
-             *     bot-in-channel API rules). Match logic identical to Discord's
-             *     `allow_list`; allowed messages still get the untrusted wrap.
+             * @description Presence-only credential indicator; no secret material or suffix is returned.
+             * @enum {string|null}
              */
-            allow_list: string[];
+            credential_hint: "Configured" | null;
+            pairing: components["schemas"]["ChannelPairingResponse"] | null;
+            last_error: components["schemas"]["ChannelLastErrorResponse"] | null;
         };
-        TelegramConfigPatch: {
-            /** @description New Telegram bot token. Omit to keep the current token; `"<redacted>"` is rejected. */
-            bot_token?: string;
-            /** @description Partner Telegram chat id. Changing it triggers a pairing message before persistence. */
-            partner_chat_id?: string;
-            /** @description Whole-array replacement. Entries get schema/length validation only. */
-            allow_list?: string[];
+        ChannelBotResponse: {
+            id: string;
+            name: string | null;
+            avatar_url: string | null;
+        };
+        ChannelOwnerResponse: {
+            /** @description Stable authenticated platform user ID established by pairing. */
+            id: string;
+            /** @description Canonical owner DM target established by pairing. */
+            dm_chat_id: string;
+        };
+        ChannelPairingResponse: {
+            /** Format: date-time */
+            expires_at: string;
+            /** @description One-time plaintext returned only by create, bot-identity replacement, or pairing rotation. */
+            code: string | null;
+        };
+        ChannelLastErrorResponse: {
+            code: string;
+            message: string;
+            /** Format: date-time */
+            at: string;
         };
         CronCreateRequest: {
             /** @description Optional label; omission defaults to the first 30 code points of message. */

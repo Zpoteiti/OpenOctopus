@@ -14,10 +14,10 @@ from openctopus_server.chat.device_snapshot import (
     load_owner_device_snapshot,
 )
 from openctopus_server.db.models import (
+    DingTalkConfig,
     DiscordConfig,
     Session,
     SystemConfig,
-    TelegramConfig,
     User,
     Workspace,
     WorkspaceMember,
@@ -79,8 +79,8 @@ async def build_system_prompt(
     discord = (
         await db.execute(select(DiscordConfig).where(DiscordConfig.user_id == user.id))
     ).scalar_one_or_none()
-    telegram = (
-        await db.execute(select(TelegramConfig).where(TelegramConfig.user_id == user.id))
+    dingtalk = (
+        await db.execute(select(DingTalkConfig).where(DingTalkConfig.user_id == user.id))
     ).scalar_one_or_none()
     devices = tuple(device_snapshot) if device_snapshot is not None else None
     if devices is None:
@@ -135,11 +135,14 @@ async def build_system_prompt(
             cache=skills_cache or get_skills_cache(),
         )
 
-    channel_lines = [f"- web — current chat_id: {session.chat_id}"]
-    if discord is not None:
-        channel_lines.append(f"- discord — partner_chat_id: {discord.partner_chat_id}")
-    if telegram is not None:
-        channel_lines.append(f"- telegram — partner_chat_id: {telegram.partner_chat_id}")
+    channel_lines = [
+        f"- current — channel: {session.channel}; chat_id: {session.chat_id}; "
+        f"label: {session.title}"
+    ]
+    if discord is not None and discord.owner_dm_chat_id is not None:
+        channel_lines.append(f"- discord — owner_dm_chat_id: {discord.owner_dm_chat_id}")
+    if dingtalk is not None and dingtalk.owner_dm_chat_id is not None:
+        channel_lines.append(f"- dingtalk — owner_dm_chat_id: {dingtalk.owner_dm_chat_id}")
 
     workspace_lines = [
         f"- Personal workspace: /{user.id}/ (default for relative server paths; private)"
@@ -199,6 +202,10 @@ async def build_system_prompt(
                 "- Relative server paths mean the personal workspace; shared workspaces require "
                 "the exact absolute `/name@suffix/` path.\n"
                 "- Use `message` to deliver files; `read_file` only exposes file content to you.\n"
+                "- Conversations are isolated: channel context never carries into another "
+                "Session.\n"
+                "- Confirmation must happen in the original conversation; ask the user to "
+                "return there instead of accepting confirmation from another Session.\n"
                 "- Server-side routing and authorization remain authoritative.\n"
                 "- Use `web_fetch` when current public web content is required."
             ),

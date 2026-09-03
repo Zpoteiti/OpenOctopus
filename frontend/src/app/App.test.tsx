@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -95,7 +95,32 @@ describe('application routes', () => {
     expect(screen.getByRole('link', { name: 'Workspace' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Devices' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Automations' })).toHaveAttribute('href', '/automations')
+    expect(screen.getByRole('link', { name: 'Channels' })).toHaveAttribute('href', '/channels')
     expect(screen.queryByRole('link', { name: 'Admin settings' })).not.toBeInTheDocument()
+  })
+
+  it('routes an authenticated user to Channels', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/me') return jsonResponse(regularUser)
+      if (url === '/api/sessions?limit=200') return jsonResponse([])
+      if (url === '/api/channels') return jsonResponse([
+        {
+          channel: 'discord', configured: false, state: 'stopped', bot: null, owner: null,
+          allow_list: [], credential_hint: null, pairing: null, last_error: null,
+        },
+        {
+          channel: 'dingtalk', configured: false, state: 'stopped', bot: null, owner: null,
+          allow_list: [], credential_hint: null, pairing: null, last_error: null,
+        },
+      ])
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderApp('/channels')
+
+    expect(await screen.findByRole('heading', { name: 'Channels' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Channels' })).toHaveAttribute('aria-current', 'page')
   })
 
   it('routes an authenticated user to Automations', async () => {
@@ -138,6 +163,20 @@ describe('application routes', () => {
     renderApp('/chat')
 
     expect(await screen.findByRole('link', { name: /Chat 9/ })).toBeInTheDocument()
+  })
+
+  it('labels external conversations with their channel in the sidebar', async () => {
+    mockApi(regularUser, [{
+      ...session('session-1', 'Project room'),
+      channel: 'discord',
+      session_key: 'discord:project-room',
+      chat_id: 'project-room',
+    }])
+
+    renderApp('/chat')
+
+    const conversation = await screen.findByRole('link', { name: /Project room/ })
+    expect(within(conversation).getByText('Discord')).toHaveClass('session-source-badge')
   })
 
   it('renames and deletes a conversation from its sidebar menu', async () => {
