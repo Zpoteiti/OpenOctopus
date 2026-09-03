@@ -734,16 +734,25 @@ not be retried automatically. A complete finalized destination remains success
 if later source acknowledgement or conditional source cleanup fails; only that
 post-finalize boundary returns warnings.
 
-The current Py6 `message` tool is web-session only. With `media: [...]` and a
-paired `openoctopus_device`, it writes an online-only device-file reference to
-the message sidecar; no bytes move at send time. When the browser later
-downloads the file through the Workspace Files `GET` route, the server opens a
-temporary WS `http_relay` slot and forwards device chunks into the HTTP response
-with bounded buffering. This is not a durable `file_transfer`: there is no
-server destination path and no RustFS write. With `openoctopus_device="server"`,
-the tool authorizes and stats the file through `WorkspaceService` and emits a
-durable workspace-file reference. Third-party channel delivery is outside this
-milestone and has no Py6 wire contract.
+Py10 Discord/DingTalk do not add Device Protocol frames. Bot credentials,
+pairing, inbound events, context backfill, receipts, and platform delivery
+outcomes remain Server/platform concerns and never traverse `/ws/device`.
+
+For owner-authorized outbound media on a paired Client, the channel Router
+reuses the existing Protocol v3 bounded Client byte-relay slot and 64 KiB chunk
+contract, streaming directly into the platform upload. There is no Server
+destination path, RustFS staging copy, resumable channel upload, or new
+protocol version. Server Workspace media is read through `WorkspaceService`
+and does not use the Device WebSocket. Attachments from allow-listed non-owners
+are rejected before byte download, so they cannot open a relay slot or reach a
+Client.
+
+The Server persists each channel action as `attempting` before platform issue
+and records `sent`, `failed`, or `unknown` afterward. A Device stream failure
+after platform issue is unknown and is not automatically retried; Protocol v3
+transport acknowledgements cannot prove the platform-side message outcome.
+Complete reply persistence and Discord/DingTalk text splitting also live above
+this protocol boundary.
 
 ### 4.7 Private recursive-directory control
 

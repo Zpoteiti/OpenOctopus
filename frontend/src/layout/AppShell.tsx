@@ -14,6 +14,7 @@ const NAV_ITEMS = [
   { to: '/workspace', icon: 'W', labelKey: 'nav.workspace' },
   { to: '/devices', icon: 'D', labelKey: 'nav.devices' },
   { to: '/automations', icon: 'A', labelKey: 'nav.automations' },
+  { to: '/channels', icon: 'H', labelKey: 'nav.channels' },
 ] as const
 
 export function AppShell(): ReactNode {
@@ -401,13 +402,24 @@ function SessionCopy({
     <span className="session-copy">
       <span className="session-title-line">
         <strong className="session-title">{session.title}</strong>
-        {session.channel === 'cron' || session.channel === 'heartbeat' ? (
-          <small className="session-source-badge">{t(`automations.${session.channel}`)}</small>
-        ) : null}
+        {sessionChannelLabel(session.channel, t)}
       </span>
       <small className="session-meta">{formatSessionTime(session.last_inbound_at, language, t)}</small>
     </span>
   )
+}
+
+function sessionChannelLabel(
+  channel: string,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): ReactNode {
+  if (channel === 'cron' || channel === 'heartbeat') {
+    return <small className="session-source-badge">{t(`automations.${channel}`)}</small>
+  }
+  if (channel === 'discord' || channel === 'dingtalk') {
+    return <small className="session-source-badge">{t(`channels.platform.${channel}`)}</small>
+  }
+  return null
 }
 
 function sessionIdFromPath(pathname: string): string | null {

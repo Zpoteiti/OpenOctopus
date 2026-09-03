@@ -795,6 +795,41 @@ class WorkspaceFS:
         temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
         return self._storage.begin_upload(temporary_object, length=size), temporary_object
 
+    async def begin_idempotent_upload(
+        self,
+        target: WorkspaceTarget,
+        relative_path: str,
+        *,
+        size: int,
+        quota_bytes: int,
+    ) -> ObjectUpload:
+        """Start a bounded upload that may reuse identical complete content."""
+        if size < 0:
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_INVALID_REQUEST,
+                "Transfer size must not be negative",
+            )
+        async with self._mutation_locks.hold(target):
+            self._ensure_active(target)
+            existing = await _stat_optional(
+                self._storage,
+                _object_key(target, relative_path),
+            )
+            if existing is None:
+                await self._ensure_destination_absent(target, relative_path)
+                await self._ensure_transfer_quota(
+                    target,
+                    size=size,
+                    quota_bytes=quota_bytes,
+                )
+            elif existing.size != size:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_FILE_CHANGED,
+                    "Workspace file already exists with different content",
+                )
+        temporary_object = f"_openoctopus-transfers/{secrets.token_hex(16)}"
+        return self._storage.begin_upload(temporary_object, length=size)
+
     async def transfer_server_to_server(
         self,
         source_target: WorkspaceTarget,
@@ -1239,6 +1274,7 @@ class WorkspaceFS:
         on_issued: Callable[[], None] | None = None,
         subtree_owner: Hashable | None = None,
         quota_reservation: DirectoryQuotaReservation | None = None,
+        reuse_if_same_etag: str | None = None,
     ) -> FileMetadata:
         """Atomically publish a completed RustFS upload under a mutation lock."""
         if size < 0:
@@ -1288,6 +1324,30 @@ class WorkspaceFS:
                     "Workspace path is a directory",
                 )
             if existing is not None:
+                reusable = (
+                    reuse_if_same_etag is not None
+                    and existing.size == size
+                    and (
+                        existing.etag == reuse_if_same_etag
+                        or await _uploaded_contents_match(
+                            self._storage,
+                            existing_object=object_name,
+                            temporary_object=temporary_object,
+                            expected_size=size,
+                        )
+                    )
+                )
+                if reusable:
+                    cleanup = asyncio.create_task(
+                        self._delete_transfer_temporary(temporary_object)
+                    )
+                    self._transfer_cleanup_tasks.add(cleanup)
+                    cleanup.add_done_callback(self._transfer_cleanup_tasks.discard)
+                    return FileMetadata(
+                        size=existing.size,
+                        etag=existing.etag,
+                        created=False,
+                    )
                 raise WorkspaceError(
                     ErrorCode.WORKSPACE_FILE_CHANGED,
                     "Workspace file already exists",
@@ -1861,6 +1921,49 @@ async def _stat_optional(
         if exc.code is ErrorCode.WORKSPACE_NOT_FOUND:
             return None
         raise
+
+
+async def _uploaded_contents_match(
+    storage: ObjectStorage,
+    *,
+    existing_object: str,
+    temporary_object: str,
+    expected_size: int,
+) -> bool:
+    temporary_digest = await _streamed_object_digest(
+        storage,
+        temporary_object,
+        expected_size=expected_size,
+    )
+    existing_digest = await _streamed_object_digest(
+        storage,
+        existing_object,
+        expected_size=expected_size,
+    )
+    return temporary_digest is not None and temporary_digest == existing_digest
+
+
+async def _streamed_object_digest(
+    storage: ObjectStorage,
+    object_name: str,
+    *,
+    expected_size: int,
+) -> bytes | None:
+    stream = await storage.open_stream(object_name)
+    digest = hashlib.sha256()
+    transferred = 0
+    try:
+        if stream.size != expected_size:
+            return None
+        while chunk := await stream.read():
+            transferred += len(chunk)
+            if transferred > expected_size:
+                return None
+            digest.update(chunk)
+        return digest.digest() if transferred == expected_size else None
+    finally:
+        cleanup = asyncio.create_task(stream.aclose())
+        await await_future_cancellation_safe(cleanup)
 
 
 def _join_relative_path(root: str, relative_path: str) -> str:

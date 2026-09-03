@@ -3,6 +3,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
@@ -16,6 +17,7 @@ from openctopus_server.chat.compaction import commit_stage_two, stage_two_source
 from openctopus_server.chat.context import project_message_rows
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Device, Message, Session, SystemConfig, User
+from openctopus_server.devices.workspace import FileSourceProbe
 from openctopus_server.dto.message import MessageResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
@@ -117,8 +119,34 @@ def test_message_response_rejects_incomplete_workspace_delivery_refs() -> None:
         )
 
 
-def test_message_response_accepts_device_delivery_ref_without_size() -> None:
+def test_message_response_rejects_device_delivery_ref_without_size() -> None:
     device_id = uuid4()
+    with pytest.raises(ValidationError):
+        MessageResponse(
+            id=uuid4(),
+            session_id=uuid4(),
+            role="assistant",
+            message_kind="assistant",
+            content=[],
+            attachment_refs=[],
+            delivery_refs=[
+                {
+                    "tool_use_id": "message-device",
+                    "type": "device_file",
+                    "device_id": str(device_id),
+                    "openoctopus_device": "laptop",
+                    "path": "reports/final.pdf",
+                    "filename": "final.pdf",
+                    "mime": "application/pdf",
+                    "online_only": True,
+                }
+            ],
+            is_compacted=False,
+            created_at=datetime.now(UTC),
+        )
+
+
+def test_message_response_accepts_device_delivery_ref_with_known_size() -> None:
     response = MessageResponse(
         id=uuid4(),
         session_id=uuid4(),
@@ -130,11 +158,12 @@ def test_message_response_accepts_device_delivery_ref_without_size() -> None:
             {
                 "tool_use_id": "message-device",
                 "type": "device_file",
-                "device_id": str(device_id),
+                "device_id": str(uuid4()),
                 "openoctopus_device": "laptop",
                 "path": "reports/final.pdf",
                 "filename": "final.pdf",
                 "mime": "application/pdf",
+                "size": 42,
                 "online_only": True,
             }
         ],
@@ -143,6 +172,7 @@ def test_message_response_accepts_device_delivery_ref_without_size() -> None:
     )
 
     assert response.delivery_refs[0].type == "device_file"
+    assert response.delivery_refs[0].size == 42
 
 
 def test_message_response_rejects_server_as_device_delivery_ref() -> None:
@@ -250,6 +280,7 @@ def _install_runtime(
     engine: AsyncEngine,
     provider: _ScriptedProvider,
     workspace_service: WorkspaceService,
+    device_registry: object | None = None,
 ) -> ChatRuntime:
     runtime = ChatRuntime(
         engine,
@@ -258,6 +289,7 @@ def _install_runtime(
             engine,
             workspace_service,
             Mock(spec=WorkspaceFS),
+            device_registry=device_registry,  # type: ignore[arg-type]
         ),
         workspace_service=workspace_service,
     )
@@ -367,6 +399,7 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
     user_client,
     test_app,
     pg_engine: AsyncEngine,
+    monkeypatch,
 ) -> None:
     await _configure_provider(pg_engine)
     user_id = await _user_id(pg_engine)
@@ -399,7 +432,34 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
         ]
     )
     workspace, workspace_fs = _workspace_service({})
-    runtime = _install_runtime(test_app, pg_engine, provider, workspace)
+    devices = SimpleNamespace(
+        transfers=SimpleNamespace(
+            idle_timeout_seconds=1.0,
+            acquire_operation=AsyncMock(
+                return_value=SimpleNamespace(aclose=AsyncMock())
+            ),
+        ),
+        get_route_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                handle=SimpleNamespace(device_id=device_id, generation=1),
+                config_epoch=1,
+                device_name="laptop",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "openctopus_server.tools.message._probe_device_file",
+        AsyncMock(
+            return_value=FileSourceProbe(size=42, fingerprint="source-v1")
+        ),
+    )
+    runtime = _install_runtime(
+        test_app,
+        pg_engine,
+        provider,
+        workspace,
+        device_registry=devices,
+    )
     session_id = uuid4()
     try:
         response = await _post(user_client, session_id)
@@ -429,6 +489,7 @@ async def test_device_message_ref_is_provider_hidden_and_does_not_open_workspace
                 "path": "reports/final.pdf",
                 "filename": "final.pdf",
                 "mime": "application/pdf",
+                "size": 42,
                 "online_only": True,
             }
         ]
@@ -600,6 +661,9 @@ async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
                 session_id=session_id,
                 message_kind="human",
                 content=[{"type": "text", "text": "send it"}],
+                sender_id=str(user_id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 delivery_refs=[],
                 is_compacted=False,
                 created_at=created_at,

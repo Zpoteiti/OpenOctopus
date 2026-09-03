@@ -710,6 +710,144 @@ describe('ChatPage', () => {
     expect(screen.queryByRole('textbox', { name: '消息' })).not.toBeInTheDocument()
   })
 
+  it('keeps Stop outside the narrow-screen optional controls for a running external session', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') {
+        return jsonResponse([{ ...baseSession, channel: 'discord', session_key: 'discord:1' }])
+      }
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/messages?limit=200')) {
+        return jsonResponse(history({ status: 'running', active_turn_id: 'turn-1' }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat(`/chat/${baseSession.id}`, 10_000)
+
+    expect(await screen.findByRole('button', { name: 'Stop' })).not.toHaveClass('chat-session-control-optional')
+    expect(screen.getByRole('button', { name: 'Refresh' })).toHaveClass('chat-session-control-optional')
+    expect(screen.getByRole('button', { name: 'Rename' })).toHaveClass('chat-session-control-optional')
+  })
+
+  it('shows external sender, folded group context, and partial delivery guidance without retry controls', async () => {
+    await i18n.changeLanguage('en')
+    const externalSession = {
+      ...baseSession,
+      channel: 'discord',
+      session_key: 'discord:guild-thread-1',
+      chat_id: 'guild-thread-1',
+      title: 'Project room',
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([externalSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        return jsonResponse(history({
+          messages: [
+            {
+              id: 'human-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
+              content: [{ type: 'text', text: 'Please summarize this.' }], delivery_refs: [],
+              sender: { id: 'external-user-7', display_name: 'Alice', classification: 'allowed_non_owner' },
+              source_message_id: 'discord-message-1',
+              channel_context: {
+                entries: [
+                  {
+                    source_message_id: 'context-1', sender_id: 'user-8', sender_display_name: 'Bob',
+                    sent_at: '2026-08-26T09:59:00Z', text: 'First background message', attachment_summaries: [],
+                  },
+                  {
+                    source_message_id: 'context-2', sender_id: 'user-9', sender_display_name: null,
+                    sent_at: '2026-08-26T09:59:30Z', text: 'Second background message', attachment_summaries: ['image.png'],
+                  },
+                ],
+                included_count: 2,
+                omitted_count: 1,
+              },
+              deliveries: [], is_compacted: false, created_at: '2026-08-26T10:00:01Z',
+            },
+            {
+              id: 'assistant-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+              content: [{ type: 'text', text: 'Here is the summary.' }], attachment_refs: [], delivery_refs: [],
+              sender: null, source_message_id: null, channel_context: null,
+              deliveries: [
+                {
+                  channel: 'discord', chat_id: 'guild-thread-1', origin: 'message_tool', status: 'sent',
+                  total_actions: 1, visible_sent_actions: 1, error_code: null,
+                  error_message: null, created_at: '2026-08-26T10:00:01Z',
+                },
+                {
+                  channel: 'discord', chat_id: 'guild-thread-1', origin: 'final', status: 'partial',
+                  total_actions: 2, visible_sent_actions: 1, error_code: 'CHANNEL_DELIVERY_UNKNOWN',
+                  error_message: null, created_at: '2026-08-26T10:00:02Z',
+                },
+                {
+                  channel: 'discord', chat_id: 'guild-thread-1', origin: 'policy_notice', status: 'failed',
+                  total_actions: 1, visible_sent_actions: 0, error_code: 'CHANNEL_DELIVERY_FAILED',
+                  error_message: null, created_at: '2026-08-26T10:00:03Z',
+                },
+                {
+                  channel: 'discord', chat_id: 'guild-thread-1', origin: 'pairing_confirmation', status: 'unknown',
+                  total_actions: 1, visible_sent_actions: 0, error_code: 'CHANNEL_DELIVERY_UNKNOWN',
+                  error_message: null, created_at: '2026-08-26T10:00:04Z',
+                },
+              ],
+              is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+            },
+          ],
+          last_message_id: 'assistant-1',
+        }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const actor = userEvent.setup()
+
+    renderChat(`/chat/${baseSession.id}`)
+
+    expect(await screen.findByText('Alice')).toBeInTheDocument()
+    expect(screen.getByText('Allowed user')).toBeInTheDocument()
+    expect(screen.getByText('external-user-7')).toBeInTheDocument()
+    const context = screen.getByRole('group', { name: '2 earlier group messages were used as context' })
+    expect(context).not.toHaveAttribute('open')
+    await actor.click(within(context).getByText('2 earlier group messages were used as context'))
+    expect(within(context).getByText('Untrusted background from the channel')).toBeInTheDocument()
+    expect(within(context).getByText('First background message')).toBeInTheDocument()
+    expect(screen.getByText('Sent')).toBeInTheDocument()
+    expect(screen.getByText('Partial')).toBeInTheDocument()
+    expect(screen.getByText('Failed')).toBeInTheDocument()
+    expect(screen.getByText('Unknown')).toBeInTheDocument()
+    expect(screen.getAllByText('Send a new message in Discord to try again.')).toHaveLength(3)
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+  })
+
+  it('shows channel context when every available entry was omitted', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        return jsonResponse(history({
+          messages: [{
+            id: 'human-omitted-context', session_id: baseSession.id, role: 'user', message_kind: 'human',
+            content: [{ type: 'text', text: 'Use the available channel context.' }], delivery_refs: [],
+            channel_context: { entries: [], included_count: 0, omitted_count: 2 },
+            is_compacted: false, created_at: '2026-08-26T10:00:01Z',
+          }],
+          last_message_id: 'human-omitted-context',
+        }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    renderChat(`/chat/${baseSession.id}`)
+
+    expect(await screen.findByText('2 older messages were omitted.')).toBeInTheDocument()
+  })
+
   it('loads later session pages before deciding a deep-linked conversation is unavailable', async () => {
     const firstPage = Array.from({ length: 200 }, (_, index) => ({
       ...baseSession,
@@ -926,12 +1064,24 @@ describe('ChatPage', () => {
 
   it('polls persisted history with an after cursor while a turn is running', async () => {
     let historyCalls = 0
+    let fullReads = 0
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
       if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
       if (url === '/api/devices') return jsonResponse([])
       if (url.endsWith('/messages?limit=200')) {
         historyCalls += 1
+        fullReads += 1
+        if (fullReads > 1) {
+          return jsonResponse(history({
+            messages: [{
+              id: 'message-2', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+              content: [{ type: 'text', text: 'finished' }], delivery_refs: [], is_compacted: false,
+              created_at: '2026-08-26T10:00:02Z',
+            }],
+            last_message_id: 'message-2',
+          }))
+        }
         return jsonResponse(history({
           messages: [{
             id: 'message-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
@@ -960,11 +1110,92 @@ describe('ChatPage', () => {
 
     expect(await screen.findByText('first')).toBeInTheDocument()
     expect(await screen.findByText('finished')).toBeInTheDocument()
-    expect(historyCalls).toBe(2)
+    await waitFor(() => expect(historyCalls).toBe(3))
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/sessions/${baseSession.id}/messages?after=message-1&limit=200`,
       expect.anything(),
     )
+  })
+
+  it('reloads the full terminal snapshot to converge delivery state on the same assistant message', async () => {
+    await i18n.changeLanguage('en')
+    let fullReads = 0
+    let incrementalReads = 0
+    const assistant = (status: 'prepared' | 'sent') => ({
+      id: 'assistant-delivery', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+      content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [],
+      deliveries: [{
+        channel: 'discord', chat_id: 'dm-1', origin: 'final', status,
+        total_actions: 1, visible_sent_actions: status === 'sent' ? 1 : 0,
+        error_code: null, error_message: null, created_at: '2026-08-26T10:00:02Z',
+      }],
+      is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+    })
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        fullReads += 1
+        return jsonResponse(history({
+          messages: [assistant(fullReads === 1 ? 'prepared' : 'sent')],
+          status: fullReads === 1 ? 'running' : 'idle',
+          active_turn_id: fullReads === 1 ? 'turn-1' : null,
+          last_message_id: 'assistant-delivery',
+        }))
+      }
+      if (url.includes('/messages?after=assistant-delivery')) {
+        incrementalReads += 1
+        return jsonResponse(history({ last_message_id: 'assistant-delivery' }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderChat(`/chat/${baseSession.id}`, 1)
+
+    expect(await screen.findByText('Sent')).toBeInTheDocument()
+    expect(screen.queryByText('Prepared')).not.toBeInTheDocument()
+    expect(fullReads).toBe(2)
+    expect(incrementalReads).toBe(1)
+    expect(screen.getAllByText('Canonical answer')).toHaveLength(1)
+  })
+
+  it('starts manual Refresh from a null history cursor', async () => {
+    await i18n.changeLanguage('en')
+    let fullReads = 0
+    let incrementalReads = 0
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/messages?limit=200')) {
+        fullReads += 1
+        return jsonResponse(history({
+          messages: [{
+            id: 'assistant-refresh', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+            content: [{ type: 'text', text: fullReads === 1 ? 'Before refresh' : 'After refresh' }],
+            delivery_refs: [], is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+          }],
+          last_message_id: 'assistant-refresh',
+        }))
+      }
+      if (url.includes('/messages?after=assistant-refresh')) {
+        incrementalReads += 1
+        return jsonResponse(history({ last_message_id: 'assistant-refresh' }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    renderChat(`/chat/${baseSession.id}`)
+    expect(await screen.findByText('Before refresh')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+
+    expect(await screen.findByText('After refresh')).toBeInTheDocument()
+    expect(fullReads).toBe(2)
+    expect(incrementalReads).toBe(0)
   })
 
   it('keeps recovering while durable pending messages are waiting between turns', async () => {

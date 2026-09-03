@@ -192,6 +192,15 @@ def _message(
     text: str,
     created_at: datetime,
 ) -> Message:
+    authority = (
+        {
+            "sender_id": str(session_id),
+            "sender_classification": "owner",
+            "ingress_tool_profile": "owner_full",
+        }
+        if kind == "human"
+        else {}
+    )
     return Message(
         id=uuid4(),
         session_id=session_id,
@@ -201,6 +210,7 @@ def _message(
         llm_fingerprint=None,
         is_compacted=False,
         created_at=created_at,
+        **authority,
     )
 
 

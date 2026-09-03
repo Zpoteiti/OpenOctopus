@@ -59,6 +59,13 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page).toHaveURL(/\/chat$/)
 
+  await page.getByRole('link', { name: 'Channels' }).click()
+  await expect(page).toHaveURL(/\/channels$/)
+  await expect(page.getByRole('heading', { name: 'Channels' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Discord' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'DingTalk' })).toBeVisible()
+  await expectSinglePaneToFillWorkspace(page)
+
   await page.getByRole('link', { name: 'Admin settings' }).click()
   await expect(page.getByRole('heading', { name: 'System configuration' })).toBeVisible()
   await expectSinglePaneToFillWorkspace(page)

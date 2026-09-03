@@ -27,6 +27,15 @@ def _message(
     created_at: datetime,
     compacted: bool = False,
 ) -> Message:
+    authority = (
+        {
+            "sender_id": str(session_id),
+            "sender_classification": "owner",
+            "ingress_tool_profile": "owner_full",
+        }
+        if kind == "human"
+        else {}
+    )
     return Message(
         id=uuid4(),
         session_id=session_id,
@@ -36,6 +45,7 @@ def _message(
         llm_fingerprint=None,
         is_compacted=compacted,
         created_at=created_at,
+        **authority,
     )
 
 
@@ -249,6 +259,9 @@ async def test_stage_one_commit_promotes_only_the_captured_pending_prefix(pg_eng
             user_id=user.id,
             session_key=session.session_key,
             content=[{"type": "text", "text": "first pending"}],
+            sender_id=str(user.id),
+            sender_classification="owner",
+            ingress_tool_profile="owner_full",
             received_at=now + timedelta(seconds=1),
         )
         later_pending = PendingMessage(
@@ -257,6 +270,9 @@ async def test_stage_one_commit_promotes_only_the_captured_pending_prefix(pg_eng
             user_id=user.id,
             session_key=session.session_key,
             content=[{"type": "text", "text": "later pending"}],
+            sender_id=str(user.id),
+            sender_classification="owner",
+            ingress_tool_profile="owner_full",
             effort="high",
             received_at=now + timedelta(seconds=2),
         )
@@ -324,6 +340,9 @@ async def test_stage_one_commit_rejects_a_stale_active_snapshot(pg_engine) -> No
             user_id=user.id,
             session_key=session.session_key,
             content=[{"type": "text", "text": "pending"}],
+            sender_id=str(user.id),
+            sender_classification="owner",
+            ingress_tool_profile="owner_full",
             received_at=now + timedelta(seconds=1),
         )
         db.add_all([source, added_after_selection, pending])
@@ -429,6 +448,9 @@ async def test_stage_two_commit_defers_to_a_pending_user_boundary(pg_engine) -> 
             user_id=user.id,
             session_key=session.session_key,
             content=[{"type": "text", "text": "new boundary"}],
+            sender_id=str(user.id),
+            sender_classification="owner",
+            ingress_tool_profile="owner_full",
             received_at=now + timedelta(seconds=1),
         )
         db.add_all([human, assistant, pending])

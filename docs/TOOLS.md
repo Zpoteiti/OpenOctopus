@@ -2,12 +2,15 @@
 
 Authoritative spec for every tool surface available to the agent. Pairs with [DECISIONS.md](DECISIONS.md) (ADRs 038–048, 071, 075–088, 131, 134). When the implementation drifts from this doc, fix one or the other.
 
-**Py9 milestone:** the fixed surface is the eleven shared tools plus
+**Py10 milestone:** owner Turns retain the fixed eleven shared tools plus
 server-side `message` and `cron`, server-orchestrated `file_transfer`, and the
 three client-only shell tools (`exec`, `write_stdin`, `list_exec_sessions`). `file_transfer` automatically
 handles one regular file or one recursive directory between any two install
 sites owned by the same user, including two distinct online Clients. Device
 and admin shared-service Server MCP add dynamic tools from four surfaces.
+Exact-ID allow-listed channel non-owners receive only the restricted text
+`message` projection; dispatch enforces the same persisted Turn profile before
+any tool-side I/O.
 
 This is a *design* document. Use it during implementation as the source of truth for tool args, result shapes, and behaviors.
 
@@ -73,7 +76,7 @@ This is a *design* document. Use it during implementation as the source of truth
 | `grep` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Search file contents |
 | `notebook_edit` | shared | `openctopus_server/tools/workspace_files.py` | `openctopus_server/tools/workspace_backend.py` + `openoctopus_client/tools/dispatcher.py` | Edit Jupyter notebook cells |
 | `web_fetch` | shared | `openctopus_server/tools/web_fetch.py` | `openctopus_server/tools/web_fetch.py` + `openoctopus_client/tools/dispatcher.py` | HTTP fetch — Server admin denylist and independent per-Device Client denylist |
-| `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` | Deliver text/media/buttons to a channel chat |
+| `message` | server-only | `openctopus_server/tools/message.py` | `openctopus_server/tools/message.py` + `channels/` Router/adapters | Deliver text or owner-authorized media to an allowed current/paired target |
 | `file_transfer` | server-orchestrated | `openctopus_server/tools/file_transfer.py` | `openctopus_server/tools/file_transfer.py` + `directory_transfer.py`/site backends + `openoctopus_client/transfer.py` | Copy or move one regular file or recursive directory between any two same-owner install sites |
 | `cron` | server-only | `openctopus_server/tools/cron.py` | `openctopus_server/tools/cron.py` + `openctopus_server/services/cron.py` | Add, list, or remove scheduled Agent jobs |
 | `exec` | client-only | `openctopus_server/tools/registry.py` | `openoctopus_client/tools/exec.py` | Execute a shell command using pipe by default or PTY/ConPTY with `tty=true` |
@@ -847,34 +850,31 @@ client-only shell tools and persistent-catalog Device MCP entries.
 
 **Lives in:** `openctopus_server/tools/message.py`
 
-**Availability:** Registered for the current web session. The current
-provider-visible schema exposes `content`, optional `media`, and the intrinsic
-`openoctopus_device` field. `content` must contain non-whitespace text and is
-capped at 16,000 characters; `media` accepts at most ten unique paths. Py6
-records media references without opening device files at send time; unknown
-MIME types use `application/octet-stream`.
+**Availability:** The registry projects one of two schemas from the persisted
+Turn profile. `owner_full` receives the complete schema below. An exact-ID
+allow-listed non-owner receives only `message_only`; every other built-in and
+MCP tool is absent. Dispatch checks the same profile again before target
+resolution, Workspace/Client access, or platform I/O.
 
-**Purpose:** Deliver text and optional workspace-file references to the current
-web session. Py6 does not expose channel, chat, or button arguments.
-
-**Source schema:**
+**Owner source schema:**
 ```json
 {
   "name": "message",
-  "description": "Send a message to the user, optionally with file attachments. This is the ONLY way to deliver files (images, documents, audio, video) to the user. Use the 'media' parameter with file paths to attach files. Do NOT use read_file to send files — that only reads content for your own analysis.",
+  "description": "Deliver a message, optionally with workspace files, to the current or an explicitly selected conversation.",
   "input_schema": {
     "type": "object",
     "properties": {
       "content": {
         "type": "string",
-        "description": "Message text for the current web session.",
         "minLength": 1,
         "maxLength": 16000
       },
+      "channel": { "type": "string", "enum": ["discord", "dingtalk"] },
+      "chat_id": { "type": "string", "minLength": 1, "maxLength": 512 },
       "openoctopus_device": {
         "type": "string",
         "enum": ["server"],
-        "description": "Install site where the media paths live. Defaults to server.",
+        "default": "server",
         "x-openoctopus-device": true
       },
       "media": {
@@ -891,39 +891,81 @@ web session. Py6 does not expose channel, chat, or button arguments.
 }
 ```
 
-**Merge-time injection:** `openoctopus_device.enum` is extended with paired device names. Source stays as `["server"]`. Detection via `x-openoctopus-device: true` marker (ADR-071). Paired-but-offline targets remain visible and return `tool_device_unreachable` at dispatch.
+**Restricted `message_only` schema:**
+```json
+{
+  "name": "message",
+  "description": "Deliver plain text to the current external conversation or the owner's paired direct message. Ask the owner to return to the source channel and mention the Bot to continue.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "content": { "type": "string", "minLength": 1, "maxLength": 16000 },
+      "channel": { "type": "string", "enum": ["discord", "dingtalk"] },
+      "chat_id": { "type": "string", "minLength": 1, "maxLength": 512 }
+    },
+    "required": ["content"],
+    "additionalProperties": false
+  }
+}
+```
+
+`channel` and `chat_id` must be supplied together. For `owner_full`, omitting
+both means the current Web, Discord, or DingTalk conversation; an explicit
+external target must have a configured, paired Bot. For `message_only`,
+omitting both requires the current Discord/DingTalk conversation, while an
+explicit pair may identify only that channel's currently paired owner DM.
+Media, device selection, Web targets, and arbitrary chats are impossible in the
+restricted schema and rejected at dispatch if forged. There is no
+agent-to-agent target.
+
+**Merge-time injection:** Only the owner schema's
+`openoctopus_device.enum` is extended with paired device names. The source stays
+`["server"]`; paired-but-offline targets remain visible and fail explicitly at
+dispatch.
 
 **Mechanism:**
-- The tool only accepts the current authenticated web session. It validates
-  `content`, caps media at ten unique paths, and rejects unknown fields.
+- `content` must contain visible text and is capped at 16,000 characters. Owner
+  media accepts at most ten unique paths; non-owner media is never resolved.
 - For `openoctopus_device="server"`, `WorkspaceService` authorizes and stats
-  each file without reading it, then records a durable workspace reference in
-  `delivery_refs`.
-- For a paired device, the tool verifies that the name is paired but does not
-  open or stage bytes. It records an online-only `device_file` reference with
-  the immutable device ID, captured device name, path, filename, and MIME hint.
-  The ID and the whole sidecar remain Provider-hidden. The frontend later
-  downloads it through the Workspace Files HTTP relay, which requires the ID to
-  still belong to the user and its current name to equal the captured name.
-  Device rename, deletion, and later reuse of the same name therefore fail
-  closed instead of redirecting an old ref. A click can also fail with
-  `tool_device_unreachable`, `workspace_not_found`, or a path-policy error.
+  each file and creates a durable workspace reference. Current-Web delivery
+  stores that reference in the provider-hidden `delivery_refs` sidecar.
+- For a paired device, the tool first captures the current generation-fenced
+  route and runs the existing metadata-only source probe under transfer
+  admission. A regular-file probe stats the source without reading or staging
+  its bytes, then freezes its byte length and opaque stat fingerprint together
+  with the immutable device ID, captured name, path, filename, and MIME hint.
+  An unknown size fails with `tool_channel_media_size_unknown`; a directory is
+  not valid media. The fingerprint remains internal: it is neither persisted in
+  `delivery_refs` nor exposed through the API. For Web, the persisted online-only
+  ref includes the frozen size and the frontend later downloads through the
+  Workspace Files HTTP relay. For an external channel, the Router opens a
+  bounded Client byte relay only after target/media preflight; Device Protocol
+  `BEGIN` must repeat the frozen size and fingerprint before bytes stream into
+  the platform upload. Neither path creates a RustFS copy.
+- Direct external final replies and external `message` calls share one Router.
+  The complete reply is persisted first, then Discord splits text at 2,000
+  characters and DingTalk splits Markdown at 20,000 UTF-8 bytes. A plan has at
+  most 32 ordered text/upload/file actions.
+- Before each platform request, the Router rechecks the current binding and
+  durably commits the action as `attempting`. Actions execute once and in
+  order. The first definitive `failed` or post-issue `unknown` outcome skips
+  the remaining tail. There is no automatic retry: restart closes incomplete
+  records without replay, the same Turn cannot issue again to that target, and
+  a new inbound user Turn is required to try again.
 - The provider-visible transcript remains the assistant message containing the
   `message` tool use plus its matching persisted `tool_result`, which records
-  delivery success/failure. The agent supplies workspace paths, never
-  `delivery_refs`. For current-web delivery, the Py6 helper generates refs,
-  links them to the matching `tool_use_id`, and appends them to the existing
-  assistant row containing that tool use. Server-workspace refs also retain the
-  immutable workspace ID and workspace-relative path so a future frontend can
-  recover from a shared-workspace rename. The helper commits this sidecar update
-  with the matching tool result and does not insert another provider-visible
-  assistant row. Provider replay ignores `delivery_refs`.
+  delivery status and durable delivery ID. No second provider-visible assistant
+  row is inserted.
 
-**Timeout:** 30s internal.
+**Timeout:** 120 seconds for target/media resolution and the logical external
+delivery; each platform action has a 30-second deadline.
 **Result cap:** 16,000 characters.
 **Errors:** `tool_channel_not_configured`, `workspace_not_found`,
-`tool_device_unreachable`, `tool_invalid_args`, and path/policy errors.
-**Related ADRs:** 015 (durable output vs transient progress), 020 (routing + defaults), 044 (workspace as media source), 090 (channel configs), 095 (result wrap), 124 (web refs vs platform-native uploads).
+`tool_device_unreachable`, `tool_device_busy`,
+`tool_channel_media_size_unknown`, `tool_is_directory`, `tool_invalid_args`, `tool_not_allowed`,
+`tool_delivery_failed`, `tool_channel_retry_requires_new_turn`,
+`tool_execution_outcome_unknown`, `tool_exec_timeout`, and path/policy errors.
+**Related ADRs:** 015, 020, 044, 090, 095, 124, 136.
 
 ---
 

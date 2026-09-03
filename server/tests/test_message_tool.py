@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock, call
 from uuid import UUID, uuid4
 
@@ -8,16 +11,24 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import Device, Session, User, Workspace, WorkspaceMember
+from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
+from openctopus_server.devices.workspace import (
+    DirectoryCommandResult,
+    FileSourceProbe,
+    SourceDirectoryJobStatus,
+)
+from openctopus_server.directory_contract import canonical_json_bytes
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.tools.base import (
     DeviceFileDeliveryRef,
     MessageDeliveryEffect,
     ToolContext,
+    ToolResult,
     WorkspaceFileDeliveryRef,
 )
 from openctopus_server.tools.device_field import DEVICE_FIELD_MARKER
-from openctopus_server.tools.message import MessageTool
+from openctopus_server.tools.message import MessageTool, ResolvedMessageTarget
 from openctopus_server.tools.registry import ToolRegistry
 from openctopus_server.workspace.fs import FileMetadata, WorkspaceFS, WorkspaceTarget
 from openctopus_server.workspace.service import AuthorizedWorkspaceFile, WorkspaceService
@@ -25,6 +36,87 @@ from openctopus_server.workspace.service import AuthorizedWorkspaceFile, Workspa
 
 def _ctx() -> ToolContext:
     return ToolContext(user_id=uuid4(), session_id=uuid4())
+
+
+class _DeviceProbeRegistry:
+    def __init__(self, *, device_id: UUID, size: int | None, fingerprint: str) -> None:
+        self.route = DeviceRouteSnapshot(
+            handle=ConnectionHandle(device_id=device_id, generation=7),
+            config_epoch=3,
+            device_name="laptop",
+        )
+        self.lease = SimpleNamespace(aclose=AsyncMock())
+        self.transfers = SimpleNamespace(
+            idle_timeout_seconds=1.0,
+            acquire_operation=AsyncMock(return_value=self.lease),
+        )
+        self._size = size
+        self._fingerprint = fingerprint
+        self.operations: list[str] = []
+
+    async def get_route_snapshot(self, device_id: UUID, **kwargs):
+        assert device_id == self.route.handle.device_id
+        assert kwargs["expected_device_name"] == "laptop"
+        return self.route
+
+    async def dispatch_tool_on_snapshot(self, **kwargs):
+        assert kwargs["route"] is self.route
+        action = kwargs["args"]
+        operation = action["operation"]
+        self.operations.append(operation)
+        if operation == "transfer_source_probe_start":
+            digest = hashlib.sha256(
+                canonical_json_bytes(
+                    {"role": "source", "path": action["path"], "version": 1}
+                )
+            ).hexdigest()
+            payload = DirectoryCommandResult(state="running", expected_digest=digest)
+        elif operation == "transfer_source_probe_status":
+            if self._size is None:
+                return SimpleNamespace(
+                    is_error=False,
+                    content=json.dumps(
+                        {
+                            "state": "succeeded",
+                            "expected_digest": action["expected_digest"],
+                            "progress_seq": 1,
+                            "entries_processed": 1,
+                            "files_processed": 1,
+                            "bytes_processed": 0,
+                            "probe": {
+                                "kind": "file",
+                                "fingerprint": self._fingerprint,
+                            },
+                        }
+                    ),
+                )
+            payload = SourceDirectoryJobStatus(
+                state="succeeded",
+                expected_digest=action["expected_digest"],
+                progress_seq=1,
+                entries_processed=1,
+                files_processed=1,
+                bytes_processed=self._size,
+                probe=FileSourceProbe(
+                    size=self._size,
+                    fingerprint=self._fingerprint,
+                ),
+            )
+        elif operation in {
+            "transfer_source_probe_cancel",
+            "transfer_source_probe_release",
+        }:
+            payload = DirectoryCommandResult(
+                state=(
+                    "accepted"
+                    if operation == "transfer_source_probe_cancel"
+                    else "released"
+                ),
+                expected_digest=action["expected_digest"],
+            )
+        else:
+            raise AssertionError(f"unexpected operation: {operation}")
+        return SimpleNamespace(is_error=False, content=payload.model_dump_json())
 
 
 async def _web_ctx(
@@ -59,7 +151,7 @@ async def _web_ctx(
     return ToolContext(user_id=owner_id, session_id=session_id)
 
 
-def test_message_schema_is_restricted_to_current_web_server_delivery(pg_engine) -> None:
+def test_owner_message_schema_supports_current_or_explicit_delivery(pg_engine) -> None:
     tool = MessageTool(pg_engine, AsyncMock(spec=WorkspaceService))
 
     schema = ToolRegistry((tool,)).get_tool_schemas()[0]
@@ -70,9 +162,18 @@ def test_message_schema_is_restricted_to_current_web_server_delivery(pg_engine) 
         "properties": {
             "content": {
                 "type": "string",
-                "description": "Message text to deliver to the current web session.",
+                "description": "Message text to deliver.",
                 "minLength": 1,
                 "maxLength": 16_000,
+            },
+            "channel": {
+                "type": "string",
+                "enum": ["discord", "dingtalk"],
+            },
+            "chat_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
             },
             "openoctopus_device": {
                 "type": "string",
@@ -186,7 +287,7 @@ async def test_message_builds_trusted_refs_without_reading_media(pg_engine) -> N
     ]
 
 
-async def test_message_builds_device_refs_without_opening_the_device(pg_engine) -> None:
+async def test_message_preflights_device_refs_without_reading_file_bytes(pg_engine) -> None:
     service = AsyncMock(spec=WorkspaceService)
     ctx = await _web_ctx(pg_engine)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
@@ -202,7 +303,20 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
         db.add(device)
         await db.commit()
         device_id = device.id
-    registry = ToolRegistry((MessageTool(pg_engine, service),))
+    devices = _DeviceProbeRegistry(
+        device_id=device_id,
+        size=42,
+        fingerprint="source-v1",
+    )
+    registry = ToolRegistry(
+        (
+            MessageTool(
+                pg_engine,
+                service,
+                device_registry=devices,  # type: ignore[arg-type]
+            ),
+        )
+    )
 
     result = await registry.execute(
         name="message",
@@ -222,10 +336,64 @@ async def test_message_builds_device_refs_without_opening_the_device(pg_engine) 
                 openoctopus_device="laptop",
                 filename="final.pdf",
                 mime="application/pdf",
+                size=42,
+                fingerprint="source-v1",
             ),
         )
     )
+    assert devices.operations == [
+        "transfer_source_probe_start",
+        "transfer_source_probe_status",
+        "transfer_source_probe_release",
+    ]
+    devices.lease.aclose.assert_awaited_once()
     service.resolve_delivery_file.assert_not_awaited()
+
+
+async def test_message_rejects_device_media_when_preflight_size_is_unknown(
+    pg_engine,
+) -> None:
+    service = AsyncMock(spec=WorkspaceService)
+    ctx = await _web_ctx(pg_engine)
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        device = Device(
+            user_id=ctx.user_id,
+            name="laptop",
+            token_hash=b"x" * 32,
+            token_hint="openoctopus_dev_...token",
+        )
+        db.add(device)
+        await db.commit()
+        device_id = device.id
+    devices = _DeviceProbeRegistry(
+        device_id=device_id,
+        size=None,
+        fingerprint="source-v1",
+    )
+    registry = ToolRegistry(
+        (
+            MessageTool(
+                pg_engine,
+                service,
+                device_registry=devices,  # type: ignore[arg-type]
+            ),
+        )
+    )
+
+    result = await registry.execute(
+        name="message",
+        args={
+            "content": "File attached.",
+            "openoctopus_device": "laptop",
+            "media": ["reports/final.pdf"],
+        },
+        ctx=ctx,
+    )
+
+    assert result.is_error is True
+    assert result.code is ErrorCode.TOOL_CHANNEL_MEDIA_SIZE_UNKNOWN
+    assert result.side_effect is None
+    assert "transfer_source_probe_release" in devices.operations
 
 
 async def test_message_rejects_a_reused_device_name_from_provider_turn_snapshot(
@@ -372,6 +540,57 @@ async def test_message_timeout_has_no_delivery_side_effect(pg_engine, monkeypatc
     assert result.is_error is True
     assert result.code is ErrorCode.TOOL_EXEC_TIMEOUT
     assert result.side_effect is None
+
+
+async def test_external_delivery_owns_its_logical_deadline(
+    pg_engine,
+    monkeypatch,
+) -> None:
+    timeout_active = False
+
+    @asynccontextmanager
+    async def tracked_timeout(_seconds: float):
+        nonlocal timeout_active
+        assert timeout_active is False
+        timeout_active = True
+        try:
+            yield
+        finally:
+            timeout_active = False
+
+    class _TargetResolver:
+        async def resolve_message_target(self, **_kwargs):
+            assert timeout_active is True
+            return ResolvedMessageTarget(
+                channel="discord",
+                chat_id="group-1",
+                binding_generation=uuid4(),
+            )
+
+    class _DeliveryRouter:
+        async def deliver_message(self, **_kwargs):
+            assert timeout_active is False
+            return ToolResult(content="router terminal result")
+
+    monkeypatch.setattr("openctopus_server.tools.message.asyncio.timeout", tracked_timeout)
+    tool = MessageTool(
+        pg_engine,
+        AsyncMock(spec=WorkspaceService),
+        target_resolver=_TargetResolver(),  # type: ignore[arg-type]
+        delivery_router=_DeliveryRouter(),  # type: ignore[arg-type]
+    )
+    ctx = ToolContext(
+        user_id=uuid4(),
+        session_id=uuid4(),
+        tool_profile="message_only",
+        current_channel="discord",
+        current_chat_id="group-1",
+        current_binding_generation=uuid4(),
+    )
+
+    result = await tool.execute({"content": "hello"}, ctx)
+
+    assert result.content == "router terminal result"
 
 
 async def test_message_rejects_contexts_outside_the_current_web_session(pg_engine) -> None:

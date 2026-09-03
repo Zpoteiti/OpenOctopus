@@ -8,11 +8,6 @@ from yaml.nodes import MappingNode, Node, ScalarNode
 from openctopus_server.main import create_app
 
 _HTTP_METHODS = {"delete", "get", "head", "options", "patch", "post", "put", "trace"}
-_DEFERRED_OPERATIONS = {
-    ("/api/channels", "get"),
-    ("/api/channels/{channel}", "delete"),
-    ("/api/channels/{channel}", "patch"),
-}
 
 
 def _static_openapi() -> dict[str, Any]:
@@ -49,11 +44,11 @@ def _operations(document: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
-def test_static_api_inventory_matches_runtime_except_deferred_routes() -> None:
+def test_static_api_inventory_matches_runtime() -> None:
     static = _static_openapi()
     runtime = create_app().openapi()
 
-    assert _operations(static) - _DEFERRED_OPERATIONS == _operations(runtime)
+    assert _operations(static) == _operations(runtime)
 
 
 def test_static_validation_statuses_match_runtime() -> None:
@@ -74,6 +69,119 @@ def test_static_validation_statuses_match_runtime() -> None:
             if str(status) in {"400", "422"}
         }
         assert static_statuses == runtime_statuses, f"{method.upper()} {path}"
+
+
+def test_static_channels_contract_matches_runtime() -> None:
+    static = _static_openapi()
+    runtime = create_app().openapi()
+
+    assert set(static["paths"]["/api/channels/{channel}"]) & _HTTP_METHODS == {
+        "patch",
+        "delete",
+    }
+    assert set(
+        static["paths"]["/api/channels/{channel}/pairing"]
+    ) & _HTTP_METHODS == {"post"}
+    for path, method in (
+        ("/api/channels", "get"),
+        ("/api/channels/{channel}", "patch"),
+        ("/api/channels/{channel}", "delete"),
+        ("/api/channels/{channel}/pairing", "post"),
+    ):
+        assert set(static["paths"][path][method]["responses"]) == set(
+            runtime["paths"][path][method]["responses"]
+        )
+
+    static_schemas = static["components"]["schemas"]
+    runtime_schemas = runtime["components"]["schemas"]
+    assert static_schemas["ExternalChannel"]["enum"] == runtime_schemas[
+        "ExternalChannel"
+    ]["enum"]
+    assert static_schemas["ChannelState"]["enum"] == runtime_schemas[
+        "ChannelState"
+    ]["enum"]
+    assert set(static_schemas["ChannelConfigPatchRequest"]["properties"]) == {
+        "bot_token",
+        "client_id",
+        "client_secret",
+        "allow_list",
+    }
+    assert all(
+        static_schemas["ChannelConfigPatchRequest"]["properties"][name][
+            "writeOnly"
+        ]
+        for name in ("bot_token", "client_id", "client_secret")
+    )
+    response = static_schemas["ChannelConfigResponse"]
+    assert set(response["required"]) == set(response["properties"])
+    assert not {
+        "bot_token",
+        "client_id",
+        "client_secret",
+    } & set(response["properties"])
+    assert set(static_schemas["ChannelOwnerResponse"]["properties"]) == {
+        "id",
+        "dm_chat_id",
+    }
+    assert set(static_schemas["ChannelOwnerResponse"]["required"]) == {
+        "id",
+        "dm_chat_id",
+    }
+    assert set(static_schemas["ChannelOwnerResponse"]["properties"]) == set(
+        runtime_schemas["ChannelOwnerResponse"]["properties"]
+    )
+
+
+def test_static_message_schemas_expose_channel_sidecars() -> None:
+    schemas = _static_openapi()["components"]["schemas"]
+    runtime_schemas = create_app().openapi()["components"]["schemas"]
+    message = schemas["Message"]
+    pending = schemas["PendingMessage"]
+
+    assert {
+        "sender",
+        "source_message_id",
+        "channel_context",
+        "deliveries",
+    } <= set(message["properties"])
+    assert {"sender", "source_message_id", "channel_context"} <= set(
+        pending["properties"]
+    )
+    assert "sender" in pending["required"]
+    assert message["properties"]["deliveries"]["items"]["$ref"].endswith(
+        "/ChannelDeliveryResponse"
+    )
+    assert set(schemas["ChannelDeliveryResponse"]["properties"]["status"]["enum"]) == {
+        "prepared",
+        "attempting",
+        "sent",
+        "partial",
+        "failed",
+        "unknown",
+    }
+    for name in (
+        "MessageSenderResponse",
+        "ChannelContextEntryResponse",
+        "ChannelContextResponse",
+        "ChannelDeliveryResponse",
+    ):
+        assert set(schemas[name]["properties"]) == set(
+            runtime_schemas[name]["properties"]
+        )
+
+
+def test_device_delivery_ref_requires_preflight_frozen_size() -> None:
+    schemas = _static_openapi()["components"]["schemas"]
+    runtime_schemas = create_app().openapi()["components"]["schemas"]
+    device_ref = schemas["MessageDeliveryRef"]["oneOf"][1]
+
+    assert "size" in device_ref["required"]
+    assert "preflight" in device_ref["properties"]["size"]["description"]
+    assert "fingerprint" not in device_ref["properties"]
+    assert "size" in runtime_schemas["DeviceFileDeliveryRefResponse"]["required"]
+    assert "fingerprint" not in runtime_schemas["DeviceFileDeliveryRefResponse"][
+        "properties"
+    ]
 
 
 def test_message_openapi_describes_user_input_and_ndjson_response() -> None:

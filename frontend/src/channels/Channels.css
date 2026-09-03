@@ -1,0 +1,27 @@
+.channels-page .settings-stack { padding-bottom: 12px; }
+.channels-retry { justify-self: start; }
+.channel-card-body { display: grid; gap: 22px; }
+.channel-empty { color: var(--muted); font-size: 11px; margin: 0; }
+.channel-form { border-top: 1px solid var(--line); padding-top: 20px; }
+.channel-identity { align-items: start; display: grid; gap: 16px; grid-template-columns: auto minmax(0, 1fr); }
+.channel-identity img, .channel-avatar { border-radius: 10px; height: 44px; width: 44px; }
+.channel-identity img { object-fit: cover; }
+.channel-avatar { align-items: center; background: var(--accent-soft); color: var(--accent-strong); display: flex; font-size: 14px; font-weight: 800; justify-content: center; }
+.channel-identity dl { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0; }
+.channel-identity dt { color: var(--faint); font-size: 9px; }
+.channel-identity dd { font-size: 11px; margin: 4px 0 0; overflow-wrap: anywhere; }
+.channel-identity code { font-size: 10px; }
+.channel-pairing, .channel-danger { border-top: 1px solid var(--line); padding-top: 20px; }
+.channel-pairing { display: grid; gap: 12px; }
+.channel-pairing h3 { font-size: 13px; margin: 0; }
+.channel-pairing > p { color: var(--muted); font-size: 10px; line-height: 1.6; margin: 0; }
+.channel-pairing > button { justify-self: start; }
+.channel-pairing-code { display: grid; gap: 7px; }
+.channel-pairing-code small { color: var(--faint); font-size: 9px; }
+.channel-delete-confirm { background: color-mix(in srgb, var(--danger), transparent 94%); border-radius: 9px; display: grid; gap: 10px; padding: 13px; }
+.channel-delete-confirm p { color: var(--muted); font-size: 10px; line-height: 1.5; margin: 0; }
+.channel-delete-confirm > div { display: flex; flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 620px) {
+  .channel-identity { grid-template-columns: 1fr; }
+}

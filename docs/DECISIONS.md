@@ -58,7 +58,8 @@ There is no separate per-session chat SSE endpoint in the Python server alpha.
   - **Inbound + current-turn preview** (user → server): `POST /api/sessions/{id}/messages` creates the web session if the client-generated UUID is missing, inserts the user message, wakes/reserves the session runner, and may stream best-effort token/tool progress events on that response.
   - **Canonical history + recovery** (server → user): `GET /api/sessions/{id}/messages` reads persisted Postgres messages and run status. Reconnect uses polling here; it does not recover missed token deltas.
 - **Device ↔ server:** WebSocket (unchanged) — devices need bidirectional real-time for tool dispatch; live behind NAT; HTTP is wrong primitive.
-- **Discord/Telegram:** via their SDKs (serenity/teloxide).
+- **Discord/DingTalk:** long-lived adapters use `discord.py` Gateway and
+  `dingtalk-stream`; platform REST/OpenAPI performs outbound actions.
 
 **Why not a separate browser SSE stream in Python-main?** The live token stream
 is only a best-effort preview for the HTTP request that starts the turn. The
@@ -95,15 +96,22 @@ class InboundMessage:
     session_key: str
     channel: str
     chat_id: str
+    source_message_id: str | None
+    channel_binding_generation: UUID | None
+    sender: InboundSender
+    ingress_tool_profile: Literal["owner_full", "message_only"]
     content: tuple[dict[str, object], ...]
     attachment_refs: tuple[dict[str, object], ...] = ()
+    channel_context: tuple[ChannelContextMessage, ...] = ()
     effort: Effort | None = None
 ```
 Callers do not freely assemble route fields. Small constructors produce the
-only Py9 routes: `web:{session_id}`, `cron:{job_id}`, and
-`heartbeat:{user_id}`. The publish transition assigns the authoritative
+Web, Cron, Heartbeat, Discord, and DingTalk routes. The publish transition
+assigns the authoritative
 receive time, prepends the runtime block through the single codec, and writes
-the pending message plus turn reservation. There is no generic metadata escape
+the sender/profile/source/binding/context facts with the Pending row. Fixed
+prefix promotion later copies those facts into canonical Messages and stores
+the exact input IDs/profile on the Turn. There is no generic metadata escape
 hatch, caller timestamp, event kind, prompt mode, or public JSON parser.
 **Consequences:** Autonomous events are normal owner messages injected into
 dedicated sessions through the same durable pending/runner path as Web input.
@@ -113,31 +121,40 @@ Authorization remains out of band; runtime text is not an authorization source.
 
 **Status:** accepted
 **Decision:** Each ingress adapter/constructor computes its complete route before
-the shared publish transition. Py9 constructors use `web:{session_id}`,
-`cron:{job_id}`, and `heartbeat:{user_id}`. Future external adapters use their
-own deterministic per-conversation key (for example a Discord DM or guild
-channel identity). There is no caller-controlled override field on the
+the shared publish transition. Internal routes use `web:{session_id}`,
+`cron:{job_id}`, and `heartbeat:{user_id}`. Discord and DingTalk use a
+deterministic per-Bot/per-conversation route; the binding generation fences a
+replacement Bot. There is no caller-controlled override field on the
 Python-main inbound envelope.
 **Consequences:** Internal automation history stays isolated, while the
 internal UUID `sessions.id` remains the browser REST path identifier and
 `session_key` remains the unique per-user route identity.
 
-### ADR-007 · No `is_partner` field; wrap baked into content at adapter
+### ADR-007 · Persist sender classification; project untrusted content at Provider boundary
 
 **Status:** accepted
-**Decision:** When a Discord/Telegram adapter receives a message from a non-partner, it wraps content with `[untrusted message from <sender_name>]:` prefix before building InboundMessage. The wrap is the authoritative trust signal; no downstream consumer re-evaluates.
-**Consequences:** Agent sees wrap-or-no-wrap in content directly; system prompt teaches the convention once. DB stores the wrapped form — history replay is faithful. No `is_partner` field propagates.
+**Decision:** Adapters emit platform facts only. Shared ingress compares the
+human sender with the paired owner and exact-user-ID allow list, then persists
+`sender_classification` and `ingress_tool_profile`. Provider projection wraps
+`allowed_non_owner` content and background channel context as untrusted; the
+stored structured authority, not wrapper text, drives authorization.
+**Consequences:** An allow-listed non-owner always runs with `message_only`,
+including after queueing or restart. Wrapper text cannot upgrade authority.
 
-### ADR-008 · No `sender_id` on InboundMessage
+### ADR-008 · Sender identity persists through Pending, Message, and Turn
 
 **Status:** accepted
-**Decision:** `sender_id` is adapter-internal only — the adapter uses it to compare against `partner_id` for the wrap decision, then discards. Not carried on the message. No downstream consumer uses it (no subagent dispatch, no per-sender moderation in v1).
-**Consequences:** Smaller struct. If a future feature (moderation, cross-channel identity, subagent dispatch) needs persisted sender identity, it can be added to the DB message row or to `metadata` at that time. "No caller = delete it."
+**Decision:** Human ingress carries and persists the exact platform
+`sender_id`, optional display name, classification, and tool profile. The
+captured consecutive Pending prefix writes its ordered IDs and one profile to
+`turn_runs` in the promotion transaction.
+**Consequences:** Runtime text is presentation metadata, not authority. Py10
+adds no agent-to-agent sender or dispatch protocol.
 
 ### ADR-009 · Owner identity stamped at ingress (not lazily derived)
 
 **Status:** accepted
-**Context:** Earlier draft considered omitting `user_id` and deriving from `{channel}:{chat_id}` at session-creation time. But every ingress point already has user_id in scope (bot identity for Discord/Telegram, JWT claims for REST, job row for cron/heartbeat). Derivation is strictly more code for zero benefit.
+**Context:** Earlier draft considered omitting `user_id` and deriving from `{channel}:{chat_id}` at session-creation time. But every ingress point already has user_id in scope (Bot binding for Discord/DingTalk, JWT claims for REST, job row for cron/heartbeat). Derivation is strictly more code for zero benefit.
 **Decision:** Python-main `InboundMessage` carries `owner_user_id`, stamped by
 the authenticated ingress constructor or internal owner synthesizer.
 **Consequences:** No per-message lookup. No failure mode ("what if the config row was just deleted?"). Clear self-documentation.
@@ -179,16 +196,13 @@ backdating timestamps.
 ### ADR-012 · Three external ingress sources + two internal synthesizers
 
 **Status:** accepted
-**Python-main Py9 decision:**
-- **Current external:** authenticated REST
-  (`POST /api/sessions/{id}/messages`) through the Web constructor.
-- **Current internal:** Cron fire and Heartbeat Phase 2 through their dedicated
-  constructors.
-- Discord and DingTalk adapters are Py10 scope and must normalize into this
-  envelope rather than adding another Agent path.
-**Consequences:** Browser and direct API callers share one JWT-authenticated Web
-route. Internal synthesizers cannot forge arbitrary route tuples, and Py10 has
-one explicit adapter seam to extend.
+**Python-main Py10 decision:**
+- **External:** authenticated Web REST, Discord Gateway, and DingTalk Stream.
+- **Internal:** Cron fire and Heartbeat Phase 2.
+- Every source normalizes into the same durable ingress/runner envelope; only
+  the external adapters add platform event facts and optional history context.
+**Consequences:** There is one Agent path. Bot/webhook events are ignored, and
+group/thread triggers require the platform's structural Bot mention.
 
 ### ADR-013 · Fire-and-forget ingress; HTTP caller does not wait on agent
 
@@ -243,9 +257,9 @@ events.
   response may receive best-effort `token_delta`, `tool_progress`,
   `message_persisted`, and `turn_finished` events. These events are subscribers
   to the runner, not durable replay state.
-- **Channel delivery:** Discord/Telegram/later adapters deliver durable final
-  messages and may aggregate or drop transient progress according to channel
-  capability. They do not inherit the old browser SSE hint contract.
+- **Channel delivery:** Discord and DingTalk adapters receive a complete,
+  persisted final message, then split it into bounded platform actions. They do
+  not inherit the old browser SSE hint contract.
 **Consequences:** The product still separates transient progress from durable
 conversation state, but the transport is Python-main POST streaming + canonical
 message polling rather than the prior Rust outbound enum.
@@ -253,7 +267,9 @@ message polling rather than the prior Rust outbound enum.
 ### ADR-016 · Best-effort browser token preview; complete messages are durable
 
 **Status:** accepted
-**Context:** Many channels (Discord, Telegram, SMS, email) don't support token streaming natively. Doing it anyway requires bespoke per-channel batch-and-edit logic with rate limits.
+**Context:** Discord and DingTalk do not use the browser's token-preview
+contract. Editing partial platform messages would introduce rate-limit and
+recovery ambiguity.
 **Python-main clarification:** ADR-121 supersedes the old blanket
 no-token-streaming rule for browser/API consumers. The durable transcript and
 channel delivery still use complete messages only.
@@ -261,8 +277,8 @@ channel delivery still use complete messages only.
 `POST /api/sessions/{id}/messages` subscriber as best-effort preview data. Token
 deltas are coalesced into `PostMessageStreamEvent(type="token_delta")`, are not
 inserted into `messages`, and are not replayed after disconnect or restart.
-Non-browser channel adapters are not required to stream tokens; they deliver the
-durable final message or aggregate progress according to ADR-019.
+Non-browser channel adapters never stream token deltas. They plan platform
+chunks only after the complete durable final message exists.
 **Consequences:** Browser UI can show live progress without making partial text
 the unit of record. Recovery, provider replay, and channel delivery remain based
 on complete persisted messages.
@@ -302,11 +318,9 @@ stream that started or subscribed to the turn.
 - **Browser:** active POST streams may receive `tool_progress`, `token_delta`,
   `message_persisted`, `turn_finished`, `stream_replaced`, and keepalive events
   defined by `PostMessageStreamEvent` in `docs/API.yaml`.
-- **Discord:** use native typing/progress affordances when useful, or drop
-  transient progress. Do not create visible spam messages for every tool event.
-- **Telegram:** use native chat actions when useful, or drop transient progress.
-- **Future channels:** define capability-specific aggregation before surfacing
-  progress; durable final messages remain the portable baseline.
+- **Discord/DingTalk:** transient progress is dropped. The portable external
+  unit is the complete durable final message, split only by the adapter's
+  platform action planner.
 **Consequences:** Transient progress adds no clutter to persistent channel
 histories. Browser preview exists only while a POST stream is connected; recovery
 uses canonical message polling.
@@ -314,20 +328,29 @@ uses canonical message polling.
 ### ADR-020 · Direct replies route to current session; `message` tool defaults to current session and allows explicit cross-channel override
 
 **Status:** accepted
-**Python-main milestone clarification:** ADR-127 defers the executable
-`message` tool and its delivery-persistence helper from Py3 to Py4. The routing
-contract below remains the eventual surface; Py4 starts with the web/workspace
-subset, while device and third-party channel branches remain gated by their
-owning milestones.
+**Python-main Py10 clarification:** The executable `message` tool now has an
+`owner_full` projection and a restricted `message_only` projection.
 **Decision:**
 - **Text-only direct reply** (no tool call): `publish_final` uses the session's own `channel` and `chat_id` (carried from the InboundMessage). Most common path.
-- **`message` tool** (nanobot-aligned): `channel` and `chat_id` are OPTIONAL. If omitted, the tool delivers to the current session's channel + chat_id — same target as a direct reply, but gives the agent access to `media` (attachments) and `buttons` (inline keyboards). If specified, the tool delivers to the named channel + chat_id — cross-channel reach.
+- **Owner `message`:** `channel` and `chat_id` are an optional pair. Omitted
+  values mean the current Web/Discord/DingTalk conversation; an explicit
+  external target must be configured and paired. Owners may attach up to ten
+  Workspace/Device files.
+- **Non-owner `message`:** only `content` plus the optional target pair is
+  projected. Omitted values mean the current external conversation; an
+  explicit target may name only the paired owner's direct message. Media,
+  device selection, Web targets, and every other tool are absent and rejected
+  again at dispatch before I/O.
 
 **Guidance surfaced to the agent** (via system prompt Operating Notes, nanobot-style):
 - Prefer plain text reply for normal conversation turns.
-- Use `message` tool when you need to attach files/media (required — `read_file` doesn't deliver files), send inline buttons, or reach a different channel.
+- Use `message` when you need to attach files/media (owner only; `read_file`
+  does not deliver files) or reach an allowed target.
 
-**Consequences:** Agent has one clear "emit text" path (direct reply), one clear "emit rich / cross-channel content" path (`message` tool). Cross-channel stays explicit via params. Attachments always flow through the `message` tool. Aligned with nanobot's message-tool contract.
+**Consequences:** Plain final text and explicit `message` delivery share one
+durable Router for external channels. Restricted non-owner confirmation must
+tell the owner to return to the original conversation and mention the Bot to
+continue there.
 
 ---
 
@@ -596,17 +619,21 @@ The active turn never interrupts an in-flight LLM request or an in-flight tool c
 
 Pending messages are not allowed to split a set of `tool_result` blocks. The next provider request sees the assistant tool request, one collapsed `user` tool-result message, and then the drained human messages in chronological order.
 
-The drain is atomic per session: capture a fixed pending prefix in
-`(received_at, id)` order before preflight, insert matching `messages` rows with the same IDs and
-`message_kind="human"`, delete the selected pending rows, commit, then
+The drain is atomic per session: capture the oldest fixed **consecutive
+same-profile** pending prefix in `(received_at, id)` order before preflight,
+insert matching `messages` rows with the same IDs and
+`message_kind="human"`, create the `turn_runs` row with that profile and the
+exact ordered input IDs, delete the selected pending rows, commit, then
 make the visible user rows available to canonical `GET messages` history and
 the current live POST preview stream.
 The promoted rows receive canonical `messages.created_at` values at drain time
 in pending order. `pending_messages.received_at` is the queue-order timestamp,
 not the eventual transcript position; copying it would place a queued follow-up
 before the assistant response it waited behind.
-Messages accepted after the prefix is captured remain pending for the following
-provider call and cannot enter the current request without being token-counted.
+Messages accepted after the prefix is captured, and the first queued row with a
+different profile plus everything behind it, remain pending for a following
+Turn and cannot enter the current request without being token-counted. The
+captured profile stays fixed through every Provider retry and ReAct iteration.
 
 For browser `POST /api/sessions/{id}/messages`, pending stream delivery is
 latest-wins. If multiple browser POSTs arrive while the session is running, all
@@ -821,7 +848,17 @@ paths only and does not create a trusted/untrusted process profile.
 
 **Status:** accepted
 **Context:** Prior OpenOctopus had `/api/files` (ephemeral upload cache, 24h TTL) running parallel to `/api/workspace/files/` (durable user tree). Two storage systems for files caused drift across message-send, context-load, and channel delivery.
-**Decision:** Workspace is canonical for files the agent operates on. No `/api/files`, no `file_store.rs`. On Python-main, server workspace bytes are persisted in RustFS behind `WorkspaceService` (ADR-123), not in a durable server disk tree. Channel adapters that receive raw attachment bytes may place those bytes under the virtual path `/.attachments/{inbound_id}/{filename}` in the user's server workspace; that object counts toward quota like any other workspace content. **M1d browser correction:** browser uploads first write bytes through `PUT /api/workspace/files/{path}?openoctopus_device=server`; `POST /api/sessions/{id}/messages` then references that existing path and does not move, copy, or rename the file into `.attachments/`. **Note:** this `.attachments/` concept exists only on the server. Client devices have no equivalent — bytes that flow to a client via `file_transfer` or `write_file` land directly in `device.workspace_path` with no special media subdir.
+**Decision:** Workspace is canonical for files the agent operates on. No
+`/api/files`, no parallel file cache. On Python-main, server workspace bytes
+are persisted in RustFS behind `WorkspaceService` (ADR-123), not in a durable
+server disk tree. Only an attachment sent by the paired channel owner may be
+downloaded into the deterministic virtual path
+`/.attachments/{inbound_id}/{filename}`; it counts toward quota like any other
+workspace content. An allow-listed non-owner's attachment is rejected at
+network ingress before any byte download, Workspace write, or Client relay.
+Browser uploads first write through the Workspace API and message POST only
+references that existing path. The `.attachments/` concept exists only on the
+Server; Client devices have no equivalent.
 **Consequences:** One durable file model for agent-accessible files. Inbound channel bytes and durable server-side attachments live in workspace paths. Device-origin outbound media is split by target channel capability: web delivery stores an online-only device file reference and lets the browser download later through the normal Workspace Files `GET` relay with `openoctopus_device=<device>`; third-party channel delivery streams bytes through the server directly into the platform's native file/media upload API. Neither path writes device bytes to RustFS. If durable OpenOctopus storage is wanted, the agent must first use `file_transfer` to copy the file into `openoctopus_device="server"`.
 
 **Storage by attachment type:**
@@ -1007,27 +1044,21 @@ because that column does not exist. Quota reads remain user-visible through
 ### ADR-080 · Byte-ingress attachments degrade gracefully under quota lock
 
 **Status:** accepted
-**Python-main clarification:** Python-main uses best-effort per-attachment
-handling for channel byte ingress into the user's personal server workspace:
-- The text portion of the message is always delivered normally to the session.
-- Each attachment is attempted independently. Successful attachments are
-  preserved (workspace file written, image block inserted into DB per ADR-059).
-  Failed attachments are skipped with a per-attachment note appended to the
-  user's text block: `[attachment skipped: workspace over quota]`.
-- No rollback: if attachment N fails, attachments 1..N-1 remain.
-- This applies only to channel byte-ingress into personal server workspace.
-  Browser message attachments (refs to existing workspace files) are not
-  byte-ingress; if a ref is missing or unreadable, the whole message is
-  rejected before persistence. Shared workspace writes are not the default
-  channel inbound target.
-**Context:** A user can hit their quota mid-conversation, then send a Discord/Telegram message with an image attachment. The attachment write would hit `SoftLocked`. Dropping the entire message would lose the user's text and make the agent miss the turn.
-**Decision:** When a channel adapter receives an inbound message with attachment bytes while the user is over quota:
-- The text portion of the message is delivered normally to the session.
-- Each attachment is attempted independently — successful attachments are kept; failed attachments are skipped. No workspace file is written AND no base64 `image` block is inserted into `messages.content` for failed attachments (the DB-side of ADR-059 is also skipped).
-- A system note is appended to the user's text block for each failed attachment: `[attachment skipped: workspace over quota]`.
+**Py10 decision:** Attachment authority is resolved before bytes:
+- Unauthorized events are ignored without a receipt or reply.
+- An exact-ID allow-listed non-owner is text-only. Attachment descriptors are
+  never opened; text plus attachments reaches the Provider as text plus a
+  Server-authored rejection note, while attachment-only input records one
+  rejection receipt and one fixed policy notice without a Provider call.
+- Only the paired owner enters bounded attachment resolution. Up to ten files
+  and 64 MiB aggregate may be written to the personal Server Workspace. Files
+  succeed independently; the accepted text and successful refs survive a
+  later quota/network/validation failure with a Server note.
 
-The agent sees the note in context, can reference it in its reply, and the user can delete files and resend.
-**Consequences:** Messages are never lost wholesale. The "you are over quota" signal surfaces through the conversation itself, not as an out-of-band error. Identical note format across channels. Best-effort per attachment preserves maximum information.
+**Consequences:** Non-owner attachment bytes cannot be forwarded into the
+owner's Workspace or Client. Owner files are owner-authorized data and are not
+automatically executed. Existing MIME sniff, size, quota, and Workspace policy
+still applies; OpenOctopus does not claim an antivirus engine.
 
 ### ADR-081 · No server-side `.attachments/` sweeper — users manage their own quota
 
@@ -1748,7 +1779,9 @@ startup, and never catches up missed boundaries. A scan cannot overlap itself.
 - Phase 2 output is persisted to `heartbeat:{user_id}`. The Web UI displays this
   as a dedicated read-only Heartbeat Session; users change behavior by editing
   `HEARTBEAT.md` through the Workspace API/UI or file tools.
-- Heartbeat does not automatically deliver to Discord, Telegram, or the latest active channel in v1. If the agent needs to contact the user externally, it must deliberately use the normal `message` tool.
+- Heartbeat does not automatically deliver to Discord, DingTalk, or the latest
+  active channel. If the agent needs to contact the user externally, it must
+  deliberately use the normal `message` tool.
 
 **Consequences:** Users can inspect heartbeat history without autonomous output
 appearing unexpectedly in external chats. The fixed worker/queue bounds protect
@@ -1759,7 +1792,10 @@ remains the only configurable LLM concurrency bound.
 
 **Status:** accepted
 **Decision:** OpenOctopus does not implement per-user rate-limit buckets, request counters, or quota enforcement in the bus for v1. LLM provider 429s retry twice with exponential backoff, then surface an error to the user. The shared provider layer may optionally enforce `system_config.llm_max_concurrent_requests` as an in-process semaphore, but this is a backend-protection knob, not a product rate-limit system.
-**Consequences:** Simpler ingress. Admin's responsibility to size their LLM provisioning for the deployment's user and concurrency targets. Future user-facing rate limits can be bolted on at the bus layer when a deployment actually needs them.
+**Consequences:** Simpler ingress. The administrator supplies the shared LLM
+credential and bears Provider usage/cost for every user's Web, channel, Cron,
+and Heartbeat turns. It is the administrator's responsibility to size that
+provisioning for the deployment's user and concurrency targets.
 
 ---
 
@@ -1854,38 +1890,35 @@ pairs cannot be stored.
 ### ADR-090 · Per-channel bot configs live in their own tables
 
 **Status:** accepted
-**Context:** Discord, Telegram, and any future messaging channel each carry several fields (bot token, partner chat identifier, channel-specific flags). Inlining these as columns on `users` is feasible but bloats the users row, couples unrelated fields together, and has to change every time a new channel is added.
-**Decision:** Each connected-channel type owns its own table: `discord_configs`, `telegram_configs`, etc. Each has `user_id` as FK (ON DELETE CASCADE per ADR-058), the channel's `bot_token`, a partner-identifier field (`partner_chat_id`), and whatever channel-specific settings the integration needs. Users table stays thin — no inline channel fields.
+**Py10 decision:** Discord and DingTalk each own a per-user config table with a
+validated unique Bot identity, write-only credential, revision,
+`binding_generation`, paired-owner identity/DM, hash-only one-time pairing
+state, and an exact-user-ID `allow_list`. Users stay thin; deleting an account
+cascades both configs.
 
 Python-main exposes those per-platform tables through one generic REST surface:
 `GET /api/channels`, `PATCH /api/channels/{channel}`, and
-`DELETE /api/channels/{channel}`. There is no `GET /api/channels/{channel}`.
-`GET /api/channels` returns every supported channel with `configured=false,
-config=null` when the user's row is absent. Config existence means enabled;
-there is no separate `enabled` flag. `DELETE` disables a channel by deleting its
-config row.
+`DELETE /api/channels/{channel}` for the fixed names `discord` and `dingtalk`;
+`POST /api/channels/{channel}/pairing` rotates the ten-minute code while
+unpaired. `GET` always returns both platform cards and never returns a secret or
+pairing code. A create/credential mutation returns the code once; later
+rotation returns a replacement once. `allow_list` is a whole-array replacement
+of manually entered platform **user IDs**, never a channel/group/guild rule.
 
-The generic API does **not** erase platform field names. Discord, Telegram,
-Feishu, Weixin, and future adapters keep their own config payload field names
-(`bot_token_hint`, `partner_chat_id`, `allow_list`, etc.) so maintainers can map
-API payloads directly to adapter code. Secret fields are never returned:
-`bot_token` is write-only, while reads return `bot_token_hint`. Sending
-`bot_token: "<redacted>"` as an update is rejected; callers omit the field to
-keep the existing secret. `allow_list` is whole-array replacement on PATCH.
+Credential writes identify the Bot before commit. Discord stores its validated
+application/Bot name/avatar. DingTalk uses `client_id` as `robotCode` and stores
+the Client ID as the Bot identity while leaving display name/avatar null because
+token and Stream handshakes expose no platform profile metadata. Replacing the
+underlying Bot rotates `binding_generation`, clears pairing, and retires the old
+runtime. Allow-list-only updates do not reconnect.
 
-`bot_token` writes are validation-first: the server calls the platform API to
-identify the bot before saving. `partner_chat_id` writes are validation-first by
-sending a pairing/success message to that target. `allow_list` entries receive
-only schema/length validation; adapters classify and enforce them at receive
-time. Py10 adds hot reload: after a successful DB write/delete, ChannelManager
-starts, reloads, or stops that user's adapter.
+The owner identity cannot be typed into the API. A human sends the exact code
+in a direct message; only a successfully delivered confirmation may commit the
+owner ID/DM. `DELETE` invalidates the binding before bounded adapter shutdown.
 
-**Consequences:** Adding a new channel = adding a new table and an adapter-owned
-config schema, no users-schema change, no migration pressure on unrelated
-features. Channel config is naturally scoped: a user with Discord configured but
-no Telegram has a row in `discord_configs` and none in `telegram_configs`.
-Account deletion cascades to all channel tables automatically. The HTTP surface
-stays small while adapter payloads stay understandable.
+**Consequences:** Channel status is one of stopped, connecting,
+awaiting-pairing, ready, or degraded. Runtime generation plus persisted binding
+generation fences late callbacks and outbound work from a replaced Bot.
 
 ### ADR-091 · Device identity: `token` is PK, `(user_id, name)` is UNIQUE, user-initiated regenerate only
 
@@ -1995,7 +2028,7 @@ timestamped historical metadata: each old block records when and where that
 message arrived, not current global state.
 **Decision:**
 - The `<runtime>` block is constructed **once**, at user-message ingress time
-  (in the channel adapter or `publish_inbound` path), using the deterministic
+  in the shared publish path, using the deterministic
   server-owned grammar in `SYSTEM_PROMPT.md`.
 - It is prepended to the user's content blocks inside the same `messages.content` JSONB row (per ADR-059), as a text block.
 - It is **immutable** after insert. No later regeneration and no stripping from
@@ -2005,6 +2038,11 @@ message arrived, not current global state.
   only the first text block of canonical human/pending content, validates the
   exact anchored grammar plus matching session `channel`/`chat_id`, and omits
   only that block. It never applies a loose regex over concatenated user text.
+- External rows separately persist sender classification/tool profile and a
+  bounded structured channel-context snapshot. Provider projection places the
+  context in `<untrusted_channel_context>` and an allow-listed sender's text in
+  `<untrusted_channel_message>`. Neither wrapper nor runtime text authorizes a
+  tool; the persisted Turn profile and dispatch gate do.
 
 **Consequences:**
 - Agent naturally understands temporal flow: *"user asked at 10:00, now it's 17:00, they're asking a follow-up"*. Old blocks aren't confusion — they're context.
@@ -2015,7 +2053,7 @@ message arrived, not current global state.
 ### ADR-095 · Tool results carry a leading untrusted-result warning block
 
 **Status:** accepted
-**Context:** Tool-returned content (web_fetch bodies, shell stdout, MCP responses, even `read_file` output from files of unknown provenance) can carry instructions crafted to hijack the agent. Channel inbound content is already marked untrusted via the `[untrusted message from <name>]:` wrap (ADR-007). Tool output had no analogous structural marker. Codex flagged this as a prompt-injection vector. M1f also allows image blocks inside tool results, so mutating the first text payload is not a sufficient universal representation.
+**Context:** Tool-returned content (web_fetch bodies, shell stdout, MCP responses, even `read_file` output from files of unknown provenance) can carry instructions crafted to hijack the agent. Channel non-owner content and context receive their own Provider projection wrappers (ADR-007). Tool output needs an analogous structural marker. M1f also allows image blocks inside tool results, so mutating the first text payload is not a sufficient universal representation.
 **Decision:** Every real `tool_result` is normalized before persistence and provider replay. Provider-facing `tool_result.content` is a safe block array. The first block is a server-generated text warning:
 
 ```text
@@ -2048,7 +2086,8 @@ The wrapped shape the LLM sees:
 }
 ```
 
-No system-prompt rule is added. The wrap itself is the signal — the agent learns the convention structurally, the same way it learned the `[untrusted message from X]:` channel wrap (ADR-007). No teaching, no exception rules, no provenance arguments.
+No system-prompt rule is added. The wrap itself is the signal. No teaching, no
+exception rules, no provenance arguments.
 M1f keeps the literal prefix uniform for device results as well; device
 provenance is already present in the preceding `tool_use.input` and in
 server/SSE metadata.
@@ -2077,8 +2116,9 @@ creates a `web` session for the authenticated user with `chat_id = id::text`,
 server verifies `session.user_id == jwt.user_id`; ids owned by another user
 return `404` without leaking existence. Browser message writes require
 `session.channel == "web"` and `session.session_key` to start with `web:`.
-Non-web sessions are not message-writable through browser REST, but user-owned
-UI metadata updates are allowed: users may rename `sessions.title` and advance
+Non-web sessions are not message-writable through browser REST and the browser
+shows no composer for them. User-owned UI metadata updates remain allowed:
+users may rename `sessions.title` and advance
 `last_read_at` for any owned session. These metadata writes never insert
 messages, wake runners, or change routing. Users cannot set or rename
 `session_key`. Python-main has no `POST /api/sessions`,
@@ -2089,9 +2129,10 @@ messages, wake runners, or change routing. Users cannot set or rename
 any user-owned session, not a safe-boundary cancel. The handler terminates the
 session's in-memory runner and live/queued POST streams, then deletes the
 `sessions` row. Database cascades remove canonical `messages` and durable
-`pending_messages` plus `turn_runs`. No stop marker or synthetic tool results are inserted
+`pending_messages`, `turn_runs`, and session-bound channel deliveries/actions.
+Receipts retain their event identity with a null Session FK. No stop marker or synthetic tool results are inserted
 because the transcript is intentionally removed. Deleting a channel session
-removes that conversation history only; it does not remove Discord/Telegram
+removes that conversation history only; it does not remove Discord/DingTalk
 configuration, so a later inbound channel message may create a fresh session.
 Deleting a Cron Session likewise does not delete its job, and deleting a
 Heartbeat Session does not disable heartbeat. The next accepted trigger
@@ -2100,7 +2141,7 @@ the Cron job is separate: it stops future triggers and preserves any existing
 Session/history.
 
 **Python-main session list metadata:** `GET /api/sessions` returns a derived
-`unread` boolean for each session, including web, Discord, Telegram, cron, and
+`unread` boolean for each session, including web, Discord, DingTalk, cron, and
 heartbeat sessions. It does not return live run status or message previews.
 Status belongs to `GET /api/sessions/{id}/messages`; previews are deferred
 until a frontend need is proven. Read state is persisted as
@@ -2121,6 +2162,10 @@ without duplicates. `before` and `after` cursors apply only to canonical
 history and are mutually exclusive; no cursor returns the latest page in
 chronological order. `pending_messages` is always returned in `(received_at,
 id)` order and is not counted against the history `limit`.
+For external history, each human row also projects sender identity/classification,
+source metadata, and collapsible channel context; assistant rows project their
+logical delivery and action outcomes. Partial/unknown delivery has no retry
+control and tells the owner to send a new message in the original channel.
 The same response includes persisted `status`, `active_turn_id`,
 `last_message_id`, `pending_count`, and `has_more_before` per ADR-125; it never
 includes partial token previews.
@@ -2220,16 +2265,22 @@ cannot overlap `workspace_path`.
 **Decision:**
 | Principal | Trusted by | To do |
 |---|---|---|
-| **Admin** (platform operator) | OpenOctopus itself, all users on this deployment | Install shared-service server-side MCPs, configure LLM provider, set rate policies (ADR-056 — none in v1), delete users |
+| **Admin** (platform operator) | OpenOctopus itself, all users on this deployment | Install shared-service server-side MCPs, configure and pay for the deployment-wide LLM provider, set rate policies (ADR-056 — none in v1), delete users |
 | **User** (OpenOctopus account partner) | Their own resources (workspace, devices, channels) | Manage their devices, their skills, their memory, their integrations, their conversation history |
 | **Agent** | The user for their own conversation | Read + write within the user's workspace; execute on the user's devices under each device's persisted policy; message through the user's connected channels |
-| **Partner** (the user's own identity on the connected channel) | The agent, for responsiveness | Treated as the user — messages are unwrapped and trusted. The partner is the user's Discord/Telegram/etc. account as configured in channel settings. |
-| **Allowed user** (a non-partner user authorized by the partner) | The agent, with structural distrust | Messages are wrapped with `[untrusted message from <name>]` per ADR-007. Agent treats them as external input, not owner commands. |
+| **Owner** (the paired account identity on Discord or DingTalk) | The Agent, for responsiveness | Pairing, not a typed ID, binds this identity. Owner messages use `owner_full`. |
+| **Allowed non-owner** (an exact platform user ID manually entered by the owner) | The Agent, with structural distrust and a hard tool profile | Text is Provider-wrapped as untrusted and the Turn can call only restricted `message`; attachment bytes are never downloaded. |
 
 **Hard boundaries:**
 - Agents never cross user boundaries (user A's agent cannot read user B's workspace).
 - Agents have no general Server `exec`/Python/eval surface. They may invoke only
   the declared schemas of admin-installed trusted Server MCP (ADR-072).
+- Provider schema projection and dispatch both enforce the persisted Turn tool
+  profile. Runtime/wrapper text cannot grant tools, and Py10 has no
+  agent-to-agent channel dispatch.
+- Non-owner attachment descriptors stop before network byte ingress. Owner
+  attachment bytes may enter the owner's Workspace as data but are not
+  automatically executed; no antivirus guarantee is made.
 - Server never inspects or executes content users upload (treated as inert data).
 - Cross-account impersonation via JWT forgery is the primary risk and handled by JWT signing (ADR-004); compromise of `JWT_SECRET` is a catastrophic admin-level concern, documented in deployment material.
 
@@ -2240,8 +2291,14 @@ cannot overlap `workspace_path`.
   structured file tools and `web_fetch`, but permitted Client exec/MCP and
   admin-installed Server MCP still run with their host OS user's privileges.
   Py8a does not claim an OS sandbox.
-- **Partners on shared channels.** If Alice shares a Discord channel with Bob, Bob's untrusted-wrapped messages reach the agent. Wrap + system prompt teach the agent to reject instructions from non-partners (ADR-007). Not a cryptographic guarantee.
-- **Quota DoS via noisy allowed-users.** If an allowed user (a non-partner human the partner has authorized to message the agent on a shared channel — e.g. a coworker added for after-hours ops) spams files or messages and burns the partner's storage / LLM quota, mitigation is the partner removing them from their per-channel allow-list. Not a platform-level concern.
+- **Prompt injection from allowed non-owners.** Owner and non-owner Turns use
+  the same complete system prompt. The untrusted wrapper is not cryptographic
+  isolation, and later owner Turns still include prior non-owner history. Py10
+  prevents privilege elevation and preserves provenance but does not promise
+  that the model cannot reveal prompt content or be influenced by it.
+- **Provider-cost DoS via noisy allowed users.** An allowed user can consume the
+  administrator's LLM quota by sending text. The owner removes the exact ID
+  from the channel allow list; Py10 adds no per-sender rate bucket.
 
 ---
 
@@ -2254,8 +2311,9 @@ Single server process is the unit of deployment. Multi-node would require sessio
 
 **Python-main clarification:** Python server alpha runs a single ASGI worker (ADR-122). CPU-intensive synchronous work (file parsing, PDF extraction, RAG document ingestion) crosses a thread/process boundary via `loop.run_in_executor`, `ProcessPoolExecutor`, or subprocess rather than blocking the event loop or requiring multi-worker horizontal scale. Multi-node deployment requires a future ADR.
 
-### ADR-062 · No subagents / agent-spawning
-One agent per session. Nanobot supports subagent dispatch via sender_id — we deliberately dropped sender_id from InboundMessage (ADR-008). Add back when a real use case appears.
+### ADR-062 · No subagents, agent spawning, or agent-to-agent channel protocol
+One Agent executes each Session Turn. Persisted external `sender_id` exists for
+owner/allow-list authority and history display only; it is not an Agent route.
 
 ### ADR-063 · No Dream (deferred, ADR-055)
 See ADR-055.
@@ -2984,13 +3042,13 @@ against older OpenAI chat-completions docs.
 **Status:** accepted
 **Context:** M1f completed the server-side agent loop, Anthropic Messages
 projection, device WebSocket routing, and test-device execution. The previous
-roadmap kept Discord/Telegram before MCP and placed the production client and
+roadmap kept external messaging before MCP and placed the production client and
 frontend after all server slices. That sequence keeps polishing server-side
 surfaces before proving OpenOctopus's core value loop: server thinks, a real client
 executes.
 
 **Options:**
-- Continue the old server-first sequence: Discord/Telegram, MCP, cron/heartbeat,
+- Continue the old server-first sequence: external channels, MCP, cron/heartbeat,
   hardening, then production client and frontend.
 - Move immediately to the full production client with packaging and strong
   sandboxing before any more server work.
@@ -3003,9 +3061,10 @@ executes.
 lifecycle, executes shared file tools against a local workspace, and proves via
 curl/API e2e that the server agent can operate on a client. MCP follows before
 the frontend, because the UI should configure and display MCP behavior after
-the runtime semantics are known. Discord, Telegram, Slack, Feishu, and similar
-channels are deferred; they remain thin ingress adapters over the existing
-session/message API and should not determine the distributed-execution contract.
+the runtime semantics are known. That sequencing decision is complete: Py10
+adds Discord and DingTalk after the Client, MCP, automation, and frontend
+contracts were established. They share the existing ingress/runner path and do
+not change the distributed-execution protocol.
 
 **Consequences:** The roadmap optimizes for an early distributed-agent alpha
 instead of a theoretically complete server. Frontend stays after protocol/API
@@ -3409,20 +3468,23 @@ the same virtual path semantics while the storage backend is object-based.
 ### ADR-124 · Channel file delivery: web refs vs platform-native uploads
 
 **Status:** accepted
-**Python-main clarification:** Web channel delivery creates online-only device
+**Python-main Py10 clarification:** Web channel delivery creates online-only device
 file refs with `delivery_refs` metadata; the browser downloads later through
-the Workspace Files GET relay. Third-party channel delivery streams
+the Workspace Files GET relay. Discord and DingTalk delivery stream
 device/server bytes directly into the platform's native file upload API.
 Server workspace media persists in RustFS; device media does not
-auto-duplicate. Python implementation via FastAPI streaming + httpx. ADR-127
-defers the first producer of `delivery_refs` and the delivery-persistence
-helper to Py4; the column remains empty through Py3.
+auto-duplicate. Before either device ref is created, the Server uses the
+current-generation route and existing metadata-only source probe to freeze the
+regular file's byte length and opaque stat fingerprint without reading or
+staging bytes. The fingerprint remains internal and is rechecked with size at
+the external relay `BEGIN`; it is not persisted in `delivery_refs` or exposed
+through the API.
 
 **Context:** The `message` tool can send media whose bytes live either in the
 server workspace or on a paired client device. Python-main also has two very
 different outbound surfaces: the web UI, which is authenticated to OpenOctopus and
-can call OpenOctopus REST APIs, and third-party channels such as Telegram, Discord,
-Feishu, or Weixin, whose users normally cannot dereference a OpenOctopus JWT-bound
+can call OpenOctopus REST APIs, and Discord/DingTalk recipients, who cannot
+dereference an OpenOctopus JWT-bound
 download endpoint.
 
 **Decision:** Outbound file delivery is channel-adapter-specific but follows
@@ -3430,15 +3492,16 @@ one boundary:
 
 - **Web channel:** `message(media=[...], openoctopus_device="<client>")` writes
   user-visible, provider-hidden delivery state with `delivery_refs` metadata
-  that names the device and path. It does **not** read the file, upload it to
-  RustFS, or count it toward workspace quota. The frontend renders a file
+  that names the device and path and carries the preflight-frozen byte length.
+  It does **not** read the file bytes, upload them to RustFS, or count them
+  toward workspace quota. The frontend renders a file
   chip/link. When the user
   clicks it, the browser calls the Workspace Files download route with the
   recorded `openoctopus_device` and `path`; the server relays that HTTP response to
   the device WebSocket stream with bounded buffering/backpressure. The link is
   online-only: if the device is offline, the path changed, or device policy
   rejects the path, the download fails at click time.
-- **Third-party channels:** `message(media=[...], openoctopus_device="<client>")`
+- **Discord/DingTalk:** `message(media=[...], openoctopus_device="<client>")`
   streams the bytes from the device over `/ws/device` and immediately uploads
   them to the platform's native file/media API. The platform owns the delivered
   copy after success. OpenOctopus does not persist those bytes in RustFS and does not
@@ -3446,7 +3509,7 @@ one boundary:
   unreadable, or the platform upload fails, the `message` tool fails.
 - **Server workspace media:** `openoctopus_device="server"` reads through
   `WorkspaceService`. Web delivery produces durable workspace file refs;
-  third-party delivery uploads the workspace bytes to the platform.
+  Discord/DingTalk delivery uploads the workspace bytes to the platform.
 - **Durable OpenOctopus links:** If the product needs a file to remain downloadable
   from OpenOctopus after the source device disconnects, the agent must first copy it
   to `openoctopus_device="server"` with `file_transfer`.
@@ -3455,18 +3518,24 @@ one boundary:
 download blocks. Web-facing download chips live in `messages.delivery_refs`, an
 API/DB sidecar that provider replay ignores.
 
-The concrete Py4 delivery record/helper must not insert another
+The delivery record/helper does not insert another
 provider-replayed assistant row between the assistant message containing the
 `message` tool use and the user-role tool-result batch that answers it. The
 persisted assistant `tool_use` remains the provider-visible message content and
-the matching persisted `tool_result` records the delivery outcome. Py4 appends
+the matching persisted `tool_result` records the delivery outcome. The Server appends
 server-generated refs, each linked by `tool_use_id`, to that existing assistant
 row's provider-hidden `delivery_refs` sidecar and commits the sidecar update with
 the matching tool result.
 
+External media resolution completes before the Router's platform issue
+boundary. Each delivery/action is durable, actions run in order, and the first
+failed or unknown action skips the tail. A request is never automatically
+retried after issue; a Device disconnect or platform ambiguity after issue is
+`unknown`, while deterministic pre-issue rejection is `failed`.
+
 **Consequences:** Web delivery is cheap and avoids unnecessary object-storage
 writes for files that are only useful while the user's device is online.
-Third-party delivery behaves like native chat apps: users receive an actual
+Discord/DingTalk delivery behaves like native chat apps: users receive an actual
 file in the platform, not a OpenOctopus-authenticated link they cannot open. Durable
 storage stays explicit and quota-accounted through the server workspace.
 
@@ -3594,6 +3663,11 @@ promotion.
 
 **Status:** accepted
 
+**Py10 clarification:** The sequencing below is complete. The active tool now
+supports current Web delivery plus paired Discord/DingTalk targets, owner media,
+and the restricted text-only `message_only` projection described by ADR-020.
+Inline buttons are not part of the contract.
+
 **Context:** A useful `message` tool depends on the workspace/file surface, and
 its former persistence sketch could insert an extra provider-visible assistant
 row inside a tool batch, breaking required tool-use/tool-result adjacency. Py3
@@ -3601,9 +3675,9 @@ only needs to prove the ReAct loop with one executable tool.
 
 **Decision:** Py3 registers and executes `web_fetch` only. It does not expose a
 `message` schema, execute the tool, or implement its delivery-persistence
-helper. Py4 introduces the initial current-web/server-workspace subset after
-`WorkspaceService` exists. Device media and cross-channel/buttons behavior remain
-gated by the client and channel milestones. `messages.delivery_refs` remains a
+helper. Py4 introduced the initial current-web/server-workspace subset after
+`WorkspaceService` existed. Device media and external-channel behavior were
+added by their owning milestones. `messages.delivery_refs` remains a
 separate provider-hidden sidecar and stays empty through Py3; keeping the
 already-created column avoids a remove-and-readd migration. Py4 must persist
 user-visible delivery state without inserting another provider-replayed
@@ -3621,7 +3695,7 @@ delivery helper. The final `message` schema remains documented in `TOOLS.md` as
 a forward contract, with field availability controlled by the owning
 milestones.
 
-### ADR-128 · Py3 has one authoritative runtime-block codec
+### ADR-128 · One authoritative runtime-block codec
 
 **Status:** accepted
 
@@ -3631,14 +3705,14 @@ and removed only from the public projection. Py2 placed construction and
 parsing beside the public DTO projection, which makes later ingress adapters
 likely to duplicate the grammar.
 
-**Decision:** Py3 moves the runtime grammar, builder, and exact parser into one
+**Decision:** The runtime grammar, builder, and exact parser live in one
 small authoritative module. Ingress constructs the block through that module;
 public projection removes the first block only when the same module parses it
-and its `channel` and `chat_id` match the owning session. Py3's grammar has only
-the fields it already needs: ingress time, channel, chat ID, partner sender ID,
-and trust. Later milestones may extend the codec when a concrete ingress field
-is required; Py3 does not add a generic metadata registry or speculative
-fields.
+and its `channel` and `chat_id` match the owning session. The grammar has
+ingress time, channel, chat ID, channel-namespaced sender ID, and trust
+classification (`owner`, `allowed_non_owner`, or `internal`). Channel context
+is a separate persisted structured field and Provider wrapper, not an extension
+to the runtime grammar. There is no generic metadata registry.
 
 Authenticated tool execution state is not model-visible runtime text. A small
 typed `ToolContext` carries authoritative user/session identity and live
@@ -4009,6 +4083,66 @@ canonicalization on the Server.
 
 ---
 
+### ADR-136 · Py10 Channels: persistent authority and durable at-most-once delivery
+
+**Status:** accepted (2026-09-02)
+
+**Decision:** Py10 supports exactly Discord and DingTalk through two layers: a
+shared ingress/authority/delivery core and thin platform adapters. The same
+durable Pending/Turn/Agent loop serves Web, Discord, DingTalk, Cron, and
+Heartbeat. Adapters normalize human event facts, fetch at most 100 recent
+messages when supported, and translate complete outbound replies; they do not
+decide user authority or run an Agent loop.
+
+Each user may configure one Bot per platform. The owner is established only by
+a hash-only one-time code sent in a human direct message. Additional humans are
+admitted by a whole-replacement allow list of exact, manually entered platform
+user IDs. There is no group/guild/channel allow rule and no agent-to-agent
+protocol. Bot and webhook events are ignored; non-DM triggers require a
+structural Bot mention.
+
+Ingress persists sender/source/binding/context and the `owner_full` or
+`message_only` profile before scheduling. Consecutive same-profile Pending rows
+form one Turn, whose input IDs and profile stay fixed. Both Provider schema
+projection and pre-I/O dispatch enforce the profile. Allowed non-owners see the
+same full system prompt as owners but receive only restricted text `message`;
+its omitted target is the current conversation and its only explicit target is
+the paired owner's DM. This is a hard tool/target boundary, not a promise of
+prompt secrecy: wrappers do not eliminate LLM prompt injection or disclosure
+risk, and later owner Turns still contain earlier non-owner history.
+
+Non-owner attachment descriptors are rejected before any byte download,
+Workspace write, or Client relay. Owner attachments are bounded
+owner-authorized data placed in the personal Server Workspace; they are not
+automatically executed, and Py10 makes no antivirus claim.
+
+The Router receives a complete persisted reply, then asks the adapter for at
+most 32 platform-bounded text/file actions. It durably records `prepared`,
+commits `attempting` before each issue, and records sent/partial/failed/unknown
+outcomes. Actions run in order and stop after the first failure or unknown.
+There is no automatic retry or background delivery worker: restart closes
+incomplete rows without replay, the same Turn fences the failed target, and a
+new inbound user Turn is required to try again.
+
+DingTalk `client_id` is also its active-message `robotCode`. Its validation
+surface exposes no platform Bot name/avatar, so OpenOctopus leaves those fields
+null and makes no platform profile claim. External Session history is
+browser-readable with sender, context, and delivery state but has no composer.
+The administrator supplies the deployment-wide LLM credential and bears
+Provider cost for all channel Turns.
+
+Channel runtimes, reconnect ownership, ingress locks, and delivery locks are
+process-local. The supported deployment is exactly one ASGI worker and one
+Server replica; multi-worker/multi-node operation requires distributed routing,
+admission, and coordination not present in Py10.
+
+**Consequences:** Config replacement and deletion are fenced by persisted
+binding generation plus runtime generation. Duplicate external callbacks and
+logical deliveries have durable identities, while uncertain platform issue is
+reported honestly instead of being replayed.
+
+---
+
 ## Appendix A · Key Design Principles
 
 Distilled from the ADRs, for fast onboarding of new contributors:
@@ -4024,7 +4158,9 @@ Distilled from the ADRs, for fast onboarding of new contributors:
 7. **No rate limiting in v1. No dream in v1.** Admin provisions their LLM; agent maintains MEMORY.md inline.
 8. **Pure functions where possible.** `context::build_context`, the fuzzy matcher, `validate_url` — all pure. Testable with synthetic inputs.
 9. **Crash recovery is narrow and durable.** Prefer JIT repair, but cross-store workspace deletion uses a small PostgreSQL outbox with runtime and startup recovery.
-10. **Channel adapters are thin.** Platform event → InboundMessage → bus. Agent doesn't know which channel it's on; adapters translate.
+10. **Channel adapters are thin.** Platform event facts → shared authority and
+    durable ingress; complete delivery plan → platform actions. Adapters do not
+    grant tools or retry issued actions.
 
 ---
 
@@ -4039,7 +4175,7 @@ For contributors migrating from the old codebase, here's what changed and why:
 | `ToolAllowlist::Only(...)` for Dream | Dropped with Dream | ADR-055 |
 | 4-crate workspace (with plexus-gateway) | 2-project monorepo (server + client, no common) | ADR-001 |
 | WebSocket for browser chat | REST with best-effort POST streaming + canonical GET polling | ADR-003, ADR-121 |
-| `InboundEvent.sender_id`, `.identity.is_partner` | Neither field on InboundMessage | ADR-007, ADR-008 |
+| Adapter-authored trust wrapper | Persist sender classification and Turn tool profile; project wrappers only for the Provider | ADR-007, ADR-008, ADR-136 |
 | Rate limiting in bus | None in v1 | ADR-056 |
 | Per-user SSRF whitelist on `web_fetch` | Independent canonical denylist snapshots: Server admin hot config and per-Device Client config; neither is an exec/MCP firewall | ADR-052, ADR-133 |
 | `/api/files` ephemeral cache | Workspace canonical | ADR-044 |

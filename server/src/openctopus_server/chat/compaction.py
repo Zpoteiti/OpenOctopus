@@ -116,6 +116,15 @@ async def commit_stage_one(
                     content=[dict(block) for block in pending.content],
                     attachment_refs=[dict(ref) for ref in (pending.attachment_refs or [])],
                     delivery_refs=[],
+                    sender_id=pending.sender_id,
+                    sender_display_name=pending.sender_display_name,
+                    sender_classification=pending.sender_classification,
+                    ingress_tool_profile=pending.ingress_tool_profile,
+                    source_message_id=pending.source_message_id,
+                    channel_binding_generation=pending.channel_binding_generation,
+                    channel_context=[
+                        dict(item) for item in (pending.channel_context or [])
+                    ],
                     llm_fingerprint=None,
                     is_compacted=False,
                     created_at=summary_created_at + timedelta(microseconds=index),

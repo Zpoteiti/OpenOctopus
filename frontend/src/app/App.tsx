@@ -8,6 +8,7 @@ import { AuthPage, RequireAdmin, RequireAuth } from '../auth/auth'
 import { useAuthenticatedUser } from '../auth/context'
 import { DeviceDetailPage, DeviceListPage, DeviceMcpPage } from '../devices/Devices'
 import { ChatPage } from '../chat'
+import { ChannelsPage } from '../channels/Channels'
 import { AppShell } from '../layout/AppShell'
 import { ThemeProvider } from '../theme/ThemeToggle'
 import { WorkspacePage } from '../workspace/WorkspacePage'
@@ -29,6 +30,7 @@ export function AppRoutes(): ReactNode {
             <Route path="/devices/:name" element={<DeviceDetailPage />} />
             <Route path="/devices/:name/mcp" element={<DeviceMcpPage />} />
             <Route path="/automations" element={<AutomationsRoute />} />
+            <Route path="/channels" element={<ChannelsPage />} />
             <Route path="/account" element={<AccountRoute />} />
             <Route element={<RequireAdmin />}>
               <Route path="/admin/settings" element={<AdminSettingsPage />} />

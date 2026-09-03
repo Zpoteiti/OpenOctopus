@@ -131,6 +131,7 @@ async def test_non_queueing_publish_skips_busy_session_without_new_rows(
                 session_id=job_id,
                 runner_instance_id=uuid4(),
                 status="running",
+                tool_profile="owner_full",
                 started_at=datetime.now(UTC),
             )
         )

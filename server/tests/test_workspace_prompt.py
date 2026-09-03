@@ -582,3 +582,37 @@ async def test_prompt_renders_all_always_on_bodies_without_aggregate_downgrade()
     assert "### one (always-on)\n\n" + body in rendered
     assert "### two (always-on)\n\n" + body in rendered
     assert "### Conditional skills" not in rendered
+
+
+async def test_channel_prompt_identifies_current_external_conversation(
+    pg_engine,
+) -> None:
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4()}@test.com",
+        password_hash="hash",
+        name="Owner",
+    )
+    session = Session(
+        id=uuid4(),
+        user_id=user.id,
+        session_key=f"discord:bot:{uuid4()}",
+        channel="discord",
+        chat_id="group-42",
+        title="Release planning",
+    )
+    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+        db.add(user)
+        await db.flush()
+        db.add(session)
+        await db.commit()
+
+        prompt = await build_system_prompt(db, session=session, user=user)
+
+    assert (
+        "- current — channel: discord; chat_id: group-42; "
+        "label: Release planning"
+    ) in prompt
+    assert "- web — current chat_id: group-42" not in prompt
+    assert "channel context never carries into another Session" in prompt
+    assert "Confirmation must happen in the original conversation" in prompt

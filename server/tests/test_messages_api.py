@@ -495,6 +495,9 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
                 session_id=session_id,
                 message_kind="human",
                 content=[{"type": "text", "text": "first"}],
+                sender_id=str(user.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 delivery_refs=[],
                 created_at=now,
             )
@@ -506,6 +509,9 @@ async def test_get_snapshot_keeps_message_visible_during_pending_promotion(
                 user_id=user.id,
                 session_key=session.session_key,
                 content=[{"type": "text", "text": "second"}],
+                sender_id=str(user.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 received_at=now + timedelta(microseconds=1),
             )
         )
@@ -596,6 +602,7 @@ async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
                     session_id=session_id,
                     runner_instance_id=uuid4(),
                     status="running",
+                    tool_profile="owner_full",
                     started_at=now,
                 ),
                 PendingMessage(
@@ -604,6 +611,9 @@ async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
                     user_id=user.id,
                     session_key=session.session_key,
                     content=[{"type": "text", "text": "captured"}],
+                    sender_id=str(user.id),
+                    sender_classification="owner",
+                    ingress_tool_profile="owner_full",
                     effort="low",
                     received_at=now,
                 ),
@@ -613,6 +623,9 @@ async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
                     user_id=user.id,
                     session_key=session.session_key,
                     content=[{"type": "text", "text": "also captured"}],
+                    sender_id=str(user.id),
+                    sender_classification="owner",
+                    ingress_tool_profile="owner_full",
                     effort="medium",
                     received_at=now + timedelta(microseconds=1),
                 ),
@@ -634,6 +647,9 @@ async def test_pending_promotion_consumes_only_the_turns_captured_prefix(
                 user_id=user.id,
                 session_key=session.session_key,
                 content=[{"type": "text", "text": "late"}],
+                sender_id=str(user.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 effort="high",
                 received_at=now + timedelta(microseconds=2),
             )
@@ -701,6 +717,7 @@ async def test_pending_promotion_with_an_empty_capture_leaves_the_queue_untouche
                     session_id=session_id,
                     runner_instance_id=uuid4(),
                     status="running",
+                    tool_profile="owner_full",
                     started_at=now,
                 ),
                 PendingMessage(
@@ -709,6 +726,9 @@ async def test_pending_promotion_with_an_empty_capture_leaves_the_queue_untouche
                     user_id=user.id,
                     session_key=session.session_key,
                     content=[{"type": "text", "text": "late"}],
+                    sender_id=str(user.id),
+                    sender_classification="owner",
+                    ingress_tool_profile="owner_full",
                     received_at=now,
                 ),
             ]
@@ -1262,6 +1282,7 @@ async def test_pending_attachment_refs_survive_promotion(
                     session_id=session_id,
                     runner_instance_id=uuid4(),
                     status="running",
+                    tool_profile="owner_full",
                     started_at=now,
                 ),
                 PendingMessage(
@@ -1270,6 +1291,9 @@ async def test_pending_attachment_refs_survive_promotion(
                     user_id=user.id,
                     session_key=session.session_key,
                     content=[{"type": "text", "text": "attached"}],
+                    sender_id=str(user.id),
+                    sender_classification="owner",
+                    ingress_tool_profile="owner_full",
                     attachment_refs=[attachment_ref],
                     received_at=now,
                 ),
@@ -1597,6 +1621,9 @@ async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
                     {"type": "text", "text": "original"},
                 ],
                 delivery_refs=[],
+                sender_id=str(user.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 created_at=now - timedelta(seconds=2),
             )
         )
@@ -1614,6 +1641,9 @@ async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
                     ),
                     {"type": "text", "text": "queued before crash"},
                 ],
+                sender_id=str(user.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 received_at=now - timedelta(seconds=1),
             )
         )
@@ -1623,6 +1653,7 @@ async def test_abandoned_run_recovery_drains_old_pending_before_new_input(
                 session_id=session_id,
                 runner_instance_id=uuid4(),
                 status="running",
+                tool_profile="owner_full",
                 started_at=now - timedelta(seconds=2),
             )
         )

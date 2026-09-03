@@ -1,0 +1,111 @@
+name: Channel Capacity
+
+on:
+  workflow_dispatch:
+    inputs:
+      adapters:
+        description: Capacity profile
+        required: true
+        default: "500"
+        type: choice
+        options:
+          - "500"
+          - "1000"
+      duration_seconds:
+        description: Observation duration
+        required: true
+        default: "600"
+        type: string
+  pull_request:
+    branches: [main]
+    types: [opened, labeled, synchronize, reopened]
+
+concurrency:
+  group: channel-capacity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: server
+
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: openoctopus
+          POSTGRES_PASSWORD: octopus
+          POSTGRES_DB: openoctopus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openoctopus -d openoctopus"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Create environment file
+        run: cp .env.example .env
+
+      - name: Run ordinary-CI ChannelManager smoke
+        run: pytest -q tests/test_channel_capacity_harness.py
+
+  capacity-profile:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'channel-capacity-500')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: server
+    env:
+      OO_CHANNEL_CAPACITY_ADAPTERS: ${{ github.event_name == 'workflow_dispatch' && inputs.adapters || '500' }}
+      OO_CHANNEL_CAPACITY_DURATION: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_seconds || '600' }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run ChannelManager capacity profile
+        run: |
+          set -o pipefail
+          python scripts/channel_capacity_harness.py \
+            --adapters "${OO_CHANNEL_CAPACITY_ADAPTERS}" \
+            --duration-seconds "${OO_CHANNEL_CAPACITY_DURATION}" \
+            --sample-interval-seconds 1 \
+            --heartbeat-interval-seconds 30 \
+            | tee "channel-capacity-${OO_CHANNEL_CAPACITY_ADAPTERS}.json"
+
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: channel-capacity-${{ github.run_id }}
+          path: server/channel-capacity-*.json
+          if-no-files-found: error
+          retention-days: 30

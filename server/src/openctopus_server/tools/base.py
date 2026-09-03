@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
+from openctopus_server.channels.types import ChannelName, ToolProfile
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.truncate import DEFAULT_MAX_TOOL_RESULT_CHARS
 
@@ -39,7 +40,8 @@ class DeviceFileDeliveryRef:
     openoctopus_device: str
     filename: str
     mime: str
-    size: int | None = None
+    size: int
+    fingerprint: str
     type: Literal["device_file"] = "device_file"
     online_only: Literal[True] = True
 
@@ -67,6 +69,13 @@ class ToolContext:
     openoctopus_device: str | None = None
     device_targets: Mapping[str, UUID] | None = None
     on_issued: Callable[[], None] | None = None
+    turn_id: UUID | None = None
+    tool_use_id: str | None = None
+    assistant_message_id: UUID | None = None
+    tool_profile: ToolProfile = "owner_full"
+    current_channel: ChannelName | None = None
+    current_chat_id: str | None = None
+    current_binding_generation: UUID | None = None
 
 
 class Tool(ABC):
@@ -80,6 +89,12 @@ class Tool(ABC):
     @abstractmethod
     def schema(self) -> dict[str, Any]:
         """Return the source schema before OpenOctopus routing fields are added."""
+
+    def schema_for_profile(self, tool_profile: ToolProfile) -> dict[str, Any] | None:
+        """Project this tool into a Provider-visible profile."""
+        if tool_profile == "owner_full":
+            return self.schema()
+        return None
 
     def max_output_chars(self) -> int:
         return DEFAULT_MAX_TOOL_RESULT_CHARS

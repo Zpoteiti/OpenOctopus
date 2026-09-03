@@ -1,27 +1,43 @@
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
+from openctopus_server.channels.types import (
+    DeliveryOrigin,
+    ExternalChannel,
+    InboundMessage,
+    ToolProfile,
+)
 from openctopus_server.chat.public_projection import message_response, pending_response
 from openctopus_server.chat.repair import synthetic_tool_result
 from openctopus_server.chat.runtime_context import build_runtime_block
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.db.advisory import lock_uuid_identity
-from openctopus_server.db.models import CronJob, Message, PendingMessage, Session, TurnRun, User
-from openctopus_server.dto.message import MessagesResponse
+from openctopus_server.db.models import (
+    ChannelDelivery,
+    CronJob,
+    DingTalkConfig,
+    DiscordConfig,
+    Message,
+    PendingMessage,
+    Session,
+    TurnRun,
+    User,
+)
+from openctopus_server.dto.message import ChannelDeliveryResponse, MessagesResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
 from openctopus_server.provider.config import load_provider_config
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services.inbound import (
-    InboundMessage,
     lock_inbound_identity,
+    serialize_channel_context,
     web_inbound,
 )
 
@@ -29,6 +45,10 @@ _CANCEL_TEXT = "[user cancelled: tool was not executed because the user pressed 
 _OUTCOME_UNKNOWN_TEXT = (
     "[user cancelled: tool execution outcome is unknown because the server stopped "
     "waiting before recording its result]"
+)
+_CHANNEL_AUTHORITY_REVOKED_TEXT = (
+    "[channel_authority_revoked] This channel request was closed because its "
+    "sender authority or Bot binding is no longer current."
 )
 _cancel_waiters: dict[UUID, set[asyncio.Future[None]]] = {}
 
@@ -136,12 +156,20 @@ async def publish_inbound_locked(
                 build_runtime_block(
                     timestamp=now.isoformat(),
                     session=session,
-                    user_id=inbound.owner_user_id,
+                    sender_id=inbound.sender.id,
+                    trust=inbound.sender.classification,
                 ),
                 *(dict(block) for block in inbound.content),
             ],
             attachment_refs=[dict(ref) for ref in inbound.attachment_refs],
             effort=inbound.effort.value if inbound.effort is not None else None,
+            sender_id=inbound.sender.id,
+            sender_display_name=inbound.sender.display_name,
+            sender_classification=inbound.sender.classification,
+            ingress_tool_profile=inbound.ingress_tool_profile,
+            source_message_id=inbound.source_message_id,
+            channel_binding_generation=inbound.channel_binding_generation,
+            channel_context=serialize_channel_context(inbound),
             received_at=now,
         )
     )
@@ -162,14 +190,14 @@ async def publish_inbound_locked(
         session_id=inbound.session_id,
         for_update=True,
     )
-    turn = _create_turn(
+    turn = await _reserve_fresh_pending_locked(
         db,
         session_id=inbound.session_id,
         runner_instance_id=runner_instance_id,
-        message_ids=tuple(row.id for row in pending_rows),
-        effort=_effort_from_pending(pending_rows[-1]),
+        pending_rows=pending_rows,
         started_at=now,
     )
+    assert turn is not None
     return AcceptedMessage(
         session_id=inbound.session_id,
         message_id=inbound.message_id,
@@ -231,15 +259,52 @@ async def reserve_pending_turn(
         if not pending_rows:
             await db.commit()
             return None
-        turn = _create_turn(
+        turn = await _reserve_fresh_pending_locked(
             db,
             session_id=session_id,
             runner_instance_id=runner_instance_id,
-            message_ids=tuple(row.id for row in pending_rows),
-            effort=_effort_from_pending(pending_rows[-1]),
+            pending_rows=pending_rows,
         )
         await db.commit()
         return turn
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def close_revoked_pending_prefix(
+    db: AsyncSession,
+    *,
+    session_id: UUID,
+    runner_instance_id: UUID,
+) -> int:
+    """Close obsolete external Pending rows without starting a current Turn."""
+    try:
+        await lock_uuid_identity(db, session_id)
+        running = (
+            await db.execute(
+                select(TurnRun)
+                .where(TurnRun.session_id == session_id, TurnRun.status == "running")
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if running is not None:
+            await db.commit()
+            return 0
+        remaining = await _pending_rows(db, session_id=session_id, for_update=True)
+        closed = 0
+        while remaining:
+            if await _valid_contiguous_profile_prefix(db, remaining):
+                break
+            await _close_revoked_pending(
+                db,
+                row=remaining[0],
+                runner_instance_id=runner_instance_id,
+            )
+            remaining = remaining[1:]
+            closed += 1
+        await db.commit()
+        return closed
     except Exception:
         await db.rollback()
         raise
@@ -270,20 +335,38 @@ async def capture_pending_for_turn(
     """Capture one pending boundary for an otherwise empty continuation turn."""
     try:
         await lock_uuid_identity(db, turn.session_id)
-        await _running_turn(db, turn.turn_id)
+        run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         if turn.message_ids:
             await db.commit()
             return turn
+        if run.input_message_ids:
+            captured = TurnStart(
+                session_id=turn.session_id,
+                turn_id=turn.turn_id,
+                message_ids=tuple(UUID(message_id) for message_id in run.input_message_ids),
+                effort=turn.effort,
+                tool_profile=_stored_tool_profile(run.tool_profile),
+            )
+            await db.commit()
+            return captured
         pending_rows = await _pending_rows(db, session_id=turn.session_id, for_update=True)
-        if not pending_rows:
+        captured_rows = await _valid_contiguous_profile_prefix(
+            db,
+            pending_rows,
+            expected_profile=run.tool_profile,
+        )
+        if not captured_rows:
             await db.commit()
             return turn
         captured = TurnStart(
             session_id=turn.session_id,
             turn_id=turn.turn_id,
-            message_ids=tuple(row.id for row in pending_rows),
-            effort=_effort_from_pending(pending_rows[-1]),
+            message_ids=tuple(row.id for row in captured_rows),
+            effort=_effort_from_pending(captured_rows[-1]),
+            tool_profile=_stored_tool_profile(run.tool_profile),
         )
+        run.input_message_ids = [str(message_id) for message_id in captured.message_ids]
         await db.commit()
         return captured
     except Exception:
@@ -298,7 +381,8 @@ async def promote_pending_for_turn(
 ) -> TurnStart:
     try:
         await lock_uuid_identity(db, turn.session_id)
-        await _running_turn(db, turn.turn_id)
+        run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         captured_ids = turn.message_ids
         if not captured_ids:
             await db.commit()
@@ -342,6 +426,7 @@ async def persist_assistant(
     try:
         await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         now = datetime.now(UTC)
         message = Message(
             id=uuid.uuid4(),
@@ -383,7 +468,8 @@ async def persist_tool_result(
 
     try:
         await lock_uuid_identity(db, turn.session_id)
-        await _running_turn(db, turn.turn_id)
+        run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         updated_assistant: Message | None = None
         if assistant_message_id is not None:
             updated_assistant = (
@@ -447,13 +533,18 @@ async def persist_human_marker(
 ) -> Message:
     try:
         await lock_uuid_identity(db, turn.session_id)
-        await _running_turn(db, turn.turn_id)
+        run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         message = Message(
             id=uuid.uuid4(),
             session_id=turn.session_id,
             message_kind="human",
             content=[{"type": "text", "text": text_content}],
             delivery_refs=[],
+            sender_id="openoctopus:server",
+            sender_display_name="OpenOctopus",
+            sender_classification="internal",
+            ingress_tool_profile=turn.tool_profile,
             is_compacted=False,
             created_at=datetime.now(UTC),
         )
@@ -469,6 +560,7 @@ async def finish_final_turn(db: AsyncSession, *, turn: TurnStart) -> None:
     try:
         await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         run.status = "completed"
         run.finished_at = datetime.now(UTC)
         session = await db.get(Session, turn.session_id)
@@ -489,17 +581,31 @@ async def finish_tool_batch_and_continue(
     try:
         await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         now = datetime.now(UTC)
         run.status = "completed"
         run.finished_at = now
         await db.flush()
         pending_rows = await _pending_rows(db, session_id=turn.session_id, for_update=True)
+        captured_rows = await _valid_contiguous_profile_prefix(
+            db,
+            pending_rows,
+            expected_profile=run.tool_profile,
+        )
         next_turn = _create_turn(
             db,
             session_id=turn.session_id,
             runner_instance_id=runner_instance_id,
-            message_ids=tuple(row.id for row in pending_rows),
-            effort=(_effort_from_pending(pending_rows[-1]) if pending_rows else turn.effort),
+            message_ids=tuple(row.id for row in captured_rows),
+            effort=(
+                _effort_from_pending(captured_rows[-1])
+                if captured_rows
+                else turn.effort
+            ),
+            tool_profile=_stored_tool_profile(run.tool_profile),
+            failed_delivery_targets=[
+                dict(target) for target in run.failed_delivery_targets
+            ],
             started_at=now,
         )
         await db.commit()
@@ -519,6 +625,7 @@ async def cancel_tool_batch(
     try:
         await lock_uuid_identity(db, turn.session_id)
         run = await _running_turn(db, turn.turn_id)
+        _require_turn_profile(turn, run)
         now = datetime.now(UTC)
         result_rows: list[Message] = []
         outcomes = [
@@ -557,6 +664,10 @@ async def cancel_tool_batch(
             message_kind="human",
             content=[{"type": "text", "text": "[User pressed stop]"}],
             delivery_refs=[],
+            sender_id="openoctopus:server",
+            sender_display_name="OpenOctopus",
+            sender_classification="internal",
+            ingress_tool_profile=turn.tool_profile,
             is_compacted=False,
             created_at=now + timedelta(microseconds=len(result_rows)),
         )
@@ -704,6 +815,45 @@ async def get_messages_response(
             first=rows[0] if rows else None,
         )
 
+    deliveries_by_message: dict[UUID, list[ChannelDeliveryResponse]] = {}
+    message_ids = tuple(row.id for row in rows)
+    if message_ids:
+        delivery_rows = list(
+            (
+                await db.scalars(
+                    select(ChannelDelivery)
+                    .where(ChannelDelivery.assistant_message_id.in_(message_ids))
+                    .order_by(ChannelDelivery.created_at, ChannelDelivery.id)
+                )
+            ).all()
+        )
+        for delivery in delivery_rows:
+            if delivery.assistant_message_id is None:
+                continue
+            deliveries_by_message.setdefault(delivery.assistant_message_id, []).append(
+                ChannelDeliveryResponse(
+                    channel=cast(ExternalChannel, delivery.channel),
+                    chat_id=delivery.chat_id,
+                    origin=cast(DeliveryOrigin, delivery.origin),
+                    status=cast(
+                        Literal[
+                            "prepared",
+                            "attempting",
+                            "sent",
+                            "partial",
+                            "failed",
+                            "unknown",
+                        ],
+                        delivery.status,
+                    ),
+                    total_actions=delivery.total_actions,
+                    visible_sent_actions=delivery.visible_sent_actions,
+                    error_code=delivery.last_error_code,
+                    error_message=delivery.last_error_message,
+                    created_at=delivery.created_at,
+                )
+            )
+
     pending_rows = await _pending_rows(db, session_id=session_id)
     latest_run = (
         await db.execute(
@@ -722,15 +872,25 @@ async def get_messages_response(
         )
     ).scalar_one_or_none()
 
-    status = "idle"
+    status: Literal["idle", "running", "failed", "abandoned"] = "idle"
     active_turn_id: UUID | None = None
     if latest_run is not None and latest_run.status in {"running", "failed", "abandoned"}:
-        status = latest_run.status
+        status = cast(
+            Literal["running", "failed", "abandoned"],
+            latest_run.status,
+        )
         if latest_run.status == "running":
             active_turn_id = latest_run.id
 
     return MessagesResponse(
-        messages=[message_response(row, session=session) for row in rows],
+        messages=[
+            message_response(
+                row,
+                session=session,
+                deliveries=deliveries_by_message.get(row.id, []),
+            )
+            for row in rows
+        ],
         pending_messages=[pending_response(row, session=session) for row in pending_rows],
         status=status,
         active_turn_id=active_turn_id,
@@ -825,6 +985,13 @@ async def _promote_pending_rows(
                 content=row.content,
                 attachment_refs=[dict(ref) for ref in (row.attachment_refs or [])],
                 delivery_refs=[],
+                sender_id=row.sender_id,
+                sender_display_name=row.sender_display_name,
+                sender_classification=row.sender_classification,
+                ingress_tool_profile=row.ingress_tool_profile,
+                source_message_id=row.source_message_id,
+                channel_binding_generation=row.channel_binding_generation,
+                channel_context=[dict(item) for item in (row.channel_context or [])],
                 is_compacted=False,
                 created_at=promoted_at + timedelta(microseconds=index),
             )
@@ -840,6 +1007,8 @@ def _create_turn(
     runner_instance_id: UUID,
     message_ids: tuple[UUID, ...],
     effort: Effort | None,
+    tool_profile: ToolProfile,
+    failed_delivery_targets: list[dict[str, Any]] | None = None,
     started_at: datetime | None = None,
 ) -> TurnStart:
     turn_id = uuid.uuid4()
@@ -849,6 +1018,11 @@ def _create_turn(
             session_id=session_id,
             runner_instance_id=runner_instance_id,
             status="running",
+            tool_profile=tool_profile,
+            input_message_ids=[str(message_id) for message_id in message_ids],
+            failed_delivery_targets=[
+                dict(target) for target in (failed_delivery_targets or [])
+            ],
             started_at=started_at or datetime.now(UTC),
         )
     )
@@ -857,6 +1031,7 @@ def _create_turn(
         turn_id=turn_id,
         message_ids=message_ids,
         effort=effort,
+        tool_profile=tool_profile,
     )
 
 
@@ -871,6 +1046,173 @@ async def _running_turn(db: AsyncSession, turn_id: UUID) -> TurnRun:
 
 def _effort_from_pending(row: PendingMessage) -> Effort | None:
     return Effort(row.effort) if row.effort is not None else None
+
+
+def _stored_tool_profile(value: str) -> ToolProfile:
+    if value not in {"owner_full", "message_only"}:
+        raise RuntimeError("Stored tool profile is invalid")
+    return cast(ToolProfile, value)
+
+
+async def _reserve_fresh_pending_locked(
+    db: AsyncSession,
+    *,
+    session_id: UUID,
+    runner_instance_id: UUID,
+    pending_rows: list[PendingMessage],
+    started_at: datetime | None = None,
+) -> TurnStart | None:
+    remaining = pending_rows
+    next_started_at = started_at
+    while remaining:
+        captured_rows = await _valid_contiguous_profile_prefix(db, remaining)
+        if captured_rows:
+            return _create_turn(
+                db,
+                session_id=session_id,
+                runner_instance_id=runner_instance_id,
+                message_ids=tuple(row.id for row in captured_rows),
+                effort=_effort_from_pending(captured_rows[-1]),
+                tool_profile=_stored_tool_profile(
+                    captured_rows[0].ingress_tool_profile
+                ),
+                started_at=next_started_at,
+            )
+        await _close_revoked_pending(
+            db,
+            row=remaining[0],
+            runner_instance_id=runner_instance_id,
+        )
+        remaining = remaining[1:]
+        next_started_at = None
+    return None
+
+
+async def _valid_contiguous_profile_prefix(
+    db: AsyncSession,
+    rows: list[PendingMessage],
+    *,
+    expected_profile: str | None = None,
+) -> list[PendingMessage]:
+    if not rows:
+        return []
+    profile = expected_profile or rows[0].ingress_tool_profile
+    if rows[0].ingress_tool_profile != profile:
+        return []
+    session = await db.get(Session, rows[0].session_id)
+    if session is None:
+        raise RuntimeError("Pending channel Session disappeared")
+    config = await _locked_channel_config(
+        db,
+        user_id=rows[0].user_id,
+        channel=session.channel,
+    )
+    captured: list[PendingMessage] = []
+    for row in rows:
+        if row.ingress_tool_profile != profile:
+            break
+        if not _pending_authority_is_current(
+            row,
+            channel=session.channel,
+            config=config,
+        ):
+            break
+        captured.append(row)
+    return captured
+
+
+async def _locked_channel_config(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    channel: str,
+) -> DiscordConfig | DingTalkConfig | None:
+    if channel == "discord":
+        return (
+            await db.execute(
+                select(DiscordConfig)
+                .where(DiscordConfig.user_id == user_id)
+                .with_for_update(read=True)
+            )
+        ).scalar_one_or_none()
+    if channel == "dingtalk":
+        return (
+            await db.execute(
+                select(DingTalkConfig)
+                .where(DingTalkConfig.user_id == user_id)
+                .with_for_update(read=True)
+            )
+        ).scalar_one_or_none()
+    return None
+
+
+def _pending_authority_is_current(
+    row: PendingMessage,
+    *,
+    channel: str,
+    config: DiscordConfig | DingTalkConfig | None,
+) -> bool:
+    if channel not in {"discord", "dingtalk"}:
+        return (
+            row.channel_binding_generation is None
+            and row.ingress_tool_profile == "owner_full"
+            and row.sender_classification in {"owner", "internal"}
+        )
+    if config is None or row.channel_binding_generation != config.binding_generation:
+        return False
+    if row.ingress_tool_profile == "owner_full":
+        return (
+            row.sender_classification == "owner"
+            and config.owner_platform_user_id is not None
+            and row.sender_id == config.owner_platform_user_id
+        )
+    return (
+        row.ingress_tool_profile == "message_only"
+        and row.sender_classification == "allowed_non_owner"
+        and row.sender_id in config.allow_list
+    )
+
+
+async def _close_revoked_pending(
+    db: AsyncSession,
+    *,
+    row: PendingMessage,
+    runner_instance_id: UUID,
+) -> None:
+    now = datetime.now(UTC)
+    await _promote_pending_rows(db, [row])
+    terminal_at = datetime.now(UTC) + timedelta(microseconds=1)
+    turn_id = uuid.uuid4()
+    db.add(
+        TurnRun(
+            id=turn_id,
+            session_id=row.session_id,
+            runner_instance_id=runner_instance_id,
+            status="failed",
+            tool_profile=row.ingress_tool_profile,
+            input_message_ids=[str(row.id)],
+            failed_delivery_targets=[],
+            started_at=now,
+            finished_at=terminal_at,
+        )
+    )
+    db.add(
+        Message(
+            id=uuid.uuid4(),
+            session_id=row.session_id,
+            message_kind="synthetic_assistant_error",
+            content=[{"type": "text", "text": _CHANNEL_AUTHORITY_REVOKED_TEXT}],
+            attachment_refs=[],
+            delivery_refs=[],
+            is_compacted=False,
+            created_at=terminal_at,
+        )
+    )
+
+
+def _require_turn_profile(turn: TurnStart, run: TurnRun) -> None:
+    if turn.tool_profile != run.tool_profile:
+        raise RuntimeError("Turn tool profile changed after reservation")
 
 
 def _is_before_anchor(anchor: Message) -> Any:

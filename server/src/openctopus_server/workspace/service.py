@@ -62,7 +62,12 @@ from openctopus_server.workspace.skills import (
     validate_skill_manifest,
     validate_skill_manifest_stream,
 )
-from openctopus_server.workspace.storage import ObjectStream, ObjectUpload, StoredObject
+from openctopus_server.workspace.storage import (
+    STREAM_CHUNK_SIZE,
+    ObjectStream,
+    ObjectUpload,
+    StoredObject,
+)
 from openctopus_server.workspace.text_edit import apply_text_edit
 
 REST_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
@@ -1091,6 +1096,143 @@ class WorkspaceService:
         finally:
             self._invalidate_skills(user_id, path)
 
+    async def write_bounded_stream(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: UUID,
+        path: str,
+        chunks: AsyncIterator[bytes],
+        expected_size: int,
+        max_bytes: int,
+    ) -> FileMetadata:
+        if not _is_channel_attachment_path(path):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_BLOCKED_PATH,
+                "Bounded channel uploads require the reserved attachment path",
+            )
+        ticket = await self.authorize_upload(db, user_id=user_id, path=path)
+        await db.commit()
+        return await self.write_authorized_bounded_stream(
+            ticket,
+            chunks=chunks,
+            expected_size=expected_size,
+            max_bytes=max_bytes,
+        )
+
+    async def write_authorized_bounded_stream(
+        self,
+        ticket: UploadTicket,
+        *,
+        chunks: AsyncIterator[bytes],
+        expected_size: int,
+        max_bytes: int,
+    ) -> FileMetadata:
+        if (
+            ticket.target != WorkspaceTarget.personal(ticket.user_id)
+            or not _is_channel_attachment_path(ticket.relative_path)
+        ):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_BLOCKED_PATH,
+                "Bounded channel uploads require the reserved attachment path",
+            )
+        if (
+            expected_size < 0
+            or max_bytes < 0
+            or expected_size > max_bytes
+            or expected_size > ticket.max_bytes
+        ):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                "Workspace stream exceeds its authorized size limit",
+            )
+        upload = await self._fs.begin_idempotent_upload(
+            ticket.target,
+            ticket.relative_path,
+            size=expected_size,
+            quota_bytes=ticket.quota_bytes,
+        )
+        try:
+            transferred = 0
+            async for chunk in chunks:
+                if not isinstance(chunk, bytes) or len(chunk) > STREAM_CHUNK_SIZE:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                        "Workspace stream chunk exceeds the bounded upload size",
+                    )
+                transferred += len(chunk)
+                if transferred > expected_size:
+                    raise WorkspaceError(
+                        ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                        "Workspace stream exceeds its declared size",
+                    )
+                await upload.write(chunk)
+            if transferred != expected_size:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_UPLOAD_TOO_LARGE,
+                    "Workspace stream did not match its declared size",
+                )
+            staged = await upload.finish()
+            if staged.size != expected_size:
+                raise WorkspaceError(
+                    ErrorCode.WORKSPACE_TRANSFER_INTEGRITY_FAILED,
+                    "Workspace staged upload size is inconsistent",
+                )
+            try:
+                metadata = await self._fs.commit_uploaded_object(
+                    ticket.target,
+                    ticket.relative_path,
+                    upload.object_name,
+                    size=expected_size,
+                    quota_bytes=ticket.quota_bytes,
+                    reuse_if_same_etag=staged.etag,
+                )
+            except UploadCommittedAfterCancellation as exc:
+                if exc.metadata is not None and exc.metadata.created:
+                    cleanup = asyncio.create_task(
+                        self.delete_channel_attachment(
+                            user_id=ticket.user_id,
+                            path=ticket.relative_path,
+                            if_match=exc.metadata.etag,
+                        )
+                    )
+                    try:
+                        await await_future_cancellation_safe(cleanup)
+                    except BaseException:
+                        exc.add_note("Committed channel attachment cleanup failed")
+                raise
+            return metadata
+        except BaseException:
+            cleanup = asyncio.create_task(upload.abort())
+            try:
+                await await_future_cancellation_safe(cleanup)
+            except BaseException:
+                pass
+            raise
+        finally:
+            self._invalidate_skills(ticket.user_id, ticket.display_path)
+
+    async def delete_channel_attachment(
+        self,
+        *,
+        user_id: UUID,
+        path: str,
+        if_match: str,
+    ) -> None:
+        if not _is_channel_attachment_path(path):
+            raise WorkspaceError(
+                ErrorCode.WORKSPACE_BLOCKED_PATH,
+                "Channel attachment cleanup requires the reserved attachment path",
+            )
+        try:
+            await self._fs.delete_file(
+                WorkspaceTarget.personal(user_id),
+                path,
+                if_match=if_match,
+            )
+        finally:
+            self._invalidate_skills(user_id, path)
+
     async def write_authorized_upload(
         self,
         ticket: UploadTicket,
@@ -1375,6 +1517,16 @@ def _decode_optional_text(data: bytes | None) -> str | None:
 
 def _search_path(path: str) -> str:
     return "" if path in {"", "."} else path
+
+
+def _is_channel_attachment_path(path: str) -> bool:
+    parsed = PurePosixPath(path)
+    return (
+        parsed.as_posix() == path
+        and len(parsed.parts) >= 4
+        and parsed.parts[:2] == (".attachments", "channels")
+        and ".." not in parsed.parts
+    )
 
 
 def _personal_relative_path(path: str, user_id: UUID) -> str:

@@ -1,0 +1,105 @@
+{
+  "adapters": 500,
+  "checks": {
+    "all_configs_reconnected": true,
+    "all_configs_started": true,
+    "callbacks_are_exactly_once": true,
+    "each_config_has_one_current_generation": true,
+    "event_loop_lag_was_sampled": true,
+    "harness_completed": true,
+    "harness_tasks_do_not_leak": true,
+    "heartbeat_interval_is_reasonable": true,
+    "heartbeat_observed_for_every_current_adapter": true,
+    "manager_tasks_are_empty_after_shutdown": true,
+    "reconnect_has_no_tight_herd": true,
+    "reconnect_jitter_is_spread": true,
+    "stale_generation_callbacks_are_fenced": true,
+    "startup_concurrency_bounded": true
+  },
+  "database_exercised": false,
+  "duration_seconds": 600.0,
+  "failure": null,
+  "limitations": [
+    "Metadata adapters do not connect to Discord or DingTalk.",
+    "The metadata config source is in memory and does not exercise PostgreSQL.",
+    "RSS and file-descriptor values are recorded evidence, not machine-portable gates."
+  ],
+  "metrics": {
+    "after_shutdown": {
+      "leaked_harness_tasks": [],
+      "manager_background_tasks": 0
+    },
+    "callbacks": {
+      "accepted": 1000,
+      "duplicate_source_ids": 0,
+      "unique_source_ids": 1000,
+      "user_mismatches": 0
+    },
+    "event_loop_lag": {
+      "maximum_seconds": 0.002434,
+      "mean_seconds": 0.001198,
+      "p95_seconds": 0.001948,
+      "sample_interval_seconds": 1.0,
+      "samples": 600
+    },
+    "generations": {
+      "current": 500,
+      "live_per_config_maximum": 1
+    },
+    "heartbeat": {
+      "adapters_observed": 500,
+      "configured_interval_seconds": 30.0,
+      "maximum_interval_seconds": 30.049755,
+      "mean_interval_seconds": 30.000634,
+      "p95_interval_seconds": 30.001064,
+      "samples": 10000
+    },
+    "process": {
+      "after_shutdown": {
+        "fd_count": 7,
+        "rss_bytes": 100614144,
+        "task_count": 1
+      },
+      "baseline": {
+        "fd_count": 7,
+        "rss_bytes": 90587136,
+        "task_count": 1
+      },
+      "fd_after_delta": 0,
+      "fd_peak_delta": 0,
+      "peak": {
+        "fd_count": 7,
+        "rss_bytes": 100614144,
+        "task_count": 503
+      },
+      "rss_after_delta_bytes": 10027008,
+      "rss_and_fd_values_are_observations_not_portable_limits": true,
+      "rss_peak_delta_bytes": 10027008,
+      "task_after_delta": 0,
+      "task_peak_delta": 502
+    },
+    "reconnect": {
+      "created_replacements": 500,
+      "maximum_starts_in_tight_window": 27,
+      "observed_start_spread_seconds": 0.999468,
+      "planned_delay_max_seconds": 0.999,
+      "planned_delay_min_seconds": 0.001,
+      "planned_delay_spread_seconds": 0.998,
+      "seconds": 1.010334,
+      "stale_callbacks_rejected": 500,
+      "tight_herd_limit": 63,
+      "tight_herd_window_seconds": 0.05
+    },
+    "startup": {
+      "concurrency_limit": 32,
+      "maximum_concurrent_starts": 32,
+      "seconds": 0.061503
+    },
+    "wall_time_seconds": 601.144829
+  },
+  "mode": "source",
+  "ok": true,
+  "platform_network_exercised": false,
+  "profile": "merge_gate_500",
+  "transport": "in_memory_metadata_adapter"
+}

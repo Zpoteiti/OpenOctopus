@@ -1,0 +1,1 @@
+"""External channel adapters."""

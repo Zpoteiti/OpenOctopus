@@ -58,6 +58,15 @@ def _message(
     created_at: datetime,
     kind: str = "assistant",
 ) -> Message:
+    authority = (
+        {
+            "sender_id": str(session_id),
+            "sender_classification": "owner",
+            "ingress_tool_profile": "owner_full",
+        }
+        if kind == "human"
+        else {}
+    )
     return Message(
         id=uuid4(),
         session_id=session_id,
@@ -66,6 +75,7 @@ def _message(
         delivery_refs=[],
         is_compacted=False,
         created_at=created_at,
+        **authority,
     )
 
 
@@ -157,6 +167,9 @@ async def test_list_unread_ignores_pending_and_respects_read_timestamp(
                 user_id=owner.id,
                 session_key=pending_only.session_key,
                 content=[{"type": "text", "text": "pending"}],
+                sender_id=str(owner.id),
+                sender_classification="owner",
+                ingress_tool_profile="owner_full",
                 received_at=now + timedelta(seconds=1),
             )
         )
@@ -229,6 +242,9 @@ async def test_patch_invalid_marker_is_atomic_and_pending_does_not_qualify(
             user_id=owner.id,
             session_key=session.session_key,
             content=[{"type": "text", "text": "pending"}],
+            sender_id=str(owner.id),
+            sender_classification="owner",
+            ingress_tool_profile="owner_full",
             received_at=now,
         )
         db.add_all([other_message, pending])
@@ -343,6 +359,9 @@ async def test_delete_cascades_completed_cron_session_history(
                     user_id=owner.id,
                     session_key=session.session_key,
                     content=[{"type": "text", "text": "pending"}],
+                    sender_id=str(owner.id),
+                    sender_classification="owner",
+                    ingress_tool_profile="owner_full",
                     received_at=now,
                 ),
                 TurnRun(
@@ -350,6 +369,7 @@ async def test_delete_cascades_completed_cron_session_history(
                     session_id=session.id,
                     runner_instance_id=uuid4(),
                     status="completed",
+                    tool_profile="owner_full",
                     started_at=now,
                     finished_at=now,
                 ),
@@ -501,6 +521,7 @@ async def test_failed_delete_abandons_interrupted_turn_and_allows_next_message(
                 session_id=session_id,
                 runner_instance_id=runtime.runner_instance_id,
                 status="running",
+                tool_profile="owner_full",
                 started_at=datetime.now(UTC),
             )
         )

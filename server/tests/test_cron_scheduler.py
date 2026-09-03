@@ -185,6 +185,7 @@ async def test_busy_fire_skips_without_creating_chat_rows_or_last_fired(pg_engin
                 session_id=job.id,
                 runner_instance_id=uuid.uuid4(),
                 status="running",
+                tool_profile="owner_full",
                 started_at=NOW - timedelta(minutes=2),
             )
         )
@@ -282,6 +283,9 @@ async def test_startup_pending_recovery_only_schedules_automation_sessions(pg_en
                     user_id=user.id,
                     session_key=route,
                     content=[{"type": "text", "text": channel}],
+                    sender_id=str(user.id),
+                    sender_classification="internal",
+                    ingress_tool_profile="owner_full",
                     attachment_refs=[],
                     effort=None,
                     received_at=NOW,
@@ -359,6 +363,9 @@ async def test_pending_recovery_handoff_is_cancellation_safe(pg_engine) -> None:
                 user_id=user.id,
                 session_key=route,
                 content=[{"type": "text", "text": "heartbeat"}],
+                sender_id=str(user.id),
+                sender_classification="internal",
+                ingress_tool_profile="owner_full",
                 attachment_refs=[],
                 effort=None,
                 received_at=NOW,
