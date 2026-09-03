@@ -3,6 +3,8 @@
 Run one AI agent server and let it work in Server Workspaces or on paired Linux,
 macOS, and Windows computers.
 
+![OpenOctopus Server connects browser, Discord, and DingTalk channels with paired Linux, Windows, and macOS clients.](docs/images/openoctopus-architecture.png)
+
 > OpenOctopus is an alpha/demo release. Its Client can run commands and local
 > MCP services with the permissions of your operating-system user. Read
 > [Security and current boundaries](#security-and-current-boundaries) before
@@ -26,6 +28,29 @@ macOS, and Windows computers.
 New accounts receive editable `SOUL.md` and `MEMORY.md` files in their personal
 Workspace. Administrators can configure the default SOUL, Provider, Workspace
 quotas, Server Web Fetch policy, users, and shared Server MCP from the UI.
+
+## See it in action
+
+### Server Workspace
+
+Browse the Server Workspace alongside paired Clients, then manage files and
+agent instructions in one place.
+
+![OpenOctopus Workspace with personal files and an online paired Client.](docs/images/openoctopus-workspace.jpg)
+
+### Paired Clients
+
+Pair a computer once, see whether it is online, and route the Agent to its
+Workspace, commands, and MCP services.
+
+![OpenOctopus Devices page showing an online paired Linux devbox.](docs/images/openoctopus-devices.jpg)
+
+### External Channels
+
+Connect a personal Discord or DingTalk Bot to the same durable conversation as
+the browser, with owner pairing and an explicit text-only allow list.
+
+![OpenOctopus Channels page for Discord and DingTalk configuration.](docs/images/openoctopus-channels.jpg)
 
 ## Architecture
 
