@@ -312,4 +312,3 @@ function formatTime(value: string, language: string | undefined): string {
     minute: '2-digit',
   }).format(new Date(value))
 }
-

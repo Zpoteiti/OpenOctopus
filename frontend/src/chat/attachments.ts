@@ -45,4 +45,3 @@ function pastedImageFilename(type: string, index: number): string {
 export function attachmentKey(ref: MessageAttachmentRef): string {
   return `${'device_id' in ref ? ref.device_id : 'server'}:${ref.path}`
 }
-

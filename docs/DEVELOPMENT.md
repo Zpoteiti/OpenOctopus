@@ -58,7 +58,8 @@ errors to tool results. Implementations live in:
 The runtime supplies the admission controller, drain registry, and path locks.
 Cancelling a coroutine does not stop its worker thread. Mutation locks remain
 held until the worker finishes; abandoned transfer work hands its resources to
-the runtime drain registry. Dispatcher shutdown still waits for tracked work.
+the runtime drain registry. The runtime still waits for work tracked by each
+dispatcher.
 
 ## MCP catalogs
 
@@ -90,6 +91,10 @@ Run the lint, type-check, unit, and browser commands in the
 [development guide](../README.md#development-and-verification). Server tests need
 PostgreSQL; real storage and device checks also need RustFS and the source Client
 installed in the test environment.
+
+The Server uses SQLAlchemy 2.0. Its dependency range stays below 2.1, which changes
+the type signatures of query and result objects. Update those annotations and
+verify the database paths together when upgrading SQLAlchemy.
 
 The Server CI enables these additional checks when running `pytest`:
 
