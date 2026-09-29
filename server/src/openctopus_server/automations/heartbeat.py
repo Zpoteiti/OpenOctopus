@@ -243,12 +243,14 @@ def heartbeat_jev_request(
             instructions=(
                 f"Should the task in state.tasks.{task_id} run at the supplied current time? "
                 "Use only the supplied document and time. Live external conditions cannot be checked here; "
-                "the Agent can perform requested checks after run. Do not run future conditions early. "
+                "the Agent performs requested checks after run. An unknown external outcome does not prevent a due check. "
+                "Only the supplied scheduling constraints and known prerequisites determine whether to check now. "
+                "Do not run future conditions early. "
                 "Exact-time work belongs in Cron."
             ),
             criteria={
-                "run": "The supplied task should execute now, including performing a requested check.",
-                "skip": "The task is not due, its prerequisite is not established, or execution is uncertain.",
+                "run": "A task or requested check is due now, including when its external outcome is unknown.",
+                "skip": "The supplied schedule or an explicitly known prerequisite makes the task inapplicable now.",
             },
         )
         for task_id in task_map

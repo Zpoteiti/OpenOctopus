@@ -376,7 +376,7 @@ function DreamHistoryRow({
   const changed = detail?.before !== null && detail?.before !== undefined && detail?.after !== null && detail?.after !== undefined && detail.before !== detail.after
   const restoreConflict = restoreError instanceof ApiError && restoreError.status === 409
   return (
-    <article className="automation-row">
+    <article className="automation-row automation-dream-row">
       <div className="automation-row-main">
         <h3>{t(`automations.dreamStatus.${item.status}`)}</h3>
         <p><Timestamp value={item.finished_at ?? item.started_at} timezone={timezone} language={i18n.resolvedLanguage} /> · {t('automations.dreamMessages', { count: item.message_count })}</p>

@@ -344,6 +344,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .empty-card-copy { color: var(--muted); font-size: 11px; margin: 0; }
 .heartbeat-meta { align-items: center; display: flex; flex-wrap: wrap; font-size: 10px; gap: 12px; margin-bottom: 8px; }
 .heartbeat-meta a { color: var(--accent-strong); font-weight: 700; }
+.automation-dream-row { align-items: center; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.automation-dream-row > :nth-child(n + 3) { grid-column: 1 / -1; }
 .automation-dream-detail { grid-column: 1 / -1; overflow-wrap: anywhere; }
 .automation-dream-detail pre { background: var(--panel-soft); border-radius: 6px; font-size: 10px; line-height: 1.5; max-height: 320px; overflow: auto; padding: 10px; white-space: pre-wrap; }
 .heartbeat-editor { display: grid; gap: 14px; margin-top: 14px; }
@@ -406,6 +408,7 @@ td small { color: var(--muted); margin-top: 3px; }
   .preference-timezone form { align-items: stretch; flex-direction: column; justify-content: flex-start; width: 100%; }
   .preference-timezone input { width: 100%; }
   .automation-row { align-items: stretch; flex-direction: column; }
+  .automation-dream-row { grid-template-columns: minmax(0, 1fr); }
   .automation-row-actions { justify-content: flex-start; }
   .secret-once { align-items: stretch; flex-direction: column; }
 }
