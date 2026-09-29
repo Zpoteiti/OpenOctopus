@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import yaml
@@ -29,6 +29,7 @@ class SkillInfo:
     always_on: bool
     body: str
     path: str
+    origin: Literal["personal", "builtin"] = "personal"
 
 
 def is_skill_manifest(path: str) -> bool:

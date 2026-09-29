@@ -61,6 +61,16 @@ This is a *design* document. Use it during implementation as the source of truth
 
 ---
 
+## Built-in skills
+
+The Server reserves `/builtin/skills/<name>/SKILL.md` for its shared release
+library (ADR-137). `read_file`, `list_dir`, `find_files`, `grep` and REST downloads
+can read it. Writes, edits, patches, deletes, uploads and `file_transfer` with a
+built-in source or destination return `workspace_blocked_path`, including path
+aliases and traversal attempts. Client-side paths are governed by the selected
+client's normal filesystem policy. Conditional built-in metadata uses a
+`builtin/` display prefix so personal skills cannot shadow it.
+
 ## Inventory
 
 | Name | Type | Source schema in | Implementation in | Purpose |

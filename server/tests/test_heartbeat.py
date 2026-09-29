@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -8,17 +9,15 @@ from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.automations.heartbeat import (
-    HEARTBEAT_DECISION_SYSTEM,
-    HEARTBEAT_DECISION_TOOL,
     HEARTBEAT_MAX_BYTES,
     HEARTBEAT_MAX_CODEPOINTS,
     HEARTBEAT_QUEUE_CAPACITY,
-    HEARTBEAT_TOOL_CHOICE,
     HEARTBEAT_USER_PAGE_SIZE,
     HEARTBEAT_WORKERS,
     HeartbeatEvaluation,
@@ -28,7 +27,7 @@ from openctopus_server.automations.heartbeat import (
     extract_active_tasks,
     load_heartbeat_document,
     next_heartbeat_boundary,
-    parse_heartbeat_decision,
+    parse_heartbeat_tasks,
 )
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import (
@@ -41,8 +40,7 @@ from openctopus_server.db.models import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.provider.anthropic import ProviderInvocationError, ProviderResult
-from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.jev import JevService
 from openctopus_server.services.heartbeat import publish_heartbeat_phase_two
 
 
@@ -210,69 +208,29 @@ async def test_heartbeat_read_failures_are_closed(
     assert result.reason == reason
 
 
-def _tool_use(input_value: object, *, name: str = "heartbeat_decision") -> dict[str, object]:
-    return {
-        "type": "tool_use",
-        "id": "toolu_heartbeat",
-        "name": name,
-        "input": input_value,
-    }
-
-
 @pytest.mark.parametrize(
-    ("content", "action", "tasks"),
+    ("section", "expected"),
     [
-        ([_tool_use({"action": "skip", "tasks": []})], "skip", ()),
-        (
-            [
-                {"type": "thinking", "thinking": "ignored"},
-                _tool_use({"action": "run", "tasks": [" one ", "two"]}),
-                {"type": "text", "text": "ignored"},
-            ],
-            "run",
-            ("one", "two"),
-        ),
+        ("", ()),
+        ("- inspect blockers\n- review jobs", ("inspect blockers", "review jobs")),
+        ("1. preserve text!\n   Keep this detail.\n2. second", ("preserve text!\n   Keep this detail.", "second")),
+        ("- [x] completed\n- [ ] pending", ("pending",)),
+        ("<!-- - hidden -->\n- visible", ("visible",)),
+        ("### Checks\n- inspect", ("inspect",)),
     ],
 )
-def test_parse_heartbeat_decision_accepts_only_the_forced_tool(
-    content: list[dict[str, object]],
-    action: str,
-    tasks: tuple[str, ...],
-) -> None:
-    result = parse_heartbeat_decision(content)
-
-    assert result.decision is not None
-    assert result.decision.action == action
-    assert result.decision.tasks == tasks
+def test_parse_heartbeat_tasks_preserves_original_bodies(section: str, expected: tuple[str, ...]) -> None:
+    assert parse_heartbeat_tasks("## Active Tasks\n" + section) == expected
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        [],
-        [{"type": "text", "text": '{"action":"run"}'}],
-        [_tool_use({"action": "run", "tasks": ["one"]}, name="other")],
-        [
-            _tool_use({"action": "skip", "tasks": []}),
-            _tool_use({"action": "skip", "tasks": []}),
-        ],
-        [_tool_use({"action": "run", "tasks": []})],
-        [_tool_use({"action": "skip", "tasks": ["one"]})],
-        [_tool_use({"action": "run", "tasks": [""]})],
-        [_tool_use({"action": "run", "tasks": ["one", " one "]})],
-        [_tool_use({"action": "run", "tasks": [True]})],
-        [_tool_use({"action": "run", "tasks": "one"})],
-        [_tool_use({"action": "run", "tasks": ["one"], "extra": 1})],
-        [_tool_use({"action": "run", "tasks": ["x" * 501]})],
-        [_tool_use({"action": "run", "tasks": ["x" * 500] * 5})],
-        [_tool_use({"action": "run", "tasks": [str(index) for index in range(9)]})],
-    ],
-)
-def test_parse_heartbeat_decision_fails_closed(content: list[dict[str, object]]) -> None:
-    result = parse_heartbeat_decision(content)
-
-    assert result.decision is None
-    assert result.reason == "invalid_response"
+@pytest.mark.parametrize("section", [
+    "- " + "x" * 501,
+    "\n".join("- " + str(index) for index in range(9)),
+    "\n".join("- " + str(index) + "x" * 499 for index in range(5)),
+])
+def test_parse_heartbeat_tasks_rejects_unbounded_task_sets(section: str) -> None:
+    with pytest.raises(ValueError):
+        parse_heartbeat_tasks("## Active Tasks\n" + section)
 
 
 @pytest.mark.parametrize(
@@ -670,161 +628,108 @@ async def test_heartbeat_phase_two_rechecks_busy_and_missing_owner(pg_engine: An
     )
 
 
-class _Provider:
-    def __init__(
-        self,
-        content: list[dict[str, Any]] | None = None,
-        *,
-        error: Exception | None = None,
-    ) -> None:
-        self.content = content or [_tool_use({"action": "skip", "tasks": []})]
-        self.error = error
-        self.calls: list[dict[str, Any]] = []
-        self.closed = False
-
-    async def stream_turn(self, **kwargs: Any) -> ProviderResult:
-        self.calls.append(kwargs)
-        if self.error is not None:
-            raise self.error
-        return ProviderResult(content=self.content, fingerprint="heartbeat-fingerprint")
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-async def _configure_provider(
-    engine: Any,
-    *,
-    max_output_tokens: int = 100,
-    max_context_tokens: int | None = 10_000,
-) -> None:
-    rows: dict[str, Any] = {
-        "llm_endpoint": "http://provider.test",
-        "llm_api_key": "secret",
-        "llm_model": "model",
-        "llm_max_output_tokens": max_output_tokens,
-        "llm_max_concurrent_requests": 3,
-    }
-    if max_context_tokens is not None:
-        rows["llm_max_context_tokens"] = max_context_tokens
+async def _configure_jev(engine: Any) -> None:
     async with AsyncSession(engine, expire_on_commit=False) as db:
-        db.add_all(SystemConfig(key=key, value=value) for key, value in rows.items())
+        db.add_all([
+            SystemConfig(key="jev_endpoint", value="http://jev.test"),
+            SystemConfig(key="jev_api_key", value="jev-secret"),
+            SystemConfig(key="jev_revision", value="first"),
+        ])
         await db.commit()
 
 
-async def test_chat_runtime_evaluates_heartbeat_with_shared_provider_and_limiter(
-    pg_engine: Any,
-) -> None:
-    await _configure_provider(pg_engine)
-    provider = _Provider(
-        content=[_tool_use({"action": "run", "tasks": [" inspect "]})]
-    )
-    factory_calls: list[ProviderConfig] = []
+def _jev_response(choices: dict[str, str]) -> dict[str, Any]:
+    return {
+        "model": "jev-1.13.0",
+        "answers": {
+            key: {"type": "choice", "choice": choice,
+                  "probabilities": {"run": 0.8 if choice == "run" else 0.2,
+                                    "skip": 0.2 if choice == "run" else 0.8},
+                  "confidence": 0.5}
+            for key, choice in choices.items()
+        },
+        "usage": {"input_tokens": 100, "output_tokens": 20},
+    }
 
-    def factory(config: ProviderConfig) -> _Provider:
-        factory_calls.append(config)
-        return provider
 
-    runtime = ChatRuntime(
-        pg_engine,
-        provider_factory=factory,
-        request_token_estimator=lambda **kwargs: 25,
-    )
-    now = datetime(2026, 9, 1, 1, 30, tzinfo=UTC)
+async def test_chat_runtime_heartbeat_uses_jev_and_original_task_order(pg_engine: Any) -> None:
+    await _configure_jev(pg_engine)
+    calls: list[dict[str, Any]] = []
 
-    first = await runtime.evaluate_heartbeat_decision(
-        document="# Heartbeat\n\n## Active Tasks\n- inspect\n",
-        now_utc=now,
-        timezone="Asia/Shanghai",
-    )
-    second = await runtime.evaluate_heartbeat_decision(
-        document="# Heartbeat\n\n## Active Tasks\n- inspect\n",
-        now_utc=now,
-        timezone="Asia/Shanghai",
-    )
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        assert request.url.path == "/v1/systemone"
+        assert request.headers["authorization"] == "Bearer jev-secret"
+        return httpx.Response(200, json=_jev_response({"task_3": "run", "task_2": "skip", "task_1": "run"}))
 
-    assert first.decision is not None
-    assert first.decision.tasks == ("inspect",)
-    assert second.decision is not None
-    assert len(factory_calls) == 1
-    call = provider.calls[0]
-    assert call["system"] == HEARTBEAT_DECISION_SYSTEM
-    assert call["messages"] == [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "Current UTC time: 2026-09-01T01:30:00Z\n"
-                        "Current local time: 2026-09-01T09:30:00+08:00\n"
-                        "IANA timezone: Asia/Shanghai\n\n"
-                        "HEARTBEAT.md:\n"
-                        "# Heartbeat\n\n## Active Tasks\n- inspect\n"
-                    ),
-                }
-            ],
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = JevService(pg_engine, client=client)
+        provider_factory = AsyncMock(side_effect=AssertionError("normal provider cannot make Phase 1 decisions"))
+        runtime = ChatRuntime(pg_engine, jev_service=service, provider_factory=provider_factory)
+        document = "## Active Tasks\n- Original first!\n- second\n- Original third.\n"
+        result = await runtime.evaluate_heartbeat_decision(
+            document=document,
+            now_utc=datetime(2026, 9, 1, 1, 30, tzinfo=UTC),
+            timezone="Asia/Shanghai",
+        )
+        assert result.decision is not None
+        assert result.decision.tasks == ("Original first!", "Original third.")
+        assert result.reason == "decision_run"
+        assert provider_factory.call_count == 0
+        assert calls[0]["model"] == "jev-latest"
+        assert calls[0]["state"] == {
+            "utc_time": "2026-09-01T01:30:00Z", "local_time": "2026-09-01T09:30:00+08:00",
+            "timezone": "Asia/Shanghai", "document": document,
+            "tasks": {"task_1": "Original first!", "task_2": "second", "task_3": "Original third."},
         }
-    ]
-    assert call["tools"] == [HEARTBEAT_DECISION_TOOL]
-    assert call["tool_choice"] == HEARTBEAT_TOOL_CHOICE
-    assert call["limiter"] is runtime.limiter
-    assert call["effort"] is None
-    await runtime.close()
-    assert provider.closed
+        assert all(question["type"] == "choice" and set(question["criteria"]) == {"run", "skip"}
+                   for question in calls[0]["questions"].values())
+        await runtime.close()
 
 
-async def test_heartbeat_context_limit_fails_before_provider_call(pg_engine: Any) -> None:
-    await _configure_provider(
-        pg_engine,
-        max_output_tokens=100,
-        max_context_tokens=200,
-    )
-    provider = _Provider()
-    runtime = ChatRuntime(
-        pg_engine,
-        provider_factory=lambda config: provider,
-        request_token_estimator=lambda **kwargs: 101,
-    )
-
-    result = await runtime.evaluate_heartbeat_decision(
-        document="# Heartbeat\n\n## Active Tasks\n- inspect\n",
-        now_utc=datetime(2026, 9, 1, 1, 30, tzinfo=UTC),
-        timezone="UTC",
-    )
-
-    assert result.decision is None
-    assert result.reason == "context_limit"
-    assert provider.calls == []
-    await runtime.close()
+@pytest.mark.parametrize("response,reason", [
+    (httpx.Response(401, text="jev-secret rejected"), "jev_unauthorized"),
+    (httpx.Response(529, text="overloaded"), "jev_unavailable"),
+    (httpx.Response(200, json=_jev_response({"wrong_id": "run"})), "jev_invalid_response"),
+])
+async def test_heartbeat_jev_failure_has_no_chat_side_effects(pg_engine: Any, response: httpx.Response, reason: str) -> None:
+    await _configure_jev(pg_engine)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+        runtime = ChatRuntime(pg_engine, jev_service=JevService(pg_engine, client=client))
+        result = await runtime.evaluate_heartbeat_decision(
+            document="## Active Tasks\n- inspect\n", now_utc=datetime(2026, 9, 1, tzinfo=UTC), timezone="UTC",
+        )
+        assert result.decision is None
+        assert result.reason == reason
+        async with AsyncSession(pg_engine, expire_on_commit=False) as db:
+            for model in (Session, Message, PendingMessage, TurnRun):
+                assert await db.scalar(select(func.count()).select_from(model)) == 0
+        await runtime.close()
 
 
-@pytest.mark.parametrize(
-    "provider",
-    [
-        _Provider(content=[{"type": "text", "text": "run"}]),
-        _Provider(error=ProviderInvocationError("failed")),
-    ],
-)
-async def test_heartbeat_provider_or_format_failure_has_no_chat_side_effects(
-    pg_engine: Any,
-    provider: _Provider,
-) -> None:
-    await _configure_provider(pg_engine)
-    runtime = ChatRuntime(
-        pg_engine,
-        provider_factory=lambda config: provider,
-        request_token_estimator=lambda **kwargs: 10,
-    )
-
-    result = await runtime.evaluate_heartbeat_decision(
-        document="# Heartbeat\n\n## Active Tasks\n- inspect\n",
-        now_utc=datetime(2026, 9, 1, 1, 30, tzinfo=UTC),
-        timezone="UTC",
-    )
-
-    assert result.decision is None
+async def test_heartbeat_requires_jev_configuration_even_when_llm_is_configured(pg_engine: Any) -> None:
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        for model in (Session, Message, PendingMessage, TurnRun):
-            assert await db.scalar(select(func.count()).select_from(model)) == 0
+        db.add_all(SystemConfig(key=key, value=value) for key, value in {
+            "llm_endpoint": "http://provider.test", "llm_api_key": "secret", "llm_model": "model",
+        }.items())
+        await db.commit()
+    runtime = ChatRuntime(pg_engine, provider_factory=AsyncMock(side_effect=AssertionError("no fallback")))
+    result = await runtime.evaluate_heartbeat_decision(
+        document="## Active Tasks\n- inspect\n", now_utc=datetime(2026, 9, 1, tzinfo=UTC), timezone="UTC",
+    )
+    assert result.decision is None
+    assert result.reason == "jev_not_configured"
     await runtime.close()
+
+
+@pytest.mark.parametrize("document", ["## Active Tasks\n<!-- empty -->", "## Active Tasks\n- " + "x" * 501])
+async def test_heartbeat_empty_or_oversize_tasks_do_not_call_jev(pg_engine: Any, document: str) -> None:
+    service = JevService(pg_engine)
+    service.evaluate = AsyncMock(side_effect=AssertionError("preflight must stop"))  # type: ignore[method-assign]
+    runtime = ChatRuntime(pg_engine, jev_service=service)
+    await runtime.evaluate_heartbeat_decision(
+        document=document, now_utc=datetime(2026, 9, 1, tzinfo=UTC), timezone="UTC",
+    )
+    service.evaluate.assert_not_called()
+    await runtime.close()
+    await service.close()

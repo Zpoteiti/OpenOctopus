@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends
@@ -49,6 +49,9 @@ from openctopus_server.workspace.storage import (
     StoredObject,
     get_object_storage,
 )
+
+if TYPE_CHECKING:
+    from openctopus_server.workspace.builtin_skills import BuiltinSkillLibrary
 
 MAX_EDIT_BYTES = 8 * 1024 * 1024
 MAX_READ_BYTES = 8 * 1024 * 1024
@@ -94,7 +97,7 @@ class FileTransform:
 
 @dataclass(frozen=True)
 class WorkspaceTarget:
-    kind: Literal["personal", "shared"]
+    kind: Literal["personal", "shared", "builtin"]
     id: UUID
 
     @classmethod
@@ -104,6 +107,10 @@ class WorkspaceTarget:
     @classmethod
     def shared(cls, workspace_id: UUID) -> WorkspaceTarget:
         return cls(kind="shared", id=workspace_id)
+
+    @classmethod
+    def builtin(cls) -> WorkspaceTarget:
+        return cls(kind="builtin", id=UUID(int=0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +686,8 @@ class WorkspaceFS:
                 self._directory_quota_reservations.pop(key)
 
     async def stat(self, target: WorkspaceTarget, relative_path: str) -> FileMetadata:
+        if target.kind == "builtin":
+            return _builtin_library().stat(relative_path)
         metadata = await self._storage.stat(_object_key(target, relative_path))
         return FileMetadata(size=metadata.size, etag=metadata.etag)
 
@@ -705,6 +714,8 @@ class WorkspaceFS:
         scan_limit: int = MAX_SCAN_OBJECTS,
     ) -> tuple[tuple[SearchObject, ...], bool]:
         self._ensure_active(target)
+        if target.kind == "builtin":
+            return _builtin_library().scan(relative_path, scan_limit=scan_limit)
         workspace_prefix = _workspace_prefix(target)
         normalized = relative_path.strip("/")
         prefix = f"{workspace_prefix}{normalized}/" if normalized else workspace_prefix
@@ -752,6 +763,11 @@ class WorkspaceFS:
         *,
         max_bytes: int,
     ) -> SearchObject:
+        if target.kind == "builtin":
+            stored = _builtin_library().read_with_metadata(item.path, max_bytes=max_bytes)
+            return item if stored.truncated else SearchObject(
+                path=item.path, size=item.size, modified=item.modified, content=stored.data
+            )
         stored = await self._storage.read(
             _object_key(target, item.path),
             max_bytes=max_bytes,
@@ -771,6 +787,8 @@ class WorkspaceFS:
         relative_path: str,
     ) -> ObjectStream:
         self._ensure_active(target)
+        if target.kind == "builtin":
+            return _builtin_library().open_stream(relative_path)
         await self._ensure_regular_file(target, relative_path)
         return await self._storage.open_stream(_object_key(target, relative_path))
 
@@ -915,6 +933,10 @@ class WorkspaceFS:
         validate_staging: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> tuple[int, str, tuple[str, ...]]:
         """Stream one server workspace object through a temporary RustFS object."""
+        from openctopus_server.workspace.builtin_skills import reject_builtin_mutation
+
+        reject_builtin_mutation(source_target.kind)
+        reject_builtin_mutation(destination_target.kind)
         if mode not in {"copy", "move"}:
             raise WorkspaceError(ErrorCode.WORKSPACE_INVALID_REQUEST, "Transfer mode is invalid")
         source = await self.open_stream(source_target, source_path)
@@ -1073,6 +1095,10 @@ class WorkspaceFS:
                 "Workspace byte range or limit is invalid",
             )
         read_limit = min(length, max_bytes) if length else max_bytes
+        if target.kind == "builtin":
+            return _builtin_library().read(
+                relative_path, offset=offset, length=length, max_bytes=max_bytes
+            )
         stored = await self._storage.read(
             _object_key(target, relative_path),
             max_bytes=read_limit,
@@ -1093,6 +1119,8 @@ class WorkspaceFS:
                 ErrorCode.WORKSPACE_BLOCKED_PATH,
                 "Workspace byte limit is invalid",
             )
+        if target.kind == "builtin":
+            return _builtin_library().read_with_metadata(relative_path, max_bytes=max_bytes)
         return await self._storage.read(
             _object_key(target, relative_path),
             max_bytes=max_bytes,
@@ -1126,6 +1154,10 @@ class WorkspaceFS:
         scan_limit: int = 10_000,
         include_noise_directories: bool = False,
     ) -> DirectoryPage:
+        if target.kind == "builtin":
+            return _builtin_library().list_page(
+                relative_path, limit=limit, offset=offset, scan_limit=scan_limit
+            )
         workspace_prefix = _workspace_prefix(target)
         if relative_path:
             object_name = _object_key(target, relative_path)
@@ -1214,6 +1246,8 @@ class WorkspaceFS:
         )
 
     async def usage(self, target: WorkspaceTarget) -> int:
+        if target.kind == "builtin":
+            return 0
         async with self._heavy_operations:
             usage = 0
             async for objects in _metadata_pages(self._storage, _workspace_prefix(target)):
@@ -2090,8 +2124,17 @@ async def _delete_prefix(storage: ObjectStorage, prefix: str) -> bool:
 
 
 def _workspace_prefix(target: WorkspaceTarget) -> str:
+    from openctopus_server.workspace.builtin_skills import reject_builtin_mutation
+
+    reject_builtin_mutation(target.kind)
     collection = "users" if target.kind == "personal" else "workspaces"
     return f"{collection}/{target.id}/"
+
+
+def _builtin_library() -> BuiltinSkillLibrary:
+    from openctopus_server.workspace.builtin_skills import get_builtin_skill_library
+
+    return get_builtin_skill_library()
 
 
 def _object_key(target: WorkspaceTarget, relative_path: str) -> str:

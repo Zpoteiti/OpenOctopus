@@ -52,6 +52,7 @@ dev = [
 
 [tool.setuptools.package-data]
 openctopus_server = [
+    "assets/builtin_skills/*/SKILL.md",
     "assets/tiktoken/*",
     "assets/web/*",
     "assets/web/assets/*",

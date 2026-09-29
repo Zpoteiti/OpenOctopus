@@ -2,6 +2,12 @@
 
 **状态：** approved（已批准）
 
+**2026-09-29 更新：** Heartbeat Phase 1 的普通 Provider/forced-tool 合同已由
+[ADR-054 和 ADR-138](../DECISIONS.md) 取代：独立管理员 Jev 配置为必需依赖，
+按原任务 ID 返回 Choice `run`/`skip`，失败跳过本轮。下文原 Phase 1 请求、
+token budget、Provider limiter 和对应测试描述保留为 Py9 历史设计；当前实现
+以更新后的 ADR 为准。Cron 调度与 Heartbeat Phase 2 的普通 Agent 合同继续适用。
+
 **Milestone：** Py9 Cron / Heartbeat
 
 **依赖：** 当前 `main` 上已经完成的 Browser Frontend、普通 Agent loop、Workspace 与消息持久化

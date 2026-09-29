@@ -894,6 +894,9 @@ paths:
           resolve to the authenticated user's personal workspace and absolute
           `/name@suffix/...` paths address shared workspaces. For a paired
           device, the client applies its own workspace/path policy.
+          Server `/builtin/skills` is the shared immutable skill library.
+          Read/list/search/download are supported; mutation and transfer return
+          `workspace_blocked_path`.
         schema: { type: string }
       - $ref: '#/components/parameters/OpenOctopusDevice'
     get:
@@ -1876,9 +1879,17 @@ paths:
       summary: Update system-wide config keys
       description: |
         Partial update — keys present are updated, keys absent are untouched.
-        Unknown keys, `null` values, empty strings, and unsupported keys such as
+        Unknown keys and unsupported keys such as
         `server_mcp` or `object_storage_*` return `400 Bad Request` and do not
         write any config changes. Quota values must be positive integers.
+        Existing LLM/config fields reject null and empty values. Jev endpoint
+        accepts null to clear it; an omitted or blank Jev key retains the saved key.
+
+        Jev uses a separate unversioned `jev_endpoint` and redacted `jev_api_key`.
+        Saving these fields does not contact Jev and resets `jev_status` to
+        unchecked (or not_configured). Use POST /api/admin/config/jev/check for
+        an explicit connection check. Observed request failures make Dream and
+        Heartbeat unavailable until the service recovers. There is no LLM fallback.
 
         When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
         the server validates the provider before writing: `GET
@@ -1956,6 +1967,21 @@ paths:
                   items: { type: string, minLength: 1, maxLength: 512 }
                   example: [127.0.0.0/8, 169.254.169.254/32]
                   description: Complete canonical Server web_fetch denylist; an empty array permits all otherwise-valid targets.
+                jev_endpoint:
+                  anyOf:
+                  - type: string
+                    maxLength: 2048
+                    minLength: 1
+                  - type: 'null'
+                  title: Jev Endpoint
+                  description: Unversioned Jev HTTP(S) API base URL; omit /v1. Null clears the endpoint.
+                  examples:
+                  - https://api.typesafe.ai
+                jev_api_key:
+                  type: string
+                  maxLength: 4096
+                  title: Jev Api Key
+                  description: New Jev credential; omit or leave blank to retain the configured key.
       responses:
         '200':
           description: OK
@@ -2094,6 +2120,117 @@ paths:
           description: Deleting this user would remove the last admin.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
+  /api/dream:
+    get:
+      tags:
+      - Dream
+      summary: List Dream Runs
+      operationId: list_dream_runs_api_dream_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DreamRunsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /api/dream/{run_id}:
+    get:
+      tags:
+      - Dream
+      summary: Get Dream Run
+      operationId: get_dream_run_api_dream__run_id__get
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DreamRunDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/dream/{run_id}/restore:
+    post:
+      tags:
+      - Dream
+      summary: Restore Dream Run
+      operationId: restore_dream_run_api_dream__run_id__restore_post
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Run Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DreamRunDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Memory changed, a run is unfinished, or this record has no restorable
+            update.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/admin/config/jev/check:
+    post:
+      tags:
+      - Admin
+      summary: Check Jev
+      operationId: check_jev_api_admin_config_jev_check_post
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JevStatus'
+      security:
+      - cookieAuth:
+        - admin
+      - bearerAuth:
+        - admin
+      description: Explicit connection check using one small Jev decision request. Returns
+        observed status without credentials or remote response bodies.
+
 components:
   securitySchemes:
     cookieAuth:
@@ -2190,7 +2327,7 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, default_soul, web_fetch_denylist]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, default_soul, web_fetch_denylist, jev_endpoint, jev_api_key, jev_status]
       description: |
         Admin-visible effective config. Quota keys are always present because
         missing rows default to 500 MiB (`524288000`).
@@ -2256,6 +2393,22 @@ components:
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 512 }
           description: Effective canonical Server web_fetch denylist; explicit empty permits all otherwise-valid targets.
+
+        jev_endpoint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Jev Endpoint
+          description: Unversioned Jev HTTP(S) API base URL.
+        jev_api_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Jev Api Key
+          description: Null when unset; "<redacted>" when configured.
+        jev_status:
+          $ref: '#/components/schemas/JevStatus'
+          description: Last observed status for the current Jev configuration.
 
     AdminUser:
       type: object
@@ -3950,3 +4103,167 @@ components:
         mcp_discovered:
           type: object
           additionalProperties: { $ref: '#/components/schemas/DeviceMcpDiscoveredServer' }
+
+    JevStatus:
+      properties:
+        state:
+          type: string
+          enum:
+          - not_configured
+          - unchecked
+          - available
+          - unreachable
+          - unauthorized
+          - invalid_response
+          - unavailable
+          title: State
+        checked_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Checked At
+      additionalProperties: false
+      type: object
+      required:
+      - state
+      - checked_at
+      title: JevStatus
+    DreamRunResponse:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        started_at:
+          type: string
+          format: date-time
+          title: Started At
+        finished_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Finished At
+        status:
+          type: string
+          enum:
+          - pending
+          - skipped
+          - unchanged
+          - updated
+          - failed
+          - restoring
+          - restored
+          title: Status
+        message_count:
+          type: integer
+          title: Message Count
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        restored_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Restored At
+      type: object
+      required:
+      - id
+      - started_at
+      - finished_at
+      - status
+      - message_count
+      - error
+      - restored_at
+      title: DreamRunResponse
+    DreamRunDetail:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        started_at:
+          type: string
+          format: date-time
+          title: Started At
+        finished_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Finished At
+        status:
+          type: string
+          enum:
+          - pending
+          - skipped
+          - unchanged
+          - updated
+          - failed
+          - restoring
+          - restored
+          title: Status
+        message_count:
+          type: integer
+          title: Message Count
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        restored_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Restored At
+        before:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Before
+        after:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: After
+      type: object
+      required:
+      - id
+      - started_at
+      - finished_at
+      - status
+      - message_count
+      - error
+      - restored_at
+      - before
+      - after
+      title: DreamRunDetail
+    DreamRunsResponse:
+      properties:
+        availability:
+          $ref: '#/components/schemas/JevStatus'
+        next_run_at:
+          type: string
+          format: date-time
+          title: Next Run At
+        items:
+          items:
+            $ref: '#/components/schemas/DreamRunResponse'
+          type: array
+          title: Items
+        next_offset:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Next Offset
+      type: object
+      required:
+      - availability
+      - next_run_at
+      - items
+      - next_offset
+      title: DreamRunsResponse

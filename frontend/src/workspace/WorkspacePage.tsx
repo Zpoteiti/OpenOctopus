@@ -33,6 +33,7 @@ interface Location {
   device: string
   root: string
   workspace?: Workspace
+  builtin?: boolean
 }
 
 interface EditorState {
@@ -88,6 +89,7 @@ export function WorkspacePage(): ReactNode {
 
   const locations = useMemo<Location[]>(() => [
     ...workspaces.map(workspaceLocation),
+    builtinSkillsLocation(),
     ...devices.filter((device) => device.online).map(deviceLocation),
   ], [devices, workspaces])
   const selectedLocation = locations.find((location) => location.key === selectedKey)
@@ -449,16 +451,18 @@ export function WorkspacePage(): ReactNode {
       <header className="workspace-header">
         <div className="breadcrumbs">
           <span>{t('workspace.title', { defaultValue: 'Workspace' })}</span><span aria-hidden="true">/</span>
-          <strong>{selectedLocation?.name ?? t('common.loading', { defaultValue: 'Loading…' })}</strong>
+          <strong>{selectedLocation ? locationName(selectedLocation, t) : t('common.loading', { defaultValue: 'Loading…' })}</strong>
         </div>
-        <button className="primary-button" type="button" onClick={() => setShowCreate((value) => !value)}>
-          {t('workspace.newShared', { defaultValue: 'New shared Workspace' })}
-        </button>
+        {selectedLocation?.builtin ? null : (
+          <button className="primary-button" type="button" onClick={() => setShowCreate((value) => !value)}>
+            {t('workspace.newShared', { defaultValue: 'New shared Workspace' })}
+          </button>
+        )}
       </header>
 
       <div className="oo-workspace-page">
         <h1 className="sr-only">
-          {t('workspace.title', { defaultValue: 'Workspace' })} — {selectedLocation?.name ?? t('common.loading')}
+          {t('workspace.title', { defaultValue: 'Workspace' })} — {selectedLocation ? locationName(selectedLocation, t) : t('common.loading')}
         </h1>
         {showCreate ? (
           <form className="oo-workspace-create" onSubmit={(event) => void submitCreate(event)}>
@@ -474,7 +478,11 @@ export function WorkspacePage(): ReactNode {
         <div className="oo-workspace-browser">
           <aside className="oo-workspace-locations" aria-label={t('workspace.locations', { defaultValue: 'Workspace locations' })}>
             <h2>{t('workspace.serverLocations', { defaultValue: 'Server Workspaces' })}</h2>
-            {locations.filter((location) => location.device === 'server').map((location) => (
+            {locations.filter((location) => location.device === 'server' && !location.builtin).map((location) => (
+              <LocationButton key={location.key} location={location} active={location.key === selectedKey} onSelect={activateLocation} />
+            ))}
+            <h2>{t('workspace.builtIn', { defaultValue: 'Built-in' })}</h2>
+            {locations.filter((location) => location.builtin).map((location) => (
               <LocationButton key={location.key} location={location} active={location.key === selectedKey} onSelect={activateLocation} />
             ))}
             <h2>{t('workspace.devices', { defaultValue: 'Devices' })}</h2>
@@ -490,7 +498,7 @@ export function WorkspacePage(): ReactNode {
                 <button type="button" disabled={!canGoUp || directoryLoading} onClick={() => void openDirectory(parentPath(currentPath, selectedLocation?.root ?? '.'))}>← {t('workspace.up', { defaultValue: 'Up' })}</button>
                 <code>{currentPath}</code>
               </div>
-              <div className="oo-workspace-upload">
+              {!selectedLocation?.builtin ? <div className="oo-workspace-upload">
                 <button type="button" disabled={busy} onClick={() => setShowNewFile((current) => !current)}>
                   {t('workspace.newFile', { defaultValue: 'New file' })}
                 </button>
@@ -499,7 +507,7 @@ export function WorkspacePage(): ReactNode {
                   <input type="file" onChange={(event) => setUpload(event.target.files?.[0] ?? null)} />
                 </label>
                 <button type="button" disabled={!upload || busy} onClick={() => void submitUpload()}>{t('workspace.upload', { defaultValue: 'Upload file' })}</button>
-              </div>
+              </div> : null}
             </div>
 
             {showNewFile ? (
@@ -569,7 +577,7 @@ export function WorkspacePage(): ReactNode {
                 {selectedEntry.kind === 'file' ? (
                   <a className="oo-workspace-download" href={fileUrl(selectedEntry.path, selectedLocation?.device ?? 'server')} download>{t('workspace.download', { defaultValue: 'Download file' })}</a>
                 ) : null}
-                {selectedEntry.kind === 'file' ? (
+                {selectedEntry.kind === 'file' && !selectedLocation?.builtin ? (
                   <button
                     className="oo-workspace-delete-file"
                     type="button"
@@ -587,8 +595,8 @@ export function WorkspacePage(): ReactNode {
                 {selectedEntry.kind === 'file' && !isTextFile(selectedEntry.name) ? <p>{t('workspace.notText', { defaultValue: 'This file is not opened as text. You can download it instead.' })}</p> : null}
                 {editor ? (
                   <div className="oo-workspace-editor">
-                    <label>{t('workspace.fileContent', { defaultValue: 'File content' })}<textarea disabled={busy} value={editor.content} onChange={(event) => setEditor({ ...editor, content: event.target.value })} /></label>
-                    <button className="primary-button" type="button" disabled={busy} onClick={() => void saveEditor()}>{t('workspace.saveFile', { defaultValue: 'Save file' })}</button>
+                    <label>{t('workspace.fileContent', { defaultValue: 'File content' })}<textarea readOnly={selectedLocation?.builtin} disabled={busy} value={editor.content} onChange={(event) => setEditor({ ...editor, content: event.target.value })} /></label>
+                    {!selectedLocation?.builtin ? <button className="primary-button" type="button" disabled={busy} onClick={() => void saveEditor()}>{t('workspace.saveFile', { defaultValue: 'Save file' })}</button> : null}
                   </div>
                 ) : null}
               </>
@@ -680,7 +688,7 @@ function LocationButton({
   return (
     <button aria-pressed={active} className={active ? 'active' : undefined} type="button" onClick={() => onSelect(location)}>
       <span aria-hidden="true" className="oo-workspace-location-mark">{location.device === 'server' ? '◉' : '◇'}</span>
-      <span><strong>{location.name}</strong><small>{detail}</small></span>
+      <span><strong>{locationName(location, t)}</strong><small>{detail}</small></span>
     </button>
   )
 }
@@ -725,6 +733,10 @@ function workspaceLocation(workspace: Workspace): Location {
   }
 }
 
+function builtinSkillsLocation(): Location {
+  return { key: 'builtin-skills', name: 'Built-in skills', device: 'server', root: '/builtin/skills', builtin: true }
+}
+
 function deviceLocation(device: Device): Location {
   return {
     key: `device:${device.id}`,
@@ -745,6 +757,10 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+}
+
+function locationName(location: Location, t: TFunction): string {
+  return location.builtin ? t('workspace.builtInSkills', { defaultValue: 'Built-in skills' }) : location.name
 }
 
 function errorMessage(caught: unknown): string {

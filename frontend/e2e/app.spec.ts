@@ -71,8 +71,8 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await expectSinglePaneToFillWorkspace(page)
   await expect(page.getByLabel('Default SOUL')).toHaveValue("You are OpenOctopus, the user's personal AI partner.")
   await expectFieldsToAlign(page, 'Maximum concurrent requests', 'Maximum output tokens')
-  await page.getByLabel('API Base URL').fill('http://127.0.0.1:18080')
-  await page.getByLabel('API Key').fill('frontend-e2e-key')
+  await page.getByLabel('API base URL', { exact: true }).fill('http://127.0.0.1:18080')
+  await page.getByLabel('API Key', { exact: true }).fill('frontend-e2e-key')
   await page.getByLabel('Model').fill('openoctopus-e2e-model')
   await page.getByLabel('Context window').fill('131072')
   await page.getByLabel('Compaction headroom').fill('16000')
@@ -90,7 +90,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
     llm_api_key: '<redacted>',
     llm_model: 'openoctopus-e2e-model',
   })
-  await expect(page.getByLabel('API Base URL')).toHaveValue('http://127.0.0.1:18080')
+  await expect(page.getByLabel('API base URL', { exact: true })).toHaveValue('http://127.0.0.1:18080')
 
   await page.getByRole('link', { name: 'Automations' }).click()
   await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible()

@@ -1243,6 +1243,9 @@ export interface paths {
                  *     resolve to the authenticated user's personal workspace and absolute
                  *     `/name@suffix/...` paths address shared workspaces. For a paired
                  *     device, the client applies its own workspace/path policy.
+                 *     Server `/builtin/skills` is the shared immutable skill library.
+                 *     Read/list/search/download are supported; mutation and transfer return
+                 *     `workspace_blocked_path`.
                  */
                 path: string;
             };
@@ -1288,6 +1291,9 @@ export interface paths {
                      *     resolve to the authenticated user's personal workspace and absolute
                      *     `/name@suffix/...` paths address shared workspaces. For a paired
                      *     device, the client applies its own workspace/path policy.
+                     *     Server `/builtin/skills` is the shared immutable skill library.
+                     *     Read/list/search/download are supported; mutation and transfer return
+                     *     `workspace_blocked_path`.
                      */
                     path: string;
                 };
@@ -1380,6 +1386,9 @@ export interface paths {
                      *     resolve to the authenticated user's personal workspace and absolute
                      *     `/name@suffix/...` paths address shared workspaces. For a paired
                      *     device, the client applies its own workspace/path policy.
+                     *     Server `/builtin/skills` is the shared immutable skill library.
+                     *     Read/list/search/download are supported; mutation and transfer return
+                     *     `workspace_blocked_path`.
                      */
                     path: string;
                 };
@@ -1480,6 +1489,9 @@ export interface paths {
                      *     resolve to the authenticated user's personal workspace and absolute
                      *     `/name@suffix/...` paths address shared workspaces. For a paired
                      *     device, the client applies its own workspace/path policy.
+                     *     Server `/builtin/skills` is the shared immutable skill library.
+                     *     Read/list/search/download are supported; mutation and transfer return
+                     *     `workspace_blocked_path`.
                      */
                     path: string;
                 };
@@ -1539,6 +1551,9 @@ export interface paths {
                      *     resolve to the authenticated user's personal workspace and absolute
                      *     `/name@suffix/...` paths address shared workspaces. For a paired
                      *     device, the client applies its own workspace/path policy.
+                     *     Server `/builtin/skills` is the shared immutable skill library.
+                     *     Read/list/search/download are supported; mutation and transfer return
+                     *     `workspace_blocked_path`.
                      */
                     path: string;
                 };
@@ -3020,9 +3035,17 @@ export interface paths {
         /**
          * Update system-wide config keys
          * @description Partial update — keys present are updated, keys absent are untouched.
-         *     Unknown keys, `null` values, empty strings, and unsupported keys such as
+         *     Unknown keys and unsupported keys such as
          *     `server_mcp` or `object_storage_*` return `400 Bad Request` and do not
          *     write any config changes. Quota values must be positive integers.
+         *     Existing LLM/config fields reject null and empty values. Jev endpoint
+         *     accepts null to clear it; an omitted or blank Jev key retains the saved key.
+         *
+         *     Jev uses a separate unversioned `jev_endpoint` and redacted `jev_api_key`.
+         *     Saving these fields does not contact Jev and resets `jev_status` to
+         *     unchecked (or not_configured). Use POST /api/admin/config/jev/check for
+         *     an explicit connection check. Observed request failures make Dream and
+         *     Heartbeat unavailable until the service recovers. There is no LLM fallback.
          *
          *     When any of `llm_endpoint`, `llm_api_key`, or `llm_model` changes,
          *     the server validates the provider before writing: `GET
@@ -3136,6 +3159,17 @@ export interface paths {
                          *     ]
                          */
                         web_fetch_denylist?: string[];
+                        /**
+                         * Jev Endpoint
+                         * @description Unversioned Jev HTTP(S) API base URL; omit /v1. Null clears the endpoint.
+                         * @example https://api.typesafe.ai
+                         */
+                        jev_endpoint?: string | null;
+                        /**
+                         * Jev Api Key
+                         * @description New Jev credential; omit or leave blank to retain the configured key.
+                         */
+                        jev_api_key?: string;
                     };
                 };
             };
@@ -3383,6 +3417,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/dream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Dream Runs */
+        get: operations["list_dream_runs_api_dream_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/dream/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Dream Run */
+        get: operations["get_dream_run_api_dream__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/dream/{run_id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore Dream Run */
+        post: operations["restore_dream_run_api_dream__run_id__restore_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/config/jev/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Jev
+         * @description Explicit connection check using one small Jev decision request. Returns observed status without credentials or remote response bodies.
+         */
+        post: operations["check_jev_api_admin_config_jev_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3491,6 +3596,18 @@ export interface components {
             default_soul: string;
             /** @description Effective canonical Server web_fetch denylist; explicit empty permits all otherwise-valid targets. */
             web_fetch_denylist: string[];
+            /**
+             * Jev Endpoint
+             * @description Unversioned Jev HTTP(S) API base URL.
+             */
+            jev_endpoint: string | null;
+            /**
+             * Jev Api Key
+             * @description Null when unset; "<redacted>" when configured.
+             */
+            jev_api_key: string | null;
+            /** @description Last observed status for the current Jev configuration. */
+            jev_status: components["schemas"]["JevStatus"];
         };
         AdminUser: {
             /** Format: uuid */
@@ -4658,6 +4775,85 @@ export interface components {
                 [key: string]: components["schemas"]["DeviceMcpDiscoveredServer"];
             };
         };
+        /** JevStatus */
+        JevStatus: {
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "not_configured" | "unchecked" | "available" | "unreachable" | "unauthorized" | "invalid_response" | "unavailable";
+            /** Checked At */
+            checked_at: string | null;
+        };
+        /** DreamRunResponse */
+        DreamRunResponse: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "skipped" | "unchanged" | "updated" | "failed" | "restoring" | "restored";
+            /** Message Count */
+            message_count: number;
+            /** Error */
+            error: string | null;
+            /** Restored At */
+            restored_at: string | null;
+        };
+        /** DreamRunDetail */
+        DreamRunDetail: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "skipped" | "unchanged" | "updated" | "failed" | "restoring" | "restored";
+            /** Message Count */
+            message_count: number;
+            /** Error */
+            error: string | null;
+            /** Restored At */
+            restored_at: string | null;
+            /** Before */
+            before: string | null;
+            /** After */
+            after: string | null;
+        };
+        /** DreamRunsResponse */
+        DreamRunsResponse: {
+            availability: components["schemas"]["JevStatus"];
+            /**
+             * Next Run At
+             * Format: date-time
+             */
+            next_run_at: string;
+            /** Items */
+            items: components["schemas"]["DreamRunResponse"][];
+            /** Next Offset */
+            next_offset: number | null;
+        };
     };
     responses: {
         /** @description Malformed request. */
@@ -4713,4 +4909,106 @@ export interface components {
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    list_dream_runs_api_dream_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DreamRunsResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+        };
+    };
+    get_dream_run_api_dream__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DreamRunDetail"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    restore_dream_run_api_dream__run_id__restore_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DreamRunDetail"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Memory changed, a run is unfinished, or this record has no restorable update. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    check_jev_api_admin_config_jev_check_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JevStatus"];
+                };
+            };
+        };
+    };
+}

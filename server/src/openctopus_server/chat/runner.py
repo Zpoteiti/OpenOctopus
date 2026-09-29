@@ -17,12 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from openctopus_server.admission import AdmissionTimeoutError, KeyedAdmission
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.automations.heartbeat import (
-    HEARTBEAT_DECISION_SYSTEM,
-    HEARTBEAT_DECISION_TOOL,
-    HEARTBEAT_TOOL_CHOICE,
+    HEARTBEAT_MAX_BYTES,
+    HEARTBEAT_MAX_CODEPOINTS,
+    HeartbeatDecision,
     HeartbeatEvaluation,
-    heartbeat_decision_messages,
-    parse_heartbeat_decision,
+    heartbeat_jev_request,
+    parse_heartbeat_tasks,
 )
 from openctopus_server.channels.types import ChannelName, ToolProfile
 from openctopus_server.chat.attachments import (
@@ -77,9 +77,11 @@ from openctopus_server.provider.anthropic import (
     AnthropicProvider,
     Provider,
     ProviderInvocationError,
+    ProviderResult,
     provider_fingerprint,
 )
 from openctopus_server.provider.config import ProviderConfig, load_provider_config
+from openctopus_server.provider.jev import JevError, JevService
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services.messages import (
@@ -298,10 +300,13 @@ class ChatRuntime:
         request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
         server_mcp_generation_resolver: ServerMcpGenerationResolver | None = None,
         channel_final_delivery: ChannelFinalDelivery | None = None,
+        jev_service: JevService | None = None,
     ) -> None:
         self.engine = engine
         self.runner_instance_id = uuid.uuid4()
         self.limiter = ProviderLimiter()
+        self.jev_service = jev_service or JevService(engine)
+        self._owns_jev_service = jev_service is None
         self.tool_registry = tool_registry or build_py3_registry(engine=engine)
         self.workspace_service = workspace_service
         self.device_registry = device_registry or get_device_registry()
@@ -330,44 +335,69 @@ class ChatRuntime:
         now_utc: datetime,
         timezone: str,
     ) -> HeartbeatEvaluation:
-        """Run the fail-closed Heartbeat Phase 1 through shared Provider resources."""
+        """Select original task IDs through mandatory Jev before a normal Agent turn."""
+        if len(document) > HEARTBEAT_MAX_CODEPOINTS or len(document.encode("utf-8")) > HEARTBEAT_MAX_BYTES:
+            return HeartbeatEvaluation(decision=None, reason="input_limit")
         try:
-            messages = heartbeat_decision_messages(
+            tasks = parse_heartbeat_tasks(document)
+        except ValueError:
+            return HeartbeatEvaluation(decision=None, reason="input_limit")
+        if not tasks:
+            return HeartbeatEvaluation(
+                decision=HeartbeatDecision(action="skip", tasks=()), reason="no_active_tasks"
+            )
+        try:
+            state, questions = heartbeat_jev_request(
                 document=document,
+                tasks=tasks,
                 now_utc=now_utc,
                 timezone=timezone,
             )
-            tools = [HEARTBEAT_DECISION_TOOL]
-            async with AsyncSession(self.engine, expire_on_commit=False) as db:
-                config = await load_provider_config(db)
-            input_tokens = await self._estimate_tokens(
-                system=HEARTBEAT_DECISION_SYSTEM,
-                messages=messages,
-                tools=tools,
-            )
-            if (
-                config.max_context_tokens is not None
-                and input_tokens + config.max_output_tokens > config.max_context_tokens
-            ):
-                return HeartbeatEvaluation(decision=None, reason="context_limit")
-            provider = await self._provider_for(config)
-
-            async def discard_delta(channel: str, text: str) -> None:
-                del channel, text
-
-            result = await provider.stream_turn(
-                config=config,
-                system=HEARTBEAT_DECISION_SYSTEM,
-                messages=messages,
-                effort=None,
-                limiter=self.limiter,
-                on_delta=discard_delta,
-                tools=tools,
-                tool_choice=HEARTBEAT_TOOL_CHOICE,
-            )
+            answers = await self.jev_service.evaluate(state=state, questions=questions)
+        except JevError as exc:
+            return HeartbeatEvaluation(decision=None, reason=f"jev_{exc.reason}")
         except Exception:
-            return HeartbeatEvaluation(decision=None, reason="provider_error")
-        return parse_heartbeat_decision(result.content)
+            return HeartbeatEvaluation(decision=None, reason="jev_unavailable")
+        selected = tuple(
+            task for index, task in enumerate(tasks, start=1)
+            if answers[f"task_{index}"].choice == "run"
+        )
+        return HeartbeatEvaluation(
+            decision=HeartbeatDecision(action="run" if selected else "skip", tasks=selected),
+            reason="decision_run" if selected else "decision_skip",
+        )
+
+    async def propose_memory_update(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tool: dict[str, Any],
+    ) -> ProviderResult:
+        """One controlled proposal call sharing normal Provider resources; no tools execute."""
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            config = await load_provider_config(db)
+        tools = [tool]
+        input_tokens = await self._estimate_tokens(system=system, messages=messages, tools=tools)
+        if config.max_context_tokens is not None and (
+            input_tokens + config.max_output_tokens > config.max_context_tokens
+        ):
+            raise ProviderInvocationError("Memory update exceeds the provider context limit")
+        provider = await self._provider_for(config)
+
+        async def discard_delta(channel: str, text: str) -> None:
+            del channel, text
+
+        return await provider.stream_turn(
+            config=config,
+            system=system,
+            messages=messages,
+            effort=None,
+            limiter=self.limiter,
+            on_delta=discard_delta,
+            tools=tools,
+            tool_choice={"type": "tool", "name": tool["name"]},
+        )
 
     async def schedule(self, accepted: AcceptedMessage) -> None:
         if accepted.turn is None:
@@ -520,6 +550,8 @@ class ChatRuntime:
             providers = list(self._providers.values())
             self._providers.clear()
         await asyncio.gather(*(provider.close() for provider in providers), return_exceptions=True)
+        if self._owns_jev_service:
+            await self.jev_service.close()
 
     async def _schedule_turn(self, turn: TurnStart) -> None:
         async with self._lease_state(turn.session_id) as state:

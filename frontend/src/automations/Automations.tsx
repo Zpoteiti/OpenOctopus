@@ -18,6 +18,7 @@ import {
   type CronSchedule,
   type CronWrite,
 } from './api'
+import { getDream, listDream, restoreDream, type DreamDetail, type DreamItem } from './dreamApi'
 
 const HEARTBEAT_PATH = 'HEARTBEAT.md'
 const HEARTBEAT_TEMPLATE = `# Heartbeat
@@ -68,6 +69,18 @@ export function AutomationsPage({ user }: { user: User }): ReactNode {
     queryKey: ['heartbeat-history', user.id],
     queryFn: () => heartbeatHistoryExists(user.id),
   })
+  const dream = useInfiniteQuery({
+    queryKey: ['dream'],
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) => listDream(pageParam),
+    getNextPageParam: (lastPage) => lastPage.next_offset ?? undefined,
+    refetchInterval: (query) => query.state.data?.pages.some((page) => (
+      page.items.some((item) => item.status === 'pending' || item.status === 'restoring')
+    )) ? 5_000 : false,
+    refetchIntervalInBackground: false,
+  })
+  const dreamItems = dream.data?.pages.flatMap((page) => page.items) ?? []
+  const dreamAvailability = dream.data?.pages[0]?.availability
 
   const saveHeartbeat = useMutation({
     mutationFn: (file: HeartbeatFile) => saveTextFile(HEARTBEAT_PATH, 'server', file.content, file.etag),
@@ -200,6 +213,8 @@ export function AutomationsPage({ user }: { user: User }): ReactNode {
         </Card>
 
         <Card title={t('automations.heartbeatTitle')} description={t('automations.heartbeatDescription')}>
+          {dreamAvailability?.state === 'unchecked' ? <p className="field-help" role="status">{t('automations.heartbeatJevCheckHelp')} {t('admin.jevReason.unchecked')}</p> : null}
+          {dreamAvailability && dreamAvailability.state !== 'available' && dreamAvailability.state !== 'unchecked' ? <p className="field-help" role="status">{t('automations.heartbeatJevHelp')} {t(`admin.jevReason.${dreamAvailability.state}`)}</p> : null}
           <div className="heartbeat-meta">
             <span>{t('automations.accountTimezone', { timezone })}</span>
             <Link to="/account">{t('automations.changeTimezone')}</Link>
@@ -233,6 +248,18 @@ export function AutomationsPage({ user }: { user: User }): ReactNode {
           )}
           <ErrorNotice error={heartbeat.error ?? heartbeatHistory.error ?? saveHeartbeat.error} />
         </Card>
+
+        <DreamSection
+          items={dreamItems}
+          availability={dreamAvailability}
+          nextRun={dream.data?.pages[0]?.next_run_at}
+          loading={dream.isPending}
+          error={dream.error}
+          hasMore={dream.hasNextPage}
+          loadingMore={dream.isFetchingNextPage}
+          onLoadMore={() => void dream.fetchNextPage()}
+          timezone={timezone}
+        />
       </div>
 
       {deleteTarget ? (
@@ -263,6 +290,144 @@ export function AutomationsPage({ user }: { user: User }): ReactNode {
       ) : null}
     </div>
   )
+}
+
+function DreamSection({
+  items, availability, nextRun, loading, error, hasMore, loadingMore, onLoadMore, timezone,
+}: {
+  items: DreamItem[]
+  availability?: { state: string; checked_at: string | null }
+  nextRun?: string
+  loading: boolean
+  error: unknown
+  hasMore: boolean
+  loadingMore: boolean
+  onLoadMore: () => void
+  timezone: string
+}): ReactNode {
+  const { i18n, t } = useTranslation()
+  const client = useQueryClient()
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const details = useQuery({
+    queryKey: ['dream-detail', expanded],
+    queryFn: () => getDream(expanded as string),
+    enabled: expanded !== null,
+    refetchInterval: (query) => query.state.data?.status === 'pending' || query.state.data?.status === 'restoring' ? 5_000 : false,
+    refetchIntervalInBackground: false,
+  })
+  const restore = useMutation({
+    mutationFn: (id: string) => restoreDream(id),
+    onSuccess: async (result, id) => {
+      client.setQueryData(['dream-detail', id], result)
+      await client.invalidateQueries({ queryKey: ['dream'] })
+    },
+  })
+  const latest = items.reduce<DreamItem | undefined>((current, item) => (
+    !current || Date.parse(item.started_at) > Date.parse(current.started_at) ? item : current
+  ), undefined)
+  return (
+    <Card title={t('automations.dreamTitle')} description={t('automations.dreamDescription')}>
+      {availability?.state === 'unchecked' ? <p className="field-help" role="status">{t('admin.jevReason.unchecked')}</p> : null}
+      {availability && availability.state !== 'available' && availability.state !== 'unchecked' ? <p className="field-help" role="status"><strong>{t('admin.dreamUnavailable')}</strong> {t(`admin.jevReason.${availability.state}`)}</p> : null}
+      <div className="heartbeat-meta">
+        <span>{t('automations.dreamSchedule', { timezone })}</span>
+        <Link to="/workspace?path=MEMORY.md">{t('automations.dreamMemory')}</Link>
+        {nextRun ? <span>{t('automations.dreamNextRun')} <Timestamp value={nextRun} timezone={timezone} language={i18n.resolvedLanguage} /></span> : null}
+        {latest ? <span>{t('automations.dreamLastRun')} <Timestamp value={latest.finished_at ?? latest.started_at} timezone={timezone} language={i18n.resolvedLanguage} /></span> : null}
+      </div>
+      {loading ? <p className="page-status">{t('automations.dreamLoading')}</p> : null}
+      {error ? <p className="field-help" role="status">{t('automations.dreamLoadError')}</p> : null}
+      {!loading && !items.length && !error ? <p className="empty-card-copy">{t('automations.dreamEmpty')}</p> : null}
+      <div className="automation-list">
+        {items.map((item) => (
+          <DreamHistoryRow
+            key={item.id}
+            item={item}
+            detail={expanded === item.id ? details.data : undefined}
+            detailLoading={expanded === item.id && details.isPending}
+            detailError={expanded === item.id ? details.error : undefined}
+            restoring={restore.isPending && restore.variables === item.id}
+            restoreError={restore.isError && restore.variables === item.id ? restore.error : null}
+            onToggle={() => setExpanded((current) => current === item.id ? null : item.id)}
+            onRestore={() => restore.mutate(item.id)}
+            timezone={timezone}
+          />
+        ))}
+      </div>
+      {hasMore ? <div className="form-actions automation-load-more"><button className="secondary-button" disabled={loadingMore} onClick={onLoadMore}>{t('automations.loadMore')}</button></div> : null}
+    </Card>
+  )
+}
+
+function DreamHistoryRow({
+  item, detail, detailLoading, detailError, restoring, restoreError, onToggle, onRestore, timezone,
+}: {
+  item: DreamItem
+  detail?: DreamDetail
+  detailLoading: boolean
+  detailError: unknown
+  restoring: boolean
+  restoreError: unknown
+  onToggle: () => void
+  onRestore: () => void
+  timezone: string
+}): ReactNode {
+  const { i18n, t } = useTranslation()
+  const changed = detail?.before !== null && detail?.before !== undefined && detail?.after !== null && detail?.after !== undefined && detail.before !== detail.after
+  const restoreConflict = restoreError instanceof ApiError && restoreError.status === 409
+  return (
+    <article className="automation-row automation-dream-row">
+      <div className="automation-row-main">
+        <h3>{t(`automations.dreamStatus.${item.status}`)}</h3>
+        <p><Timestamp value={item.finished_at ?? item.started_at} timezone={timezone} language={i18n.resolvedLanguage} /> · {t('automations.dreamMessages', { count: item.message_count })}</p>
+        {item.error ? <p role="alert">{t(dreamErrorKey(item.error))}</p> : null}
+      </div>
+      <div className="automation-row-actions">
+        <button className="secondary-button" type="button" onClick={onToggle}>{t('automations.dreamDetails')}</button>
+        {detail && changed && item.status === 'updated' && !item.restored_at && !restoreConflict ? <button className="secondary-button" type="button" disabled={restoring} onClick={onRestore}>{t('automations.dreamRestore')}</button> : null}
+      </div>
+      {detailLoading ? <p className="field-help">{t('automations.dreamLoading')}</p> : null}
+      {detailError ? <p className="form-error" role="alert">{dreamApiErrorMessage(detailError, t)}</p> : null}
+      {restoreError ? <p className="form-error" role="alert">{restoreApiErrorMessage(restoreError, t)}</p> : null}
+      {detail ? <div className="field-help automation-dream-detail">
+        {changed ? <>
+          <details><summary>{t('automations.dreamBefore')}</summary><pre>{detail.before}</pre></details>
+          <details><summary>{t('automations.dreamAfter')}</summary><pre>{detail.after}</pre></details>
+        </> : null}
+        {detail.restored_at ? <p>{t('automations.dreamRestoredAt')} <Timestamp value={detail.restored_at} timezone={timezone} language={i18n.resolvedLanguage} /></p> : null}
+      </div> : null}
+    </article>
+  )
+}
+
+function dreamErrorKey(code: string | null): string {
+  if (!code) return 'automations.dreamError.processing_failed'
+  if (code.startsWith('provider_')) return 'automations.dreamError.provider'
+  switch (code) {
+    case 'jev_not_configured':
+    case 'jev_unreachable':
+    case 'jev_unauthorized':
+    case 'jev_invalid_response':
+    case 'jev_unavailable':
+    case 'jev_input_limit':
+    case 'invalid_proposal':
+    case 'memory_too_large':
+    case 'workspace_file_changed':
+    case 'processing_failed':
+      return `automations.dreamError.${code}`
+    default:
+      return 'automations.dreamError.processing_failed'
+  }
+}
+
+function dreamApiErrorMessage(error: unknown, t: ReturnType<typeof useTranslation>['t']): string {
+  return t(dreamErrorKey(error instanceof ApiError ? error.code : null))
+}
+
+function restoreApiErrorMessage(error: unknown, t: ReturnType<typeof useTranslation>['t']): string {
+  if (error instanceof ApiError && error.status === 409) return t('automations.dreamRestoreConflict')
+  if (error instanceof ApiError && error.code !== 'request_failed') return t(dreamErrorKey(error.code))
+  return t('automations.dreamRestoreError')
 }
 
 function CronForm({

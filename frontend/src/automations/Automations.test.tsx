@@ -92,6 +92,67 @@ describe('AutomationsPage', () => {
     )
   })
 
+  it('shows Dream history and restores a memory change', async () => {
+    const requests: Array<{ url: string; method: string }> = []
+    const item = {
+      id: 'dream-1', started_at: '2026-09-28T16:00:00Z', finished_at: '2026-09-28T16:01:00Z',
+      status: 'updated', message_count: 4, error: null, restored_at: null,
+    }
+    const restoringItem = { ...item, id: 'dream-restoring', status: 'restoring' }
+    const providerFailure = { ...item, id: 'dream-provider-failure', status: 'failed', error: 'provider_timeout' }
+    const detail = { ...item, before: 'Old memory', after: 'New memory' }
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      requests.push({ url, method })
+      if (url === '/api/cron?limit=50&offset=0') return json({ items: [], next_offset: null })
+      if (url === '/api/workspace/files/HEARTBEAT.md?openoctopus_device=server') return json({ code: 'workspace_not_found', message: 'missing' }, 404)
+      if (url === `/api/sessions/${userProfile.id}/messages?limit=1`) return json({ code: 'session_not_found', message: 'missing' }, 404)
+      if (url === '/api/dream?limit=50&offset=0') return json({ availability: { state: 'available', checked_at: '2026-09-29T00:00:00Z' }, next_run_at: '2026-09-29T16:00:00Z', items: [item, restoringItem, providerFailure], next_offset: null })
+      if (url === '/api/dream/dream-1' && method === 'GET') return json(detail)
+      if (url === '/api/dream/dream-1/restore' && method === 'POST') return json({ ...detail, status: 'restored', restored_at: '2026-09-29T02:00:00Z' })
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    }))
+
+    renderPage()
+    const user = userEvent.setup()
+    expect(await screen.findByRole('heading', { name: 'Dream' })).toBeInTheDocument()
+    expect(await screen.findByText('Memory updated')).toBeInTheDocument()
+    expect(screen.getByText('Restoring previous memory…')).toBeInTheDocument()
+    expect(screen.getByText('The configured LLM provider could not update MEMORY.md. Check Admin settings and retry.')).toBeInTheDocument()
+    expect(screen.queryByText('provider_timeout')).not.toBeInTheDocument()
+    await user.click(screen.getAllByRole('button', { name: 'Change details' })[0])
+    expect(await screen.findByText('Old memory')).toBeInTheDocument()
+    expect(screen.getByText('New memory')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Restore previous memory' }))
+    await waitFor(() => expect(requests).toContainEqual({ url: '/api/dream/dream-1/restore', method: 'POST' }))
+    expect(await screen.findByText('Restored:')).toBeInTheDocument()
+  })
+
+  it('blocks Dream restore when MEMORY.md has changed since the snapshot', async () => {
+    const item = {
+      id: 'dream-conflict', started_at: '2026-09-28T16:00:00Z', finished_at: '2026-09-28T16:01:00Z',
+      status: 'updated', message_count: 2, error: null, restored_at: null,
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/cron?limit=50&offset=0') return json({ items: [], next_offset: null })
+      if (url === '/api/workspace/files/HEARTBEAT.md?openoctopus_device=server') return json({ code: 'workspace_not_found', message: 'missing' }, 404)
+      if (url === `/api/sessions/${userProfile.id}/messages?limit=1`) return json({ code: 'session_not_found', message: 'missing' }, 404)
+      if (url === '/api/dream?limit=50&offset=0') return json({ availability: { state: 'available', checked_at: null }, next_run_at: '2026-09-29T16:00:00Z', items: [item], next_offset: null })
+      if (url === '/api/dream/dream-conflict' && !init?.method) return json({ ...item, before: 'Old', after: 'Dream version' })
+      if (url === '/api/dream/dream-conflict/restore' && init?.method === 'POST') return json({ code: 'workspace_file_changed', message: 'changed' }, 409)
+      throw new Error(`Unexpected request: ${init?.method ?? 'GET'} ${url}`)
+    }))
+
+    renderPage()
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('button', { name: 'Change details' }))
+    await user.click(await screen.findByRole('button', { name: 'Restore previous memory' }))
+    expect(await screen.findByText('MEMORY.md changed after this snapshot. Restore was cancelled to keep the current edits.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Restore previous memory' })).not.toBeInTheDocument()
+  })
+
   it('creates, edits, and deletes a cron job using mutually exclusive schedule fields', async () => {
     const writes: Array<{ url: string; method: string; body?: unknown }> = []
     const job = {
