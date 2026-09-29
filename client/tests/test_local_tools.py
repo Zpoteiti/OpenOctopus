@@ -13,8 +13,10 @@ from typing import Any, cast
 import httpx
 import pytest
 
+import openoctopus_client.tools.file_tools as file_tools_module
+import openoctopus_client.tools.local_transfer as local_transfer_module
+import openoctopus_client.tools.web_fetch as web_fetch_module
 from openoctopus_client.tools import ClientToolDispatcher
-from openoctopus_client.tools import dispatcher as dispatcher_module
 from openoctopus_client.tools.common import ToolFailure, ToolOutput
 
 
@@ -117,7 +119,7 @@ def test_file_mutation_result_returns_a_reusable_canonical_path(tmp_path: Path) 
 
 
 def test_patch_result_stays_valid_json_when_path_details_exceed_the_result_bound() -> None:
-    encoded = dispatcher_module._file_patch_result(
+    encoded = file_tools_module._file_patch_result(
         dry_run=False,
         edits=[
             {
@@ -132,7 +134,7 @@ def test_patch_result_stays_valid_json_when_path_details_exceed_the_result_bound
     )
 
     payload = json.loads(encoded)
-    assert len(encoded) <= dispatcher_module._FILE_RESULT_JSON_MAX_CHARS
+    assert len(encoded) <= file_tools_module._FILE_RESULT_JSON_MAX_CHARS
     assert payload["total_edits"] == 20
     assert payload["omitted_edits"] > 0
     assert len(payload["edits"]) + payload["omitted_edits"] == 20
@@ -141,7 +143,7 @@ def test_patch_result_stays_valid_json_when_path_details_exceed_the_result_bound
 def test_patch_result_can_omit_one_unrepresentable_path_detail() -> None:
     path = "\x01" * 5000
 
-    encoded = dispatcher_module._file_patch_result(
+    encoded = file_tools_module._file_patch_result(
         dry_run=False,
         edits=[
             {
@@ -155,7 +157,7 @@ def test_patch_result_can_omit_one_unrepresentable_path_detail() -> None:
     )
 
     payload = json.loads(encoded)
-    assert len(encoded) <= dispatcher_module._FILE_RESULT_JSON_MAX_CHARS
+    assert len(encoded) <= file_tools_module._FILE_RESULT_JSON_MAX_CHARS
     assert payload["edits"] == []
     assert payload["omitted_edits"] == 1
 
@@ -319,8 +321,8 @@ def test_notebook_edit_rejects_invalid_complete_notebook_shapes(
 
 
 def test_invalid_riff_is_not_reported_as_webp(tmp_path: Path) -> None:
-    assert dispatcher_module._image_media_type(b"RIFF" + b"x" * 20) is None
-    assert dispatcher_module._image_media_type(b"RIFF" + b"x" * 4 + b"WEBP") == "image/webp"
+    assert file_tools_module._image_media_type(b"RIFF" + b"x" * 20) is None
+    assert file_tools_module._image_media_type(b"RIFF" + b"x" * 4 + b"WEBP") == "image/webp"
 
 
 def test_web_fetch_maps_httpx_timeout_and_transport_errors(
@@ -332,12 +334,12 @@ def test_web_fetch_maps_httpx_timeout_and_transport_errors(
     async def transport(*args: object, **kwargs: object) -> object:
         raise httpx.ConnectError("failed")
 
-    monkeypatch.setattr(dispatcher_module, "_fetch_bounded", timeout)
+    monkeypatch.setattr(web_fetch_module, "_fetch_bounded", timeout)
     tools = ClientToolDispatcher(Path.cwd(), restrict_to_workspace=False, ssrf_denylist=[])
     timed_out = _run(tools, "web_fetch", url="https://example.com")
     assert timed_out.code == "network_timeout"
 
-    monkeypatch.setattr(dispatcher_module, "_fetch_bounded", transport)
+    monkeypatch.setattr(web_fetch_module, "_fetch_bounded", transport)
     failed = _run(tools, "web_fetch", url="https://example.com")
     assert failed.code == "network_http_error"
 
@@ -350,14 +352,14 @@ def test_mutations_detect_external_changes_before_commit(
     target = workspace / "notes.txt"
     target.write_text("old")
     tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
-    original = dispatcher_module._apply_text_edit
+    original = file_tools_module._apply_text_edit
 
     def apply_and_race(*args: Any, **kwargs: Any) -> tuple[str, int, bool]:
         result = original(*args, **kwargs)
         target.write_text("external")
         return result
 
-    monkeypatch.setattr(dispatcher_module, "_apply_text_edit", apply_and_race)
+    monkeypatch.setattr(file_tools_module, "_apply_text_edit", apply_and_race)
     result = _run(tools, "edit_file", path="notes.txt", old_text="old", new_text="new")
 
     assert result.code == "workspace_file_changed"
@@ -371,14 +373,14 @@ def test_cancelled_mutation_keeps_path_lock_until_worker_finishes(tmp_path: Path
         tools = ClientToolDispatcher(workspace, restrict_to_workspace=True, ssrf_denylist=[])
         started = threading.Event()
         release = threading.Event()
-        original = tools._atomic_write
+        original = tools._files._atomic_write
 
         def blocking(path: Path, data: bytes) -> None:
             started.set()
             release.wait(timeout=1)
             original(path, data)
 
-        tools._atomic_write = blocking  # type: ignore[method-assign]
+        tools._files._atomic_write = blocking  # type: ignore[method-assign]
         first = asyncio.create_task(
             tools.execute("write_file", {"path": "same.txt", "content": "first"})
         )
@@ -445,13 +447,13 @@ def test_path_resolution_runs_outside_the_event_loop_thread(
         tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         resolve_threads: list[int] = []
-        original = tools._paths.resolve
+        original = tools._files._paths.resolve
 
         def tracked(path: str, *, directory: bool | None) -> Path:
             resolve_threads.append(threading.get_ident())
             return original(path, directory=directory)
 
-        monkeypatch.setattr(tools._paths, "resolve", tracked)
+        monkeypatch.setattr(tools._files._paths, "resolve", tracked)
         result = await tools.execute("read_file", {"path": "notes.txt"})
 
         assert result.is_error is False
@@ -470,7 +472,7 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
         tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
         loop_thread = threading.get_ident()
         open_threads: list[int] = []
-        original_open = dispatcher_module._open_transfer_source
+        original_open = local_transfer_module._open_transfer_source
 
         def tracked_open(
             path: Path, delete_access: bool = False
@@ -478,7 +480,7 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
             open_threads.append(threading.get_ident())
             return original_open(path, delete_access)
 
-        monkeypatch.setattr(dispatcher_module, "_open_transfer_source", tracked_open)
+        monkeypatch.setattr(local_transfer_module, "_open_transfer_source", tracked_open)
         result = await tools.execute(
             "__workspace_rest__",
             {
@@ -497,7 +499,7 @@ def test_local_transfer_source_preparation_runs_outside_event_loop(
 
 def test_match_enumeration_fails_at_the_candidate_limit() -> None:
     with pytest.raises(ToolFailure, match="candidate limit"):
-        dispatcher_module._matches("x" * 10_000, "x")
+        file_tools_module._matches("x" * 10_000, "x")
 
 
 @pytest.mark.parametrize(
@@ -519,7 +521,7 @@ def test_filesystem_errors_are_stable_and_do_not_leak_paths(
         del path, directory
         raise failure
 
-    monkeypatch.setattr(tools._paths, "resolve", reject)
+    monkeypatch.setattr(tools._files._paths, "resolve", reject)
     output = _run(tools, "read_file", path="notes.txt")
 
     assert output.code == code
@@ -533,14 +535,14 @@ def test_apply_patch_stops_preparing_files_when_cumulative_limit_is_exceeded(
     for name in ("one.txt", "two.txt", "three.txt"):
         (tmp_path / name).write_text("123456", encoding="utf-8")
     prepared: list[str] = []
-    original = dispatcher_module._capture_regular
+    original = file_tools_module._capture_regular
 
     def capture(path: Path, limit: int) -> object:
         prepared.append(path.name)
         return original(path, limit)
 
-    monkeypatch.setattr(dispatcher_module, "MAX_TEXT_EDIT_BYTES", 10)
-    monkeypatch.setattr(dispatcher_module, "_capture_regular", capture)
+    monkeypatch.setattr(file_tools_module, "MAX_TEXT_EDIT_BYTES", 10)
+    monkeypatch.setattr(file_tools_module, "_capture_regular", capture)
     tools = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     result = _run(
         tools,
@@ -592,7 +594,7 @@ def test_regular_file_opens_request_nonblocking_mode(
 
     monkeypatch.setattr(os, "open", reject_open)
     with pytest.raises(ToolFailure):
-        dispatcher_module._read_regular_fd(tmp_path / "pipe", 100)
+        file_tools_module._read_regular_fd(tmp_path / "pipe", 100)
 
     assert flags_seen[0] & nonblocking
 
@@ -613,7 +615,7 @@ def test_transfer_source_open_requests_nonblocking_mode(
 
     monkeypatch.setattr(os, "open", reject_open)
     with pytest.raises(ToolFailure):
-        dispatcher_module._open_transfer_source(source)
+        local_transfer_module._open_transfer_source(source)
 
     assert flags_seen[0] & nonblocking
 
@@ -746,10 +748,10 @@ def test_web_fetch_revalidates_original_host_on_redirect(
         async def send(self, request: object, *, stream: bool) -> Response:
             return next(self.responses)
 
-    monkeypatch.setattr(dispatcher_module, "_validated_addresses", fake_validate)
+    monkeypatch.setattr(web_fetch_module, "_validated_addresses", fake_validate)
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
 
-    result = asyncio.run(dispatcher_module._fetch_bounded("https://public.example/root/", ()))
+    result = asyncio.run(web_fetch_module._fetch_bounded("https://public.example/root/", ()))
 
     assert result[0] == b"ok"
     assert calls == ["public.example", "public.example"]

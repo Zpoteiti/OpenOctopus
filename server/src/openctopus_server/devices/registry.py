@@ -38,11 +38,9 @@ from openctopus_server.devices.protocol import (
     encode_server_frame,
     new_uuid7,
 )
-from openctopus_server.devices.transfer import (
-    FairTransferAdmission,
-    TransferDisconnectedError,
-    TransferManager,
-)
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import FairTransferAdmission
+from openctopus_server.devices.transfer_types import TransferDisconnectedError
 
 
 class DeviceUnavailableError(RuntimeError):

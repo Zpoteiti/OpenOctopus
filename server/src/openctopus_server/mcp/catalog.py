@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from openctopus_server.devices.mcp_catalog import (
     build_persisted_catalog,
     canonical_json_bytes,
     catalog_digest,
+    extract_resource_template_variables,
     with_catalog_digest,
 )
 from openctopus_server.devices.mcp_models import (
@@ -49,9 +49,6 @@ CURSOR_BYTES_MAX = 4096
 
 _DEVICE_FIELD_NAME = "openoctopus_device"
 _ANY_URL_ADAPTER = TypeAdapter(AnyUrl)
-_VAR_SEGMENT = r"(?:[A-Za-z0-9_]|%[0-9A-Fa-f]{2})+"
-_VAR_NAME = re.compile(rf"^{_VAR_SEGMENT}(?:\.{_VAR_SEGMENT})*$")
-_TEMPLATE_OPERATORS = frozenset("+#./;?&")
 
 type McpSurface = Literal["tool", "resource", "resource_template", "prompt"]
 type SourceRouteKey = tuple[McpSurface, str, str]
@@ -94,70 +91,6 @@ def normalized_resource_uri(value: str) -> AnyUrl:
         return _ANY_URL_ADAPTER.validate_python(value, strict=True)
     except ValidationError:
         raise _validation_error("resource URI is invalid") from None
-
-
-def _parse_varspec(varspec: str) -> str:
-    if not varspec:
-        raise _validation_error("resource template contains an empty variable")
-    if varspec.endswith("*"):
-        name = varspec[:-1]
-        if not name or "*" in name or ":" in name:
-            raise _validation_error("resource template explode modifier is invalid")
-    elif ":" in varspec:
-        if varspec.count(":") != 1:
-            raise _validation_error("resource template prefix modifier is invalid")
-        name, prefix = varspec.split(":", 1)
-        if (
-            not prefix.isascii()
-            or not prefix.isdigit()
-            or len(prefix) > 4
-            or prefix.startswith("0")
-            or not 1 <= int(prefix) <= 9999
-        ):
-            raise _validation_error("resource template prefix must be in 1..9999")
-    else:
-        name = varspec
-        if "*" in name:
-            raise _validation_error("resource template modifier is invalid")
-    if _VAR_NAME.fullmatch(name) is None:
-        raise _validation_error("resource template variable name is invalid")
-    return name
-
-
-def extract_resource_template_variables(template: str) -> tuple[str, ...]:
-    variables: list[str] = []
-    seen: set[str] = set()
-    index = 0
-    while index < len(template):
-        character = template[index]
-        if character == "}":
-            raise _validation_error("resource template contains an unmatched closing brace")
-        if character != "{":
-            index += 1
-            continue
-        end = template.find("}", index + 1)
-        if end < 0:
-            raise _validation_error("resource template contains an unmatched opening brace")
-        expression = template[index + 1 : end]
-        if not expression or "{" in expression or "}" in expression:
-            raise _validation_error("resource template expression is invalid")
-        if expression[0] in _TEMPLATE_OPERATORS:
-            expression = expression[1:]
-        if not expression:
-            raise _validation_error("resource template expression has no variables")
-        for varspec in expression.split(","):
-            name = _parse_varspec(varspec)
-            if name not in seen:
-                seen.add(name)
-                variables.append(name)
-        index = end + 1
-    try:
-        parsed = tuple(str(value) for value in uritemplate.variables(template))
-    except (TypeError, ValueError) as exc:
-        raise _validation_error("resource template is not valid RFC 6570") from exc
-    if parsed != tuple(variables):
-        raise _validation_error("resource template variable projection is ambiguous")
-    return tuple(variables)
 
 
 def expand_resource_template(template: str, arguments: Mapping[str, str]) -> AnyUrl:

@@ -18,7 +18,7 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferIntegrityError
+from openctopus_server.devices.transfer_types import TransferIntegrityError
 from openctopus_server.devices.workspace import (
     DestinationDirectoryJobStatus,
     DirectoryCommandResult,

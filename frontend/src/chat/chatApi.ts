@@ -220,3 +220,11 @@ function ambiguousStreamError(accepted: boolean, cause?: unknown): MessageStream
       })
   return new MessageStreamError(accepted, message, cause)
 }
+
+export function chatErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) {
+    const codeSuffix = `(${error.code})`
+    return error.message.includes(codeSuffix) ? error.message : `${error.message} ${codeSuffix}`
+  }
+  return error instanceof Error ? error.message : fallback
+}

@@ -37,7 +37,7 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferDisconnectedError, TransferError
+from openctopus_server.devices.transfer_types import TransferDisconnectedError, TransferError
 from openctopus_server.devices.workspace import (
     DeviceDirectoryPageResult,
     DeviceFileMutationResult,

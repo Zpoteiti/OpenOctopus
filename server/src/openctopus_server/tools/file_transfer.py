@@ -22,14 +22,13 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import (
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import TransferBusyError, TransferLease
+from openctopus_server.devices.transfer_types import (
     BRIDGE_SOURCE_DELETE_TIMEOUT_SECONDS,
-    TransferBusyError,
     TransferDisconnectedError,
     TransferError,
     TransferIntegrityError,
-    TransferLease,
-    TransferManager,
     TransferUnavailableError,
 )
 from openctopus_server.devices.workspace import (

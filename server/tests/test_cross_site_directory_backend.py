@@ -16,12 +16,12 @@ from openctopus_server.devices.registry import (
     DeviceOutcomeUnknownError,
     DeviceRouteSnapshot,
 )
-from openctopus_server.devices.transfer import (
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import TransferLease
+from openctopus_server.devices.transfer_types import (
     TransferCommitResult,
     TransferCommittedAfterCancellation,
     TransferIntegrityError,
-    TransferLease,
-    TransferManager,
     TransferResult,
 )
 from openctopus_server.directory_contract import (

@@ -25,7 +25,7 @@ from openctopus_server.devices.registry import (
     DeviceRegistry,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferDisconnectedError
+from openctopus_server.devices.transfer_types import TransferDisconnectedError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import DeviceError, WorkspaceError
 from openctopus_server.errors.http import ERROR_STATUS

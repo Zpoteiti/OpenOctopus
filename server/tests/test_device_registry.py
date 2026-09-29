@@ -44,7 +44,7 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferUnavailableError
+from openctopus_server.devices.transfer_types import TransferUnavailableError
 from openctopus_server.mcp.authority import ServerMcpAuthorityFence
 from openctopus_server.mcp.models import empty_server_mcp_envelope, parse_server_mcp_configs
 

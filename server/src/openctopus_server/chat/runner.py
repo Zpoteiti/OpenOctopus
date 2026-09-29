@@ -54,6 +54,7 @@ from openctopus_server.chat.device_snapshot import (
 )
 from openctopus_server.chat.public_projection import message_response
 from openctopus_server.chat.repair import repair_unpaired_tool_uses
+from openctopus_server.chat.session_streams import SessionStreams
 from openctopus_server.chat.stream import StreamSubscriber
 from openctopus_server.chat.token_estimator import estimate_request_tokens
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
@@ -155,10 +156,7 @@ class _SessionState:
     leases: int = 0
     starts: deque[TurnStart] = field(default_factory=deque)
     runner_task: asyncio.Task[None] | None = None
-    turn_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
-    queued_subscribers: dict[UUID, StreamSubscriber] = field(default_factory=dict)
-    active_turn_id: UUID | None = None
-    active_preview_message_ids: frozenset[UUID] = field(default_factory=frozenset)
+    streams: SessionStreams = field(default_factory=SessionStreams)
 
 
 @dataclass(slots=True)
@@ -414,14 +412,7 @@ class ChatRuntime:
             task = state.runner_task
             state.runner_task = None
             state.starts.clear()
-            subscribers = [
-                *state.turn_subscribers.values(),
-                *state.queued_subscribers.values(),
-            ]
-            state.turn_subscribers.clear()
-            state.queued_subscribers.clear()
-            state.active_turn_id = None
-            state.active_preview_message_ids = frozenset()
+            subscribers = state.streams.detach()
 
         if task is not None:
             task.cancel()
@@ -466,13 +457,12 @@ class ChatRuntime:
                     location, running_turn_id = await self._queued_location(accepted)
                     if location == "running" and running_turn_id is not None:
                         if (
-                            state.active_turn_id != running_turn_id
-                            or accepted.message_id not in state.active_preview_message_ids
+                            state.streams.active_turn_id != running_turn_id
+                            or accepted.message_id not in state.streams.active_preview_message_ids
                         ):
                             subscriber.close()
                             return subscriber
-                        self._install_newest_subscriber(
-                            state,
+                        state.streams.install(
                             turn_id=running_turn_id,
                             subscriber=subscriber,
                         )
@@ -480,20 +470,19 @@ class ChatRuntime:
                     if location == "done":
                         subscriber.close()
                         return subscriber
-                    self._queue_subscriber(state, subscriber)
+                    state.streams.queue(subscriber)
                     return subscriber
 
                 if not await self._turn_is_running(accepted.turn.turn_id):
                     subscriber.close()
                     return subscriber
-                self._set_active_turn(state, accepted.turn, inherit_preview=False)
+                state.streams.set_active_turn(accepted.turn, inherit_preview=False)
                 candidates = [
                     subscriber,
-                    *self._take_queued_subscribers(state, accepted.turn.message_ids),
+                    *state.streams.take_queued(accepted.turn.message_ids),
                 ]
                 for candidate in candidates:
-                    self._install_newest_subscriber(
-                        state,
+                    state.streams.install(
                         turn_id=accepted.turn.turn_id,
                         subscriber=candidate,
                     )
@@ -508,11 +497,7 @@ class ChatRuntime:
         async with self._lease_state(session_id, create=False) as state:
             if state is not None:
                 async with state.lock:
-                    if state.queued_subscribers.get(subscriber.message_id) is subscriber:
-                        state.queued_subscribers.pop(subscriber.message_id, None)
-                    for turn_id, candidate in tuple(state.turn_subscribers.items()):
-                        if candidate is subscriber:
-                            state.turn_subscribers.pop(turn_id, None)
+                    state.streams.unregister(subscriber)
             subscriber.close()
 
     async def close(self) -> None:
@@ -540,7 +525,7 @@ class ChatRuntime:
         async with self._lease_state(turn.session_id) as state:
             assert state is not None
             async with state.lock:
-                self._set_active_turn(state, turn, inherit_preview=False)
+                state.streams.set_active_turn(turn, inherit_preview=False)
                 state.starts.append(turn)
                 self._ensure_runner_locked(state)
 
@@ -577,8 +562,8 @@ class ChatRuntime:
             state.leases == 0
             and state.runner_task is None
             and not state.starts
-            and not state.turn_subscribers
-            and not state.queued_subscribers
+            and not state.streams.turn_subscribers
+            and not state.streams.queued_subscribers
         ):
             self._states.pop(state.session_id)
 
@@ -672,10 +657,9 @@ class ChatRuntime:
         turn: TurnStart,
     ) -> None:
         async with state.lock:
-            self._set_active_turn(state, turn, inherit_preview=False)
-            for subscriber in self._take_queued_subscribers(state, turn.message_ids):
-                self._install_newest_subscriber(
-                    state,
+            state.streams.set_active_turn(turn, inherit_preview=False)
+            for subscriber in state.streams.take_queued(turn.message_ids):
+                state.streams.install(
                     turn_id=turn.turn_id,
                     subscriber=subscriber,
                 )
@@ -947,7 +931,7 @@ class ChatRuntime:
                         async with AsyncSession(self.engine, expire_on_commit=False) as db:
                             turn = await capture_pending_for_turn(db, turn=turn)
                         async with state.lock:
-                            self._set_active_turn(state, turn, inherit_preview=True)
+                            state.streams.set_active_turn(turn, inherit_preview=True)
                         try:
                             prepared = await self._prepare_turn(turn)
                             turn = prepared.turn
@@ -1726,7 +1710,7 @@ class ChatRuntime:
         event: dict[str, Any],
     ) -> None:
         async with state.lock:
-            subscriber = state.turn_subscribers.get(turn_id)
+            subscriber = state.streams.turn_subscribers.get(turn_id)
             if subscriber is not None:
                 subscriber.send(event)
 
@@ -1737,31 +1721,7 @@ class ChatRuntime:
         new_turn: TurnStart,
     ) -> None:
         async with state.lock:
-            self._set_active_turn(state, new_turn, inherit_preview=True)
-            candidates = [
-                candidate
-                for candidate in [
-                    state.turn_subscribers.pop(old_turn_id, None),
-                    state.turn_subscribers.pop(new_turn.turn_id, None),
-                    *self._take_queued_subscribers(state, new_turn.message_ids),
-                ]
-                if candidate is not None and not candidate.closed
-            ]
-            if not candidates:
-                return
-            winner = max(candidates, key=lambda candidate: candidate.accepted_at)
-            for candidate in candidates:
-                if candidate is winner:
-                    continue
-                candidate.send(
-                    {
-                        "type": "stream_replaced",
-                        "message_id": str(candidate.message_id),
-                        "by_message_id": str(winner.message_id),
-                    }
-                )
-                candidate.close()
-            state.turn_subscribers[new_turn.turn_id] = winner
+            state.streams.transfer(old_turn_id, new_turn)
 
     async def _close_turn_subscriber(
         self,
@@ -1769,19 +1729,11 @@ class ChatRuntime:
         turn_id: UUID,
     ) -> None:
         async with state.lock:
-            subscriber = state.turn_subscribers.pop(turn_id, None)
-            if subscriber is not None:
-                subscriber.close()
-            self._clear_active_turn(state, turn_id)
+            state.streams.close_turn(turn_id)
 
     async def _close_chain_subscribers(self, state: _SessionState) -> None:
         async with state.lock:
-            subscribers = list(state.turn_subscribers.values())
-            state.turn_subscribers.clear()
-            state.active_turn_id = None
-            state.active_preview_message_ids = frozenset()
-            for subscriber in subscribers:
-                subscriber.close()
+            state.streams.close_chain()
 
     async def _adopt_running_turn_subscriber(
         self,
@@ -1789,17 +1741,7 @@ class ChatRuntime:
         turn_id: UUID,
     ) -> None:
         async with state.lock:
-            candidates = [
-                candidate for candidate in state.turn_subscribers.values() if not candidate.closed
-            ]
-            state.turn_subscribers.clear()
-            state.active_turn_id = turn_id
-            if not candidates:
-                return
-            winner = candidates[0]
-            for candidate in candidates[1:]:
-                winner = self._replace_older(winner, candidate)
-            state.turn_subscribers[turn_id] = winner
+            state.streams.adopt_running(turn_id)
 
     async def _claim_promoted_subscriber(
         self,
@@ -1807,88 +1749,7 @@ class ChatRuntime:
         turn: TurnStart,
     ) -> None:
         async with state.lock:
-            for subscriber in self._take_queued_subscribers(state, turn.message_ids):
-                self._install_newest_subscriber(
-                    state,
-                    turn_id=turn.turn_id,
-                    subscriber=subscriber,
-                )
-
-    def _queue_subscriber(
-        self,
-        state: _SessionState,
-        subscriber: StreamSubscriber,
-    ) -> None:
-        current = state.queued_subscribers.get(subscriber.message_id)
-        if current is None:
-            state.queued_subscribers[subscriber.message_id] = subscriber
-            return
-        state.queued_subscribers[subscriber.message_id] = self._replace_older(
-            current,
-            subscriber,
-        )
-
-    @staticmethod
-    def _set_active_turn(
-        state: _SessionState,
-        turn: TurnStart,
-        *,
-        inherit_preview: bool,
-    ) -> None:
-        state.active_turn_id = turn.turn_id
-        if turn.message_ids:
-            state.active_preview_message_ids = frozenset(turn.message_ids)
-        elif not inherit_preview:
-            state.active_preview_message_ids = frozenset()
-
-    @staticmethod
-    def _clear_active_turn(state: _SessionState, turn_id: UUID) -> None:
-        if state.active_turn_id != turn_id:
-            return
-        state.active_turn_id = None
-        state.active_preview_message_ids = frozenset()
-
-    @staticmethod
-    def _take_queued_subscribers(
-        state: _SessionState,
-        message_ids: tuple[UUID, ...],
-    ) -> list[StreamSubscriber]:
-        return [
-            subscriber
-            for message_id in message_ids
-            if (subscriber := state.queued_subscribers.pop(message_id, None)) is not None
-            and not subscriber.closed
-        ]
-
-    def _install_newest_subscriber(
-        self,
-        state: _SessionState,
-        *,
-        turn_id: UUID,
-        subscriber: StreamSubscriber,
-    ) -> None:
-        current = state.turn_subscribers.get(turn_id)
-        if current is None:
-            state.turn_subscribers[turn_id] = subscriber
-            return
-        winner = self._replace_older(current, subscriber)
-        state.turn_subscribers[turn_id] = winner
-
-    @staticmethod
-    def _replace_older(
-        left: StreamSubscriber,
-        right: StreamSubscriber,
-    ) -> StreamSubscriber:
-        winner, loser = (right, left) if left.accepted_at <= right.accepted_at else (left, right)
-        loser.send(
-            {
-                "type": "stream_replaced",
-                "message_id": str(loser.message_id),
-                "by_message_id": str(winner.message_id),
-            }
-        )
-        loser.close()
-        return winner
+            state.streams.claim(turn)
 
 
 def _synthetic_error_content(*, error: ProviderInvocationError | None) -> dict[str, str]:

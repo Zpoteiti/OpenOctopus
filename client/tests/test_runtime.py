@@ -15,6 +15,8 @@ from uuid import UUID
 import pytest
 
 import openoctopus_client.connection as connection_module
+import openoctopus_client.tools.blocking as blocking_module
+import openoctopus_client.tools.file_tools as file_tools_module
 from openoctopus_client import cli
 from openoctopus_client.config import ConfigurationError, load_config
 from openoctopus_client.connection import (
@@ -219,10 +221,10 @@ def test_runtime_owns_shared_local_transfer_admission_and_drain_registry(
         runtime._default_dispatcher(tmp_path, True, []),
     )
 
-    assert first._transfer_admission is runtime._local_transfer_admission
-    assert second._transfer_admission is runtime._local_transfer_admission
-    assert first._transfer_drains is runtime._local_transfer_drains
-    assert second._transfer_drains is runtime._local_transfer_drains
+    assert first._files._transfers._transfer_admission is runtime._local_transfer_admission
+    assert second._files._transfers._transfer_admission is runtime._local_transfer_admission
+    assert first._files._transfers._transfer_drains is runtime._local_transfer_drains
+    assert second._files._transfers._transfer_drains is runtime._local_transfer_drains
 
 
 def test_runtime_shutdown_waits_for_local_transfer_drains() -> None:
@@ -2508,7 +2510,7 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
             async def close(self, code: int, reason: str) -> None:
                 del code, reason
 
-        monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
+        monkeypatch.setattr(file_tools_module, "_read_regular", blocking_read)
         # On Windows, allow the thread-pool worker to start before exercising
         # the timeout path; the events below prove the residual thread exists.
         monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
@@ -3038,7 +3040,7 @@ def test_tool_worker_waits_for_timed_out_thread_before_dequeuing_next_call(
                 self.frames.append(payload)
                 sent.set()
 
-        monkeypatch.setattr(dispatcher_module, "_read_regular", blocking_read)
+        monkeypatch.setattr(file_tools_module, "_read_regular", blocking_read)
         # On Windows, allow the thread-pool worker to start before exercising
         # the timeout path; the events below prove the residual thread exists.
         monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
@@ -3129,7 +3131,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_mutation(
                     started.set()
                     released.wait()
 
-                await dispatcher_module._run_mutation(blocked_mutation)
+                await blocking_module._run_mutation(blocked_mutation)
                 return ToolOutput("finished")
 
         def hard_exit(code: int) -> None:
@@ -3179,7 +3181,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_read(
             released.wait()
             return b"finished\n"
 
-        monkeypatch.setattr(dispatcher_module, "_read_regular", blocked_read)
+        monkeypatch.setattr(file_tools_module, "_read_regular", blocked_read)
         dispatcher = dispatcher_module.ClientToolDispatcher(
             tmp_path, restrict_to_workspace=True, ssrf_denylist=[]
         )
