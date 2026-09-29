@@ -192,6 +192,35 @@ describe('WorkspacePage', () => {
     expect(screen.queryByText(/MIME|modified/i)).not.toBeInTheDocument()
   })
 
+  it('browses built-in skills as a separate read-only Server location', async () => {
+    const fetchMock = baseFetch((url) => {
+      if (url === '/api/workspace/list//builtin/skills?openoctopus_device=server&recursive=false&limit=200&offset=0') {
+        return json({ ...rootEntries, items: [{ name: 'creating-skills', path: '/builtin/skills/creating-skills', kind: 'directory', size: 0 }] })
+      }
+      if (url === '/api/workspace/list//builtin/skills/creating-skills?openoctopus_device=server&recursive=false&limit=200&offset=0') {
+        return json({ ...rootEntries, items: [{ name: 'SKILL.md', path: '/builtin/skills/creating-skills/SKILL.md', kind: 'file', size: 19 }] })
+      }
+      if (url === '/api/workspace/files//builtin/skills/creating-skills/SKILL.md?openoctopus_device=server') {
+        return new Response('# Create skills\nRead only.', { headers: { ETag: '"builtin-etag"' } })
+      }
+      return undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: /Built-in skills/ }))
+    await user.click(await screen.findByRole('button', { name: /creating-skills.*Folder/ }))
+    await user.click(await screen.findByRole('button', { name: /SKILL\.md.*File/ }))
+    expect(await screen.findByRole('textbox', { name: 'File content' })).toHaveValue('# Create skills\nRead only.')
+    expect(screen.queryByRole('button', { name: 'New shared Workspace' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'New file' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Choose file')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save file' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete file' })).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([, init]) => ['PUT', 'DELETE'].includes(init?.method ?? ''))).toBe(false)
+  })
+
   it('follows directory next_offset pages instead of hiding later entries', async () => {
     vi.stubGlobal('fetch', baseFetch((url) => {
       if (url === '/api/workspace/list/.?openoctopus_device=server&recursive=false&limit=200&offset=0') {

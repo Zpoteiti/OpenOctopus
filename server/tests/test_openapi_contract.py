@@ -272,7 +272,9 @@ def test_admin_config_schema_exposes_every_structured_control() -> None:
     assert properties["llm_model"]["examples"]
     assert properties["web_fetch_denylist"]["description"]
     assert not patch.get("required")
-    assert all('"null"' not in json.dumps(value) for value in patch["properties"].values())
+    assert all('"null"' not in json.dumps(value)
+               for key, value in patch["properties"].items() if key != "jev_endpoint")
+    assert {branch.get("type") for branch in patch["properties"]["jev_endpoint"]["anyOf"]} == {"string", "null"}
 
 
 def test_static_effort_enum_keeps_off_as_a_string() -> None:
@@ -323,3 +325,13 @@ def test_runtime_validation_responses_match_stable_error_envelope() -> None:
     workspace_patch = runtime["paths"]["/api/workspace/patch"]["post"]["responses"]
     assert {"400", "422"} <= set(workspace_upload)
     assert {"400", "422"} <= set(workspace_patch)
+
+
+def test_dream_and_jev_static_schemas_match_runtime() -> None:
+    static = _static_openapi()
+    runtime = create_app().openapi()
+    for name in ("DreamRunResponse", "DreamRunDetail", "DreamRunsResponse", "JevStatus"):
+        assert static["components"]["schemas"][name] == runtime["components"]["schemas"][name]
+    for name in ("jev_endpoint", "jev_api_key", "jev_status"):
+        assert name in static["components"]["schemas"]["AdminConfig"]["required"]
+    assert "before" not in runtime["components"]["schemas"]["DreamRunResponse"]["properties"]

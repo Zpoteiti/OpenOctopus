@@ -1716,13 +1716,24 @@ agent work, not a delivery router; Py9 does not add external-channel delivery.
 **Status:** accepted
 **Decision:**
 - A deterministic preflight requires a non-empty, bounded, strict UTF-8
-  `HEARTBEAT.md` with a real `## Active Tasks` section before any Provider call.
-- **Phase 1** is a standalone, lifecycle-owned Provider call, not an Agent
-  turn. It receives only the bounded file plus UTC/local time and the user's
-  IANA timezone, and must call the sole forced `heartbeat_decision` tool exactly
-  once. Invalid/missing/multiple calls, invalid task payloads, context overflow,
-  or Provider failure fail closed to `skip` without persistence.
-- **Phase 2** occurs only for a strict `run`: selected tasks are synthesized into
+  `HEARTBEAT.md` with a real `## Active Tasks` section and bounded parsed tasks
+  before any Jev call. Top-level bullet/numbered entries and plain paragraphs
+  supply original task bodies; completed `[x]` entries are ignored. The limits
+  are eight tasks, 500 code points per task, and 2,000 code points in total.
+- **Phase 1** is a standalone, lifecycle-owned Jev evaluation through the
+  mandatory separate administrator-configured endpoint/key (ADR-138). It
+  receives only the bounded file, original task map, UTC/local time, and IANA
+  timezone. Each task ID has a Choice question with `run`/`skip` criteria.
+  Code validates matching IDs, answer types, options, and numeric values, then
+  uses the returned choice directly; confidence has no decision cutoff.
+  Choice probabilities cover both options, stay finite within `[0, 1]`, and
+  sum to one with a `1e-6` serialization-rounding tolerance; the returned choice
+  must have the maximum probability. Confidence must be finite within `[0, 1]`.
+  Missing configuration, invalid responses, and service failures skip that
+  pulse with an explicit diagnostic reason. No normal-LLM decision fallback
+  runs. Live external checks remain work for Phase 2.
+- **Phase 2** occurs only for selected `run` answers: original task bodies remain
+  in file order and are synthesized into
   the stable `heartbeat:{user_id}` Session (whose UUID is the user UUID) through
   the normal pending-message/turn path. It does not copy the whole heartbeat
   file into history.
@@ -1731,12 +1742,21 @@ owner system prompt and full tool list. Phase 1 creates no Session or decision
 row. The read-only Heartbeat Session may be deleted and is recreated with the
 same UUID only by a later real Phase 2.
 
-### ADR-055 · Dream deferred for v1
+**Verification:** The [official Jev API](https://docs.typesafe.ai/api) defines
+`POST /v1/systemone`, bearer authentication, `jev-latest`, and typed Choice
+answers. Mocked HTTP tests cover decisions, invalid output, timeouts,
+authentication/service failures, settings observations, and recovery. Live Jev
+authentication, deployment compatibility, latency/cost, and selection quality
+remain unverified.
 
-**Status:** deferred
-**Context:** Prior OpenOctopus had Dream as a two-phase background consolidation of history into `MEMORY.md` + skill discovery.
-**Decision:** Not in M0–M3. MEMORY.md is maintained inline by the main agent via `edit_file` during conversations. When Dream eventually lands, it will be a separate sidecar module (not on the bus) with its own restricted tool registry, matching the nanobot pattern. Nothing in the rebuild architecture blocks its future addition.
-**Consequences:** No `last_dream_at` column, no `dream_phase1_prompt`/`dream_phase2_prompt` system_config keys, no `ToolAllowlist::Only(...)` enum, no `kind` column on `cron_jobs` (system cron kind was only used for dream + heartbeat; heartbeat is a tick loop, not a cron row).
+### ADR-055 · Original Dream deferral
+
+**Status:** superseded by ADR-138 for Python-main Py11.
+**Context:** The early rebuild deferred automatic memory consolidation while the
+normal agent maintained `MEMORY.md` during conversations.
+**Decision:** Py11 implements a controlled Jev-gated workflow that edits only
+`MEMORY.md`, with persisted progress and undo. It runs outside the agent bus;
+skill discovery and unrestricted tool execution are not part of Dream.
 
 ### ADR-112 · Cron ticker mechanics
 
@@ -1777,10 +1797,13 @@ startup, and never catches up missed boundaries. A scan cannot overlap itself.
   of 100, stages work through a queue of 64, and uses 32 fixed workers. New
   users past the scan's initial upper bound wait for the next pulse.
 - A user whose stable Heartbeat Session is running or pending is skipped before
-  file IO and the Provider call. Missing, oversized, unreadable, invalid UTF-8,
+  file IO and the Jev call. Missing, oversized, unreadable, invalid UTF-8,
   or deterministically inactive `HEARTBEAT.md` files are also skipped without a
-  Provider call.
-- Provider capacity is an admin responsibility. Deployments with weaker providers can configure the shared LLM-provider concurrency cap in `system_config.llm_max_concurrent_requests` or place a gateway such as LiteLLM in front of OpenOctopus.
+  Jev call.
+- Phase 1 uses the shared Jev service with eight concurrent requests and a
+  15-second deadline including admission, plus a 10-second HTTP timeout.
+  Requests/responses are bounded to 512,000/128,000 bytes. Phase 2 uses the
+  configured normal LLM and its `llm_max_concurrent_requests` limiter.
 - Phase 2 output is persisted to `heartbeat:{user_id}`. The Web UI displays this
   as a dedicated read-only Heartbeat Session; users change behavior by editing
   `HEARTBEAT.md` through the Workspace API/UI or file tools.
@@ -1790,8 +1813,9 @@ startup, and never catches up missed boundaries. A scan cannot overlap itself.
 
 **Consequences:** Users can inspect heartbeat history without autonomous output
 appearing unexpectedly in external chats. The fixed worker/queue bounds protect
-DB, object-storage, and memory staging; the existing shared Provider limiter
-remains the only configurable LLM concurrency bound.
+DB, object-storage, and memory staging. Jev decision capacity and normal LLM
+execution capacity have separate bounds; `llm_max_concurrent_requests` governs
+normal LLM calls.
 
 ### ADR-056 · No rate limiting in v1
 
@@ -1799,7 +1823,8 @@ remains the only configurable LLM concurrency bound.
 **Decision:** OpenOctopus does not implement per-user rate-limit buckets, request counters, or quota enforcement in the bus for v1. LLM provider 429s retry twice with exponential backoff, then surface an error to the user. The shared provider layer may optionally enforce `system_config.llm_max_concurrent_requests` as an in-process semaphore, but this is a backend-protection knob, not a product rate-limit system.
 **Consequences:** Simpler ingress. The administrator supplies the shared LLM
 credential and bears Provider usage/cost for every user's Web, channel, Cron,
-and Heartbeat turns. It is the administrator's responsibility to size that
+and Heartbeat Phase 2 turns. Jev decisions use the separate shared admin Jev
+credential. It is the administrator's responsibility to size that
 provisioning for the deployment's user and concurrency targets.
 
 ---
@@ -1967,8 +1992,9 @@ future boundary, and missed boundaries are not replayed. A previous scan still
 running at a boundary causes that boundary to be skipped.
 **Consequences:** Restart carries no heartbeat cursor or decision baggage. If
 Phase 1 selects work, the only persistence is the resulting Heartbeat Session
-history. Phase 1 outcomes remain bounded lifecycle logs rather than DB audit
-rows. Multiple ASGI workers require a future distributed leader mechanism and
+history plus the shared Jev service availability observation (ADR-138).
+Per-task Phase 1 outcomes remain bounded lifecycle logs rather than DB audit
+rows; the service observation stores no task decisions. Multiple ASGI workers require a future distributed leader mechanism and
 are outside Py9's supported deployment contract.
 
 ### ADR-093 · Per-session chat SSE stream is historical
@@ -3144,9 +3170,9 @@ does not count as production code. Numbered implementation milestones start at
 | **Py8a** | Server MCP security boundary + shared runtime | Admin whole-list CAS API and last-good catalog; FastMCP 3.4.7 stdio/Streamable HTTP/SSE; four surfaces; one shared runtime per name; Server-first namespace/capacity; bounded fair queue and degraded recovery; trusted same-UID stdio with no OS sandbox | Py7 | Three-transport fake MCP contract; Server-first shadow/capacity and Device mutation races; bounded/fair queue; degraded MCP leaves `/health` healthy; clean runtime shutdown |
 | **Py8b** | Distinct-Client regular-file transfer | Same-owner Client A→Client B pure relay over one captured Protocol v3 slot; bounded admission; conditional move cleanup; no Server byte staging | Py7 | Five regular-file topologies share one public tool/REST shape; route, integrity, cancellation, late-frame, warning, and no-inner-admission contracts |
 | **Py8c** | Recursive directory transfer | Automatic file/directory dispatch; bounded immutable manifests; five topologies; sequential child slots; exact cleanup; same-Client atomic rename; Skills prevalidation | Py8b | 10,000-entry/5 MiB bounds; no-overwrite/empty/link/drift/cleanup contracts; bounded aggregate result; unchanged Protocol v3 |
-| **Py9** | Cron / Heartbeat | Stable per-job/per-user automation Sessions; shared atomic inbound publish; timezone-aware schedule service; `/api/cron` + `cron` tool; wall-clock Heartbeat preflight/forced-decision/Phase 2; Account + Automations UI | Py8c + Frontend | Cron and Heartbeat reuse normal pending/Agent paths; busy occurrences never backlog; delete/recreate and restart recovery are deterministic; real Provider + Docker acceptance |
+| **Py9** | Cron / Heartbeat | Stable per-job/per-user automation Sessions; shared atomic inbound publish; timezone-aware schedule service; `/api/cron` + `cron` tool; wall-clock Heartbeat preflight/mandatory Jev decision/normal Agent Phase 2; Account + Automations UI | Py8c + Frontend | Cron and Heartbeat reuse normal pending/Agent paths; busy occurrences never backlog; delete/recreate and restart recovery are deterministic; mocked Jev contracts pass; live Jev acceptance pending |
 | **Py10** | Channels | Extensible channel adapter layer and per-channel configuration, built on the normalized inbound transition | Py9 | Real bot e2e for at least 2 platforms; offline/online adapter hot-reload |
-| **Py11** | Memory / Dream consolidation | Deferred; revisit when agent loop + workspace_files stabilize | — | — |
+| **Py11** | Built-in skills / Memory | Shared immutable skill library; mandatory Jev gate for Dream and Heartbeat; controlled daily memory updates, history and undo; [contract](specs/2026-09-29-builtin-skills-and-dream-direction.md) | Py10 | Mocked Jev and workflow acceptance; live Jev pending credentials |
 | **Frontend** | Browser application (pulled forward before Py9) | React/Vite SPA, same-origin FastAPI delivery, auth/chat/workspace/device/admin UIs and browser CI | Py8c | Complete: accepted design `2026-08-26-browser-frontend-design.zh.md`, implementation, real browser gate, and cross-platform release CI |
 | **Py13** | Release publication | Publish the unsigned alpha Server image and Client artifacts with deployment docs; signing, installers, and multi-worker scale-out remain future ADRs | Frontend | `v0.0.1` prerelease contains the amd64/arm64 Server image, four native Client bundles, checksums, and published-artifact acceptance evidence |
 | **Py14** | Extra channels + deeper MCP | WeChat, WhatsApp, LINE, SMS/voice; MCP pool/session isolation, per-user MCP credentials, deeper resource/prompt support | — | — |
@@ -4155,6 +4181,48 @@ reported honestly instead of being replayed.
 
 ---
 
+### ADR-137 · Shared immutable built-in skills
+
+**Status:** accepted
+**Decision:** Ship six conditional `SKILL.md` guides in server package resources
+and validate/index them once at startup. The shared `/builtin/skills` namespace
+is readable through ordinary workspace APIs and agent `read_file`, and browsable
+in the frontend. Server authorization rejects every mutation and transfers
+involving this namespace. Personal skill names remain separate. No per-user copy,
+startup generation, database seed or user-editable mirror is created.
+
+**Consequences:** Built-ins update with the server release. Documentation uses
+the same capabilities actually available in the app and does not grant agents
+new configuration powers. Registration continues to seed only personal soul and
+memory files.
+
+### ADR-138 · Jev decisions and controlled daily memory updates
+
+**Status:** accepted; live Jev acceptance pending credentials.
+**Decision:** A mandatory admin-configured Jev endpoint/key provides typed
+`run`/`skip` decisions for Dream and Heartbeat Phase 1. Admin reads redact the key;
+configuration edits reset observed status. Explicit connection checks and actual
+requests record availability fenced by configuration revision. Missing or failed
+Jev makes Dream unavailable and skips Heartbeat decisions, with no normal LLM
+fallback. Cron remains schedule-driven.
+
+Dream makes completed local days eligible at midnight in each user's IANA
+timezone and catches up unprocessed input after downtime. Saved user/assistant
+text across all owned conversation channels retains Session and speaker context.
+A bounded workflow asks Jev for novelty versus memory, then the configured LLM
+for a constrained memory proposal with source references. Only `MEMORY.md` may
+change. Version checks preserve concurrent edits; durable prepared changes and
+per-message offsets support interruption recovery and large inputs. Owned run
+history exposes before/after and conflict-protected undo, which does not rewind
+source progress. Dream creates no chat turns and never consumes its own history.
+
+The exact bounds, retry rules and source exclusions are in the
+[implementation contract](specs/2026-09-29-builtin-skills-and-dream-direction.md).
+Mocked HTTP and workflow tests establish the implementation contract; they do
+not establish live service compatibility or the model's memory-selection quality.
+
+---
+
 ## Appendix A · Key Design Principles
 
 Distilled from the ADRs, for fast onboarding of new contributors:
@@ -4167,7 +4235,7 @@ Distilled from the ADRs, for fast onboarding of new contributors:
    not auto-versioned. Py8a Server entries are authoritative across tenancies;
    conflicting Device projections are deterministically suppressed.
 6. **No speculative scaffolding.** Fields without consumers are rejected. Add them back in five lines when a consumer appears.
-7. **No rate limiting in v1. No dream in v1.** Admin provisions their LLM; agent maintains MEMORY.md inline.
+7. **Admin-provisioned models.** Normal chat and controlled Dream proposals share the configured LLM; mandatory Jev decisions gate Dream and Heartbeat. The agent may also maintain MEMORY.md inline.
 8. **Pure functions where possible.** `context::build_context`, the fuzzy matcher, `validate_url` — all pure. Testable with synthetic inputs.
 9. **Crash recovery is narrow and durable.** Prefer JIT repair, but cross-store workspace deletion uses a small PostgreSQL outbox with runtime and startup recovery.
 10. **Channel adapters are thin.** Platform event facts → shared authority and
@@ -4184,7 +4252,7 @@ For contributors migrating from the old codebase, here's what changed and why:
 |---|---|---|
 | `EventKind::{UserTurn, Cron, Dream, Heartbeat}` | No kind; autonomous = user-message injection | ADR-005, ADR-010 |
 | `PromptMode::{UserTurn, Heartbeat, Dream}` | Single system prompt shape | ADR-023 |
-| `ToolAllowlist::Only(...)` for Dream | Dropped with Dream | ADR-055 |
+| `ToolAllowlist::Only(...)` for Dream | Controlled proposal workflow with no executable tools | ADR-138 |
 | 4-crate workspace (with plexus-gateway) | 2-project monorepo (server + client, no common) | ADR-001 |
 | WebSocket for browser chat | REST with best-effort POST streaming + canonical GET polling | ADR-003, ADR-121 |
 | Adapter-authored trust wrapper | Persist sender classification and Turn tool profile; project wrappers only for the Provider | ADR-007, ADR-008, ADR-136 |

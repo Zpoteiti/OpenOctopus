@@ -1,4 +1,5 @@
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from sqlalchemy import select, text
@@ -18,6 +19,7 @@ from openctopus_server.network_policy import (
     canonicalize_ssrf_denylist,
     compile_ssrf_policy,
 )
+from openctopus_server.provider.jev import jev_config_status, lock_jev_config
 
 _QUOTA_DEFAULT = 524288000  # 500 MiB
 LLM_MAX_OUTPUT_TOKENS_DEFAULT = 16_384
@@ -35,6 +37,10 @@ _CONFIG_KEYS = {
     "llm_endpoint",
     "llm_api_key",
     "llm_model",
+    "jev_endpoint",
+    "jev_api_key",
+    "jev_revision",
+    "jev_status",
     "llm_max_context_tokens",
     "llm_compaction_threshold_tokens",
     "llm_max_concurrent_requests",
@@ -57,6 +63,9 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
         llm_endpoint=rows.get("llm_endpoint"),
         llm_api_key=_REDACTED if "llm_api_key" in rows else None,
         llm_model=rows.get("llm_model"),
+        jev_endpoint=rows.get("jev_endpoint"),
+        jev_api_key=_REDACTED if rows.get("jev_api_key") else None,
+        jev_status=jev_config_status(rows),
         llm_max_context_tokens=rows.get("llm_max_context_tokens"),
         llm_compaction_threshold_tokens=rows.get("llm_compaction_threshold_tokens"),
         llm_max_concurrent_requests=rows.get("llm_max_concurrent_requests"),
@@ -71,7 +80,10 @@ async def get_config_view(db: AsyncSession) -> AdminConfig:
 
 
 async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
-    if any(getattr(payload, field) is None for field in payload.model_fields_set):
+    if any(
+        getattr(payload, field) is None
+        for field in payload.model_fields_set - {"jev_endpoint"}
+    ):
         raise ConfigError(
             ErrorCode.CONFIG_VALIDATION_FAILED,
             "Config values cannot be null",
@@ -80,11 +92,14 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
     data = payload.model_dump(exclude_unset=True)
     existing = await _get_all_rows(db)
 
-    if data.get("llm_api_key") == _REDACTED:
-        raise ConfigError(
-            ErrorCode.CONFIG_VALIDATION_FAILED,
-            "Cannot set llm_api_key to the redaction marker",
-        )
+    for key in ("llm_api_key", "jev_api_key"):
+        if data.get(key) == _REDACTED:
+            raise ConfigError(
+                ErrorCode.CONFIG_VALIDATION_FAILED,
+                f"Cannot set {key} to the redaction marker",
+            )
+    if "jev_api_key" in data and not data["jev_api_key"].strip():
+        del data["jev_api_key"]
 
     if "web_fetch_denylist" in data:
         data["web_fetch_denylist"] = list(
@@ -103,6 +118,20 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
                 "First-time LLM setup requires llm_endpoint, llm_api_key, and llm_model together",
             )
         await validate_llm_identity(str(endpoint), str(api_key), str(model))
+
+    if {"jev_endpoint", "jev_api_key"} & data.keys():
+        await lock_jev_config(db)
+        existing = await _get_all_rows(db)
+        if any(data[key] != existing.get(key) for key in ("jev_endpoint", "jev_api_key") if key in data):
+            data["jev_revision"] = uuid4().hex
+            data["jev_status"] = {
+                "revision": data["jev_revision"],
+                "state": "unchecked" if (
+                    data.get("jev_endpoint", existing.get("jev_endpoint"))
+                    and data.get("jev_api_key", existing.get("jev_api_key"))
+                ) else "not_configured",
+                "checked_at": None,
+            }
 
     if _TOKEN_LIMIT_KEYS & data.keys():
         await db.execute(

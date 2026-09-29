@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { type FormEvent, type ReactNode, useState } from 'react'
+import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate } from 'react-router-dom'
 
@@ -11,6 +11,7 @@ import type {
   ServerMcpServerConfig,
   ServerMcpServerConfigView,
 } from '../api/types'
+import type { components } from '../api/openapi'
 import { useAuthenticatedUser } from '../auth/context'
 import { Card, ErrorNotice, PageHeader, StatusBadge } from '../components/Page'
 import { CapabilityCatalog, type DiscoveredServer, McpForm } from '../devices/Devices'
@@ -20,6 +21,8 @@ const ADMIN_CONFIG_KEY = ['admin-config'] as const
 const SERVER_MCP_KEY = ['server-mcp'] as const
 const USER_PAGE_SIZE = 50
 const MAX_RUNTIME_REFRESHES = 12
+
+type JevStatus = components['schemas']['JevStatus']
 
 function lines(value: FormDataEntryValue | null): string[] {
   return String(value ?? '').split('\n').map((item) => item.trim()).filter(Boolean)
@@ -38,6 +41,7 @@ function addNumber(body: Record<string, unknown>, key: string, value: FormDataEn
 export function AdminSettingsPage(): ReactNode {
   const { t } = useTranslation()
   const client = useQueryClient()
+  const jevApiKeyInput = useRef<HTMLInputElement>(null)
   const config = useQuery({
     queryKey: ADMIN_CONFIG_KEY,
     queryFn: () => apiJson<AdminConfig>('/api/admin/config'),
@@ -48,6 +52,10 @@ export function AdminSettingsPage(): ReactNode {
       body: JSON.stringify(body),
     }),
     onSuccess: (result) => client.setQueryData(ADMIN_CONFIG_KEY, result),
+  })
+  const checkJev = useMutation({
+    mutationFn: () => apiJson<JevStatus>('/api/admin/config/jev/check', { method: 'POST' }),
+    onSuccess: (status) => client.setQueryData<AdminConfig>(ADMIN_CONFIG_KEY, (current) => current ? { ...current, jev_status: status } : current),
   })
 
   if (config.isPending) return <p className="page-status">{t('admin.loading')}</p>
@@ -83,6 +91,18 @@ export function AdminSettingsPage(): ReactNode {
     event.preventDefault()
     patchConfig.mutate({ default_soul: String(new FormData(event.currentTarget).get('default_soul') ?? '') })
   }
+  const saveJev = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const endpoint = String(data.get('jev_endpoint') ?? '').trim()
+    const key = String(data.get('jev_api_key') ?? '')
+    patchConfig.mutate({ jev_endpoint: endpoint || null, ...(key ? { jev_api_key: key } : {}) }, {
+      onSuccess: () => { if (jevApiKeyInput.current) jevApiKeyInput.current.value = '' },
+    })
+  }
+  const jevState = value.jev_status.state
+  const status = value.jev_status
+  const jevUnavailable = jevState !== 'available' && jevState !== 'unchecked'
 
   return (
     <div className="page-scroll">
@@ -118,6 +138,20 @@ export function AdminSettingsPage(): ReactNode {
             </label>
             <label>{t('admin.maxOutput')}<input name="llm_max_output_tokens" type="number" min="1" max="1000000" defaultValue={value.llm_max_output_tokens} required /></label>
             <div className="form-actions full-row"><button className="primary-button" disabled={patchConfig.isPending}>{t('admin.saveProvider')}</button></div>
+          </form>
+        </Card>
+        <Card title={t('admin.jevTitle')} description={t('admin.jevDescription')}>
+          <form className="form-grid" onSubmit={saveJev}>
+            <label className="full-row">{t('admin.jevEndpoint')}<input name="jev_endpoint" type="url" defaultValue={value.jev_endpoint ?? ''} placeholder="https://api.typesafe.ai" /></label>
+            <label className="full-row">{t('admin.jevApiKey')}<input ref={jevApiKeyInput} name="jev_api_key" type="password" placeholder={value.jev_api_key === '<redacted>' ? t('admin.apiKeyConfigured') : t('admin.apiKeyMissing')} autoComplete="off" /></label>
+            <p className="field-help full-row">{t('admin.jevAvailability', { state: t(`admin.jevState.${jevState}`) })} {t(`admin.jevReason.${jevState}`)}{status.checked_at ? ` ${t('admin.jevCheckedAt', { time: new Date(status.checked_at).toLocaleString() })}` : ''}</p>
+            {jevUnavailable ? <p className="field-help full-row" role="status"><strong>{t('admin.dreamUnavailable')}</strong> {t(`admin.jevReason.${jevState}`)}</p> : null}
+            {jevState === 'unchecked' ? <p className="field-help full-row">{t('admin.heartbeatJevCheckHelp')}</p> : jevState !== 'available' ? <p className="field-help full-row">{t('admin.heartbeatJevHelp')}</p> : null}
+            <div className="form-actions full-row">
+              <button className="primary-button" disabled={patchConfig.isPending || checkJev.isPending}>{t('admin.saveJev')}</button>
+              <button className="secondary-button" type="button" disabled={checkJev.isPending || patchConfig.isPending || jevState === 'not_configured'} onClick={() => checkJev.mutate()}>{t('admin.checkJev')}</button>
+            </div>
+            {checkJev.error ? <p className="form-error full-row" role="alert">{t('admin.jevCheckFailed')}</p> : null}
           </form>
         </Card>
         <Card title={t('admin.quotas')} description={t('admin.quotasDescription')}>

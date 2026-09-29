@@ -24,10 +24,13 @@ macOS, and Windows computers.
 - Connects one Discord Bot and one DingTalk Bot per user to the same durable
   conversation and Agent loop as the browser.
 - Uses an Anthropic-compatible Messages API as the LLM Provider.
+- Ships six read-only built-in skill guides, available to every agent and in Workspace.
+- Runs scheduled jobs and Jev-gated Heartbeat checks. Dream reviews completed days'
+  conversation text and updates `MEMORY.md`, with change history and undo in Automations.
 
 New accounts receive editable `SOUL.md` and `MEMORY.md` files in their personal
 Workspace. Administrators can configure the default SOUL, Provider, Workspace
-quotas, Server Web Fetch policy, users, and shared Server MCP from the UI.
+quotas, Jev decision service, Server Web Fetch policy, users, and shared Server MCP from the UI.
 
 ## See it in action
 
@@ -62,6 +65,7 @@ OpenOctopus Server (one ASGI worker)
   |-- PostgreSQL: users, conversations, configuration, MCP catalogs
   |-- RustFS: Server Workspaces and uploaded attachments
   |-- Anthropic-compatible LLM Provider
+  |-- Jev decision API for Heartbeat Phase 1 and Dream
   |-- Discord Gateway + REST adapter
   |-- DingTalk Stream + OpenAPI adapter
   |-- Server-owned MCP connections and stdio child processes
@@ -124,7 +128,25 @@ host must be addressed by an address reachable from the Server container;
 
 The administrator owns this shared Provider configuration and API key, and
 therefore bears Provider usage and cost for browser, channel, Cron, and
-Heartbeat turns from every account on the deployment.
+Heartbeat Phase 2 turns and Dream memory proposals from every account on the deployment.
+
+### Configure Jev decisions
+
+In **Admin settings**, set the separate **Jev API base URL** (for example,
+`https://api.typesafe.ai`, without `/v1`) and **Jev API key**. Saved keys are
+redacted; leaving the key blank retains it. Clearing the endpoint disables the
+configuration. Saving these settings requires no service request.
+
+Use **Check Jev** to send a small explicit evaluation and display the observed
+status and check time. Opening settings reads the saved status. Endpoint or key
+changes reset that status to unchecked until a request succeeds. Heartbeat
+Phase 1 and Dream require Jev; missing configuration or failed/invalid decisions
+defer work. Selected Heartbeat tasks then execute through the normal LLM Agent.
+Cron follows its configured schedule.
+
+The administrator owns Jev usage and cost for the deployment. The HTTP contract,
+failure handling, and recovery have mocked test coverage; live Jev authentication,
+deployment compatibility, latency/cost, and decision quality remain unverified.
 
 ### Stop or remove the stack
 

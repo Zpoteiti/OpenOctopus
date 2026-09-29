@@ -21,6 +21,8 @@ EXPECTED_COLUMNS = {
     "workspace_members": 3,
     "workspace_deletions": 3,
     "cron_jobs": 10,
+    "dream_runs": 12,
+    "dream_progress": 3,
 }
 
 EXPECTED_INDEXES = {
@@ -43,6 +45,8 @@ EXPECTED_INDEXES = {
     ("idx_workspace_members_user", "workspace_members"),
     ("idx_cron_jobs_user_id", "cron_jobs"),
     ("idx_cron_jobs_next_fire", "cron_jobs"),
+    ("idx_dream_runs_user_started", "dream_runs"),
+    ("idx_dream_runs_one_pending", "dream_runs"),
 }
 
 

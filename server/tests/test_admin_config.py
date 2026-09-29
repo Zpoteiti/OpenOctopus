@@ -5,6 +5,7 @@ import pytest
 
 from openctopus_server.dto.config import AdminConfig
 from openctopus_server.network_policy import DEFAULT_SSRF_DENYLIST
+from openctopus_server.provider.jev import JevService
 from openctopus_server.services import system_config
 from openctopus_server.services.system_config import validate_llm_identity
 
@@ -44,6 +45,9 @@ async def test_get_config_defaults(admin_client):
     assert body["llm_endpoint"] is None
     assert body["llm_api_key"] is None
     assert body["llm_model"] is None
+    assert body["jev_endpoint"] is None
+    assert body["jev_api_key"] is None
+    assert body["jev_status"] == {"state": "not_configured", "checked_at": None}
     assert body["llm_max_context_tokens"] is None
     assert body["llm_compaction_threshold_tokens"] is None
     assert body["llm_max_concurrent_requests"] is None
@@ -51,6 +55,85 @@ async def test_get_config_defaults(admin_client):
     assert body["default_soul"] == "You are OpenOctopus, the user's personal AI partner."
     assert body["web_fetch_denylist"] == list(DEFAULT_SSRF_DENYLIST)
     assert set(body) == set(AdminConfig.model_fields)
+
+
+async def test_jev_save_and_read_do_not_call_service(admin_client, test_app, pg_engine):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        test_app.state.jev_service = JevService(pg_engine, client=client)
+        saved = await admin_client.patch("/api/admin/config", json={
+            "jev_endpoint": "https://jev.test/", "jev_api_key": "jev-secret",
+        })
+        assert saved.status_code == 200
+        assert saved.json()["jev_endpoint"] == "https://jev.test"
+        assert saved.json()["jev_api_key"] == "<redacted>"
+        assert saved.json()["jev_status"] == {"state": "unchecked", "checked_at": None}
+        read = await admin_client.get("/api/admin/config")
+        assert read.json()["jev_status"]["state"] == "unchecked"
+        assert calls == []
+        retained = await admin_client.patch("/api/admin/config", json={"jev_api_key": "   "})
+        assert retained.status_code == 200
+        checked = await admin_client.post("/api/admin/config/jev/check")
+        assert checked.status_code == 200
+        assert checked.json()["state"] == "unauthorized"
+        assert checked.json()["checked_at"] is not None
+        assert len(calls) == 1
+        assert calls[0].headers["authorization"] == "Bearer jev-secret"
+        restored = await admin_client.patch("/api/admin/config", json={"jev_api_key": "updated-key"})
+        assert restored.json()["jev_status"] == {"state": "unchecked", "checked_at": None}
+        cleared = await admin_client.patch("/api/admin/config", json={"jev_endpoint": None})
+        assert cleared.status_code == 200
+        assert cleared.json()["jev_status"] == {"state": "not_configured", "checked_at": None}
+        assert cleared.json()["jev_api_key"] == "<redacted>"
+
+
+async def test_jev_explicit_probe_recovers_after_failure(admin_client, test_app, pg_engine):
+    await admin_client.patch("/api/admin/config", json={"jev_endpoint": "https://jev.test", "jev_api_key": "key"})
+    failed = True
+
+    def handler(request):
+        if failed:
+            return httpx.Response(529, text="unavailable")
+        body = {
+            "model": "jev-1.13.0",
+            "answers": {"connection_check": {"type": "choice", "choice": "skip", "probabilities": {"run": 0.0, "skip": 1.0}, "confidence": 1.0}},
+            "usage": {"input_tokens": 30, "output_tokens": 15},
+        }
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        test_app.state.jev_service = JevService(pg_engine, client=client)
+        checked = await admin_client.post("/api/admin/config/jev/check")
+        assert checked.json()["state"] == "unavailable"
+        failed = False
+        checked = await admin_client.post("/api/admin/config/jev/check")
+        assert checked.json()["state"] == "available"
+        read = await admin_client.get("/api/admin/config")
+        assert read.json()["jev_status"] == checked.json()
+
+
+@pytest.mark.parametrize("endpoint", ["ftp://jev.test", "https://jev.test/v1", "https://user:secret@jev.test", "https://jev.test?token=secret", "https://jev.test#fragment", "https://jev.test:99999", "https://"])
+async def test_invalid_jev_endpoint_is_rejected_before_save(admin_client, endpoint):
+    response = await admin_client.patch("/api/admin/config", json={"jev_endpoint": endpoint})
+    assert response.status_code == 400
+    read = await admin_client.get("/api/admin/config")
+    assert read.json()["jev_endpoint"] is None
+
+
+async def test_jev_redaction_marker_cannot_be_saved(admin_client):
+    response = await admin_client.patch("/api/admin/config", json={"jev_api_key": "<redacted>"})
+    assert response.status_code == 400
+    assert response.json()["code"] == "config_validation_failed"
+
+
+async def test_jev_check_requires_admin(user_client):
+    response = await user_client.post("/api/admin/config/jev/check")
+    assert response.status_code == 403
 
 
 def test_admin_config_openapi_requires_nullable_unconfigured_fields():

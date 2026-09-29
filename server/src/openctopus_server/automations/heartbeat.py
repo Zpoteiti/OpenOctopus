@@ -11,12 +11,12 @@ from typing import Any, Literal, Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.db.models import PendingMessage, TurnRun, User
 from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.provider.jev import JevChoiceQuestion, JevState
 
 HEARTBEAT_PATH = "HEARTBEAT.md"
 HEARTBEAT_MAX_BYTES = 128_000
@@ -28,36 +28,9 @@ HEARTBEAT_USER_PAGE_SIZE = 100
 HEARTBEAT_WORKERS = 32
 HEARTBEAT_QUEUE_CAPACITY = 64
 
-HEARTBEAT_DECISION_TOOL: dict[str, Any] = {
-    "name": "heartbeat_decision",
-    "description": "Decide which active heartbeat tasks, if any, should run now.",
-    "input_schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["action", "tasks"],
-        "properties": {
-            "action": {"type": "string", "enum": ["skip", "run"]},
-            "tasks": {
-                "type": "array",
-                "maxItems": HEARTBEAT_MAX_TASKS,
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": HEARTBEAT_MAX_TASK_CODEPOINTS,
-                },
-            },
-        },
-    },
-}
-HEARTBEAT_TOOL_CHOICE = {"type": "tool", "name": "heartbeat_decision"}
-HEARTBEAT_DECISION_SYSTEM = (
-    "Review HEARTBEAT.md and select only tasks that should run now. "
-    "Use heartbeat_decision exactly once. Return at most 8 tasks in file priority order. "
-    "Do not run future conditions early or invent tasks. Exact-time work belongs in Cron."
-)
-
 _FENCE_START = re.compile(r"^(`{3,}|~{3,})")
 _ATX_LEVEL_ONE_OR_TWO = re.compile(r"^#{1,2}(?:\s+|$)")
+_TASK_MARKER = re.compile(r"^(?:[-*+]|\d+[.)])\s+(.*)$")
 _LOGGER = logging.getLogger(__name__)
 _PULSE_LATE_GRACE = timedelta(seconds=5)
 
@@ -127,13 +100,6 @@ class _HeartbeatUser:
 
 
 HeartbeatPhaseTwoPublisher = Callable[[HeartbeatPhaseTwoRequest], Awaitable[bool]]
-
-
-class _DecisionInput(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    action: Literal["skip", "run"]
-    tasks: list[str] = Field(max_length=HEARTBEAT_MAX_TASKS)
 
 
 def extract_active_tasks(document: str) -> str | None:
@@ -207,61 +173,87 @@ async def load_heartbeat_document(
     return HeartbeatDocument(content=content, reason="ready")
 
 
-def parse_heartbeat_decision(content: list[dict[str, Any]]) -> HeartbeatEvaluation:
-    tool_uses = [block for block in content if block.get("type") == "tool_use"]
-    if len(tool_uses) != 1 or tool_uses[0].get("name") != "heartbeat_decision":
-        return HeartbeatEvaluation(decision=None, reason="invalid_response")
-    raw_input = tool_uses[0].get("input")
-    try:
-        parsed = _DecisionInput.model_validate(raw_input)
-    except ValidationError:
-        return HeartbeatEvaluation(decision=None, reason="invalid_response")
-
+def parse_heartbeat_tasks(document: str) -> tuple[str, ...]:
+    """Extract original task bodies; Jev selects IDs rather than rewriting tasks."""
+    section = extract_active_tasks(document)
+    if section is None:
+        return ()
     tasks: list[str] = []
-    for raw_task in parsed.tasks:
-        if len(raw_task) > HEARTBEAT_MAX_TASK_CODEPOINTS:
-            return HeartbeatEvaluation(decision=None, reason="invalid_response")
-        task = raw_task.strip()
-        if not task or task in tasks:
-            return HeartbeatEvaluation(decision=None, reason="invalid_response")
-        tasks.append(task)
-    if sum(len(task) for task in tasks) > HEARTBEAT_MAX_TOTAL_TASK_CODEPOINTS:
-        return HeartbeatEvaluation(decision=None, reason="invalid_response")
-    if parsed.action == "skip" and tasks:
-        return HeartbeatEvaluation(decision=None, reason="invalid_response")
-    if parsed.action == "run" and not tasks:
-        return HeartbeatEvaluation(decision=None, reason="invalid_response")
-    decision = HeartbeatDecision(action=parsed.action, tasks=tuple(tasks))
-    return HeartbeatEvaluation(
-        decision=decision,
-        reason="decision_run" if parsed.action == "run" else "decision_skip",
-    )
+    current: list[str] = []
+    completed = False
+    fence: tuple[str, int] | None = None
+
+    def finish() -> None:
+        task = "\n".join(current).strip()
+        if task and not completed:
+            tasks.append(task)
+        current.clear()
+
+    for line in section.splitlines():
+        stripped = line.strip()
+        previous_fence = fence
+        fence = _updated_fence(fence, stripped)
+        if previous_fence is not None or fence is not None:
+            if current:
+                current.append(line)
+            continue
+        match = _TASK_MARKER.match(line)
+        if match is not None:
+            finish()
+            body = match.group(1)
+            completed = body.startswith(("[x] ", "[X] "))
+            if body.startswith(("[ ] ", "[x] ", "[X] ")):
+                body = body[4:]
+            current.append(body)
+        elif stripped.startswith("#"):
+            finish()
+            completed = False
+        elif stripped or current:
+            if not current:
+                completed = False
+            current.append(line)
+    finish()
+    if (
+        len(tasks) > HEARTBEAT_MAX_TASKS
+        or any(len(task) > HEARTBEAT_MAX_TASK_CODEPOINTS for task in tasks)
+        or sum(len(task) for task in tasks) > HEARTBEAT_MAX_TOTAL_TASK_CODEPOINTS
+    ):
+        raise ValueError("Heartbeat tasks exceed decision limits")
+    return tuple(tasks)
 
 
-def heartbeat_decision_messages(
+def heartbeat_jev_request(
     *,
     document: str,
+    tasks: tuple[str, ...],
     now_utc: datetime,
     timezone: str,
-) -> list[dict[str, Any]]:
+) -> tuple[JevState, dict[str, JevChoiceQuestion]]:
     local_time = now_utc.astimezone(ZoneInfo(timezone))
-    return [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"Current UTC time: {_rfc3339(now_utc)}\n"
-                        f"Current local time: {_rfc3339(local_time)}\n"
-                        f"IANA timezone: {timezone}\n\n"
-                        "HEARTBEAT.md:\n"
-                        f"{document}"
-                    ),
-                }
-            ],
-        }
-    ]
+    task_map = {f"task_{index}": task for index, task in enumerate(tasks, start=1)}
+    state = {
+        "utc_time": _rfc3339(now_utc),
+        "local_time": _rfc3339(local_time),
+        "timezone": timezone,
+        "document": document,
+        "tasks": task_map,
+    }
+    questions = {
+        task_id: JevChoiceQuestion(
+            instructions=(
+                f"Should the task in state.tasks.{task_id} run at the supplied current time? "
+                "Use only the supplied document and time. Live external conditions cannot be checked here; "
+                "the Agent can perform requested checks after run. Do not run future conditions early. "
+                "Exact-time work belongs in Cron."
+            ),
+            criteria={
+                "run": "The supplied task should execute now, including performing a requested check.",
+                "skip": "The task is not due, its prerequisite is not established, or execution is uncertain.",
+            },
+        )
+        for task_id in task_map
+    }
+    return state, questions
 
 
 def build_heartbeat_phase_two_text(request: HeartbeatPhaseTwoRequest) -> str:

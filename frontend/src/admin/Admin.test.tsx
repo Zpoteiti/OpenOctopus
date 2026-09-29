@@ -51,6 +51,7 @@ describe('admin pages', () => {
       llm_max_output_tokens: 16384,
       default_soul: "You are OpenOctopus, the user's personal AI partner.",
       web_fetch_denylist: ['127.0.0.0/8'],
+      jev_endpoint: null, jev_api_key: null, jev_status: { state: 'not_configured', checked_at: null },
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === 'PATCH') {
@@ -91,6 +92,7 @@ describe('admin pages', () => {
       llm_max_output_tokens: 16384,
       default_soul: "You are OpenOctopus, the user's personal AI partner.",
       web_fetch_denylist: [],
+      jev_endpoint: null, jev_api_key: null, jev_status: { state: 'not_configured', checked_at: null },
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === 'PATCH') {
@@ -116,6 +118,41 @@ describe('admin pages', () => {
     })
   })
 
+  it('shows Jev unavailable state, recovers after an explicit check, and retains the saved key on save', async () => {
+    const patches: Array<Record<string, unknown>> = []
+    const config = {
+      quota_bytes: 524288000, shared_workspace_quota_bytes: 524288000,
+      llm_endpoint: null, llm_api_key: null, llm_model: null, llm_max_context_tokens: null,
+      llm_compaction_threshold_tokens: null, llm_max_concurrent_requests: null,
+      llm_max_output_tokens: 16384, default_soul: 'Default identity', web_fetch_denylist: [],
+      jev_endpoint: 'https://jev.example', jev_api_key: '<redacted>',
+      jev_status: { state: 'unauthorized', checked_at: '2026-09-29T01:00:00Z' },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/admin/config/jev/check' && init?.method === 'POST') return json({ state: 'available', checked_at: '2026-09-29T02:00:00Z' })
+      if (url === '/api/admin/config' && init?.method === 'PATCH') {
+        patches.push(JSON.parse(String(init.body)))
+        return json({ ...config, jev_status: { state: 'unchecked', checked_at: null } })
+      }
+      return json(config)
+    }))
+
+    renderPage(<AdminSettingsPage />)
+    const user = userEvent.setup()
+    expect(await screen.findByText('Dream is not available')).toBeInTheDocument()
+    expect(screen.getAllByText(/Jev rejected the API key/).length).toBeGreaterThan(0)
+    await user.click(screen.getByRole('button', { name: 'Check Jev connection' }))
+    await waitFor(() => expect(screen.queryByText('Dream is not available')).not.toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'Save Jev settings' }))
+    await waitFor(() => expect(patches).toHaveLength(1))
+    expect(patches[0]).toEqual({ jev_endpoint: 'https://jev.example' })
+    expect(patches[0]).not.toHaveProperty('jev_api_key')
+    expect(patches[0]).not.toHaveProperty('jev_status')
+    expect(screen.queryByText('Dream is not available')).not.toBeInTheDocument()
+    expect(screen.getByText(/Check the Jev connection to confirm it is available/)).toBeInTheDocument()
+  })
+
   it('saves the default SOUL independently from Provider configuration', async () => {
     const patches: unknown[] = []
     const config = {
@@ -130,6 +167,7 @@ describe('admin pages', () => {
       llm_max_output_tokens: 16384,
       default_soul: 'Default identity',
       web_fetch_denylist: [],
+      jev_endpoint: null, jev_api_key: null, jev_status: { state: 'not_configured', checked_at: null },
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === 'PATCH') {

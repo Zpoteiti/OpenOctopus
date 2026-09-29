@@ -6,6 +6,7 @@ from openctopus_server.api import (
     cron,
     device_ws,
     devices,
+    dream,
     health,
     me,
     sessions,
@@ -22,6 +23,7 @@ router.include_router(auth.router)
 router.include_router(channels.router)
 router.include_router(me.router)
 router.include_router(cron.router)
+router.include_router(dream.router)
 router.include_router(sessions.collection_router)
 router.include_router(sessions.router)
 router.include_router(sessions.control_router)

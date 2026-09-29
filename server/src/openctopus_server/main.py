@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.api.router import router as api_router
 from openctopus_server.automations.cron import CronScheduler
+from openctopus_server.automations.dream import DreamService
 from openctopus_server.automations.heartbeat import HeartbeatPulse
 from openctopus_server.channels.adapters.base import ChannelAdapter
 from openctopus_server.channels.adapters.dingtalk import (
@@ -65,6 +66,7 @@ from openctopus_server.frontend import FRONTEND_BUILD_DIR, install_frontend
 from openctopus_server.mcp.authority import ServerMcpAuthorityFence
 from openctopus_server.mcp.models import ServerMcpEnvelope, empty_server_mcp_envelope
 from openctopus_server.mcp.supervisor import ServerMcpSupervisor
+from openctopus_server.provider.jev import JevService
 from openctopus_server.services.channels import ValidatedBotIdentity
 from openctopus_server.services.heartbeat import publish_heartbeat_phase_two
 from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
@@ -79,6 +81,7 @@ from openctopus_server.tools.registry import (
     get_content_converter,
     get_web_fetch_admission,
 )
+from openctopus_server.workspace.builtin_skills import validate_builtin_skills
 from openctopus_server.workspace.fs import _workspace_fs_for_storage
 from openctopus_server.workspace.service import WorkspaceService
 from openctopus_server.workspace.storage import ObjectStorage, get_object_storage
@@ -182,6 +185,8 @@ async def _close_lifespan_resources(
     deletion_worker: WorkspaceDeletionWorker | None,
     object_storage: ObjectStorage | None,
     engine: AsyncEngine | None,
+    dream_service: DreamService | None = None,
+    jev_service: JevService | None = None,
 ) -> None:
     try:
         if channel_ingress is not None:
@@ -193,8 +198,12 @@ async def _close_lifespan_resources(
                 await channel_manager.begin_shutdown()
         finally:
             try:
-                if heartbeat_pulse is not None:
-                    await heartbeat_pulse.close()
+                try:
+                    if dream_service is not None:
+                        await dream_service.close()
+                finally:
+                    if heartbeat_pulse is not None:
+                        await heartbeat_pulse.close()
             finally:
                 try:
                     if cron_scheduler is not None:
@@ -205,8 +214,12 @@ async def _close_lifespan_resources(
                             await server_mcp_supervisor.begin_shutdown()
                     finally:
                         try:
-                            if runtime is not None:
-                                await runtime.close()
+                            try:
+                                if runtime is not None:
+                                    await runtime.close()
+                            finally:
+                                if jev_service is not None:
+                                    await jev_service.close()
                         finally:
                             try:
                                 if channel_manager is not None:
@@ -294,6 +307,7 @@ async def _fetch_recent_channel_context(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    validate_builtin_skills()
     try:
         settings = get_settings()
         initialize_token_estimator()
@@ -370,6 +384,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     server_mcp_supervisor: ServerMcpSupervisor | None = None
     cron_scheduler: CronScheduler | None = None
     heartbeat_pulse: HeartbeatPulse | None = None
+    dream_service: DreamService | None = None
+    jev_service = JevService(engine)
+    app.state.jev_service = jev_service
     channel_manager = getattr(app.state, "channel_runtime", None)
     channel_delivery_router = getattr(app.state, "channel_delivery_router", None)
     channel_ingress = getattr(app.state, "channel_ingress", None)
@@ -486,6 +503,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             runtime = ChatRuntime(
                 engine,
                 workspace_service=workspace_service,
+                jev_service=jev_service,
                 tool_registry=build_py4_registry(
                     engine,
                     workspace_service,
@@ -585,11 +603,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         heartbeat_pulse.start()
         app.state.heartbeat_pulse = heartbeat_pulse
+        dream_service = DreamService(
+            engine=engine, workspace=workspace_service, jev=jev_service, writer=runtime,
+        )
+        app.state.dream_service = dream_service
+        dream_service.start()
     except BaseException:
         await _close_lifespan_resources(
             channel_ingress=channel_ingress,
             channel_manager=channel_manager,
             heartbeat_pulse=heartbeat_pulse,
+            dream_service=dream_service,
+            jev_service=jev_service,
             cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,
@@ -607,6 +632,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             channel_ingress=channel_ingress,
             channel_manager=channel_manager,
             heartbeat_pulse=heartbeat_pulse,
+            dream_service=dream_service,
+            jev_service=jev_service,
             cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,

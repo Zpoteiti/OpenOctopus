@@ -38,8 +38,10 @@ and DingTalk use the same system prompt builder. Owner/internal Turns receive
 the owner tool catalog; an exact-ID allow-listed non-owner receives the same
 complete system prompt but only the restricted `message` schema. The persisted
 Turn profile and dispatch gate, not prompt text, are authoritative. Heartbeat
-Phase 1 is a separate forced-decision Provider call and never builds this Agent
-prompt.
+Phase 1 uses the mandatory administrator-configured Jev Choice API. It receives
+the bounded Heartbeat document, parsed original task bodies, time, and timezone;
+each task gets a typed `run`/`skip` answer. It builds no Agent prompt and has no
+tools. Only selected original tasks enter the normal Phase 2 Agent turn.
 
 ---
 
@@ -97,42 +99,22 @@ target channel + chat_id.
 
 ## Skills
 
-You have 1 always-on skill (full body below) and 1 conditional
-skill (available on demand).
-
-### create_skill (always-on)
-
-To install a new skill into your personal workspace:
-
-1. Source: a folder containing SKILL.md (YAML frontmatter with
-   `name`, `description`, optional `always_on: false`) plus
-   any supporting files. The folder name and the `name` field
-   in frontmatter must match exactly.
-2. Copy with file_transfer (relative dst_path → your personal
-   workspace):
-   file_transfer(
-     openoctopus_src_device="<where source lives>",
-     src_path="<source folder path>",
-     openoctopus_dst_device="server",
-     dst_path="skills/<skill-name>/",
-     mode="copy"
-   )
-3. Validation runs at write time. If SKILL.md is malformed,
-   workspace_fs rejects the write — fix and retry. For folder
-   transfers, ALL SKILL.md files under skills/*/SKILL.md in the
-   source tree are pre-validated before the first destination file
-   is committed. If any is malformed, the destination stays absent.
-4. The new skill appears in next turn's Skills section.
-
-To install from a shared workspace, use that workspace's
-absolute path as src_path — e.g.,
-src_path="/production-department@a4f7e2d1/skills-source/codestyle-guide/".
-
 ### Conditional skills
 
-- **morning-standup** — Generate a morning standup summary
-  from team sprint state and post to Discord. Load full body:
-  read_file(openoctopus_device="server", path="skills/morning-standup/SKILL.md")
+- builtin/create-skill — Create or install a personal skill. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/create-skill/SKILL.md")
+- builtin/connect-mcp — Connect an MCP server. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/connect-mcp/SKILL.md")
+- builtin/pair-client — Pair a client device. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/pair-client/SKILL.md")
+- builtin/connect-channel — Connect an external channel. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/connect-channel/SKILL.md")
+- builtin/manage-cron — Create and manage scheduled jobs. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/manage-cron/SKILL.md")
+- builtin/manage-heartbeat — Edit proactive task checks. Load:
+  read_file(openoctopus_device="server", path="/builtin/skills/manage-heartbeat/SKILL.md")
+- morning-standup — Generate a morning standup summary from team sprint state.
+  Load: read_file(openoctopus_device="server", path="skills/morning-standup/SKILL.md")
 
 ---
 
@@ -354,7 +336,8 @@ the public DTO layer does not own a second grammar.
   are not rendered here.
 
 ### Skills
-- Only loaded from personal workspace `/<user_id>/skills/`.
+- Personal skills load from `/<user_id>/skills/`; six conditional built-ins load
+  from the shared release library at `/builtin/skills/` (ADR-137).
 - Shared workspaces have no skills folder by design — avoids 100+ shared-workspace agents carrying every department's SOPs in-prompt.
 - Discovery scans at most 1,000 ordered workspace listing records and examines
   the first 200 direct `skills/<name>/` candidates. Missing manifests consume a
@@ -371,7 +354,11 @@ the public DTO layer does not own a second grammar.
   or cached during prompt construction.
 - Concurrent cache misses for one user share a single immutable snapshot load;
   cache invalidation during that load prevents stale repopulation.
-- The `create_skill` skill is auto-installed at user registration so every agent knows how to install additional skills by file-transferring into `/<user_id>/skills/<name>/`.
+- Built-ins are indexed once at startup, never copied into user workspaces.
+  Their `builtin/` display prefix separates them from personal names. Read-only
+  enforcement belongs to workspace authorization, not prompt instructions.
+  Registration seeds `SOUL.md` and `MEMORY.md`; it does not install a personal
+  `create_skill` skill.
 
 ### Workspaces
 - Personal workspace always listed first.

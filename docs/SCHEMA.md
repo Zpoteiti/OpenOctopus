@@ -40,6 +40,8 @@ unsupported keys return `400 Bad Request`):
 | `llm_endpoint` | string | ADR-101 | Unversioned base URL of an Anthropic-compatible Messages API; do not include `/v1`. |
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
 | `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
+| `jev_endpoint` | string or JSON null | ADR-138 | Unversioned HTTP(S) base URL for Jev `POST /v1/systemone`; omit `/v1`. Explicit null clears the endpoint. |
+| `jev_api_key` | string | ADR-138 | Separate bearer credential for mandatory Heartbeat Phase 1 and Dream decisions; redacted in admin API responses. Omitted/blank PATCH values retain the current key. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with the configured-model Python tokenizer strategy (ADR-025, ADR-101). |
 | `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
 | `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, `llm_max_context_tokens` is required and the value must be `4001 <= threshold < max_context_tokens`. |
@@ -52,10 +54,18 @@ Dedicated admin-managed keys (not editable through `PATCH /api/admin/config`):
 |---|---|---|---|
 | `server_mcp` | `ServerMcpEnvelope` object | ADR-114 | Authoritative Py8a admin shared-service MCP config, monotonic revision, and complete last-good catalog. Managed only through `GET/PUT /api/admin/server-mcp`. |
 
+Server-managed observation keys (not editable through admin PATCH):
+
+| Key | Type | ADR | Purpose |
+|---|---|---|---|
+| `jev_revision` | string | ADR-138 | Opaque revision replaced atomically when the Jev endpoint or key changes. |
+| `jev_status` | object | ADR-138 | `{revision, state, checked_at}` for the last observed Jev request. A shared advisory lock and matching revision prevent a request using old settings from overwriting current status. Contains no input, task decision, credential, or response body. |
+
 Bootstrap does not seed `system_config` rows. Fresh `GET /api/admin/config`
 therefore returns the effective quota defaults, `llm_max_output_tokens=16384`,
-and the effective canonical `web_fetch_denylist`, while omitting the unconfigured
-LLM identity and context/compaction/concurrency keys until an admin writes values. Deployments
+and the effective canonical `web_fetch_denylist`. Unconfigured LLM/Jev identity
+and LLM context/compaction/concurrency fields are null; Jev status is
+`{state: "not_configured", checked_at: null}`. Deployments
 may carry additional opaque keys inserted outside the admin API; OpenOctopus
 ignores them in the admin config view. `PATCH /api/admin/config` rejects keys
 outside the admin-editable table above, including `server_mcp` and
@@ -73,10 +83,22 @@ endpoint. Object storage is deployment
 infrastructure config supplied through environment / deployment secrets, not
 `system_config`.
 
+Jev settings are saved independently of LLM identity, with no live validation
+required on PATCH. Endpoint/key changes reset observations. Both credentials
+reject the literal `"<redacted>"` marker. `GET /api/admin/config` exposes
+`jev_status` as `{state, checked_at}`, omitting the internal revision. Status is
+`not_configured` when either identity value is missing, `unchecked` when complete
+settings have no observation, or `available`, `unreachable`, `unauthorized`,
+`invalid_response`, or `unavailable` after a request. Settings reads never call
+Jev. `POST /api/admin/config/jev/check` is an admin-only small explicit evaluation;
+normal Dream/Heartbeat decisions also update this shared observation. These
+contracts have mocked HTTP coverage; live Jev acceptance remains unverified.
+
 The Provider identity and API key are deployment-wide administrator
 configuration. Channel owners do not supply a separate LLM credential: all
-Web, Discord, DingTalk, Cron, and Heartbeat turns use the administrator's
+Web, Discord, DingTalk, Cron, and Heartbeat Phase 2 turns use the administrator's
 Provider account, so the administrator bears their Provider usage and cost.
+Jev decisions use the separate administrator-configured Jev account.
 
 `system_config.server_mcp` stores one strict JSONB envelope:
 
@@ -815,7 +837,47 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
   PendingMessage/TurnRun in one transaction. Deleting a job preserves any
   Session/history; deleting the Session preserves the job and permits later
   JIT recreation with the same UUID.
-- **No `kind` column** — heartbeat is a tick loop, not a cron row, and Dream is deferred (ADR-055, ADR-092).
+- **No `kind` column** — Heartbeat and Dream have their own lifecycle tickers (ADR-054, ADR-138).
+
+---
+
+## 17. `dream_runs` — memory consolidation history (ADR-138)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | UUID PK | Server-generated run ID. |
+| `user_id` | UUID FK users CASCADE | Private owner. |
+| `status` | text | `pending`, `skipped`, `unchanged`, `updated`, `failed`, `restoring`, `restored`. |
+| `source` | JSONB | Bounded message excerpts while processing; message/session/speaker provenance and text offsets after completion. |
+| `before`, `after` | nullable text | Actual proposed memory change; each bounded to 64,000 UTF-8 bytes by the workflow. |
+| `before_etag`, `after_etag` | nullable text | Conditional write/undo revision checks. |
+| `error` | nullable text | Sanitized local reason code, never remote response content. |
+| `started_at` | timestamptz | Attempt start. |
+| `finished_at` | nullable timestamptz | Terminal processing time. |
+| `restored_at` | nullable timestamptz | Completed undo time. |
+
+A partial unique index allows only one `pending` or `restoring` record per user.
+The supported single-process runtime shares one per-user lock for processing
+and undo. Proposed before/after contents are committed before the object write;
+completion and input progress commit together afterward. Restart recovery
+reconciles prepared changes against the current memory rather than asking the
+models to generate the same update again. Failed, unprepared work retains its
+input and retries after an hour. An interrupted undo remains recoverable.
+
+## 18. `dream_progress` — consumed text positions (ADR-138)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `message_id` | UUID PK/FK messages CASCADE | Original immutable transcript message. |
+| `next_offset` | integer >= 0 | Next unprocessed character of its text projection. |
+| `complete` | boolean | Whole message consumed by a successful/unchanged update or valid Jev skip. |
+
+Each batch bounds both message count and text size. Offsets permit large messages
+to continue without truncation; failed work does not advance them. This avoids a
+global timestamp cursor that could lose messages from active Sessions or delayed
+turns. Undo leaves consumed offsets unchanged. User deletion cascades runs and,
+through Sessions/messages, progress. Deleting a Session removes its progress;
+owned memory-change history survives separately.
 
 ---
 
@@ -859,6 +921,8 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
 | `idx_workspace_members_user` | workspace_members | Per-user "list my workspaces" for system-prompt rebuild. |
 | `idx_cron_jobs_user_id` | cron_jobs | List user's cron jobs. |
 | `idx_cron_jobs_next_fire` | cron_jobs (`next_fire_at, id`) | Stable scheduler due scan. |
+| `idx_dream_runs_user_started` | dream_runs (`user_id, started_at`) | Owned history and retry scan. |
+| `idx_dream_runs_one_pending` | dream_runs (partial UNIQUE `user_id`) | One unfinished update/undo per user. |
 
 ---
 

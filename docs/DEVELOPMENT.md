@@ -17,6 +17,25 @@ that lock. A turn claims only subscribers belonging to its captured message IDs;
 messages arriving after that boundary remain queued. Persisted history remains
 authoritative when a preview closes, is replaced, or disconnects.
 
+## Built-in skills and memory automation
+
+[`workspace/builtin_skills.py`](../server/src/openctopus_server/workspace/builtin_skills.py)
+validates and indexes the packaged library; workspace authorization enforces its
+reserved read-only namespace. Packaged files are under `assets/builtin_skills/`.
+
+[`provider/jev.py`](../server/src/openctopus_server/provider/jev.py) owns bounded
+HTTP decisions and configuration-revision-fenced availability. Heartbeat Phase 1
+selects existing parsed tasks through this service. Phase 2 uses the normal agent.
+
+[`automations/dream.py`](../server/src/openctopus_server/automations/dream.py)
+owns midnight eligibility, bounded text batches, durable progress, prepared
+memory changes and undo. `ChatRuntime.propose_memory_update` shares the normal
+provider and limiter for a single constrained proposal; it never dispatches
+executable tools. New database tables bootstrap with the development schema.
+Test with mock Jev transport until credentials are available; do not substitute a
+runtime fake or imply live model acceptance. See the
+[workflow contract](specs/2026-09-29-builtin-skills-and-dream-direction.md).
+
 ## Server device transfers
 
 | Module | Responsibility |

@@ -15,6 +15,7 @@ from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.directory_contract import DirectoryManifest, DirectoryManifestEntry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError, WorkspaceError
+from openctopus_server.workspace.builtin_skills import reject_builtin_mutation
 from openctopus_server.workspace.file_content import (
     DocumentParser,
     render_file_content,
@@ -771,6 +772,7 @@ class WorkspaceService:
         path: str,
     ) -> UploadTicket:
         resolved = await self._resolver.resolve(db, user_id=user_id, path=path)
+        reject_builtin_mutation(resolved.target.kind)
         return UploadTicket(
             target=resolved.target,
             relative_path=resolved.relative_path,
@@ -788,6 +790,7 @@ class WorkspaceService:
         path: str,
     ) -> TransferPathTicket:
         resolved = await self._preflight(db, user_id=user_id, path=path)
+        reject_builtin_mutation(resolved.target.kind)
         return TransferPathTicket(
             user_id=user_id,
             display_path=path,
@@ -804,6 +807,7 @@ class WorkspaceService:
         path: str,
     ) -> TransferPathTicket:
         resolved = await self._preflight(db, user_id=user_id, path=path)
+        reject_builtin_mutation(resolved.target.kind)
         return TransferPathTicket(
             user_id=user_id,
             display_path=path,

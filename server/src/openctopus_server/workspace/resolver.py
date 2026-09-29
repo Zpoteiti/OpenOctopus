@@ -10,6 +10,7 @@ from openctopus_server.db.advisory import lock_personal_quota_read
 from openctopus_server.db.models import SystemConfig, User, Workspace, WorkspaceMember
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.workspace.builtin_skills import builtin_relative_path
 from openctopus_server.workspace.fs import WorkspaceTarget
 
 _PERSONAL_QUOTA_DEFAULT = 500 * 1024 * 1024
@@ -33,6 +34,11 @@ class WorkspacePathResolver:
         path: str,
     ) -> ResolvedWorkspacePath:
         path = normalize_virtual_workspace_path(path)
+        builtin_path = builtin_relative_path(path)
+        if builtin_path is not None:
+            return ResolvedWorkspacePath(
+                target=WorkspaceTarget.builtin(), relative_path=builtin_path, quota_bytes=0
+            )
         if not path.startswith("/"):
             await _lock_personal_workspace(db, user_id)
             return ResolvedWorkspacePath(

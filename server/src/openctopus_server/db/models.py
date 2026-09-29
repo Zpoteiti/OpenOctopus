@@ -270,6 +270,59 @@ class Message(Base):
     )
 
 
+class DreamRun(Base):
+    __tablename__ = "dream_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    before: Mapped[str | None] = mapped_column(Text)
+    after: Mapped[str | None] = mapped_column(Text)
+    before_etag: Mapped[str | None] = mapped_column(Text)
+    after_etag: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    restored_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','skipped','unchanged','updated','failed','restoring','restored')",
+            name="check_dream_run_status",
+        ),
+        Index("idx_dream_runs_user_started", "user_id", "started_at"),
+        Index(
+            "idx_dream_runs_one_pending",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending','restoring')"),
+        ),
+    )
+
+
+class DreamProgress(Base):
+    __tablename__ = "dream_progress"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    next_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("next_offset >= 0", name="check_dream_progress_offset"),
+    )
+
+
 class PendingMessage(Base):
     __tablename__ = "pending_messages"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
@@ -24,6 +25,41 @@ CompactionThreshold = Annotated[int, Field(ge=4001)]
 ConcurrencyLimit = Annotated[int, Field(ge=0, le=1_000_000)]
 OutputTokenLimit = Annotated[int, Field(ge=1, le=1_000_000)]
 DefaultSoul = Annotated[str, Field(min_length=1, max_length=32_000, pattern=r".*\S.*")]
+
+
+def _jev_endpoint(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "v1" in parsed.path.split("/")
+        or any(char.isspace() for char in value)
+    ):
+        raise ValueError("Jev endpoint must be an unversioned HTTP(S) base URL without credentials")
+    try:
+        if parsed.port == 0:
+            raise ValueError("Jev endpoint port is invalid")
+    except ValueError as exc:
+        raise ValueError("Jev endpoint port is invalid") from exc
+    return value.rstrip("/")
+
+
+JevEndpoint = Annotated[str, Field(min_length=1, max_length=2048), AfterValidator(_jev_endpoint)]
+JevStatusState = Literal[
+    "not_configured", "unchecked", "available", "unreachable", "unauthorized",
+    "invalid_response", "unavailable",
+]
+
+
+class JevStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: JevStatusState
+    checked_at: str | None
 
 
 class ConfigPatch(BaseModel):
@@ -53,6 +89,15 @@ class ConfigPatch(BaseModel):
         default=None,
         description="Provider model identifier.",
         examples=["Qwen/Qwen3.5-4B"],
+    )
+    jev_endpoint: JevEndpoint | None = Field(
+        default=None,
+        description="Unversioned Jev HTTP(S) API base URL; omit /v1. Null clears the endpoint.",
+        examples=["https://api.typesafe.ai"],
+    )
+    jev_api_key: Annotated[str, Field(max_length=4096)] | SkipJsonSchema[None] = Field(
+        default=None,
+        description="New Jev credential; omit or leave blank to retain the configured key.",
     )
     llm_max_context_tokens: PositiveInt | SkipJsonSchema[None] = Field(
         default=None,
@@ -112,6 +157,9 @@ class AdminConfig(BaseModel):
         description="Provider model identifier.",
         examples=["Qwen/Qwen3.5-4B"],
     )
+    jev_endpoint: str | None = Field(description="Unversioned Jev HTTP(S) API base URL.")
+    jev_api_key: str | None = Field(description='Null when unset; "<redacted>" when configured.')
+    jev_status: JevStatus = Field(description="Last observed status for the current Jev configuration.")
     llm_max_context_tokens: int | None = Field(
         description="Configured provider context-window size.",
         examples=[131_072],
