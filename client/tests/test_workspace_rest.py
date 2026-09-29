@@ -12,7 +12,8 @@ from typing import Any, cast
 
 import pytest
 
-import openoctopus_client.tools.dispatcher as dispatcher_module
+import openoctopus_client.tools.file_tools as file_tools_module
+import openoctopus_client.tools.local_transfer as local_transfer_module
 import openoctopus_client.transfer as transfer_module
 from openoctopus_client.tools import ClientToolDispatcher
 from openoctopus_client.tools.common import ToolFailure, ToolOutput
@@ -166,7 +167,7 @@ def test_workspace_rest_scan_cap_keeps_pages_within_the_retained_prefix(
 ) -> None:
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     entries = [(f"directory-{index:05d}", 0.0, True) for index in range(10_000)]
-    monkeypatch.setattr(dispatcher, "_walk", lambda _root: entries)
+    monkeypatch.setattr(dispatcher._files, "_walk", lambda _root: entries)
     extra = {"recursive": True} if operation == "list_dir" else {"include_dirs": True}
 
     first = _json(
@@ -298,7 +299,7 @@ def test_workspace_rest_local_transfer_honors_source_if_match(tmp_path: Path) ->
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
-    fingerprint = dispatcher_module._stat_fingerprint(source)
+    fingerprint = file_tools_module._stat_fingerprint(source)
     assert fingerprint is not None
 
     matched = _run(
@@ -372,7 +373,7 @@ def test_cancelled_local_transfer_hands_late_open_and_slot_to_runtime_drain(
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
-    original_open = dispatcher_module._open_transfer_source
+    original_open = local_transfer_module._open_transfer_source
     started = threading.Event()
     release = threading.Event()
     opened: list[tuple[int, tuple[int, int, int, int, int]]] = []
@@ -386,7 +387,7 @@ def test_cancelled_local_transfer_hands_late_open_and_slot_to_runtime_drain(
         release.wait(timeout=2)
         return result
 
-    monkeypatch.setattr(dispatcher_module, "_open_transfer_source", delayed_open)
+    monkeypatch.setattr(local_transfer_module, "_open_transfer_source", delayed_open)
 
     async def exercise() -> None:
         admission = LocalTransferAdmission(capacity=1)
@@ -417,12 +418,12 @@ def test_cancelled_local_transfer_hands_late_open_and_slot_to_runtime_drain(
         assert admission.active_count == 1
         assert admission.try_acquire() is None
         assert dispatcher.has_pending_blocking() is False
-        assert dispatcher._locks.reservation_count == 2
+        assert dispatcher._files._locks.reservation_count == 2
 
         release.set()
         assert await drains.wait(timeout_seconds=1)
         assert admission.active_count == 0
-        assert dispatcher._locks.reservation_count == 0
+        assert dispatcher._files._locks.reservation_count == 0
         with pytest.raises(OSError):
             os.fstat(opened[0][0])
 
@@ -437,7 +438,7 @@ def test_cancelled_local_transfer_retains_fd_lock_and_slot_until_check_drains(
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
-    original_unchanged = dispatcher_module._source_unchanged
+    original_unchanged = local_transfer_module._source_unchanged
     started = threading.Event()
     release = threading.Event()
     descriptor: list[int] = []
@@ -450,7 +451,7 @@ def test_cancelled_local_transfer_retains_fd_lock_and_slot_until_check_drains(
         release.wait(timeout=2)
         return original_unchanged(path, source_fd, initial)
 
-    monkeypatch.setattr(dispatcher_module, "_source_unchanged", delayed_unchanged)
+    monkeypatch.setattr(local_transfer_module, "_source_unchanged", delayed_unchanged)
 
     async def transfer(dispatcher: ClientToolDispatcher) -> ToolOutput:
         return await dispatcher.execute(
@@ -480,7 +481,7 @@ def test_cancelled_local_transfer_retains_fd_lock_and_slot_until_check_drains(
             await asyncio.wait_for(first, timeout=1)
 
         assert os.fstat(descriptor[0]).st_size == len(b"payload")
-        assert dispatcher._locks.reservation_count == 2
+        assert dispatcher._files._locks.reservation_count == 2
         assert admission.active_count == 1
 
         second = asyncio.create_task(transfer(dispatcher))
@@ -488,14 +489,14 @@ def test_cancelled_local_transfer_retains_fd_lock_and_slot_until_check_drains(
             await asyncio.sleep(0)
         await asyncio.sleep(0.01)
         assert second.done() is False
-        assert dispatcher._locks.reservation_count == 2
+        assert dispatcher._files._locks.reservation_count == 2
 
         release.set()
         result = await asyncio.wait_for(second, timeout=1)
         assert result.is_error is False
         assert await drains.wait(timeout_seconds=1)
         assert admission.active_count == 0
-        assert dispatcher._locks.reservation_count == 0
+        assert dispatcher._files._locks.reservation_count == 0
         with pytest.raises(OSError):
             os.fstat(descriptor[0])
 
@@ -548,7 +549,7 @@ def test_workspace_rest_local_transfer_detects_external_source_change(
     source = tmp_path / "source.bin"
     source.write_bytes(b"before")
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
-    original_unchanged = dispatcher_module._source_unchanged
+    original_unchanged = local_transfer_module._source_unchanged
 
     def change_before_commit(
         path: Path, descriptor: int, initial: tuple[int, int, int, int, int]
@@ -556,7 +557,7 @@ def test_workspace_rest_local_transfer_detects_external_source_change(
         source.write_bytes(b"after")
         return original_unchanged(path, descriptor, initial)
 
-    monkeypatch.setattr(dispatcher_module, "_source_unchanged", change_before_commit)
+    monkeypatch.setattr(local_transfer_module, "_source_unchanged", change_before_commit)
     result = _run(
         dispatcher,
         operation="transfer_local",
@@ -575,7 +576,7 @@ def test_workspace_rest_local_move_uses_native_rename_without_hard_link(
     source.write_bytes(b"payload")
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
     monkeypatch.setattr(
-        dispatcher_module,
+        local_transfer_module,
         "_link_transfer_no_replace",
         lambda *_args: (_ for _ in ()).throw(AssertionError("move used hard link")),
     )
@@ -600,7 +601,7 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
     destination = tmp_path / "destination.bin"
     source.write_bytes(b"before")
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
-    native_rename = dispatcher_module._rename_transfer_no_replace
+    native_rename = local_transfer_module._rename_transfer_no_replace
 
     def change_then_rename(
         source_path: Path, destination_path: Path, source_fd: int
@@ -609,7 +610,7 @@ def test_workspace_rest_local_move_hashes_the_content_that_was_renamed(
         native_rename(source_path, destination_path, source_fd)
 
     monkeypatch.setattr(
-        dispatcher_module,
+        local_transfer_module,
         "_rename_transfer_no_replace",
         change_then_rename,
     )
@@ -637,14 +638,14 @@ def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
     source.write_bytes(before)
     host_is_windows = os.name == "nt"
     source_fd = (
-        dispatcher_module._open_windows_transfer_source(source, delete_access=False)
+        local_transfer_module._open_windows_transfer_source(source, delete_access=False)
         if host_is_windows
         else os.open(source, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
     )
-    native_rename = dispatcher_module._rename_transfer_no_replace
+    native_rename = local_transfer_module._rename_transfer_no_replace
     monkeypatch.setattr(os, "name", "nt")
     initial_info = os.fstat(source_fd)
-    initial = dispatcher_module._transfer_identity(initial_info)
+    initial = local_transfer_module._transfer_identity(initial_info)
 
     def change_then_rename(
         source_path: Path, destination_path: Path, descriptor: int
@@ -660,12 +661,12 @@ def test_workspace_rest_local_move_rehashes_windows_identity_stable_commit_race(
             os.rename(source_path, destination_path)
 
     monkeypatch.setattr(
-        dispatcher_module,
+        local_transfer_module,
         "_rename_transfer_no_replace",
         change_then_rename,
     )
     try:
-        bytes_transferred, digest = dispatcher_module._rename_verify_and_hash_fd(
+        bytes_transferred, digest = local_transfer_module._rename_verify_and_hash_fd(
             source,
             destination,
             source_fd,
@@ -688,7 +689,7 @@ def test_workspace_rest_local_move_returns_result_after_cancel_follows_rename(
     destination = tmp_path / "destination.bin"
     source.write_bytes(b"payload")
     dispatcher = ClientToolDispatcher(tmp_path, restrict_to_workspace=True, ssrf_denylist=[])
-    native_rename = dispatcher_module._rename_transfer_no_replace
+    native_rename = local_transfer_module._rename_transfer_no_replace
     rename_completed = threading.Event()
     release_hash = threading.Event()
 
@@ -706,7 +707,7 @@ def test_workspace_rest_local_move_returns_result_after_cancel_follows_rename(
             release_hash.wait(timeout=2)
         return original_read(descriptor, size)
 
-    monkeypatch.setattr(dispatcher_module, "_rename_transfer_no_replace", rename_then_signal)
+    monkeypatch.setattr(local_transfer_module, "_rename_transfer_no_replace", rename_then_signal)
     monkeypatch.setattr(os, "read", slow_read)
 
     async def exercise() -> ToolOutput:
@@ -755,7 +756,7 @@ def test_workspace_rest_local_move_cross_volume_failure_leaves_both_paths_unchan
         )
 
     monkeypatch.setattr(
-        dispatcher_module,
+        local_transfer_module,
         "_rename_transfer_no_replace",
         reject_cross_volume,
     )
@@ -776,7 +777,7 @@ def test_rest_and_transfer_etags_use_the_same_opaque_stat_fingerprint(tmp_path: 
     source = tmp_path / "source.bin"
     source.write_bytes(b"payload")
 
-    assert dispatcher_module._stat_fingerprint(source) == transfer_module._stat_fingerprint(source)
+    assert file_tools_module._stat_fingerprint(source) == transfer_module._stat_fingerprint(source)
 
 
 def test_workspace_rest_local_transfer_cancellation_cleans_temporary_file(
@@ -794,7 +795,7 @@ def test_workspace_rest_local_transfer_cancellation_cleans_temporary_file(
             await asyncio.sleep(60)
             raise AssertionError("cancelled transfer resumed")
 
-        monkeypatch.setattr(dispatcher_module, "_stream_fd", blocked_stream)
+        monkeypatch.setattr(local_transfer_module, "_stream_fd", blocked_stream)
         task = asyncio.create_task(
             dispatcher.execute(
                 "__workspace_rest__",
