@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import openctopus_server.devices.transfer as transfer_module
 from openctopus_server.devices.protocol import (
     TransferBeginFrame,
     TransferEndFrame,
@@ -16,19 +17,19 @@ from openctopus_server.devices.protocol import (
     new_uuid7,
     parse_server_frame,
 )
-from openctopus_server.devices.transfer import (
-    TOMBSTONE_MAX_ENTRIES,
-    FairTransferAdmission,
-    TransferBusyError,
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import FairTransferAdmission, TransferBusyError
+from openctopus_server.devices.transfer_slots import TOMBSTONE_MAX_ENTRIES
+from openctopus_server.devices.transfer_types import (
     TransferCommitResult,
     TransferCommittedAfterCancellation,
     TransferDisconnectedError,
     TransferError,
-    TransferManager,
     TransferProtocolError,
     TransferResult,
     TransferRoute,
     TransferSink,
+    TransferTransport,
     TransferUnavailableError,
 )
 
@@ -861,9 +862,9 @@ async def test_server_tombstones_are_bounded_and_evict_oldest() -> None:
     first = (uuid4(), 1, uuid4())
     for index in range(TOMBSTONE_MAX_ENTRIES + 1):
         key = first if index == 0 else (uuid4(), 1, uuid4())
-        manager._remember_tombstone_locked(key, (0.0, None, False))
-    assert len(manager._tombstones) == TOMBSTONE_MAX_ENTRIES
-    assert first not in manager._tombstones
+        manager._state.remember_tombstone_locked(key, (0.0, None, False))
+    assert len(manager._state.tombstones) == TOMBSTONE_MAX_ENTRIES
+    assert first not in manager._state.tombstones
     await manager.close()
 
 
@@ -1341,6 +1342,7 @@ async def test_committed_client_sender_accepts_only_its_late_timeout_until_tombs
         await original_cleanup(slot, skip_worker=skip_worker)  # type: ignore[arg-type]
 
     async def capture_send(
+        transport: TransferTransport,
         sent_handle: object,
         payload: str,
         *,
@@ -1353,7 +1355,7 @@ async def test_committed_client_sender_accepts_only_its_late_timeout_until_tombs
         return await transport.send_text(sent_handle, payload)
 
     monkeypatch.setattr(manager, "_cleanup", blocked_cleanup)
-    monkeypatch.setattr(manager, "_send_text", capture_send)
+    monkeypatch.setattr(transfer_module, "send_transfer_text", capture_send)
     task, slot_id = await _send_client_relay(
         manager,
         transport,
@@ -1539,7 +1541,7 @@ async def test_committed_finish_cleanup_survives_worker_cancellation(
         TransferEndFrame(id=slot_id, ack=False, ok=True, bytes_sent=0, sha256=digest),
     )
     await cleanup_started.wait()
-    slot = next(iter(manager._slots.values()))
+    slot = next(iter(manager._state.slots.values()))
     assert slot.worker is not None
     slot.worker.cancel()
     release_cleanup.set()
@@ -1987,7 +1989,7 @@ async def test_cancelling_while_new_slot_waits_releases_admission_lease(directio
     async def make_sink(_: TransferBeginFrame) -> TransferSink:
         return Sink()
 
-    await manager._lock.acquire()
+    await manager._state.lock.acquire()
     try:
         if direction == "server_to_client":
             task = asyncio.create_task(
@@ -2020,7 +2022,7 @@ async def test_cancelling_while_new_slot_waits_releases_admission_lease(directio
         assert manager._admission.active_count == 0
         assert manager.active_slots == 0
     finally:
-        manager._lock.release()
+        manager._state.lock.release()
 
 
 async def test_client_to_server_end_wakes_an_idle_zero_byte_receiver() -> None:

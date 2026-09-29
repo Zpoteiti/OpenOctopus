@@ -30,12 +30,8 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import (
-    TransferBusyError,
-    TransferError,
-    TransferIntegrityError,
-    TransferLease,
-)
+from openctopus_server.devices.transfer_admission import TransferBusyError, TransferLease
+from openctopus_server.devices.transfer_types import TransferError, TransferIntegrityError
 from openctopus_server.devices.workspace import FileSourceProbe
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.tools.base import (

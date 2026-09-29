@@ -29,7 +29,7 @@ from openctopus_server.api.router import router as api_router
 from openctopus_server.config import get_settings
 from openctopus_server.db.engine import get_engine
 from openctopus_server.devices.dependencies import get_device_registry
-from openctopus_server.devices.transfer import TransferError
+from openctopus_server.devices.transfer_types import TransferError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
 from openctopus_server.errors.http import register_error_handler

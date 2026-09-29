@@ -47,7 +47,7 @@ from openctopus_server.devices.registry import (
     DeviceProtocolError,
     DeviceRegistry,
 )
-from openctopus_server.devices.transfer import TransferProtocolError
+from openctopus_server.devices.transfer_types import TransferProtocolError
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.services import devices
 

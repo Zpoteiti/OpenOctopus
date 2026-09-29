@@ -6,7 +6,7 @@ from collections.abc import Callable
 from uuid import UUID
 
 from openctopus_server.async_utils import await_future_cancellation_safe
-from openctopus_server.devices.transfer import TransferIntegrityError
+from openctopus_server.devices.transfer_types import TransferIntegrityError
 from openctopus_server.directory_contract import DirectoryManifest, DirectoryManifestEntry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError

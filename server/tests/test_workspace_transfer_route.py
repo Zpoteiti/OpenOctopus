@@ -9,7 +9,8 @@ from pydantic import TypeAdapter, ValidationError
 
 from openctopus_server.api.workspace_files import transfer_workspace_file
 from openctopus_server.config import get_settings
-from openctopus_server.devices.transfer import TransferBusyError, TransferError
+from openctopus_server.devices.transfer_admission import TransferBusyError
+from openctopus_server.devices.transfer_types import TransferError
 from openctopus_server.dto.workspace_file import TransferResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError

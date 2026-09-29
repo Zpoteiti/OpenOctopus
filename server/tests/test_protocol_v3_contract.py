@@ -16,7 +16,7 @@ from openctopus_server.devices.protocol import (
     parse_client_frame,
     parse_server_frame,
 )
-from openctopus_server.devices.transfer import LATE_PROGRESS_MAX
+from openctopus_server.devices.transfer_types import LATE_PROGRESS_MAX
 
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "protocol_v3" / "frames.json"

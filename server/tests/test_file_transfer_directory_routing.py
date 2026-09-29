@@ -17,7 +17,7 @@ from openctopus_server.devices.registry import (
     DeviceRouteSnapshot,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import TransferError
+from openctopus_server.devices.transfer_types import TransferError
 from openctopus_server.devices.workspace import DirectorySourceProbe, FileSourceProbe
 from openctopus_server.directory_contract import (
     DirectoryManifest,

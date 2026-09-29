@@ -84,12 +84,9 @@ from openctopus_server.devices.registry import (
     DeviceRegistry,
     DeviceUnavailableError,
 )
-from openctopus_server.devices.transfer import (
-    TRANSFER_QUEUE_CHUNKS,
-    TransferBusyError,
-    TransferManager,
-    TransferResult,
-)
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import TransferBusyError
+from openctopus_server.devices.transfer_types import TRANSFER_QUEUE_CHUNKS, TransferResult
 from openctopus_server.services.devices import parse_stored_mcp_catalog, token_digest, token_hint
 
 _DEFAULT_CONNECTIONS = 8
@@ -210,13 +207,13 @@ class _BridgeMetrics:
     local_slot_high_water: int = 0
 
     def record(self, manager: TransferManager, peers: list[_SourcePeer]) -> None:
-        bridges = tuple(manager._bridges.values())  # noqa: SLF001
-        tombstones = tuple(manager._bridge_tombstones.values())  # noqa: SLF001
+        bridges = tuple(manager._state.bridges.values())  # noqa: SLF001
+        tombstones = tuple(manager._state.bridge_tombstones.values())  # noqa: SLF001
         admission = manager._admission  # noqa: SLF001
         self.active_high_water = max(self.active_high_water, len(bridges))
         self.endpoint_high_water = max(
             self.endpoint_high_water,
-            len(manager._bridge_endpoints),  # noqa: SLF001
+            len(manager._state.bridge_endpoints),  # noqa: SLF001
         )
         self.queue_high_water = max(
             self.queue_high_water,
@@ -229,7 +226,7 @@ class _BridgeMetrics:
         )
         self.reserved_tombstone_high_water = max(
             self.reserved_tombstone_high_water,
-            manager._reserved_tombstone_credits,  # noqa: SLF001
+            manager._state.reserved_tombstone_credits,  # noqa: SLF001
         )
         self.admission_active_high_water = max(
             self.admission_active_high_water,
@@ -258,16 +255,16 @@ class _BridgeMetrics:
 
     @staticmethod
     def current(manager: TransferManager, peers: list[_SourcePeer]) -> dict[str, int]:
-        bridges = tuple(manager._bridges.values())  # noqa: SLF001
-        tombstones = tuple(manager._bridge_tombstones.values())  # noqa: SLF001
+        bridges = tuple(manager._state.bridges.values())  # noqa: SLF001
+        tombstones = tuple(manager._state.bridge_tombstones.values())  # noqa: SLF001
         return {
             "bridge_slots": len(bridges),
-            "bridge_endpoints": len(manager._bridge_endpoints),  # noqa: SLF001
+            "bridge_endpoints": len(manager._state.bridge_endpoints),  # noqa: SLF001
             "bridge_tombstones": len(tombstones),
             "bridge_pinned_tombstones": sum(
                 tombstone.pinned for tombstone in tombstones
             ),
-            "bridge_reserved_tombstones": manager._reserved_tombstone_credits,  # noqa: SLF001
+            "bridge_reserved_tombstones": manager._state.reserved_tombstone_credits,  # noqa: SLF001
             "bridge_tasks": sum(
                 task is not None and not task.done()
                 for bridge in bridges

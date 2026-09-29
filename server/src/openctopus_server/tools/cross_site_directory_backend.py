@@ -7,13 +7,13 @@ from uuid import UUID
 from openctopus_server.async_utils import await_future_cancellation_safe
 from openctopus_server.devices.protocol import TransferBeginFrame, new_uuid7
 from openctopus_server.devices.registry import DeviceOutcomeUnknownError
-from openctopus_server.devices.transfer import (
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import TransferLease
+from openctopus_server.devices.transfer_types import (
     TransferCommitResult,
     TransferCommittedAfterCancellation,
     TransferError,
     TransferIntegrityError,
-    TransferLease,
-    TransferManager,
     TransferResult,
 )
 from openctopus_server.directory_contract import (

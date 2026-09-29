@@ -20,11 +20,10 @@ from openctopus_server.devices.protocol import (
     parse_server_frame,
 )
 from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
-from openctopus_server.devices.transfer import (
-    FairTransferAdmission,
-    TransferBusyError,
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import FairTransferAdmission, TransferBusyError
+from openctopus_server.devices.transfer_types import (
     TransferError,
-    TransferManager,
     TransferResult,
     TransferUnavailableError,
 )

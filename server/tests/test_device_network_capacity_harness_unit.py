@@ -71,10 +71,12 @@ def test_bridge_metrics_track_logical_slots_endpoints_queue_and_cleanup() -> Non
         finish_task=None,
     )
     manager = SimpleNamespace(
-        _bridges={uuid4(): first, uuid4(): second},
-        _bridge_endpoints={uuid4(): object() for _ in range(4)},
-        _bridge_tombstones={uuid4(): SimpleNamespace(pinned=True)},
-        _reserved_tombstone_credits=4,
+        _state=SimpleNamespace(
+            bridges={uuid4(): first, uuid4(): second},
+            bridge_endpoints={uuid4(): object() for _ in range(4)},
+            bridge_tombstones={uuid4(): SimpleNamespace(pinned=True)},
+            reserved_tombstone_credits=4,
+        ),
         _admission=SimpleNamespace(
             active_count=2,
             waiting_count=3,

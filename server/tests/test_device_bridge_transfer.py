@@ -8,6 +8,8 @@ from uuid import UUID, uuid4
 import pytest
 
 import openctopus_server.devices.transfer as transfer_module
+import openctopus_server.devices.transfer_bridge as bridge_module
+import openctopus_server.devices.transfer_slots as slots_module
 from openctopus_server.devices.protocol import (
     MAX_BINARY_CHUNK_BYTES,
     TransferBeginFrame,
@@ -20,18 +22,18 @@ from openctopus_server.devices.protocol import (
     parse_server_frame,
 )
 from openctopus_server.devices.registry import ConnectionHandle, DeviceRouteSnapshot
-from openctopus_server.devices.transfer import (
+from openctopus_server.devices.transfer import TransferManager
+from openctopus_server.devices.transfer_admission import FairTransferAdmission, TransferBusyError
+from openctopus_server.devices.transfer_types import (
     LATE_PROGRESS_MAX,
     TRANSFER_QUEUE_CHUNKS,
-    FairTransferAdmission,
-    TransferBusyError,
     TransferCommittedAfterCancellation,
     TransferDisconnectedError,
     TransferError,
     TransferIntegrityError,
-    TransferManager,
     TransferProtocolError,
     TransferResult,
+    TransferSink,
 )
 
 
@@ -735,7 +737,7 @@ def _gate_worker_failure_claim(
     stage_waiting = asyncio.Event()
     claim_started = asyncio.Event()
     release_claim = asyncio.Event()
-    original_wait = manager._wait_bridge_stage
+    original_wait = manager._bridge._wait_bridge_stage
 
     async def gated_wait(bridge: Any, *futures: asyncio.Future[Any]) -> Any:
         watches_terminal_failure = bool(futures) and futures[0] is bridge.source_end_future
@@ -751,7 +753,7 @@ def _gate_worker_failure_claim(
             await release_claim.wait()
         return result
 
-    monkeypatch.setattr(manager, "_wait_bridge_stage", gated_wait)
+    monkeypatch.setattr(manager._bridge, "_wait_bridge_stage", gated_wait)
     return stage_waiting, claim_started, release_claim
 
 
@@ -763,8 +765,8 @@ async def test_bridge_uuid_collision_across_distinct_route_pairs_fails_before_se
     first_source, first_destination = _routes()
     second_source, second_destination = _routes()
     user_id = uuid4()
-    collision = transfer_module.new_uuid7()
-    monkeypatch.setattr(transfer_module, "new_uuid7", lambda: collision)
+    collision = bridge_module.new_uuid7()
+    monkeypatch.setattr(bridge_module, "new_uuid7", lambda: collision)
     first_task, first_request = await _start_bridge(
         manager,
         transport,
@@ -792,6 +794,59 @@ async def test_bridge_uuid_collision_across_distinct_route_pairs_fails_before_se
         assert admission.active_count == 1
     finally:
         await _cancel_bridge_task(first_task)
+
+
+@pytest.mark.parametrize("first_kind", ["direct", "relay"])
+async def test_direct_and_relay_transfers_share_endpoint_collision_and_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    first_kind: str,
+) -> None:
+    transport = _BridgeTransport()
+    manager, admission = _manager(transport)
+    source, destination = _routes()
+    user_id = uuid4()
+    slot_id = new_uuid7()
+    monkeypatch.setattr(transfer_module, "new_uuid7", lambda: slot_id)
+    monkeypatch.setattr(bridge_module, "new_uuid7", lambda: slot_id)
+
+    async def sink_factory(frame: TransferBeginFrame) -> TransferSink:
+        raise AssertionError("collision must be rejected before opening a sink")
+
+    async def start(kind: str) -> TransferResult:
+        if kind == "direct":
+            return await manager.start_client_to_server(
+                handle=source.handle,
+                route=source,
+                user_id=user_id,
+                src_path="source.bin",
+                dst_path="destination.bin",
+                sink_factory=sink_factory,
+            )
+        return await manager.start_client_to_client(
+            source_route=source,
+            destination_route=destination,
+            user_id=user_id,
+            src_path="source.bin",
+            dst_path="destination.bin",
+            mode="copy",
+            delete_source=None,
+            on_issued=None,
+        )
+
+    first = asyncio.create_task(start(first_kind))
+    try:
+        request = await _wait_for_text_frame(transport, source.handle, TransferRequestFrame)
+        assert request.id == slot_id
+        sends_before_collision = len(transport.text)
+        with pytest.raises(TransferProtocolError, match="collided"):
+            await asyncio.wait_for(start("relay" if first_kind == "direct" else "direct"), 1)
+        assert len(transport.text) == sends_before_collision
+        assert manager.active_slots == 1
+        assert admission.active_count == 1
+    finally:
+        await _cancel_bridge_task(first)
+    assert manager.active_slots == 0
+    assert admission.active_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1858,7 +1913,7 @@ async def test_bridge_tombstones_reject_wrong_endpoint_role_and_conflicting_term
 async def test_bridge_reserves_two_endpoint_tombstones_but_counts_one_logical_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(transfer_module, "TOMBSTONE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(slots_module, "TOMBSTONE_MAX_ENTRIES", 2)
     transport = _BridgeTransport()
     manager, admission = _manager(transport)
     source_route, destination_route = _routes()
@@ -1906,7 +1961,7 @@ async def test_bridge_reserves_two_endpoint_tombstones_but_counts_one_logical_sl
 async def test_tombstone_capacity_evicts_final_entries_without_evicting_pinned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(transfer_module, "TOMBSTONE_MAX_ENTRIES", 4)
+    monkeypatch.setattr(slots_module, "TOMBSTONE_MAX_ENTRIES", 4)
     transport = _BlockingFailureSendTransport()
     manager, admission = _manager(transport, idle_timeout_seconds=0.2)
     pinned_source, pinned_destination = _routes()
@@ -2189,11 +2244,12 @@ async def test_peer_rejection_and_disconnect_send_failure_once(
     release_first_send = asyncio.Event()
     duplicate_send_started = asyncio.Event()
     failure_sends = 0
-    original_send_text = manager._send_text  # noqa: SLF001
+    original_send_text = bridge_module.send_transfer_text  # noqa: SLF001
     failure_route = source_route if failure_origin == "source" else destination_route
     peer_route = destination_route if failure_origin == "source" else source_route
 
     async def gated_send_text(
+        transport: Any,
         handle: object,
         payload: str,
         *,
@@ -2210,16 +2266,17 @@ async def test_peer_rejection_and_disconnect_send_failure_once(
             else:
                 duplicate_send_started.set()
         return await original_send_text(
+            transport,
             handle,
             payload,
             route=route,
             on_issued=on_issued,
         )
 
-    monkeypatch.setattr(manager, "_send_text", gated_send_text)
+    monkeypatch.setattr(bridge_module, "send_transfer_text", gated_send_text)
     await manager.handle_frame(failure_route.handle, failure)
     await asyncio.wait_for(first_send_started.wait(), timeout=1)
-    bridge = manager._bridges[request.id]  # noqa: SLF001
+    bridge = manager._state.bridges[request.id]  # noqa: SLF001
     assert bridge.worker is not None
     disconnect = asyncio.create_task(manager.disconnect(failure_route.handle))
 
@@ -2446,7 +2503,7 @@ async def test_source_failure_after_begin_but_before_destination_issue_stays_sou
     source_route, destination_route = _routes()
     source_begin_claimed = asyncio.Event()
     release_source_begin = asyncio.Event()
-    original_wait = manager._wait_bridge_stage
+    original_wait = manager._bridge._wait_bridge_stage
 
     async def gate_source_begin(
         bridge: Any,
@@ -2462,7 +2519,7 @@ async def test_source_failure_after_begin_but_before_destination_issue_stays_sou
             await release_source_begin.wait()
         return result
 
-    monkeypatch.setattr(manager, "_wait_bridge_stage", gate_source_begin)
+    monkeypatch.setattr(manager._bridge, "_wait_bridge_stage", gate_source_begin)
     task, request = await _start_bridge(
         manager,
         transport,
@@ -2528,7 +2585,7 @@ async def test_destination_failure_after_ready_before_worker_claim_is_valid(
     source_route, destination_route = _routes()
     destination_ready_claimed = asyncio.Event()
     release_destination_ready = asyncio.Event()
-    original_wait = manager._wait_bridge_stage
+    original_wait = manager._bridge._wait_bridge_stage
 
     async def gate_destination_ready(
         bridge: Any,
@@ -2544,7 +2601,7 @@ async def test_destination_failure_after_ready_before_worker_claim_is_valid(
             await release_destination_ready.wait()
         return result
 
-    monkeypatch.setattr(manager, "_wait_bridge_stage", gate_destination_ready)
+    monkeypatch.setattr(manager._bridge, "_wait_bridge_stage", gate_destination_ready)
     task, request = await _start_bridge(
         manager,
         transport,
@@ -2728,7 +2785,7 @@ async def test_endpoint_fence_rejects_same_tick_source_binary_without_mutation(
         uuid4(),
         total_bytes=1,
     )
-    bridge = manager._bridges[request.id]  # noqa: SLF001
+    bridge = manager._state.bridges[request.id]  # noqa: SLF001
     fenced_route = source_route if fenced_endpoint == "source" else destination_route
 
     manager.fence_handle(fenced_route.handle)
@@ -2982,7 +3039,7 @@ async def test_bridge_lookup_rechecks_tombstone_after_endpoint_cleanup(
     late_ack = destination_end.model_copy(update={"ack": True})
     first_lookup_done = asyncio.Event()
     release_late_lookup = asyncio.Event()
-    original = manager._handle_bridge_tombstone_frame  # noqa: SLF001
+    original = manager._bridge._handle_bridge_tombstone_frame  # noqa: SLF001
 
     async def gate_first_lookup(handle: object, frame: object) -> bool:
         if frame is late_ack:
@@ -2992,7 +3049,7 @@ async def test_bridge_lookup_rechecks_tombstone_after_endpoint_cleanup(
             return handled
         return await original(handle, frame)
 
-    monkeypatch.setattr(manager, "_handle_bridge_tombstone_frame", gate_first_lookup)
+    monkeypatch.setattr(manager._bridge, "_handle_bridge_tombstone_frame", gate_first_lookup)
     late = asyncio.create_task(manager.handle_frame(destination_route.handle, late_ack))
     await asyncio.wait_for(first_lookup_done.wait(), timeout=1)
     await manager.handle_frame(destination_route.handle, chosen_ack)
@@ -3082,7 +3139,7 @@ async def test_source_binary_is_rejected_until_ready_send_is_issued() -> None:
     try:
         with pytest.raises(TransferProtocolError):
             await manager.handle_binary(source_route.handle, request.id.bytes + b"x")
-        assert manager._bridges[request.id].bytes_received == 0  # noqa: SLF001
+        assert manager._state.bridges[request.id].bytes_received == 0  # noqa: SLF001
     finally:
         transport.release_ready_send.set()
         await asyncio.wait_for(ready, timeout=1)
@@ -3181,8 +3238,8 @@ async def test_timeout_boundary_does_not_adopt_ack_validated_after_resolution(
     release_ack = asyncio.Event()
     timeout_selected = asyncio.Event()
     release_publication = asyncio.Event()
-    original_destination_end = manager._handle_bridge_destination_end  # noqa: SLF001
-    original_publish = manager._publish_bridge_tombstones  # noqa: SLF001
+    original_destination_end = manager._bridge._handle_bridge_destination_end  # noqa: SLF001
+    original_publish = manager._bridge._publish_bridge_tombstones  # noqa: SLF001
 
     async def gated_destination_end(bridge: Any, frame: TransferEndFrame) -> None:
         if frame.ack:
@@ -3200,8 +3257,8 @@ async def test_timeout_boundary_does_not_adopt_ack_validated_after_resolution(
             await release_publication.wait()
         await original_publish(bridge)
 
-    monkeypatch.setattr(manager, "_handle_bridge_destination_end", gated_destination_end)
-    monkeypatch.setattr(manager, "_publish_bridge_tombstones", gated_publish)
+    monkeypatch.setattr(manager._bridge, "_handle_bridge_destination_end", gated_destination_end)
+    monkeypatch.setattr(manager._bridge, "_publish_bridge_tombstones", gated_publish)
     task, request = await _start_ready_bridge(
         manager,
         transport,
@@ -3255,7 +3312,7 @@ async def test_finalization_updates_an_in_flight_provisional_timeout_ack(
     transport.source_handle = source_route.handle
     tombstones_published = asyncio.Event()
     release_cleanup = asyncio.Event()
-    original_publish = manager._publish_bridge_tombstones  # noqa: SLF001
+    original_publish = manager._bridge._publish_bridge_tombstones  # noqa: SLF001
 
     async def gated_publish(bridge: Any) -> None:
         await original_publish(bridge)
@@ -3263,7 +3320,7 @@ async def test_finalization_updates_an_in_flight_provisional_timeout_ack(
             tombstones_published.set()
             await release_cleanup.wait()
 
-    monkeypatch.setattr(manager, "_publish_bridge_tombstones", gated_publish)
+    monkeypatch.setattr(manager._bridge, "_publish_bridge_tombstones", gated_publish)
     task, request = await _start_ready_bridge(
         manager,
         transport,
@@ -3445,7 +3502,7 @@ async def test_abort_ack_is_rejected_before_its_endpoint_issue_boundary(
         uuid4(),
     )
     endpoint_route = source_route if endpoint == "source" else destination_route
-    bridge = manager._bridges[request.id]  # noqa: SLF001
+    bridge = manager._state.bridges[request.id]  # noqa: SLF001
 
     try:
         async with asyncio.timeout(1):
@@ -3502,7 +3559,7 @@ async def test_already_admitted_bridge_uses_exact_id_without_releasing_outer_lea
     manager, admission = _manager(transport)
     source_route, destination_route = _routes()
     user_id = uuid4()
-    slot_id = transfer_module.new_uuid7()
+    slot_id = bridge_module.new_uuid7()
     lease = await manager.acquire_operation(user_id)
 
     task = asyncio.create_task(
@@ -3674,7 +3731,7 @@ async def test_already_admitted_bridge_strips_destination_metadata_from_source_a
     manager, admission = _manager(transport)
     source_route, destination_route = _routes()
     user_id = uuid4()
-    slot_id = transfer_module.new_uuid7()
+    slot_id = bridge_module.new_uuid7()
     lease = await manager.acquire_operation(user_id)
     task = asyncio.create_task(
         manager.start_client_to_client_admitted(
@@ -3755,7 +3812,7 @@ async def test_admitted_bridge_rejects_source_drift_before_destination_issue(
     manager, admission = _manager(transport)
     source_route, destination_route = _routes()
     user_id = uuid4()
-    slot_id = transfer_module.new_uuid7()
+    slot_id = bridge_module.new_uuid7()
     lease = await manager.acquire_operation(user_id)
     task = asyncio.create_task(
         manager.start_client_to_client_admitted(
@@ -3822,11 +3879,11 @@ async def test_admitted_bridge_reports_commit_after_caller_cancellation(
     manager, admission = _manager(transport)
     source_route, destination_route = _routes()
     user_id = uuid4()
-    slot_id = transfer_module.new_uuid7()
+    slot_id = bridge_module.new_uuid7()
     lease = await manager.acquire_operation(user_id)
     finish_started = asyncio.Event()
     release_finish = asyncio.Event()
-    original_finish = manager._finish_bridge_once
+    original_finish = manager._bridge._finish_bridge_once
 
     async def blocked_finish(
         bridge: object,
@@ -3839,7 +3896,7 @@ async def test_admitted_bridge_reports_commit_after_caller_cancellation(
             await release_finish.wait()
         await original_finish(bridge, result=result, error=error)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(manager, "_finish_bridge_once", blocked_finish)
+    monkeypatch.setattr(manager._bridge, "_finish_bridge_once", blocked_finish)
     task = asyncio.create_task(
         manager.start_client_to_client_admitted(
             source_route=source_route,
