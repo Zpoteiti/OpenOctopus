@@ -1270,6 +1270,11 @@ discovery of tools, static resources, resource templates, and prompts.
 runtime/client/session. Per-site persistence and lifecycle remain in their
 owning package while Provider-visible names and result mapping stay identical.
 
+Within the Server package, Server and Device MCP catalogs use the same strict
+resource-template parser in `devices/mcp_catalog.py`. This is local reuse within
+the existing package boundary; the independently packaged Client retains its
+own implementation and contract tests.
+
 ### ADR-048 · MCP wrapping — tools, resources, prompts as tool-registry entries
 
 **Status:** superseded by ADR-133
@@ -4018,6 +4023,13 @@ returns `source_delete_failed`. Destination commit remains authoritative, and
 neither warning triggers replay or rollback. Routing, admission, bridge state,
 and late-frame containment are process-local under the current single-ASGI-
 worker boundary.
+
+`devices/transfer.py` owns direct transfers and coordinates the relay lifecycle
+in `devices/transfer_bridge.py`. Both use one `TransferSlots` registry/lock and
+one fair admission controller. The registry owns the shared endpoint namespace
+and tombstone budget; separating implementations preserves those shared limits
+and the existing issue, acknowledgement, and cleanup ordering. See
+[Implementation ownership](DEVELOPMENT.md#server-device-transfers).
 
 **Consequences:** All Server/Client and same-owner Client/Client regular-file
 combinations share one public tool and REST shape. Py8c reuses the same slot for

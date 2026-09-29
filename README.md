@@ -242,6 +242,8 @@ use HTTPS/WSS, and set `OPENOCTOPUS_COOKIE_SECURE=true` in a private copy of
 ## Development and verification
 
 Python packages require Python 3.12 or newer. The frontend uses Node.js 24.
+See [Implementation ownership](docs/DEVELOPMENT.md) for module boundaries and
+the lifecycle rules that refactors must preserve.
 
 Frontend:
 
