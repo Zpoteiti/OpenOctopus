@@ -430,8 +430,8 @@ async def test_runtime_terminate_session_closes_all_streams_without_respawn(pg_e
                     effort=None,
                 )
             )
-            state.turn_subscribers[turn_id] = active
-            state.queued_subscribers[queued_message_id] = queued
+            state.streams.turn_subscribers[turn_id] = active
+            state.streams.queued_subscribers[queued_message_id] = queued
 
     await runtime.terminate_session(session_id)
 
@@ -508,8 +508,8 @@ async def test_failed_delete_abandons_interrupted_turn_and_allows_next_message(
         assert state is not None
         async with state.lock:
             state.runner_task = runner_task
-            state.active_turn_id = old_turn_id
-            state.turn_subscribers[old_turn_id] = subscriber
+            state.streams.active_turn_id = old_turn_id
+            state.streams.turn_subscribers[old_turn_id] = subscriber
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         owner = await _user(db)
         await _configure_provider(db)

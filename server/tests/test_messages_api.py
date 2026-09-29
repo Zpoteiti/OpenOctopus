@@ -938,7 +938,7 @@ async def test_late_registration_joins_its_matching_running_continuation(
         )
 
         assert subscriber.closed is False
-        assert state.turn_subscribers[continuation_turn_id] is subscriber
+        assert state.streams.turn_subscribers[continuation_turn_id] is subscriber
         await runtime.unregister(session_id=session_id, subscriber=subscriber)
     await runtime.close()
 
@@ -991,8 +991,8 @@ async def test_idle_assignment_keeps_post_boundary_subscriber_queued(
             ),
         )
 
-        assert state.turn_subscribers[turn_id] is captured
-        assert state.queued_subscribers[later_id] is later
+        assert state.streams.turn_subscribers[turn_id] is captured
+        assert state.streams.queued_subscribers[later_id] is later
         assert captured.closed is False
         assert later.closed is False
     await runtime.unregister(session_id=session_id, subscriber=captured)
@@ -1047,8 +1047,8 @@ async def test_delayed_initial_registration_keeps_post_boundary_subscriber_queue
 
     async with runtime._lease_state(session_id) as state:
         assert state is not None
-        assert state.turn_subscribers[turn_id] is older
-        assert state.queued_subscribers[newer_id] is newer
+        assert state.streams.turn_subscribers[turn_id] is older
+        assert state.streams.queued_subscribers[newer_id] is newer
         assert older.closed is False
         assert newer.closed is False
     await runtime.unregister(session_id=session_id, subscriber=older)
