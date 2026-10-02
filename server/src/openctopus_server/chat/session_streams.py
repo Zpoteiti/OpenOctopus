@@ -81,6 +81,12 @@ class SessionStreams:
         for subscriber in subscribers:
             subscriber.close()
 
+    def close_queued(self) -> None:
+        subscribers = tuple(self.queued_subscribers.values())
+        self.queued_subscribers.clear()
+        for subscriber in subscribers:
+            subscriber.close()
+
     def adopt_running(
         self,
         turn_id: UUID,

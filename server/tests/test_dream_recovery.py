@@ -46,6 +46,7 @@ async def test_prepared_proposal_recovers_ordinary_failures_without_repeating_mo
         assert saved.after is not None and saved.status == "pending"
 
     monkeypatch.setattr(target, attribute, original)
+    gate.config_state = "not_configured"
     recovered = await dream.process_user(owner.id, now=NOW + timedelta(minutes=1))
     assert recovered.id == deferred.id and recovered.status == "updated"
     assert recovered.error is None
@@ -77,6 +78,7 @@ async def test_restore_recovers_transient_failure_without_rerunning_the_update(
         assert (await db.get(DreamRun, updated.id)).status == "restoring"
 
     monkeypatch.setattr(target, attribute, original)
+    gate.config_state = "not_configured"
     recovered = await dream.process_user(owner.id, now=NOW + timedelta(minutes=1))
     assert recovered.status == "restored" and memory.data == before
     assert len(memory.writes) == 2

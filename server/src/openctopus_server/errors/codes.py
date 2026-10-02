@@ -120,6 +120,7 @@ class ErrorCode(StrEnum):
     PROVIDER_NOT_CONFIGURED = "provider_not_configured"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
+    CHAT_STREAM_BUSY = "chat_stream_busy"
     # System
     SERVER_RESTART = "server_restart"
     USER_CANCELLED = "user_cancelled"

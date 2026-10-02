@@ -65,6 +65,10 @@ summaries are excluded; original messages remain eligible even after compaction.
 Running or queued Sessions wait until settled. Current-day messages wait until
 the next midnight.
 
+When Jev is unconfigured, new decisions wait without creating run history,
+reading memory or advancing source progress. Prepared writes and restores still
+recover; configured endpoints that become unreachable retain the hourly retry.
+
 1. Read a bounded batch and the current `MEMORY.md` plus its ETag.
 2. Ask Jev whether there is new durable evidence or a supported correction that
    is not already in memory. Empty input makes no Jev or LLM request.

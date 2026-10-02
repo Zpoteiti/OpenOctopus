@@ -110,6 +110,7 @@ async def get_messages(
         403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
     },
 )
@@ -122,12 +123,11 @@ async def post_message(
     workspace_service: WorkspaceService = Depends(get_workspace_service),
 ) -> StreamingResponse:
     async with runtime.session_operation(session_id):
-        if body.attachments:
-            await messages.preflight_message_target(
-                db,
-                user_id=user.id,
-                session_id=session_id,
-            )
+        await messages.preflight_message_target(
+            db,
+            user_id=user.id,
+            session_id=session_id,
+        )
         attachment_refs = await normalize_browser_attachment_refs(
             db,
             user_id=user.id,
@@ -142,17 +142,22 @@ async def post_message(
             ],
             attachments=body.attachments,
         )
-        accepted = await messages.accept_message(
-            db,
-            user=user,
-            session_id=session_id,
-            content=content,
-            attachment_refs=attachment_refs,
-            effort=body.effort,
-            runner_instance_id=runtime.runner_instance_id,
-        )
-        await runtime.schedule(accepted)
-        subscriber = await runtime.register(accepted)
+        release_stream = await runtime.reserve_web_stream(session_id)
+        try:
+            accepted = await messages.accept_message(
+                db,
+                user=user,
+                session_id=session_id,
+                content=content,
+                attachment_refs=attachment_refs,
+                effort=body.effort,
+                runner_instance_id=runtime.runner_instance_id,
+            )
+            await runtime.schedule(accepted)
+            subscriber = await runtime.register(accepted, on_close=release_stream)
+        except BaseException:
+            release_stream()
+            raise
 
     async def event_stream() -> AsyncIterator[bytes]:
         try:

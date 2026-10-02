@@ -78,6 +78,7 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.PROVIDER_NOT_CONFIGURED: 503,
     ErrorCode.PROVIDER_UNAVAILABLE: 503,
     ErrorCode.PROVIDER_PROTOCOL_ERROR: 502,
+    ErrorCode.CHAT_STREAM_BUSY: 429,
 }
 
 

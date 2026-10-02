@@ -10,6 +10,7 @@
   "CHANNEL_CREDENTIALS_UNVERIFIED": "channel_credentials_unverified",
   "CHANNEL_NOT_SUPPORTED": "channel_not_supported",
   "CHANNEL_PAIRING_UNAVAILABLE": "channel_pairing_unavailable",
+  "CHAT_STREAM_BUSY": "chat_stream_busy",
   "CONFIG_VALIDATION_FAILED": "config_validation_failed",
   "CRON_INVALID_SCHEDULE": "cron_invalid_schedule",
   "CRON_JOB_NOT_FOUND": "cron_job_not_found",

@@ -148,6 +148,10 @@ async def delete_user(
         return
     user = locked_user
 
+    session_ids = tuple(
+        (await db.scalars(select(Session.id).where(Session.user_id == user.id))).all()
+    )
+
     device_ids = tuple(
         (
             await db.scalars(
@@ -215,10 +219,16 @@ async def delete_user(
             await db.close()
         finally:
             try:
-                await device_registry.remove_devices(device_ids)
-            finally:
                 if runtime is not None:
-                    await runtime.forget_mcp_user(user_id=user.id)
+                    for session_id in session_ids:
+                        async with runtime.session_operation(session_id):
+                            await runtime.terminate_session(session_id)
+            finally:
+                try:
+                    await device_registry.remove_devices(device_ids)
+                finally:
+                    if runtime is not None:
+                        await runtime.forget_mcp_user(user_id=user.id)
 
     invalidation = asyncio.create_task(commit_release_and_invalidate_devices())
     await await_future_cancellation_safe(invalidation)

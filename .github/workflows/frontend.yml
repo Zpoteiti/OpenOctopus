@@ -2,28 +2,6 @@ name: Frontend CI
 
 on:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - "frontend/**"
-      - "docs/API.yaml"
-      - "server/**"
-      - "Dockerfile"
-      - "compose.yaml"
-      - ".env.example"
-      - ".dockerignore"
-      - ".github/workflows/frontend.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "frontend/**"
-      - "docs/API.yaml"
-      - "server/**"
-      - "Dockerfile"
-      - "compose.yaml"
-      - ".env.example"
-      - ".dockerignore"
-      - ".github/workflows/frontend.yml"
 
 permissions:
   contents: read

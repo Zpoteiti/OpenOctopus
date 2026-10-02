@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -17,6 +17,7 @@ class StreamSubscriber:
         default_factory=lambda: asyncio.Queue(maxsize=_STREAM_QUEUE_MAX_EVENTS)
     )
     closed: bool = False
+    on_close: Callable[[], None] | None = None
 
     def send(self, event: dict[str, Any]) -> None:
         if self.closed:
@@ -30,6 +31,8 @@ class StreamSubscriber:
         if self.closed:
             return
         self.closed = True
+        if self.on_close is not None:
+            self.on_close()
         try:
             self.queue.put_nowait(None)
         except asyncio.QueueFull:
@@ -38,6 +41,8 @@ class StreamSubscriber:
 
     def _disconnect_slow_consumer(self) -> None:
         self.closed = True
+        if self.on_close is not None:
+            self.on_close()
         self._discard_pending()
         self.queue.put_nowait(None)
 

@@ -642,6 +642,12 @@ export interface paths {
          *     preview. Reconnect/recovery uses
          *     `GET /api/sessions/{session_id}/messages`; missed token deltas are not replayed.
          *
+         *     Live browser streams are capped at 1,024 per Server process and 32 queued
+         *     streams per session. When full, POST returns `429 chat_stream_busy`
+         *     before accepting the message. A failed database handoff is retried up
+         *     to three times; exhausted retries close queued previews while accepted
+         *     messages remain durable for recovery.
+         *
          *     Py2 retries a transient provider failure only before the first
          *     text/thinking delta is emitted. A later failure persists a
          *     `synthetic_assistant_error`, marks the turn failed, and discards the
@@ -766,6 +772,15 @@ export interface paths {
                 };
                 /** @description A Client attachment name and immutable device id no longer identify the same owned Device (`tool_device_unreachable`). */
                 409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Live message stream capacity is full (`chat_stream_busy`); the message was not accepted. */
+                429: {
                     headers: {
                         [name: string]: unknown;
                     };

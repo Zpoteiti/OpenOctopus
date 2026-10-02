@@ -881,8 +881,8 @@ async def test_post_boundary_subscriber_waits_for_its_captured_turn(
     registered: asyncio.Queue[UUID] = asyncio.Queue()
     original_register = runtime.register
 
-    async def track_queued_registration(accepted):
-        subscriber = await original_register(accepted)
+    async def track_queued_registration(accepted, *, on_close=None):
+        subscriber = await original_register(accepted, on_close=on_close)
         if accepted.turn is None:
             registered.put_nowait(accepted.message_id)
         return subscriber
@@ -976,11 +976,11 @@ async def test_pending_promoted_during_preflight_claims_newest_stream(
     runtime = install_runtime(provider, _ScriptedTool([]))
     original_register = runtime.register
 
-    async def delayed_queued_registration(accepted):
+    async def delayed_queued_registration(accepted, *, on_close=None):
         if accepted.turn is None:
             queued_registration_started.set()
             await release_queued_registration.wait()
-        subscriber = await original_register(accepted)
+        subscriber = await original_register(accepted, on_close=on_close)
         if accepted.turn is None:
             queued_registration_finished.set()
         return subscriber

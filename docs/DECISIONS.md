@@ -184,6 +184,11 @@ scans or a cross-worker queue. A process restart discards live stream
 subscribers and in-flight partial tokens. Durable pending rows are recovered by
 the next inbound POST/channel activity for that session, which rebuilds context
 from Postgres and drains at the next safe boundary.
+Database failures while reserving the next turn retry up to three times with
+one reservation ID. A lost commit acknowledgement can recover that reservation
+only while its captured input remains pending. Exhausted retries close queued
+previews; later inbound activity can resume an unstarted reservation owned by
+the same process without replaying completed tool work.
 **Py3 clarification:** ADR-126 supersedes the direct-to-`messages` idle path
 above. Beginning with Py3, every inbound user message is durable in
 `pending_messages` before provider-visible promotion. When Stage 1 compaction
@@ -451,6 +456,10 @@ the actual model context window.
 **Status:** accepted
 **Context:** Some LLMs don't support images. Prior design had `vision_stripped: bool` on session state, persisted across turns.
 **Decision:** No session state. Send the full provider payload first. Auth/config errors fail fast. Transient errors retry the same payload with exponential backoff. In the M1f Anthropic Messages wire format, if the request contained `image` blocks and the provider returns an image/payload compatibility error (`400`, `413`, `415`, `422`, or clear unsupported-image text), retry with only the `image` blocks stripped and keep all text blocks. If stripping leaves no content, send an empty content array/string rather than inventing a marker. Each projection has its own normal maximum-three-attempt budget (first attempt plus two retries): the original image-bearing projection may use up to three attempts, and switching to the stripped projection starts a fresh budget of up to three attempts. One turn therefore makes at most six provider attempts across both projections. No flag propagates.
+Image detection and stripping cover both top-level message images and images in
+`tool_result.content`. Tool-result IDs, error flags and text remain intact,
+including string content and empty results after stripping. Image-shaped JSON
+inside `tool_use.input` remains ordinary tool data.
 **Consequences:** DB stores full-fidelity messages always. Switching to a VLM mid-session works immediately — no stale flag. Non-VLM providers can still answer text-only content after image stripping.
 
 ### ADR-027 · Path-text markers accompany every chat attachment
@@ -1882,6 +1891,11 @@ remove devices, sessions, messages, cron jobs, and channel configs. RustFS
 prefix cleanup happens idempotently after commit; a transient purge failure is
 retried at runtime and startup and does not make the committed account deletion
 appear to fail.
+
+After the account transaction commits, the runtime cancels each owned session
+runner, removes queued starts and closes live previews under the session operation
+gate. It then invalidates devices and private MCP clients. Cancellation of the
+delete request waits for this cleanup; a rolled-back deletion leaves runs intact.
 
 ### ADR-059 · Messages store provider-shape content blocks as JSONB; images inline as base64
 
@@ -3355,6 +3369,9 @@ comes from asyncio tasks inside that worker, not from multiple server processes.
 - Live POST subscribers use bounded event queues. If a browser cannot consume
   preview events before its queue fills, only that transient stream is closed;
   the runner continues and the browser recovers through canonical `GET messages`.
+- Browser stream admission allows at most 1,024 live streams per process and 32
+  queued streams per session. Excess requests return `429 chat_stream_busy`
+  before message persistence. Closing a stream releases its admission slot.
 - Per-session scheduler state is evicted once it has no runner, queued start, or
   subscriber. A later message recreates it from PostgreSQL-backed session state;
   active users of a state hold a short lease so eviction cannot split a session.
@@ -4225,7 +4242,11 @@ memory files.
 configuration edits reset observed status. Explicit connection checks and actual
 requests record availability fenced by configuration revision. Missing or failed
 Jev makes Dream unavailable and skips Heartbeat decisions, with no normal LLM
-fallback. Cron remains schedule-driven.
+fallback. Without Jev configuration, Dream creates no new run records and reads
+no memory for decisions. Unprocessed input waits for configuration; prepared
+memory writes and restores still recover. Configured service failures retain the
+normal retry policy so a recovered endpoint can resume work. Cron remains
+schedule-driven.
 
 Dream makes completed local days eligible at midnight in each user's IANA
 timezone and catches up unprocessed input after downtime. Saved user/assistant
