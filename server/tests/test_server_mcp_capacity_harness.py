@@ -14,7 +14,11 @@ from server_mcp_capacity_harness import HarnessConfig, run_harness  # noqa: E402
 
 
 @pytest.mark.asyncio
-async def test_server_mcp_capacity_harness_small_real_http_smoke() -> None:
+async def test_server_mcp_capacity_harness_small_real_http_smoke(monkeypatch) -> None:
+    def unexpected_settings():
+        raise AssertionError("The standalone MCP harness must not require Server configuration")
+
+    monkeypatch.setattr("openctopus_server.config.get_settings", unexpected_settings)
     result = await run_harness(HarnessConfig(
         users=20, max_clients=2, sample_interval_seconds=0.001,
     ))

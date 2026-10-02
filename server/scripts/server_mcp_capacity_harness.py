@@ -26,6 +26,7 @@ from openctopus_server.devices.mcp_models import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ConfigError
+from openctopus_server.mcp.catalog import discover_server_catalog
 from openctopus_server.mcp.models import empty_server_mcp_envelope, parse_server_mcp_configs
 from openctopus_server.mcp.routes import build_composite_mcp_snapshot
 from openctopus_server.mcp.supervisor import ServerMcpSupervisor
@@ -228,8 +229,10 @@ async def run_harness(config: HarnessConfig = HarnessConfig()) -> dict[str, Any]
     started = time.perf_counter()
     application = _SearchMcpApplication(config.max_clients)
     server = _LoopbackMcpServer(application)
-    supervisor = ServerMcpSupervisor.create_default(
+    supervisor = ServerMcpSupervisor(
+        discoverer=discover_server_catalog,
         max_clients=config.max_clients,
+        max_stdio_clients=config.max_clients,
         max_starting=config.max_clients,
     )
     peaks = {"rss": 0, "fds": 0, "tasks": 0, "http_connections": 0}
