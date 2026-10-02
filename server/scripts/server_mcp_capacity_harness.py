@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Py8a 500-user Server MCP capacity gate.
-
-The harness drives the production ``ServerMcpCoordinator`` and one real,
-shared FastMCP Streamable HTTP client/session against a loopback MCP search
-server.  It emits one JSON document suitable for a merge-gate artifact.
-"""
+"""Measure bounded private Server MCP clients against a loopback HTTP server."""
 
 from __future__ import annotations
 
@@ -16,61 +11,44 @@ import resource
 import socket
 import sys
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, cast
 from uuid import UUID, uuid5
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from fastmcp.client.transports import StreamableHttpTransport
-from mcp import types
 
-from openctopus_server.mcp.scheduler import (
-    GLOBAL_MAX_RESERVED,
-    PER_USER_MAX_RESERVED,
-    QUEUE_DEADLINE_SECONDS,
-    AdmissionClock,
-    AdmissionLease,
-    AdmissionTicket,
-    IssuedAdmission,
-    RuntimeAdmission,
-    ServerMcpBusyError,
-    ServerMcpCoordinator,
-    runtime_waiting_capacity,
+from openctopus_server.devices.mcp_models import (
+    SourceMcpCatalog,
+    SourceMcpServerCatalog,
+    SourceMcpTool,
 )
-from openctopus_server.mcp.transport import (
-    RuntimeClient,
-    RuntimeSession,
-    create_fastmcp_client,
-    create_mcp_http_client,
-)
+from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import ConfigError
+from openctopus_server.mcp.models import empty_server_mcp_envelope, parse_server_mcp_configs
+from openctopus_server.mcp.routes import build_composite_mcp_snapshot
+from openctopus_server.mcp.supervisor import ServerMcpSupervisor
+from openctopus_server.services import server_mcp
+from openctopus_server.tools.base import ToolResult
 
 _NAMESPACE = UUID("f78285ed-5b83-4f87-8871-e647d3b95a1b")
 _DEFAULT_USERS = 500
-_DEFAULT_RUNTIME_CONCURRENCY = 8
-_DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.005
+_DEFAULT_CLIENTS = 8
 _MAX_RSS_GROWTH_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class HarnessConfig:
     users: int = _DEFAULT_USERS
-    runtime_concurrency: int = _DEFAULT_RUNTIME_CONCURRENCY
-    sample_interval_seconds: float = _DEFAULT_SAMPLE_INTERVAL_SECONDS
+    max_clients: int = _DEFAULT_CLIENTS
+    sample_interval_seconds: float = 0.005
 
     def normalized(self) -> HarnessConfig:
-        if not 1 <= self.runtime_concurrency <= 32:
-            raise ValueError("runtime concurrency must be in 1..32")
-        minimum_users = self.runtime_concurrency + runtime_waiting_capacity(
-            self.runtime_concurrency
-        )
-        if self.users <= minimum_users:
-            raise ValueError(
-                "users must exceed runtime active plus waiting capacity to exercise busy admission"
-            )
+        if not 1 <= self.max_clients <= 32:
+            raise ValueError("max clients must be in 1..32")
+        if self.users <= self.max_clients:
+            raise ValueError("users must exceed the private client cap")
         if self.sample_interval_seconds <= 0:
             raise ValueError("sample interval must be positive")
         return self
@@ -88,65 +66,54 @@ def _process_sample() -> _ProcessSample:
     fd_count: int | None = None
     try:
         with open("/proc/self/statm", encoding="ascii") as statm:
-            resident_pages = int(statm.read().split()[1])
-        rss_bytes = resident_pages * os.sysconf("SC_PAGE_SIZE")
+            rss_bytes = int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     except (FileNotFoundError, IndexError, OSError, ValueError):
         try:
-            peak_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-            rss_bytes = peak_rss if sys.platform == "darwin" else peak_rss * 1024
+            peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            rss_bytes = peak if sys.platform == "darwin" else peak * 1024
         except (OSError, ValueError):
             pass
     try:
         fd_count = len(os.listdir("/proc/self/fd"))
     except (FileNotFoundError, OSError):
-        pass
-    return _ProcessSample(
-        rss_bytes=rss_bytes,
-        fd_count=fd_count,
-        task_count=len(asyncio.all_tasks()),
-    )
-
-
-class _GateClock(AdmissionClock):
-    def __init__(self) -> None:
-        self.current = 0.0
-        self._changed = asyncio.Event()
-
-    def now(self) -> float:
-        return self.current
-
-    async def sleep_until(self, deadline: float) -> None:
-        while self.current < deadline:
-            await self._changed.wait()
-            self._changed.clear()
-
-    def advance(self, seconds: float) -> None:
-        self.current += seconds
-        self._changed.set()
+        fd_count = None
+    return _ProcessSample(rss_bytes, fd_count, len(asyncio.all_tasks()))
 
 
 class _SearchMcpApplication:
-    """Small real Streamable HTTP MCP endpoint with observable request load."""
+    """Observable MCP endpoint with one live server session per private client."""
 
     def __init__(self, expected_parallel_searches: int) -> None:
         self.expected_parallel_searches = expected_parallel_searches
+        self.initialize_requests = 0
+        self.session_ids: set[str] = set()
+        self.closed_session_ids: set[str] = set()
+        self.search_requests = 0
         self.active_search_requests = 0
         self.active_search_requests_high_water = 0
-        self.search_requests = 0
-        self.search_queries: set[str] = set()
+        self.search_sessions: set[str] = set()
         self.all_searches_started = asyncio.Event()
         self.release_searches = asyncio.Event()
         self.app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
-        self.app.add_api_route("/mcp", self.handle, methods=["POST"])
+        self.app.add_api_route("/mcp", self.handle, methods=["POST", "DELETE"])
 
     async def handle(self, request: Request) -> Response:
+        if request.method == "DELETE":
+            session_id = request.headers.get("mcp-session-id")
+            if session_id is not None:
+                self.closed_session_ids.add(session_id)
+            return Response(status_code=200)
         payload = cast(dict[str, Any], await request.json())
         if "id" not in payload:
             return Response(status_code=202)
-
         request_id = payload["id"]
         method = payload.get("method")
+        headers: dict[str, str] = {}
         if method == "initialize":
+            self.initialize_requests += 1
+            session_id = f"capacity-session-{self.initialize_requests}"
+            self.session_ids.add(session_id)
+            headers["mcp-session-id"] = session_id
             params = cast(dict[str, Any], payload["params"])
             result: dict[str, object] = {
                 "protocolVersion": params["protocolVersion"],
@@ -155,49 +122,47 @@ class _SearchMcpApplication:
             }
         elif method == "tools/list":
             result = {
-                "tools": [
-                    {
-                        "name": "search",
-                        "description": "Search the local capacity fixture",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"query": {"type": "string"}},
-                            "required": ["query"],
-                            "additionalProperties": False,
-                        },
-                    }
-                ]
+                "tools": [{
+                    "name": "search",
+                    "description": "Search the local capacity fixture",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                }]
             }
         elif method == "tools/call":
             params = cast(dict[str, Any], payload["params"])
             if params.get("name") != "search":
-                raise ValueError("capacity MCP received an unknown tool")
+                raise ValueError("unknown MCP tool")
             arguments = cast(dict[str, Any], params["arguments"])
             query = arguments.get("query")
             if not isinstance(query, str):
-                raise ValueError("capacity MCP search query must be a string")
+                raise ValueError("search query must be a string")
+            session_id = request.headers.get("mcp-session-id")
+            if session_id is None:
+                raise ValueError("private MCP session header is missing")
+            self.search_sessions.add(session_id)
             self.search_requests += 1
-            self.search_queries.add(query)
             self.active_search_requests += 1
             self.active_search_requests_high_water = max(
-                self.active_search_requests_high_water,
-                self.active_search_requests,
+                self.active_search_requests_high_water, self.active_search_requests
             )
-            if self.active_search_requests_high_water >= self.expected_parallel_searches:
+            if self.active_search_requests >= self.expected_parallel_searches:
                 self.all_searches_started.set()
             try:
                 await self.release_searches.wait()
             finally:
                 self.active_search_requests -= 1
-            result = {
-                "content": [
-                    {"type": "text", "text": f"capacity result for {query}"},
-                ]
-            }
+            result = {"content": [{"type": "text", "text": f"capacity result for {query}"}]}
         else:
-            raise ValueError(f"capacity MCP received unexpected method {method!r}")
-
-        return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+            raise ValueError(f"unexpected MCP method {method!r}")
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "result": result},
+            headers=headers,
+        )
 
 
 class _LoopbackMcpServer:
@@ -206,12 +171,10 @@ class _LoopbackMcpServer:
         self.listener: socket.socket | None = None
         self.server: uvicorn.Server | None = None
         self.task: asyncio.Task[None] | None = None
-        self.url: str | None = None
 
     @property
     def connection_count(self) -> int:
-        server = self.server
-        return len(server.server_state.connections) if server is not None else 0
+        return len(self.server.server_state.connections) if self.server is not None else 0
 
     async def start(self) -> str:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -220,527 +183,233 @@ class _LoopbackMcpServer:
         listener.listen(512)
         listener.setblocking(False)
         port = cast(tuple[str, int], listener.getsockname())[1]
-        server = uvicorn.Server(
-            uvicorn.Config(
-                self.application.app,
-                host="127.0.0.1",
-                port=port,
-                lifespan="off",
-                log_config=None,
-                access_log=False,
-            )
-        )
+        server = uvicorn.Server(uvicorn.Config(
+            self.application.app, host="127.0.0.1", port=port,
+            lifespan="off", log_config=None, access_log=False,
+        ))
         task = asyncio.create_task(server.serve(sockets=[listener]))
-        self.listener = listener
-        self.server = server
-        self.task = task
-        self.url = f"http://127.0.0.1:{port}/mcp"
+        self.listener, self.server, self.task = listener, server, task
         while not server.started:
             if task.done():
                 await task
                 raise RuntimeError("loopback MCP server stopped before startup")
             await asyncio.sleep(0.001)
-        return self.url
+        return f"http://127.0.0.1:{port}/mcp"
 
     async def stop(self) -> None:
-        server = self.server
-        task = self.task
-        listener = self.listener
-        if server is not None:
-            server.should_exit = True
-        if task is not None:
-            await asyncio.wait_for(task, timeout=5)
-        if listener is not None:
-            listener.close()
-        self.server = None
-        self.task = None
-        self.listener = None
+        if self.server is not None:
+            self.server.should_exit = True
+        if self.task is not None:
+            await asyncio.wait_for(self.task, timeout=5)
+        if self.listener is not None:
+            self.listener.close()
 
 
-@dataclass(slots=True)
-class _HighWaterMetrics:
-    peak_rss_bytes: int | None = None
-    peak_fd_count: int | None = None
-    peak_task_count: int = 0
-    queue_high_water: int = 0
-    pending_future_high_water: int = 0
-    runtime_reserved_high_water: int = 0
-    global_reserved_high_water: int = 0
-    per_user_reserved_high_water: int = 0
-    http_connection_high_water: int = 0
-
-    def record_process(self, *, http_connections: int) -> None:
-        sample = _process_sample()
-        if sample.rss_bytes is not None:
-            self.peak_rss_bytes = max(self.peak_rss_bytes or 0, sample.rss_bytes)
-        if sample.fd_count is not None:
-            self.peak_fd_count = max(self.peak_fd_count or 0, sample.fd_count)
-        self.peak_task_count = max(self.peak_task_count, sample.task_count)
-        self.http_connection_high_water = max(
-            self.http_connection_high_water,
-            http_connections,
-        )
-
-    def record_scheduler(
-        self,
-        coordinator: ServerMcpCoordinator,
-        runtimes: list[RuntimeAdmission],
-        *,
-        pending_futures: int = 0,
-        include_runtime_reserved: bool = True,
-    ) -> None:
-        snapshot = coordinator.snapshot()
-        self.global_reserved_high_water = max(
-            self.global_reserved_high_water,
-            snapshot.reserved,
-        )
-        self.per_user_reserved_high_water = max(
-            self.per_user_reserved_high_water,
-            max(snapshot.reserved_by_user.values(), default=0),
-        )
-        if include_runtime_reserved:
-            self.runtime_reserved_high_water = max(
-                self.runtime_reserved_high_water,
-                max((runtime.reserved_count for runtime in runtimes), default=0),
-            )
-        self.queue_high_water = max(
-            self.queue_high_water,
-            max((runtime.waiting_count for runtime in runtimes), default=0),
-        )
-        self.pending_future_high_water = max(
-            self.pending_future_high_water,
-            pending_futures,
-        )
-
-
-class _MetricsSampler:
-    def __init__(
-        self,
-        metrics: _HighWaterMetrics,
-        server: _LoopbackMcpServer,
-        interval_seconds: float,
-    ) -> None:
-        self.metrics = metrics
-        self.server = server
-        self.interval_seconds = interval_seconds
-        self.task: asyncio.Task[None] | None = None
-
-    async def start(self) -> None:
-        self.metrics.record_process(http_connections=self.server.connection_count)
-        self.task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        task = self.task
-        if task is None:
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        self.task = None
-        self.metrics.record_process(http_connections=self.server.connection_count)
-
-    async def _run(self) -> None:
-        while True:
-            await asyncio.sleep(self.interval_seconds)
-            self.metrics.record_process(http_connections=self.server.connection_count)
-
-
-def _start_value(value: object) -> Callable[[AdmissionLease], object]:
-    def start(_lease: AdmissionLease) -> object:
-        return value
-
-    return start
-
-
-async def _close_admissions(admissions: list[IssuedAdmission]) -> None:
-    await asyncio.gather(*(admission.lease.aclose() for admission in admissions))
-
-
-async def _run_fixed_boundary_probes(metrics: _HighWaterMetrics) -> None:
-    global_coordinator = ServerMcpCoordinator(clock=_GateClock())
-    global_runtimes = [
-        global_coordinator.create_runtime(max_concurrent_calls=32) for _ in range(16)
-    ]
-    global_admissions: list[IssuedAdmission] = []
-    for index in range(GLOBAL_MAX_RESERVED):
-        runtime = global_runtimes[index % len(global_runtimes)]
-        ticket = await runtime.submit(
-            uuid5(_NAMESPACE, f"global-user-{index}"),
-            _start_value(index),
-        )
-        global_admissions.append(await ticket.wait())
-        metrics.record_scheduler(
-            global_coordinator,
-            global_runtimes,
-            include_runtime_reserved=False,
-        )
-    overflow = await global_runtimes[0].submit(
-        uuid5(_NAMESPACE, "global-overflow"),
-        _start_value("overflow"),
-    )
-    metrics.record_scheduler(
-        global_coordinator,
-        global_runtimes,
-        pending_futures=1,
-        include_runtime_reserved=False,
-    )
-    if overflow.issued or global_coordinator.snapshot().reserved != GLOBAL_MAX_RESERVED:
-        raise RuntimeError("global Server MCP admission boundary was not enforced")
-    await overflow.cancel()
-    await _close_admissions(global_admissions)
-    await global_coordinator.close()
-
-    user_coordinator = ServerMcpCoordinator(clock=_GateClock())
-    user_runtimes = [
-        user_coordinator.create_runtime(max_concurrent_calls=32),
-        user_coordinator.create_runtime(max_concurrent_calls=32),
-    ]
-    user_id = uuid5(_NAMESPACE, "per-user-boundary")
-    user_tickets = [
-        await user_runtimes[index % 2].submit(user_id, _start_value(index))
-        for index in range(PER_USER_MAX_RESERVED + 1)
-    ]
-    user_admissions = [await ticket.wait() for ticket in user_tickets if ticket.issued]
-    queued = [ticket for ticket in user_tickets if not ticket.issued]
-    metrics.record_scheduler(
-        user_coordinator,
-        user_runtimes,
-        pending_futures=len(queued),
-        include_runtime_reserved=False,
-    )
-    if (
-        len(user_admissions) != PER_USER_MAX_RESERVED
-        or len(queued) != 1
-        or user_coordinator.snapshot().reserved_by_user.get(user_id)
-        != PER_USER_MAX_RESERVED
-    ):
-        raise RuntimeError("per-user Server MCP admission boundary was not enforced")
-    await queued[0].cancel()
-    await _close_admissions(user_admissions)
-    await user_coordinator.close()
-
-
-async def _call_search(session: RuntimeSession, query: str) -> types.CallToolResult:
-    return await session.send_request(
-        types.ClientRequest(
-            types.CallToolRequest(
-                params=types.CallToolRequestParams(
-                    name="search",
-                    arguments={"query": query},
-                )
-            )
-        ),
-        types.CallToolResult,
-    )
-
-
-async def _wait_for_expiry(ticket: AdmissionTicket) -> bool:
-    try:
-        await ticket.wait()
-    except ServerMcpBusyError:
-        return True
-    return False
-
-
-async def _run_pressure(
-    config: HarnessConfig,
-    client: RuntimeClient,
-    application: _SearchMcpApplication,
+async def _sample_until_stopped(
+    stop: asyncio.Event,
     server: _LoopbackMcpServer,
-    metrics: _HighWaterMetrics,
-) -> tuple[dict[str, int], int, int]:
-    clock = _GateClock()
-    coordinator = ServerMcpCoordinator(clock=clock)
-    runtime = coordinator.create_runtime(
-        max_concurrent_calls=config.runtime_concurrency
-    )
-    launch = asyncio.Event()
-    invocation_tasks: list[asyncio.Task[types.CallToolResult]] = []
-    issued_admissions: list[IssuedAdmission] = []
-    queued_tickets: list[AdmissionTicket] = []
-
-    def start(query: str) -> Callable[[AdmissionLease], object]:
-        def issue(_lease: AdmissionLease) -> object:
-            task = asyncio.create_task(_call_search(client.session, query))
-            invocation_tasks.append(task)
-            return task
-
-        return issue
-
-    async def submit(index: int) -> AdmissionTicket | None:
-        await launch.wait()
-        try:
-            return await runtime.submit(
-                uuid5(_NAMESPACE, f"pressure-user-{index}"),
-                start(f"query-{index}"),
-            )
-        except ServerMcpBusyError:
-            return None
-
-    submission_tasks = [asyncio.create_task(submit(index)) for index in range(config.users)]
-    await asyncio.sleep(0)
-    metrics.record_process(http_connections=server.connection_count)
-    launch.set()
-    submitted = await asyncio.gather(*submission_tasks)
-    accepted_tickets = [ticket for ticket in submitted if ticket is not None]
-    busy = sum(ticket is None for ticket in submitted)
-    immediate_tickets = [ticket for ticket in accepted_tickets if ticket.issued]
-    queued_tickets = [ticket for ticket in accepted_tickets if not ticket.issued]
-    issued_admissions = [await ticket.wait() for ticket in immediate_tickets]
-    metrics.record_scheduler(
-        coordinator,
-        [runtime],
-        pending_futures=len(queued_tickets),
-    )
-
-    try:
-        await asyncio.wait_for(application.all_searches_started.wait(), timeout=5)
-        metrics.record_process(http_connections=server.connection_count)
-
-        clock.advance(QUEUE_DEADLINE_SECONDS)
-        expiry_tasks = [asyncio.create_task(_wait_for_expiry(ticket)) for ticket in queued_tickets]
-        await asyncio.sleep(0)
-        metrics.record_process(http_connections=server.connection_count)
-        expired = sum(await asyncio.gather(*expiry_tasks))
-        metrics.record_scheduler(coordinator, [runtime])
-
-        application.release_searches.set()
-        invocation_results = await asyncio.gather(*invocation_tasks)
-        completed = sum(result.isError is not True for result in invocation_results)
-        await _close_admissions(issued_admissions)
-        metrics.record_scheduler(coordinator, [runtime])
-        final_snapshot = coordinator.snapshot()
-        final_waiting = runtime.waiting_count
-        outcomes = {
-            "accepted": len(accepted_tickets),
-            "issued": len(immediate_tickets),
-            "queued": len(queued_tickets),
-            "busy": busy,
-            "expired": expired,
-            "completed": completed,
-        }
-        return outcomes, final_snapshot.reserved, final_waiting
-    finally:
-        application.release_searches.set()
-        for ticket in queued_tickets:
-            await ticket.cancel()
-        await asyncio.gather(*invocation_tasks, return_exceptions=True)
-        await _close_admissions(issued_admissions)
-        await runtime.retire()
-        await coordinator.close()
+    interval: float,
+    peaks: dict[str, int],
+) -> None:
+    while not stop.is_set():
+        sample = _process_sample()
+        peaks["tasks"] = max(peaks["tasks"], sample.task_count)
+        if sample.rss_bytes is not None:
+            peaks["rss"] = max(peaks["rss"], sample.rss_bytes)
+        if sample.fd_count is not None:
+            peaks["fds"] = max(peaks["fds"], sample.fd_count)
+        peaks["http_connections"] = max(peaks["http_connections"], server.connection_count)
+        await asyncio.sleep(interval)
 
 
-def _sample_dict(sample: _ProcessSample) -> dict[str, int | None]:
-    return {
-        "rss_bytes": sample.rss_bytes,
-        "fd_count": sample.fd_count,
-        "task_count": sample.task_count,
-    }
-
-
-async def _wait_for_no_http_connections(server: _LoopbackMcpServer) -> None:
-    deadline = asyncio.get_running_loop().time() + 2
-    while server.connection_count and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.01)
-
-
-async def run_harness(config: HarnessConfig = HarnessConfig()) -> dict[str, object]:
+async def run_harness(config: HarnessConfig = HarnessConfig()) -> dict[str, Any]:
     config = config.normalized()
     baseline = _process_sample()
-    metrics = _HighWaterMetrics()
-    application = _SearchMcpApplication(config.runtime_concurrency)
-    server = _LoopbackMcpServer(application)
-    sampler = _MetricsSampler(metrics, server, config.sample_interval_seconds)
-    client: RuntimeClient | None = None
-    client_entered = False
-    server_started = False
-    clients_created = 0
-    sessions_entered = 0
-    connections_after_client_close = -1
-    outcomes: dict[str, int] = {}
-    final_scheduler_reserved = -1
-    final_scheduler_waiting = -1
-    failure: str | None = None
     started = time.perf_counter()
-
+    application = _SearchMcpApplication(config.max_clients)
+    server = _LoopbackMcpServer(application)
+    supervisor = ServerMcpSupervisor.create_default(
+        max_clients=config.max_clients,
+        max_starting=config.max_clients,
+    )
+    peaks = {"rss": 0, "fds": 0, "tasks": 0, "http_connections": 0}
+    stop_sampling = asyncio.Event()
+    sampler: asyncio.Task[None] | None = None
+    server_started = False
+    first_tasks: list[asyncio.Task[ToolResult]] = []
+    failure: str | None = None
+    outcomes = {"issued": 0, "busy": 0, "completed": 0, "reused": 0, "evicted": 0}
+    active_high_water = 0
+    idle_after_calls = -1
+    initial_search_sessions = -1
+    sessions_after_shutdown = -1
+    connections_after_shutdown = -1
     try:
         url = await server.start()
         server_started = True
-        await sampler.start()
-        transport = StreamableHttpTransport(
-            url,
-            httpx_client_factory=partial(create_mcp_http_client),
+        sampler = asyncio.create_task(_sample_until_stopped(
+            stop_sampling, server, config.sample_interval_seconds, peaks
+        ))
+        configs = parse_server_mcp_configs([{
+            "name": "search", "transport": "streamable_http", "url": url,
+            "headers": {}, "enabled_capabilities": [],
+            "max_concurrent_calls": config.max_clients,
+        }])
+        source = SourceMcpCatalog(version=1, servers=[SourceMcpServerCatalog(
+            name="search", tools=[SourceMcpTool(
+                raw_name="search",
+                description="Search the local capacity fixture",
+                input_schema={
+                    "type": "object", "properties": {"query": {"type": "string"}},
+                    "required": ["query"], "additionalProperties": False,
+                },
+            )],
+        )])
+        envelope = server_mcp.build_candidate_envelope(
+            empty_server_mcp_envelope(), configs,
+            validate_servers=("search",), source_catalog=source,
         )
-        client = cast(RuntimeClient, create_fastmcp_client(transport))
-        clients_created = 1
-        await client.__aenter__()
-        client_entered = True
-        sessions_entered = 1
-        tools = await client.session.list_tools()
-        if [tool.name for tool in tools.tools] != ["search"]:
-            raise RuntimeError("loopback MCP did not expose the expected search tool")
-        await _run_fixed_boundary_probes(metrics)
-        outcomes, final_scheduler_reserved, final_scheduler_waiting = await _run_pressure(
-            config,
-            client,
-            application,
-            server,
-            metrics,
+        await supervisor.start(envelope)
+
+        async def call(index: int) -> ToolResult:
+            user_id = uuid5(_NAMESPACE, f"user-{index}")
+            session_id = uuid5(_NAMESPACE, f"conversation-{index}")
+            async with supervisor.run(user_id=user_id, session_id=session_id):
+                private, generations = await supervisor.prepare(
+                    user_id=user_id, session_id=session_id, envelope=envelope
+                )
+                route = build_composite_mcp_snapshot(
+                    private, [], runtime_generations=generations
+                ).server_routes[0]
+                return await supervisor.dispatch_server_mcp(
+                    route=route, user_id=user_id, session_id=session_id,
+                    name=route.final_name, args={"query": f"query-{index}"},
+                )
+
+        first_tasks = [
+            asyncio.create_task(call(index))
+            for index in range(config.max_clients)
+        ]
+        await asyncio.wait_for(application.all_searches_started.wait(), timeout=15)
+        active_high_water = supervisor.runtime_snapshot(envelope)["search"].active_sessions
+        overflow = await asyncio.gather(
+            *(call(index) for index in range(config.max_clients, config.users)),
+            return_exceptions=True,
         )
+        outcomes["busy"] = sum(
+            isinstance(value, ConfigError) and value.code is ErrorCode.TOOL_MCP_BUSY
+            for value in overflow
+        )
+        if outcomes["busy"] != len(overflow):
+            raise RuntimeError(f"overflow calls were not rejected: {overflow[:3]!r}")
+        application.release_searches.set()
+        completed = await asyncio.gather(*first_tasks)
+        outcomes["issued"] = len(first_tasks)
+        outcomes["completed"] = sum(not value.is_error for value in completed)
+        idle_after_calls = supervisor.runtime_snapshot(envelope)["search"].idle_sessions
+        initial_search_sessions = len(application.search_sessions)
+
+        initialized = application.initialize_requests
+        await call(0)
+        outcomes["reused"] = int(application.initialize_requests == initialized)
+        await call(config.max_clients)
+        outcomes["evicted"] = int(application.initialize_requests == initialized + 1)
     except Exception as exc:
         failure = f"{type(exc).__name__}: {exc}"
     finally:
         application.release_searches.set()
-        if client is not None and client_entered:
-            try:
-                await client.close()
-            except Exception as exc:
-                if failure is None:
-                    failure = f"{type(exc).__name__}: {exc}"
-        await _wait_for_no_http_connections(server)
-        connections_after_client_close = server.connection_count
-        await sampler.stop()
+        if first_tasks:
+            await asyncio.gather(*first_tasks, return_exceptions=True)
         try:
-            await server.stop()
+            await supervisor.begin_shutdown()
+            await supervisor.shutdown()
         except Exception as exc:
-            if failure is None:
-                failure = f"{type(exc).__name__}: {exc}"
+            failure = failure or f"{type(exc).__name__}: {exc}"
+        sessions_after_shutdown = sum(
+            slot.active_sessions + slot.idle_sessions + slot.closing_sessions
+            for slot in supervisor.runtime_snapshot(None).values()
+        )
+        if sampler is not None:
+            stop_sampling.set()
+            await sampler
+        if server_started:
+            await server.stop()
+        connections_after_shutdown = server.connection_count
     await asyncio.sleep(0)
     after_cleanup = _process_sample()
-    elapsed = time.perf_counter() - started
-
-    waiting_limit = runtime_waiting_capacity(config.runtime_concurrency)
-    expected_accepted = config.runtime_concurrency + waiting_limit
-    expected_busy = config.users - expected_accepted
-    peak_rss_growth = (
-        max(0, metrics.peak_rss_bytes - baseline.rss_bytes)
-        if metrics.peak_rss_bytes is not None and baseline.rss_bytes is not None
-        else None
+    rss_growth = (
+        max(0, peaks["rss"] - baseline.rss_bytes)
+        if baseline.rss_bytes is not None else None
     )
-    peak_fd_growth = (
-        max(0, metrics.peak_fd_count - baseline.fd_count)
-        if metrics.peak_fd_count is not None and baseline.fd_count is not None
-        else None
+    fd_growth = (
+        max(0, peaks["fds"] - baseline.fd_count)
+        if baseline.fd_count is not None else None
     )
-    task_limit = baseline.task_count + config.users + (5 * config.runtime_concurrency) + 64
-    fd_growth_limit = (2 * config.runtime_concurrency) + 32
     limits = {
-        "runtime_reserved": config.runtime_concurrency,
-        "runtime_waiting": waiting_limit,
-        "global_reserved": GLOBAL_MAX_RESERVED,
-        "per_user_reserved": PER_USER_MAX_RESERVED,
-        "http_connections": config.runtime_concurrency,
-        "task_high_water": task_limit,
-        "fd_growth_high_water": fd_growth_limit,
-        "rss_growth_high_water_bytes": _MAX_RSS_GROWTH_BYTES,
+        "private_clients": config.max_clients,
+        "rss_growth_bytes": _MAX_RSS_GROWTH_BYTES,
+        "fd_growth": 4 * config.max_clients + 32,
+        "task_high_water": baseline.task_count + config.users + 10 * config.max_clients + 64,
     }
     checks = {
         "harness_completed": failure is None,
-        "accepted_is_active_plus_bounded_queue": outcomes.get("accepted")
-        == expected_accepted,
-        "immediate_issue_matches_runtime_limit": outcomes.get("issued")
-        == config.runtime_concurrency,
-        "queue_reaches_but_does_not_exceed_limit": outcomes.get("queued")
-        == waiting_limit
-        and metrics.queue_high_water == waiting_limit,
-        "overflow_is_immediately_busy": outcomes.get("busy") == expected_busy,
-        "queued_calls_expire_without_issue": outcomes.get("expired") == waiting_limit,
-        "issued_searches_complete": outcomes.get("completed")
-        == config.runtime_concurrency,
-        "runtime_reserved_is_bounded": metrics.runtime_reserved_high_water
-        == config.runtime_concurrency,
-        "global_reserved_is_bounded": metrics.global_reserved_high_water
-        == GLOBAL_MAX_RESERVED,
-        "per_user_reserved_is_bounded": metrics.per_user_reserved_high_water
-        == PER_USER_MAX_RESERVED,
-        "pending_futures_are_bounded": metrics.pending_future_high_water
-        <= waiting_limit,
-        "one_shared_client_reaches_real_http": application.search_requests
-        == config.runtime_concurrency
-        and len(application.search_queries) == config.runtime_concurrency,
-        "http_requests_are_bounded": application.active_search_requests_high_water
-        == config.runtime_concurrency,
-        "http_connections_are_observed_and_bounded": 1
-        <= metrics.http_connection_high_water
-        <= config.runtime_concurrency,
-        "tasks_are_bounded": metrics.peak_task_count <= task_limit,
-        "fds_are_observed_and_bounded": peak_fd_growth is not None
-        and peak_fd_growth <= fd_growth_limit,
-        "rss_is_observed_and_bounded": peak_rss_growth is not None
-        and peak_rss_growth <= _MAX_RSS_GROWTH_BYTES,
-        "scheduler_is_empty_after_pressure": final_scheduler_reserved == 0
-        and final_scheduler_waiting == 0,
-        "http_connections_close": connections_after_client_close == 0,
-        "tasks_return_to_baseline": after_cleanup.task_count <= baseline.task_count,
+        "active_sessions_bounded": active_high_water == config.max_clients,
+        "overflow_is_immediately_busy": outcomes["busy"] == config.users - config.max_clients,
+        "no_queue": outcomes["issued"] == outcomes["completed"] == config.max_clients,
+        "private_http_sessions_observed": initial_search_sessions == config.max_clients,
+        "conversation_reuses_client": outcomes["reused"] == 1,
+        "idle_lru_evicts_client": outcomes["evicted"] == 1,
+        "idle_sessions_observed": idle_after_calls == config.max_clients,
+        "sessions_close_at_shutdown": sessions_after_shutdown == 0,
+        "remote_http_sessions_close": application.closed_session_ids == application.session_ids,
+        "connections_close_at_shutdown": connections_after_shutdown == 0,
+        "rss_bounded": rss_growth is not None and rss_growth <= limits["rss_growth_bytes"],
+        "fds_bounded": fd_growth is not None and fd_growth <= limits["fd_growth"],
+        "tasks_bounded": peaks["tasks"] <= limits["task_high_water"],
         "fds_return_to_baseline": baseline.fd_count is not None
         and after_cleanup.fd_count is not None
         and after_cleanup.fd_count <= baseline.fd_count,
     }
     return {
-        "ok": all(checks.values()),
-        "failure": failure,
-        "mode": "source",
+        "ok": all(checks.values()), "failure": failure,
         "transport": "real_loopback_streamable_http",
-        "network_exercised": server_started,
-        "http_transport_exercised": application.search_requests > 0,
-        "mcp_fixture": "local equivalent search wrapper",
-        "fastmcp_clients": clients_created,
-        "fastmcp_sessions": sessions_entered,
-        "users": config.users,
-        "outcomes": outcomes,
-        "limits": limits,
+        "users": config.users, "outcomes": outcomes, "limits": limits,
         "metrics": {
-            "wall_time_seconds": round(elapsed, 6),
-            "peak_rss_bytes": metrics.peak_rss_bytes,
-            "peak_fd_count": metrics.peak_fd_count,
-            "peak_task_count": metrics.peak_task_count,
-            "pending_future_high_water": metrics.pending_future_high_water,
-            "queue_high_water": metrics.queue_high_water,
-            "runtime_reserved_high_water": metrics.runtime_reserved_high_water,
-            "global_reserved_high_water": metrics.global_reserved_high_water,
-            "per_user_reserved_high_water": metrics.per_user_reserved_high_water,
-            "http_connection_high_water": metrics.http_connection_high_water,
-            "http_active_request_high_water": (
-                application.active_search_requests_high_water
-            ),
+            "wall_time_seconds": round(time.perf_counter() - started, 6),
+            "private_http_sessions_initialized": application.initialize_requests,
+            "private_http_sessions_used": len(application.search_sessions),
+            "initial_private_http_sessions_used": initial_search_sessions,
+            "private_http_sessions_closed": len(application.closed_session_ids),
+            "active_session_high_water": active_high_water,
+            "idle_sessions_after_calls": idle_after_calls,
             "http_search_requests": application.search_requests,
-            "rss_growth_high_water_bytes": peak_rss_growth,
-            "fd_growth_high_water": peak_fd_growth,
-            "measurement": {
-                "http_connections": "live Uvicorn TCP protocol objects",
-                "pending_futures": "accepted tickets still waiting for scheduler issue",
-                "rss": "current procfs RSS with resource fallback",
-                "fds": "procfs open descriptor count",
-                "tasks": "asyncio.all_tasks in the harness process",
+            "http_active_request_high_water": application.active_search_requests_high_water,
+            "http_connection_high_water": peaks["http_connections"],
+            "peak_rss_bytes": peaks["rss"], "peak_fd_count": peaks["fds"],
+            "peak_task_count": peaks["tasks"], "rss_growth_bytes": rss_growth,
+            "fd_growth": fd_growth,
+            "baseline": {
+                "rss_bytes": baseline.rss_bytes, "fd_count": baseline.fd_count,
+                "task_count": baseline.task_count,
             },
-            "baseline": _sample_dict(baseline),
             "after_cleanup": {
-                **_sample_dict(after_cleanup),
-                "http_connections": connections_after_client_close,
-                "scheduler_reserved": final_scheduler_reserved,
-                "scheduler_waiting": final_scheduler_waiting,
+                "rss_bytes": after_cleanup.rss_bytes,
+                "fd_count": after_cleanup.fd_count,
+                "task_count": after_cleanup.task_count,
+                "http_connections": connections_after_shutdown,
+                "private_sessions": sessions_after_shutdown,
             },
         },
         "checks": checks,
-        "limitations": [
-            "The MCP endpoint is a local deterministic search wrapper, not public SearXNG.",
-            "The harness exercises the scheduler and shared FastMCP HTTP session, not an Agent/provider turn.",
-        ],
+        "limitations": ["The endpoint is a deterministic local search fixture."],
     }
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--users", type=int, default=_DEFAULT_USERS)
-    parser.add_argument(
-        "--runtime-concurrency",
-        type=int,
-        default=_DEFAULT_RUNTIME_CONCURRENCY,
-    )
-    parser.add_argument(
-        "--sample-interval-ms",
-        type=float,
-        default=_DEFAULT_SAMPLE_INTERVAL_SECONDS * 1000,
-    )
+    parser.add_argument("--max-clients", type=int, default=_DEFAULT_CLIENTS)
+    parser.add_argument("--sample-interval-ms", type=float, default=5.0)
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args(argv)
 
@@ -748,15 +417,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        result = asyncio.run(
-            run_harness(
-                HarnessConfig(
-                    users=args.users,
-                    runtime_concurrency=args.runtime_concurrency,
-                    sample_interval_seconds=args.sample_interval_ms / 1000,
-                )
-            )
-        )
+        result = asyncio.run(run_harness(HarnessConfig(
+            users=args.users,
+            max_clients=args.max_clients,
+            sample_interval_seconds=args.sample_interval_ms / 1000,
+        )))
     except (OSError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         return 2

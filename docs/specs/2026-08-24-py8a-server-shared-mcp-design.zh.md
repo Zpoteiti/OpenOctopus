@@ -1,5 +1,9 @@
 # Py8a Admin Shared-service Server MCP 设计
 
+> 历史设计：共享连接、固定运行期 catalog、公平等待队列及无状态限制已被
+> [conversation-owned Server MCP lifecycle](2026-10-02-conversation-server-mcp-lifecycle.md)
+> 与 ADR-139 取代。以下内容保留为 Py8a 的历史记录。
+
 **状态：** accepted，待实现
 **Milestone：** Py8a Server shared MCP
 **依赖：** 已完成的 Py7 Client workspace restriction 与 Device MCP

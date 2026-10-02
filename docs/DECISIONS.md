@@ -736,8 +736,8 @@ inventory table in `docs/TOOLS.md`.
   `openoctopus_client`; their fixed schemas are server-canonical and the server
   routes calls without importing client executors.
 - **MCP-wrapped tools/resources/templates/prompts** are dynamic. Device entries
-  run on a user's paired Device; Py8a admin shared-service entries run through
-  one Server runtime per configured name and use install site `server`.
+  run on a user's paired Device; admin-installed Server entries use
+  conversation-owned clients and install site `server` (ADR-139).
 
 The original server-owned listing included `web_fetch`, but ADR-052 supersedes
 that part: `web_fetch` is a shared server/client tool.
@@ -777,12 +777,13 @@ availability. Each Provider iteration freezes an immutable catalog route;
 dispatch rechecks the durable revision/digest and current accepted runtime.
 Equal logical MCP entries may merge across Devices only when their canonical
 Provider shape and invocation identity match exactly.
-**Py8a clarification:** Persisted Server MCP entries are selected first and
-reserve their structured Server config name. Device entries under a reserved
-name are shadowed even when the Server runtime is down or the Server entry is
-disabled. Remaining Device logical groups are selected deterministically only
-from the Provider count/byte budget left after all enabled Server entries.
-Server and Device routes are frozen together for each Provider iteration.
+**ADR-139 clarification:** Conversation-discovered Server MCP entries are
+selected first and reserve their structured Server config name. Device entries
+under a reserved name are shadowed even if the conversation cannot connect or
+the Server entry is disabled. Remaining Device logical groups are selected
+deterministically only from the Provider count/byte budget left after the
+allowlisted Server entries. Server and Device routes are frozen together for
+each Provider iteration.
 **Context:** Without this rule, if `read_file` exists on server + three devices, the agent would see four separate tools or four overlapping schemas. That defeats the point of the unified tool surface (ADR-041) and blows up the agent's tool-registry cognitive load.
 **Decision:** At tool-schema-build time (per session), `tools_registry::build_tool_schemas` deduplicates:
 
@@ -1258,17 +1259,18 @@ offline targets fail at dispatch with `tool_device_unreachable`.
 
 ### ADR-047 · MCP clients live at their execution site
 
-**Status:** superseded in detail by ADR-133 for Device MCP and the accepted
-Py8a Server shared-MCP design.
+**Status:** superseded in detail by ADR-133 for Device MCP and ADR-139 for
+conversation-owned Server MCP clients.
 **Decision:** Device MCP transport/runtime code lives in `openoctopus_client`;
 admin shared-service transport/runtime code lives in `openoctopus_server/mcp`.
 Both use FastMCP 3.4.7 and the same contract fixtures, but neither package
 imports the other and Python-main does not add a shared code package. Server MCP
 supports explicit stdio, Streamable HTTP, and legacy SSE transports and full
 discovery of tools, static resources, resource templates, and prompts.
-**Consequences:** Each configured Server name owns one shared process-lifetime
-runtime/client/session. Per-site persistence and lifecycle remain in their
-owning package while Provider-visible names and result mapping stay identical.
+**Consequences:** Server MCP client ownership follows the user and conversation;
+the Server still owns the configured transport and admin installation record.
+Per-site persistence and lifecycle remain in their owning package while
+Provider-visible names and result mapping stay identical.
 
 Within the Server package, Server and Device MCP catalogs use the same strict
 resource-template parser in `devices/mcp_catalog.py`. This is local reuse within
@@ -1309,7 +1311,8 @@ Merge-time injection (ADR-071) is uniform across all three: `openoctopus_device`
 **Decision:** Every MCP add or effective modification validates before save.
 Device candidates require the current Client to initialize and discover all
 four surfaces; only pure Device deletion may commit offline. Server candidates
-validate through an isolated Server runtime before the whole-list CAS commit;
+validate through a temporary Server client, which closes after discovery,
+before the whole-list CAS commit;
 pure deletion does not require the removed endpoint to be reachable. No failed
 candidate is persisted or later pruned as a corrective action.
 
@@ -1391,32 +1394,50 @@ Example:
 
 **Consequences:** Simple mental model — one config field, tools only. Resources and prompts are always available. Discovery via config validation response lets users see what is available without a separate probe endpoint. Users fill the `enabled_tools` list themselves based on discovered capabilities.
 
-### ADR-114 · Python-main MCP tenancy: admin shared-service + device only
+### ADR-114 · Python-main MCP tenancy: admin installs and Device installs
 
-**Status:** accepted
-**Py8a clarification:** Both accepted tenancy scopes are active. Server MCP is
-managed through `GET/PUT /api/admin/server-mcp`; Device MCP remains managed on
-the Device config route.
-**Context:** MCP sessions can carry credentials and state. A single admin-installed server-side MCP client shared by every user is acceptable for deliberately shared service-account tools (stateless search, internal KB lookup), but unsafe for personal OAuth, browser state, IDE/LSP state, shell/REPL state, or any integration whose state belongs to one user.
-**Decision:** Python-main supports exactly two MCP tenancy scopes:
-- **Admin shared-service MCP.** Configured only by admins in the atomic
-  `system_config.server_mcp` envelope. It uses admin-provided shared
-  credentials, appears as `openoctopus_device="server"`, and is intended only
-  for stateless or low-state service tools. Each configured name has one shared
-  runtime/client/session, a per-runtime concurrency limit, and a bounded fair
-  queue: user FIFO, user round-robin, global 32 and per-user 4 active/draining
-  permits, and a 5-second wait deadline. Runtime failure is degraded state and
-  does not remove its last-good schema or fail `/health`. There is no client
-  pool, per-user runtime, session-scoped runtime, or `pool_size`.
-- **Device MCP.** Configured by a user on a device row (`devices.mcp_servers`). The MCP subprocess runs on that user's device, registers through `register_mcp`, and appears as `openoctopus_device="<device-name>"`. User-specific credentials, browser/IDE state, and resource-heavy tools belong here.
+**Status:** superseded by ADR-139.
+**Historical decision:** The initial Python-main design used one Server MCP
+runtime per configured name, shared among every user, and kept user-specific
+state on Device MCP. The admin API, Server install-site name, Device priority,
+and credential ownership described here remain in force; the shared runtime
+and admission model do not.
 
-User-scoped server MCP and session-scoped MCP are out of scope for the accepted Python-main contract. They require per-user secret storage, runtime isolation, idle teardown, resource limits, and clear UX around "this runs on the server"; until that design exists, users who need personal MCP integrations install them on a device.
+### ADR-139 · Conversation-owned Server MCP clients
 
-**Consequences:** The server avoids N users × M MCP long-lived subprocess growth
-and avoids accidentally granting every user access to an admin's personal
-credentials. Admin Server names authoritatively reserve their logical namespace
-and shadow, rather than delete, existing Device installs. Personal/stateful MCPs
-stay naturally isolated by Device ownership and OS process boundaries.
+**Status:** accepted.
+**Context:** Administrators need to configure a service once for all users,
+while each MCP client session must remain private to the user and conversation
+that created it. Reusing one live client across users can leak conversation or
+account state. Retaining only the installation-time catalog can also miss
+capabilities that change between model steps.
+**Decision:** Admins install and configure Server MCP services through
+`GET/PUT /api/admin/server-mcp`. Each conversation creates its own clients from
+the admin configuration. Before each tool-enabled LLM iteration, it connects
+and discovers the current catalogs, then applies the admin's saved capability
+allowlist. The runtime stays available throughout that iteration and is kept
+for up to 10 idle minutes after use, then closed. Admin candidate validation
+uses a temporary client and closes it after discovery; it does not create a
+conversation runtime.
+
+Idle clients may be evicted by LRU when the process reaches its hard client or
+stdio-client cap. Active clients are never evicted. There is no global queue
+shared by users. Process limits are configured with
+`OPENOCTOPUS_SERVER_MCP_MAX_CLIENTS` (default 256),
+`OPENOCTOPUS_SERVER_MCP_MAX_STDIO_CLIENTS` (default 32), and
+`OPENOCTOPUS_SERVER_MCP_MAX_STARTING` (default 8 concurrent starts). Idle
+retention is 600 seconds from last use, measured with a monotonic clock.
+Runtime state is in memory: idle eviction and process restart may require a
+later iteration to reconnect, with no durability guarantee. The admin API
+exposes aggregate active, idle, closing, and active-call counts without user or
+conversation identifiers.
+
+Server MCP remains admin-installed and available to all users, and its name
+continues to reserve the same Device MCP namespace. Existing admin-provided
+credentials remain shared; per-user OAuth and credentials are not implemented.
+Device MCP remains configured on the Device row and runs on that user's paired
+computer. Server stdio runs with the Server OS user's permissions and has no OS
+sandbox. No claim of 500 concurrently active isolated sessions is made.
 
 ### ADR-105 · MCP subprocess lifecycle on openoctopus_client
 

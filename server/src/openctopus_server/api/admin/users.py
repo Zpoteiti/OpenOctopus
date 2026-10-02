@@ -7,7 +7,9 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.api.sessions import get_chat_runtime
 from openctopus_server.auth.dependencies import require_admin
+from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.advisory import lock_personal_quota_read
 from openctopus_server.db.models import SystemConfig, User
 from openctopus_server.db.session import get_db
@@ -85,6 +87,7 @@ async def delete_user(
     db: AsyncSession = Depends(get_db),
     workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
     device_registry: DeviceRegistry = Depends(get_device_registry),
+    runtime: ChatRuntime = Depends(get_chat_runtime),
 ) -> Response:
     target = await users.get_user_by_id(db, user_id)
     if target is None:
@@ -94,5 +97,6 @@ async def delete_user(
         target,
         workspace_fs=workspace_fs,
         device_registry=device_registry,
+        runtime=runtime,
     )
     return Response(status_code=204)

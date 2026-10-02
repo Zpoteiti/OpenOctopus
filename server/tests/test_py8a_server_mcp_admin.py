@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -28,6 +29,7 @@ from openctopus_server.devices.mcp_models import (
 )
 from openctopus_server.dto.server_mcp import ServerMcpRuntimeSlot
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import ConfigError
 from openctopus_server.mcp.models import (
     ServerMcpEnvelope,
     ServerMcpServerConfig,
@@ -64,7 +66,7 @@ def _source_catalog(names: tuple[str, ...]) -> SourceMcpCatalog:
                 tools=[
                     SourceMcpTool(
                         raw_name="query",
-                        description="Search the shared index.",
+                        description="Search the index.",
                         input_schema={
                             "type": "object",
                             "properties": {"q": {"type": "string"}},
@@ -222,25 +224,29 @@ async def test_admin_get_synthesizes_revision_one_without_seeding_a_row(
     assert await _stored_row(pg_engine) is None
 
 
-async def test_admin_get_reports_replacement_active_and_draining_generations(
+async def test_admin_validation_closes_candidate_and_publishes_no_user_session(
     admin_client,
     pg_engine,
     test_app,
 ) -> None:
-    close_started = asyncio.Event()
-    release_close = asyncio.Event()
+    opened = 0
+    closed = 0
 
-    async def delayed_close() -> None:
-        close_started.set()
-        await release_close.wait()
+    async def entered() -> None:
+        nonlocal opened
+        opened += 1
 
-    clients = iter((_RuntimeClient(close=delayed_close), _RuntimeClient()))
+    async def exited() -> None:
+        nonlocal closed
+        closed += 1
 
     async def discover(name: str, _session: object) -> SourceMcpServerCatalog:
         return _source_catalog((name,)).servers[0]
 
     supervisor = ServerMcpSupervisor(
-        client_factory=lambda _config, **_kwargs: next(clients),
+        client_factory=lambda _config, **_kwargs: _RuntimeClient(
+            enter=entered, close=exited
+        ),
         discoverer=discover,
     )
     test_app.state.server_mcp_supervisor = supervisor
@@ -258,43 +264,23 @@ async def test_admin_get_reports_replacement_active_and_draining_generations(
             source_catalog=first_candidate.source_catalog,
         )
         await supervisor.publish(first_candidate, first)
-        first_generation = supervisor.ready_generations(first)["search"]
-
-        changed_payload = first_configs[0].storage_dict()
-        changed_payload["max_concurrent_calls"] = 9
-        second_configs = parse_server_mcp_configs([changed_payload])
-        second_candidate = await supervisor.validate(
-            configs=second_configs,
-            changed_names=("search",),
-            validate_servers=("search",),
-        )
-        second = server_mcp.build_candidate_envelope(
-            first,
-            second_configs,
-            validate_servers=("search",),
-            source_catalog=second_candidate.source_catalog,
-        )
-        await _store_envelope(pg_engine, second)
-        await supervisor.publish(second_candidate, second)
-        await close_started.wait()
+        await _store_envelope(pg_engine, first)
 
         response = await admin_client.get("/api/admin/server-mcp")
 
         assert response.status_code == 200, response.text
         slot = response.json()["runtimes"]["search"]
         assert slot["configured"] is True
-        assert slot["active"]["state"] == "ready"
-        assert slot["active"]["config_revision"] == 3
-        assert slot["active"]["runtime_generation"] != str(first_generation)
-        assert slot["draining"]["state"] == "draining"
-        assert slot["draining"]["config_revision"] == 2
-        assert slot["draining"]["runtime_generation"] == str(first_generation)
+        assert slot["active_sessions"] == 0
+        assert slot["idle_sessions"] == 0
+        assert slot["closing_sessions"] == 0
+        assert slot["active_calls"] == 0
+        assert opened == closed == 1
     finally:
-        release_close.set()
         await supervisor.shutdown()
 
 
-async def test_all_configured_mcp_can_be_down_without_losing_schema_or_health(
+async def test_private_prepare_failure_preserves_admin_schema_and_health(
     admin_client,
     pg_engine,
     test_app,
@@ -338,23 +324,16 @@ async def test_all_configured_mcp_can_be_down_without_losing_schema_or_health(
     test_app.state.server_mcp_supervisor = supervisor
     try:
         await supervisor.start(envelope)
-        for _ in range(50):
-            runtimes = supervisor.runtime_snapshot(envelope)
-            if len(runtimes) == 2 and all(
-                slot.active is not None and slot.active.state == "unavailable"
-                for slot in runtimes.values()
-            ):
-                break
-            await asyncio.sleep(0)
-
-        assert supervisor.ready_generations(envelope) == {
-            "first": None,
-            "second": None,
-        }
         assert all(
-            slot.active is not None and slot.active.state == "unavailable"
+            slot.configured and slot.active_sessions == 0 and slot.idle_sessions == 0
             for slot in supervisor.runtime_snapshot(envelope).values()
         )
+        user_id, session_id = uuid4(), uuid4()
+        async with supervisor.run(user_id=user_id, session_id=session_id):
+            with pytest.raises(ConfigError):
+                await supervisor.prepare(
+                    user_id=user_id, session_id=session_id, envelope=envelope
+                )
 
         admin_response = await admin_client.get("/api/admin/server-mcp")
         assert admin_response.status_code == 200, admin_response.text
@@ -363,7 +342,7 @@ async def test_all_configured_mcp_can_be_down_without_losing_schema_or_health(
         composite = build_composite_mcp_snapshot(
             envelope,
             [],
-            runtime_generations=supervisor.ready_generations(envelope),
+            runtime_generations={"first": None, "second": None},
         )
         assert {schema.name for schema in composite.schemas} == {
             "mcp_first_query",

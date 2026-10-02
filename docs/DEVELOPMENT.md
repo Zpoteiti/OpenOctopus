@@ -89,6 +89,22 @@ The Server MCP catalog imports that parser alongside the existing shared catalog
 validation helpers. Client MCP remains an independent implementation, aligned
 through contract tests as specified in [ADR-047](DECISIONS.md#adr-047--mcp-clients-live-at-their-execution-site).
 
+Admins configure Server MCP services once for all users. Candidate validation
+uses a temporary client and closes it after discovery. During each tool-enabled
+Agent iteration, the conversation-owned runtime connects and refreshes the
+catalog before Provider schemas are built; the saved administrator allowlist is
+applied to that fresh catalog. The client remains available to the same
+conversation across the iteration and is retained for up to 10 idle minutes.
+Idle clients may be evicted under configured process-wide client and stdio
+limits (`OPENOCTOPUS_SERVER_MCP_MAX_CLIENTS=256`,
+`OPENOCTOPUS_SERVER_MCP_MAX_STDIO_CLIENTS=32`, and
+`OPENOCTOPUS_SERVER_MCP_MAX_STARTING=8` by default); active clients are never
+evicted. Runtime ownership is in memory, so
+restarts and idle eviction may end a connection and require a later iteration
+to reconnect. It is not durable state. User-specific OAuth credentials are not
+implemented; current remote headers and stdio environment credentials remain
+administrator-owned and shared.
+
 ## Browser chat
 
 - [`ChatPage.tsx`](../frontend/src/chat/ChatPage.tsx) coordinates the active

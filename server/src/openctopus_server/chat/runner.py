@@ -4,7 +4,7 @@ import json
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
@@ -68,6 +68,7 @@ from openctopus_server.devices.mcp_routes import (
 )
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
+from openctopus_server.errors.exceptions import ConfigError, McpError
 from openctopus_server.mcp.models import ServerMcpEnvelope
 from openctopus_server.mcp.routes import (
     CompositeMcpSnapshot,
@@ -110,13 +111,24 @@ from openctopus_server.workspace.skills import get_skills_cache
 
 ProviderFactory = Callable[[ProviderConfig], Provider]
 RequestTokenEstimator = Callable[..., int | Awaitable[int]]
-ServerMcpGenerationResolver = Callable[
-    [ServerMcpEnvelope], Mapping[str, UUID | None]
-]
 ChannelContextProjector = Callable[
     [Mapping[UUID, int]],
     list[dict[str, Any]],
 ]
+
+
+class ServerMcpSessions(Protocol):
+    def run(
+        self, *, user_id: UUID, session_id: UUID
+    ) -> AbstractAsyncContextManager[None]: ...
+
+    async def prepare(
+        self, *, user_id: UUID, session_id: UUID, envelope: ServerMcpEnvelope
+    ) -> tuple[ServerMcpEnvelope, Mapping[str, UUID | None]]: ...
+
+    async def forget_session(self, *, user_id: UUID, session_id: UUID) -> None: ...
+
+    async def forget_user(self, *, user_id: UUID) -> None: ...
 
 
 class ChannelFinalDelivery(Protocol):
@@ -298,7 +310,7 @@ class ChatRuntime:
         device_registry: DeviceRegistry | None = None,
         context_admission: KeyedAdmission | None = None,
         request_token_estimator: RequestTokenEstimator = estimate_request_tokens,
-        server_mcp_generation_resolver: ServerMcpGenerationResolver | None = None,
+        server_mcp_sessions: ServerMcpSessions | None = None,
         channel_final_delivery: ChannelFinalDelivery | None = None,
         jev_service: JevService | None = None,
     ) -> None:
@@ -312,7 +324,7 @@ class ChatRuntime:
         self.device_registry = device_registry or get_device_registry()
         self.context_admission = context_admission or get_context_admission()
         self._estimate_request_tokens = request_token_estimator
-        self._server_mcp_generation_resolver = server_mcp_generation_resolver
+        self._server_mcp_sessions = server_mcp_sessions
         self._channel_final_delivery = channel_final_delivery
         self.skills_cache = get_skills_cache()
         self._provider_factory = provider_factory or AnthropicProvider
@@ -431,6 +443,16 @@ class ChatRuntime:
     async def terminate_session(self, session_id: UUID) -> None:
         detached = await self.detach_session(session_id)
         self.finalize_detached_session(detached, deleted=True)
+
+    async def forget_mcp_session(self, *, user_id: UUID, session_id: UUID) -> None:
+        if self._server_mcp_sessions is not None:
+            await self._server_mcp_sessions.forget_session(
+                user_id=user_id, session_id=session_id
+            )
+
+    async def forget_mcp_user(self, *, user_id: UUID) -> None:
+        if self._server_mcp_sessions is not None:
+            await self._server_mcp_sessions.forget_user(user_id=user_id)
 
     async def detach_session(self, session_id: UUID) -> DetachedSession:
         async with self._states_lock:
@@ -697,6 +719,18 @@ class ChatRuntime:
                 )
 
     async def _execute_chain(self, state: _SessionState, initial_turn: TurnStart) -> None:
+        if self._server_mcp_sessions is None or initial_turn.tool_profile != "owner_full":
+            await self._execute_chain_with_sessions(state, initial_turn)
+            return
+        user_id = await self._session_owner_id(initial_turn.session_id)
+        async with self._server_mcp_sessions.run(
+            user_id=user_id, session_id=initial_turn.session_id
+        ):
+            await self._execute_chain_with_sessions(state, initial_turn)
+
+    async def _execute_chain_with_sessions(
+        self, state: _SessionState, initial_turn: TurnStart
+    ) -> None:
         turn = initial_turn
         repeated_call: tuple[str, str] | None = None
         repeated_count = 0
@@ -1078,6 +1112,25 @@ class ChatRuntime:
                 safe_message="The server is busy preparing other conversations. Please retry.",
             ) from exc
 
+    async def _prepare_server_mcp(
+        self, turn: TurnStart, user_id: UUID, envelope: ServerMcpEnvelope
+    ) -> tuple[ServerMcpEnvelope, Mapping[str, UUID | None]]:
+        if self._server_mcp_sessions is None or turn.tool_profile != "owner_full":
+            return envelope, {}
+        try:
+            return await self._server_mcp_sessions.prepare(
+                user_id=user_id, session_id=turn.session_id, envelope=envelope
+            )
+        except ConfigError as exc:
+            if exc.code is ErrorCode.TOOL_MCP_BUSY:
+                raise McpError(
+                    exc.code, "Server MCP capacity is busy. Please try again shortly."
+                ) from None
+            raise McpError(
+                ErrorCode.TOOL_MCP_UNAVAILABLE,
+                "Server MCP tools are unavailable. Please try again or contact an administrator.",
+            ) from None
+
     async def _prepare_turn(self, turn: TurnStart) -> _PreparedTurn:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             await repair_unpaired_tool_uses(db, session_id=turn.session_id)
@@ -1164,17 +1217,16 @@ class ChatRuntime:
                 current_fingerprint=current_fingerprint,
                 add_compaction_continuation=False,
             )
+        server_envelope, runtime_generations = await self._prepare_server_mcp(
+            turn, user_id, server_envelope
+        )
         device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
             owner_devices,
             tool_registry=self.tool_registry,
             tool_profile=turn.tool_profile,
             attachment_targets=attachment_targets,
             server_envelope=server_envelope,
-            runtime_generations=(
-                self._server_mcp_generation_resolver(server_envelope)
-                if self._server_mcp_generation_resolver is not None
-                else {}
-            ),
+            runtime_generations=runtime_generations,
         )
 
         prospective_context_rows: list[ChannelHumanRow] = [
@@ -1318,17 +1370,16 @@ class ChatRuntime:
                     ),
                 )
             current_fingerprint = provider_fingerprint(config)
+            server_envelope, runtime_generations = await self._prepare_server_mcp(
+                turn, user_id, server_envelope
+            )
             device_targets, mcp_snapshot, registry_schemas = _build_owner_tool_state(
                 owner_devices,
                 tool_registry=self.tool_registry,
                 tool_profile=turn.tool_profile,
                 attachment_targets=attachment_targets,
                 server_envelope=server_envelope,
-                runtime_generations=(
-                    self._server_mcp_generation_resolver(server_envelope)
-                    if self._server_mcp_generation_resolver is not None
-                    else {}
-                ),
+                runtime_generations=runtime_generations,
             )
             final_input_tokens = await self._estimate_tokens(
                 system=system,
@@ -1534,7 +1585,7 @@ class ChatRuntime:
         await self._fail_provider(
             state,
             turn,
-            error=exc if isinstance(exc, ProviderInvocationError) else None,
+            error=exc if isinstance(exc, (ProviderInvocationError, McpError)) else None,
         )
 
     async def _fail_provider(
@@ -1542,7 +1593,7 @@ class ChatRuntime:
         state: _SessionState,
         turn: TurnStart,
         *,
-        error: ProviderInvocationError | None = None,
+        error: ProviderInvocationError | McpError | None = None,
     ) -> None:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             message = await persist_assistant(
@@ -1784,7 +1835,9 @@ class ChatRuntime:
             state.streams.claim(turn)
 
 
-def _synthetic_error_content(*, error: ProviderInvocationError | None) -> dict[str, str]:
+def _synthetic_error_content(*, error: ProviderInvocationError | McpError | None) -> dict[str, str]:
+    if isinstance(error, McpError):
+        return {"type": "text", "text": f"[{error.code.value}] {error.message}"}
     if error is not None and error.protocol:
         code = ErrorCode.PROVIDER_PROTOCOL_ERROR
         message = "The model provider returned an unsupported response."

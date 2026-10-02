@@ -521,9 +521,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ),
                 context_admission=get_context_admission(),
                 device_registry=device_registry,
-                server_mcp_generation_resolver=(
-                    server_mcp_supervisor.ready_generations
-                ),
+                server_mcp_sessions=server_mcp_supervisor,
                 channel_final_delivery=channel_outbound,
             )
             runtime_ref = runtime

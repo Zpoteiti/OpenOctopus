@@ -97,12 +97,15 @@ class _Dispatcher:
         *,
         route: FrozenServerMcpEntryRoute,
         user_id: UUID,
+        session_id: UUID,
         name: str,
         args: dict[str, object],
         on_issued: Callable[[], None] | None = None,
         issue_guard: Callable[[], bool] | None = None,
     ) -> ToolResult:
-        del user_id, name
+        assert user_id == _USER_ID
+        assert session_id == _SESSION_ID
+        del name
         if issue_guard is not None and not issue_guard():
             return ToolResult(
                 content="unavailable",

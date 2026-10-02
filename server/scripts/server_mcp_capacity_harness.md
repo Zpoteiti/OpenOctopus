@@ -1,41 +1,16 @@
-# Server MCP 500-user capacity evidence
+# Server MCP private-client capacity evidence
 
-Run the merge gate from `server/`:
+Run the optional 500-user burst gate from `server/`:
 
 ```bash
 conda run --no-capture-output -n oo python \
   scripts/server_mcp_capacity_harness.py \
-  --users 500 --runtime-concurrency 8 \
+  --users 500 --max-clients 8 \
   | tee /tmp/openoctopus-server-mcp-capacity-500.json
 ```
 
-The harness submits 500 unique users to the production
-`ServerMcpCoordinator` and one default-concurrency runtime. The first eight
-calls are issued, 32 remain in the bounded queue, and the rest receive
-immediate busy admission. The deterministic scheduler clock then expires the
-queued calls at the production five-second deadline without sleeping for five
-wall-clock seconds.
+The harness opens eight private Streamable HTTP MCP clients for eight users and holds a real `search` call open on each. It then tries 492 more users while those eight conversations are active. All 492 must receive immediate `tool_mcp_busy` capacity errors; there is no waiting queue. The report counts MCP session IDs returned by the loopback server, active and idle supervisor sessions, actual HTTP calls and connections, process RSS, file descriptors, and asyncio tasks. It checks that a later call in one conversation reuses its client and that an idle client is evicted when a new user arrives.
 
-Issued calls use one real shared FastMCP client/session over Streamable HTTP to
-a loopback MCP server exposing an equivalent `search` tool. The loopback server
-runs under Uvicorn, and the report samples its live TCP protocol objects for the
-HTTP connection high-water. It also records real process RSS, file descriptor
-and asyncio task high-water values. Pending-future high-water means accepted
-scheduler tickets whose issue future is still unresolved; queue and reservation
-counters come directly from the production scheduler.
+After shutdown, all MCP session IDs must have received a close request, and the supervisor must have no private sessions or open HTTP connections. The ordinary CI smoke uses 20 users with a two-client cap. The 500-user workflow runs manually or when a pull request has the `capacity-500` label.
 
-The same run separately fills the fixed global 32-permit boundary and submits
-five calls from one user across runtimes to prove the fixed per-user limit of
-four. Cleanup must leave zero scheduler reservations, waiters and HTTP
-connections, with task and descriptor counts returned to their baseline.
-
-Ordinary Server CI runs the 20-user smoke in
-`tests/test_server_mcp_capacity_harness.py`. The 500-user merge gate is the
-`Server MCP Capacity 500 Gate` workflow, triggered manually or by applying the
-existing `capacity-500` label to a pull request. That label also starts the
-separate Device capacity gate. Retain both JSON artifacts with the merge
-evidence.
-
-This is a scheduler/shared-session capacity gate. Its MCP endpoint is a local,
-deterministic search wrapper rather than public SearXNG, and it does not run a
-Provider/Agent turn. The separate Py8a real smoke covers those product paths.
+This gate measures a **500-user burst against an eight-client cap**, not 500 simultaneous live clients. Its endpoint is a deterministic local search fixture, and it does not make a Provider/Agent call. The opt-in Py8a acceptance test covers real chat turns with HTTP and stdio MCP fixtures.

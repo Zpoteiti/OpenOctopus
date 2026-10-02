@@ -138,6 +138,7 @@ async def _delete_owned_transition(
                 if detached is not None:
                     runtime.finalize_detached_session(detached, deleted=False)
             raise
+        await runtime.forget_mcp_session(user_id=user_id, session_id=session_id)
 
 
 async def _abandon_interrupted_turns(

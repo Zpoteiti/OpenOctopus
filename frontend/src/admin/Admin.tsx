@@ -235,18 +235,7 @@ function serverMcpInput(view: ServerMcpServerConfigView): ServerMcpServerConfig 
 
 type ServerMcpDraft = { baseRevision: number; servers: ServerMcpServerConfig[] }
 type ServerMcpEditing = { baseRevision: number; server: ServerMcpServerConfig; catalog?: DiscoveredServer }
-type RuntimeStatus = NonNullable<ServerMcpResponse['runtimes'][string]['active']>
-
-const RUNTIME_STATE_LABELS: Record<RuntimeStatus['state'], string> = {
-  starting: 'admin.runtimeStateStarting',
-  discovering: 'admin.runtimeStateDiscovering',
-  ready: 'admin.runtimeStateReady',
-  unavailable: 'admin.runtimeStateUnavailable',
-  backoff: 'admin.runtimeStateBackoff',
-  drifted: 'admin.runtimeStateDrifted',
-  draining: 'admin.runtimeStateDraining',
-  cleanup_blocked: 'admin.runtimeStateCleanupBlocked',
-}
+type RuntimeSlotState = ServerMcpResponse['runtimes'][string]
 
 export function AdminMcpPage(): ReactNode {
   const { t } = useTranslation()
@@ -332,9 +321,8 @@ export function AdminMcpPage(): ReactNode {
               )}
             >
               <div className="mcp-summary"><code>{server.transport === 'stdio' ? server.command : server.url}</code><span>{t('mcp.maxConcurrency')}: {server.max_concurrent_calls}</span></div>
-              {runtime?.active ? <RuntimeSlot label={t('admin.runtimeActive', { count: runtime.active.active_calls })} runtime={runtime.active} /> : <StatusBadge>{t('admin.notRunning')}</StatusBadge>}
-              {runtime?.draining ? <RuntimeSlot label={t('admin.runtimeDraining', { count: runtime.draining.draining_calls })} runtime={runtime.draining} /> : null}
-              {catalog ? <CapabilityCatalog catalog={catalog} /> : null}
+              {runtime ? <RuntimeSlot runtime={runtime} /> : null}
+              {catalog ? <><p className="field-help">{t('admin.installationPreview')}</p><CapabilityCatalog catalog={catalog} /></> : null}
             </Card>
           )
         })}
@@ -342,8 +330,7 @@ export function AdminMcpPage(): ReactNode {
           const runtime = config.data?.runtimes[runtimeName]
           return (
             <Card key={runtimeName} title={runtimeName} description={t('admin.runtimeUnconfigured')}>
-              {runtime?.active ? <RuntimeSlot label={t('admin.runtimeActive', { count: runtime.active.active_calls })} runtime={runtime.active} /> : null}
-              {runtime?.draining ? <RuntimeSlot label={t('admin.runtimeDraining', { count: runtime.draining.draining_calls })} runtime={runtime.draining} /> : null}
+              {runtime ? <RuntimeSlot runtime={runtime} /> : null}
             </Card>
           )
         })}
@@ -363,13 +350,11 @@ export function AdminMcpPage(): ReactNode {
   )
 }
 
-function RuntimeSlot({ label, runtime }: { label: string; runtime: RuntimeStatus }): ReactNode {
+function RuntimeSlot({ runtime }: { runtime: RuntimeSlotState }): ReactNode {
   const { t } = useTranslation()
   return (
     <div className="mcp-summary">
-      <strong>{label}</strong>
-      <StatusBadge tone={runtime.state === 'ready' ? 'success' : runtime.state === 'unavailable' || runtime.state === 'cleanup_blocked' ? 'danger' : 'warning'}>{t(RUNTIME_STATE_LABELS[runtime.state])}</StatusBadge>
-      <span>{t('admin.runtimeStats', { active: runtime.active_calls, waiting: runtime.waiting_calls, draining: runtime.draining_calls, restart: runtime.restart_attempt })}</span>
+      <span>{t('admin.runtimeStats', { active: runtime.active_sessions, idle: runtime.idle_sessions, closing: runtime.closing_sessions, calls: runtime.active_calls })}</span>
       {runtime.last_error ? <span className="form-error">{runtime.last_error.message} <code>{runtime.last_error.code}</code></span> : null}
     </div>
   )

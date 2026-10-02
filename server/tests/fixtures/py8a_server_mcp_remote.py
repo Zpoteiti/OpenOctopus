@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--transport", choices=("streamable_http", "sse"), required=True)
@@ -19,14 +19,24 @@ mcp = FastMCP(
     args.marker,
     host="127.0.0.1",
     port=args.port,
-    stateless_http=args.transport == "streamable_http",
+    stateless_http=False,
     json_response=True,
 )
+_counts: dict[int, int] = {}
 
 
 @mcp.tool(name=tool_name, description=f"Call {args.marker}.")
-def capability(text: str) -> str:
+def capability(text: str, ctx: Context) -> str:
+    # The first call changes discovery metadata without replacing the MCP server.
+    mcp._tool_manager.get_tool(tool_name).description = f"Updated {args.marker} capability."
     return f"{args.marker}:{text}"
+
+
+@mcp.tool(name="counter", description=f"Count calls in one {args.marker} MCP session.")
+def counter(ctx: Context) -> str:
+    key = id(ctx.session)
+    _counts[key] = _counts.get(key, 0) + 1
+    return f"{args.marker}-counter:{_counts[key]}"
 
 
 if __name__ == "__main__":

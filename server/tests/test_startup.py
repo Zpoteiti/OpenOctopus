@@ -33,7 +33,7 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         start=AsyncMock(),
         begin_shutdown=AsyncMock(),
         shutdown=AsyncMock(),
-        ready_generations=Mock(return_value={}),
+        prepare=AsyncMock(),
         dispatch_server_mcp=AsyncMock(),
     )
     scheduler = SimpleNamespace(

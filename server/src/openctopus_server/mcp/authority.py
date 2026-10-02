@@ -55,7 +55,7 @@ class ServerMcpAuthorityFence:
             not self._transitioning
             and snapshot.valid
             and route.config_revision == snapshot.config_revision
-            and route.catalog_digest == snapshot.catalog_digest
+            and route.server in snapshot.reserved_names
         )
 
     def matches(self, envelope: ServerMcpEnvelope) -> bool:

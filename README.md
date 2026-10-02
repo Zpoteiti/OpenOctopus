@@ -68,7 +68,7 @@ OpenOctopus Server (one ASGI worker)
   |-- Jev decision API for Heartbeat Phase 1 and Dream
   |-- Discord Gateway + REST adapter
   |-- DingTalk Stream + OpenAPI adapter
-  |-- Server-owned MCP connections and stdio child processes
+  |-- Admin-installed Server MCP services with conversation-owned clients
   `-- Protocol v3 WebSocket
         `-- OpenOctopus Client
               |-- local file tools and transfers
@@ -78,9 +78,12 @@ OpenOctopus Server (one ASGI worker)
 ```
 
 The Server does not run Client shell commands. Device MCP and Client tools run
-on the paired computer. Server MCP is owned by the Server: `stdio` services run
-as child processes with the Server OS user's permissions, while HTTP/SSE
-services run at their configured remote endpoints.
+on the paired computer. Admins install Server MCP once for all users. Each
+conversation connects to those services using its own client and refreshes the
+catalog during each tool-enabled model step. Idle conversation clients are
+retained for up to 10 minutes, subject to process-wide client and stdio limits.
+Server `stdio` services run as child processes with the Server OS user's
+permissions; HTTP/SSE clients connect to their configured remote endpoints.
 
 ## Five-minute Docker quickstart
 
@@ -254,8 +257,8 @@ a new Agent turn and try again.
 - Document conversion supports PDF, DOCX, XLSX, PPTX, and downloaded HTML. OCR,
   audio/video, archive recursion, and direct remote PDF/Office conversion are
   not enabled.
-- `/health` checks PostgreSQL and RustFS. Optional MCP runtime status is exposed
-  through the corresponding administrator configuration view.
+- `/health` checks PostgreSQL and RustFS. Aggregate Server MCP conversation
+  counts and sanitized errors are exposed through the administrator view.
 
 For an Internet-facing deployment, keep OpenOctopus behind a TLS reverse proxy,
 use HTTPS/WSS, and set `OPENOCTOPUS_COOKIE_SECURE=true` in a private copy of
