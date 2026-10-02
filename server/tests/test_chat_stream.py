@@ -15,7 +15,11 @@ async def test_close_preserves_events_for_a_healthy_subscriber() -> None:
 
 
 async def test_queue_overflow_disconnects_slow_subscriber() -> None:
-    subscriber = StreamSubscriber(message_id=uuid4(), accepted_at=datetime.now(UTC))
+    released = []
+    subscriber = StreamSubscriber(
+        message_id=uuid4(), accepted_at=datetime.now(UTC),
+        on_close=lambda: released.append(True),
+    )
     for index in range(_STREAM_QUEUE_MAX_EVENTS):
         subscriber.send({"type": "token_delta", "text": str(index)})
 
@@ -24,3 +28,5 @@ async def test_queue_overflow_disconnects_slow_subscriber() -> None:
     assert subscriber.closed is True
     assert subscriber.queue.qsize() == 1
     assert [chunk async for chunk in subscriber.ndjson()] == []
+    subscriber.close()
+    assert released == [True]

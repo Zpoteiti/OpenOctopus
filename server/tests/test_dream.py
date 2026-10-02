@@ -66,6 +66,10 @@ class Gate:
         self.choice = choice
         self.calls = []
         self.failure = None
+        self.config_state = "unchecked"
+
+    async def status(self):
+        return SimpleNamespace(state=self.config_state)
 
     async def evaluate(self, *, state, questions):
         self.calls.append(state)
@@ -174,6 +178,38 @@ async def test_empty_day_uses_no_model_calls_or_history(pg_engine):
         assert not list(await db.scalars(select(DreamRun)))
 
 
+async def test_unconfigured_jev_does_not_start_dream_and_resumes_when_configured(
+    pg_engine, monkeypatch
+):
+    owner = await user(pg_engine)
+    _, message = await conversation(pg_engine, owner)
+    dream, memory, gate, writer = service(pg_engine)
+    gate.config_state = "not_configured"
+    original_stat = memory.stat
+    original_read = memory.read_with_metadata
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("unconfigured Dream read memory")
+
+    monkeypatch.setattr(memory, "stat", forbidden)
+    monkeypatch.setattr(memory, "read_with_metadata", forbidden)
+    for hours in (0, 1, 24, 48):
+        assert await dream.process_user(owner.id, now=NOW + timedelta(hours=hours)) is None
+    assert not gate.calls and not writer.calls
+    async with AsyncSession(pg_engine) as db:
+        assert not list(await db.scalars(select(DreamRun)))
+        assert await db.get(DreamProgress, message.id) is None
+
+    gate.config_state = "unchecked"
+    monkeypatch.setattr(memory, "stat", original_stat)
+    monkeypatch.setattr(memory, "read_with_metadata", original_read)
+    resumed = await dream.process_user(owner.id, now=NOW + timedelta(hours=49))
+    assert resumed.status == "updated"
+    assert len(gate.calls) == len(writer.calls) == 1
+    async with AsyncSession(pg_engine) as db:
+        assert (await db.get(DreamProgress, message.id)).complete
+
+
 async def test_all_channels_and_speakers_are_preserved_but_other_users_today_and_summaries_excluded(
     pg_engine,
 ):
@@ -266,10 +302,13 @@ async def test_failure_keeps_work_and_retries_after_bounded_delay(pg_engine):
     run = await dream.process_user(owner.id, now=NOW)
     assert run.status == "failed" and run.error == "jev_unreachable"
     assert not memory.writes and not writer.calls
+    gate.config_state = "unreachable"
     assert await dream.process_user(owner.id, now=NOW + timedelta(minutes=5)) is None
+    assert len(gate.calls) == 1
     gate.failure, gate.choice = None, "skip"
     retry = await dream.process_user(owner.id, now=NOW + timedelta(hours=1))
     assert retry.status == "skipped" and retry.source == run.source
+    assert len(gate.calls) == 2
 
 
 async def test_update_uses_restricted_writer_and_undo_preserves_progress(pg_engine):

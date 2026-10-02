@@ -320,6 +320,8 @@ class DreamService:
                     )
                 )
                 if run is None:
+                    if (await self.jev.status()).state == "not_configured":
+                        return None
                     recent_failure = await db.scalar(
                         select(DreamRun.id)
                         .where(
@@ -343,6 +345,8 @@ class DreamService:
                     return await self._restore(run, now)
                 if run.after is not None:
                     await self._commit_memory(run, now)
+                    return run
+                if (await self.jev.status()).state == "not_configured":
                     return run
                 if not any(item["text"].strip() for item in run.source):
                     await self._finish(run, "skipped", now)

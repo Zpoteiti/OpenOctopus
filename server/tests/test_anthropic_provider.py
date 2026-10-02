@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -635,6 +636,115 @@ async def test_image_fallback_starts_a_fresh_retry_budget(monkeypatch):
     assert delays == [0.25, 0.5, 0.25, 0.5]
     assert result.content == [{"type": "text", "text": "done"}]
     await provider.close()
+
+
+@pytest.mark.parametrize("include_text", [True, False])
+async def test_image_fallback_strips_tool_result_images_on_wire_without_mutating_history(include_text):
+    image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="},
+    }
+    text_content = [{"type": "text", "text": "screenshot description"}] if include_text else []
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "image_call",
+                    "name": "screenshot",
+                    "input": {"example": image},
+                },
+                {"type": "tool_use", "id": "text_call", "name": "read_file", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "image_call",
+                    "content": [*text_content, image],
+                    "is_error": False,
+                },
+                {"type": "tool_result", "tool_use_id": "text_call", "content": "plain text"},
+            ],
+        },
+    ]
+    original = deepcopy(messages)
+    requests: list[dict[str, Any]] = []
+    sse = "".join(
+        _sse_event(event)
+        for event in [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_fallback",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "fake-model",
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 3, "output_tokens": 0},
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "done"},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"type": "invalid_request_error", "message": "images unsupported"}},
+            )
+        return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+
+    config = ProviderConfig(
+        endpoint="http://fake.test",
+        api_key="fake-key",
+        model="fake-model",
+        max_output_tokens=16384,
+        max_concurrent_requests=0,
+        max_context_tokens=None,
+    )
+    client = AsyncAnthropic(
+        api_key=config.api_key,
+        base_url=config.endpoint,
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False),
+    )
+    provider = AnthropicProvider(config, client=client)
+    try:
+        result = await provider.stream_turn(
+            config=config,
+            system="system",
+            messages=messages,
+            effort=None,
+            limiter=ProviderLimiter(),
+            on_delta=lambda channel, text: _noop_delta(),
+        )
+    finally:
+        await provider.close()
+
+    expected = deepcopy(original)
+    expected[1]["content"][0]["content"] = text_content
+    assert [request["messages"] for request in requests] == [original, expected]
+    assert messages == original
+    assert result.content == [{"type": "text", "text": "done"}]
 
 
 async def _noop_delta() -> None:

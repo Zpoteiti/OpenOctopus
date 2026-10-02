@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -68,7 +69,7 @@ from openctopus_server.devices.mcp_routes import (
 )
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import ConfigError, McpError
+from openctopus_server.errors.exceptions import ChatError, ConfigError, McpError
 from openctopus_server.mcp.models import ServerMcpEnvelope
 from openctopus_server.mcp.routes import (
     CompositeMcpSnapshot,
@@ -96,6 +97,7 @@ from openctopus_server.services.messages import (
     persist_human_marker,
     persist_tool_result,
     promote_pending_for_turn,
+    recover_unstarted_turn,
     register_cancel_waiter,
     reserve_pending_turn,
 )
@@ -144,7 +146,11 @@ class ChannelFinalDelivery(Protocol):
     ) -> None: ...
 
 _MAX_ITERATIONS = 200
+_MAX_LIVE_WEB_STREAMS = 1024
+_MAX_QUEUED_WEB_STREAMS_PER_SESSION = 32
+_HANDOFF_RESERVE_ATTEMPTS = 3
 _MCP_AUTHORITY_SNAPSHOT_ATTEMPTS = 3
+_logger = logging.getLogger(__name__)
 _COMPACTION_SYSTEM = (
     "Summarize the conversation state for another assistant that will continue it. "
     "Preserve user intent, constraints, decisions, completed work, tool findings, "
@@ -334,6 +340,7 @@ class ChatRuntime:
         self._states: dict[UUID, _SessionState] = {}
         self._states_lock = asyncio.Lock()
         self._session_operations: dict[UUID, _SessionOperation] = {}
+        self._live_web_streams = 0
 
     def set_provider_factory(self, factory: ProviderFactory) -> None:
         if self._providers:
@@ -412,15 +419,25 @@ class ChatRuntime:
         )
 
     async def schedule(self, accepted: AcceptedMessage) -> None:
-        if accepted.turn is None:
-            return
         task = asyncio.create_task(
-            self._schedule_turn(accepted.turn),
-            name=f"chat-activate-{accepted.turn.turn_id}",
+            self._recover_queued_turn(accepted.session_id)
+            if accepted.turn is None
+            else self._schedule_turn(accepted.turn),
+            name=f"chat-activate-{accepted.session_id}",
         )
         self._activation_tasks.add(task)
         task.add_done_callback(self._activation_tasks.discard)
         await await_future_cancellation_safe(task)
+
+    async def _recover_queued_turn(self, session_id: UUID) -> None:
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            turn = await recover_unstarted_turn(
+                db,
+                session_id=session_id,
+                runner_instance_id=self.runner_instance_id,
+            )
+        if turn is not None:
+            await self._schedule_recovered_turn(turn)
 
     @asynccontextmanager
     async def session_operation(self, session_id: UUID) -> AsyncIterator[None]:
@@ -489,10 +506,41 @@ class ChatRuntime:
                 subscriber.send(event)
             subscriber.close()
 
-    async def register(self, accepted: AcceptedMessage) -> StreamSubscriber:
+    async def reserve_web_stream(self, session_id: UUID) -> Callable[[], None]:
+        async with self._lease_state(session_id) as state:
+            assert state is not None
+            async with state.lock:
+                if (
+                    self._live_web_streams >= _MAX_LIVE_WEB_STREAMS
+                    or len(state.streams.queued_subscribers)
+                    >= _MAX_QUEUED_WEB_STREAMS_PER_SESSION
+                ):
+                    raise ChatError(
+                        ErrorCode.CHAT_STREAM_BUSY,
+                        "Too many open message streams; try again after one finishes",
+                    )
+                self._live_web_streams += 1
+
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._live_web_streams -= 1
+
+        return release
+
+    async def register(
+        self,
+        accepted: AcceptedMessage,
+        *,
+        on_close: Callable[[], None] | None = None,
+    ) -> StreamSubscriber:
         subscriber = StreamSubscriber(
             message_id=accepted.message_id,
             accepted_at=accepted.accepted_at,
+            on_close=on_close,
         )
         subscriber.send(
             {
@@ -579,6 +627,28 @@ class ChatRuntime:
         async with self._lease_state(turn.session_id) as state:
             assert state is not None
             async with state.lock:
+                if any(start.turn_id == turn.turn_id for start in state.starts):
+                    return
+                if (
+                    state.runner_task is not None
+                    and not state.runner_task.done()
+                    and state.streams.active_turn_id == turn.turn_id
+                ):
+                    return
+                if not await self._turn_is_running(turn.turn_id):
+                    return
+                state.streams.set_active_turn(turn, inherit_preview=False)
+                state.starts.append(turn)
+                self._ensure_runner_locked(state)
+
+    async def _schedule_recovered_turn(self, turn: TurnStart) -> None:
+        async with self._lease_state(turn.session_id) as state:
+            assert state is not None
+            async with state.lock:
+                if state.starts or (state.runner_task is not None and not state.runner_task.done()):
+                    return
+                if not await self._turn_is_running(turn.turn_id):
+                    return
                 state.streams.set_active_turn(turn, inherit_preview=False)
                 state.starts.append(turn)
                 self._ensure_runner_locked(state)
@@ -678,12 +748,29 @@ class ChatRuntime:
                     raise
                 except Exception:
                     await self._fail_unexpected_chain(state)
-                async with AsyncSession(self.engine, expire_on_commit=False) as db:
-                    current = await reserve_pending_turn(
-                        db,
-                        session_id=state.session_id,
-                        runner_instance_id=self.runner_instance_id,
-                    )
+                reservation_turn_id = uuid.uuid4()
+                for attempt in range(_HANDOFF_RESERVE_ATTEMPTS):
+                    try:
+                        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                            current = await reserve_pending_turn(
+                                db,
+                                session_id=state.session_id,
+                                runner_instance_id=self.runner_instance_id,
+                                reservation_turn_id=reservation_turn_id,
+                            )
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if attempt == _HANDOFF_RESERVE_ATTEMPTS - 1:
+                            _logger.exception(
+                                "Could not reserve pending messages for session %s",
+                                state.session_id,
+                            )
+                            async with state.lock:
+                                state.streams.close_queued()
+                            return
+                        await asyncio.sleep(0.1 * (attempt + 1))
                 if current is not None:
                     await self._assign_queued_subscribers(state, current)
         finally:

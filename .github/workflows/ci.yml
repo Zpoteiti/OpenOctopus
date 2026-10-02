@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: classify-changes
+    runs-on: ubuntu-24.04
+    outputs:
+      server: ${{ steps.classify.outputs.server }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      client: ${{ steps.classify.outputs.client }}
+      client_matrix: ${{ steps.classify.outputs.client_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          server=false
+          frontend=false
+          client=false
+          client_matrix=false
+
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            server=true
+            frontend=true
+            client=true
+            client_matrix=true
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              diff_range="$BASE_SHA...$HEAD_SHA"
+            else
+              diff_range="$BASE_SHA..$HEAD_SHA"
+            fi
+            changed_paths="$RUNNER_TEMP/changed-paths"
+            git diff --no-renames --name-only -z "$diff_range" > "$changed_paths"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                server/*|client/*|docs/API.yaml|tests/fixtures/directory_transfer_v1/*|tests/fixtures/protocol_v3/*|.github/workflows/*)
+                  server=true
+                  ;;
+              esac
+              case "$path" in
+                frontend/*|docs/API.yaml|server/*|Dockerfile|compose.yaml|.env.example|.dockerignore|.github/workflows/*)
+                  frontend=true
+                  ;;
+              esac
+              case "$path" in
+                client/*|server/*|docs/API.yaml|server/tests/fixtures/documents/*|tests/fixtures/directory_transfer_v1/*|tests/fixtures/protocol_v3/*|.github/workflows/*)
+                  client=true
+                  ;;
+              esac
+              case "$path" in
+                client/*|docs/API.yaml|server/tests/fixtures/documents/*|tests/fixtures/directory_transfer_v1/*|tests/fixtures/protocol_v3/*|.github/workflows/*)
+                  client_matrix=true
+                  ;;
+              esac
+            done < "$changed_paths"
+          fi
+
+          echo "server=$server" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "client=$client" >> "$GITHUB_OUTPUT"
+          echo "client_matrix=$client_matrix" >> "$GITHUB_OUTPUT"
+
+  server:
+    name: Python Server CI
+    needs: changes
+    if: ${{ needs.changes.outputs.server == 'true' }}
+    uses: ./.github/workflows/py-server.yml
+    permissions:
+      contents: read
+
+  frontend:
+    name: Frontend CI
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    uses: ./.github/workflows/frontend.yml
+    permissions:
+      contents: read
+
+  client:
+    name: Python Client CI
+    needs: changes
+    if: ${{ needs.changes.outputs.client == 'true' }}
+    uses: ./.github/workflows/client-spike.yml
+    with:
+      run_platform_matrix: ${{ fromJSON(needs.changes.outputs.client_matrix) }}
+    permissions:
+      contents: read
+
+  ci:
+    name: CI
+    if: ${{ always() }}
+    needs: [changes, server, frontend, client]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enforce selected checks
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SERVER_RESULT: ${{ needs.server.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          CLIENT_RESULT: ${{ needs.client.result }}
+          SERVER_SELECTED: ${{ needs.changes.outputs.server }}
+          FRONTEND_SELECTED: ${{ needs.changes.outputs.frontend }}
+          CLIENT_SELECTED: ${{ needs.changes.outputs.client }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change classification result: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          for check in SERVER FRONTEND CLIENT; do
+            selected_variable="${check}_SELECTED"
+            result_variable="${check}_RESULT"
+            selected="${!selected_variable}"
+            result="${!result_variable}"
+            if [[ "$selected" == "true" && "$result" != "success" ]]; then
+              echo "$check was selected but completed with: $result" >&2
+              exit 1
+            fi
+            if [[ "$selected" != "true" && "$result" != "skipped" ]]; then
+              echo "$check was not selected but completed with: $result" >&2
+              exit 1
+            fi
+          done

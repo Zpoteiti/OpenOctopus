@@ -2,26 +2,6 @@ name: Python Server CI
 
 on:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - "server/**"
-      - "client/**"
-      - "docs/API.yaml"
-      - "tests/fixtures/directory_transfer_v1/**"
-      - "tests/fixtures/protocol_v3/**"
-      - ".github/workflows/py-server.yml"
-      - ".github/workflows/release.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "server/**"
-      - "client/**"
-      - "docs/API.yaml"
-      - "tests/fixtures/directory_transfer_v1/**"
-      - "tests/fixtures/protocol_v3/**"
-      - ".github/workflows/py-server.yml"
-      - ".github/workflows/release.yml"
 
 permissions:
   contents: read

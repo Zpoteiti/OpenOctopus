@@ -2,24 +2,12 @@ name: Python Client CI
 
 on:
   workflow_call:
-  push:
-    branches: [main]
-    paths:
-      - "client/**"
-      - "server/**"
-      - "server/tests/fixtures/documents/**"
-      - "tests/fixtures/directory_transfer_v1/**"
-      - "tests/fixtures/protocol_v3/**"
-      - ".github/workflows/client-spike.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "client/**"
-      - "server/**"
-      - "server/tests/fixtures/documents/**"
-      - "tests/fixtures/directory_transfer_v1/**"
-      - "tests/fixtures/protocol_v3/**"
-      - ".github/workflows/client-spike.yml"
+    inputs:
+      run_platform_matrix:
+        description: Build and test the native client packages on every platform
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -96,6 +84,7 @@ jobs:
           if-no-files-found: warn
 
   macos-native:
+    if: ${{ inputs.run_platform_matrix }}
     name: macos-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -176,6 +165,7 @@ jobs:
           if-no-files-found: warn
 
   windows-native:
+    if: ${{ inputs.run_platform_matrix }}
     name: windows-x64
     runs-on: windows-2025
     timeout-minutes: 40

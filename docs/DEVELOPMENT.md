@@ -17,6 +17,14 @@ that lock. A turn claims only subscribers belonging to its captured message IDs;
 messages arriving after that boundary remain queued. Persisted history remains
 authoritative when a preview closes, is replaced, or disconnects.
 
+Browser stream admission caps the process at 1,024 open streams and each session
+at 32 queued previews. Full capacity returns `429 chat_stream_busy` before
+message persistence. Completion, replacement, disconnect and cancellation release
+the slot. Pending-turn reservation retries database failures up to three times;
+exhausted attempts close queued previews and retain durable input for the next
+inbound activity, including after a restart. Account deletion cancels owned session
+runners and queued starts, closes their previews, and releases their MCP clients.
+
 ## Built-in skills and memory automation
 
 [`workspace/builtin_skills.py`](../server/src/openctopus_server/workspace/builtin_skills.py)
@@ -31,7 +39,9 @@ selects existing parsed tasks through this service. Phase 2 uses the normal agen
 owns midnight eligibility, bounded text batches, durable progress, prepared
 memory changes and undo. `ChatRuntime.propose_memory_update` shares the normal
 provider and limiter for a single constrained proposal; it never dispatches
-executable tools. New database tables bootstrap with the development schema.
+executable tools. Missing Jev configuration defers new decisions before run
+creation and memory reads, while prepared writes and restores remain recoverable.
+New database tables bootstrap with the development schema.
 Test with mock Jev transport until credentials are available; do not substitute a
 runtime fake or imply live model acceptance. See the
 [workflow contract](specs/2026-09-29-builtin-skills-and-dream-direction.md).
@@ -138,6 +148,16 @@ OO_RUN_CAPACITY_HARNESS=1 OO_RUN_NETWORK_CAPACITY_HARNESS=1 \
 RUN_RUSTFS_INTEGRATION=1 PY5_REAL_E2E=1 PY6_REAL_E2E=1 \
 PY7_REAL_E2E=1 PY8A_REAL_E2E=1 PY8C_REAL_E2E=1 pytest -q
 ```
+
+GitHub pull requests use the always-running `CI` check. It selects Server,
+Frontend, and Client checks from the changed paths, then fails if a selected
+workflow fails or is cancelled. Documentation-only changes still complete the
+`CI` check successfully. Backend changes keep the Linux frozen Client-to-Server
+integration run; native macOS and Windows packaging runs only for Client,
+shared API/protocol, and Client runtime fixture changes. Workflow changes run
+the full set. New pull request commits cancel the earlier CI run for that PR.
+Release builds call the reusable acceptance workflows directly and keep the
+full native Client matrix.
 
 Preserve the existing cancellation, late-frame, shared-admission, and
 cross-platform move tests when changing these boundaries. Native Client CI and

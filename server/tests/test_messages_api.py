@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import openctopus_server.chat.runner as chat_runner
 from openctopus_server.chat.public_projection import build_runtime_block
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
@@ -23,7 +24,7 @@ from openctopus_server.db.models import (
     User,
 )
 from openctopus_server.errors.codes import ErrorCode
-from openctopus_server.errors.exceptions import WorkspaceError
+from openctopus_server.errors.exceptions import ChatError, WorkspaceError
 from openctopus_server.provider.anthropic import (
     DeltaCallback,
     ProviderInvocationError,
@@ -33,6 +34,7 @@ from openctopus_server.provider.anthropic import (
 from openctopus_server.provider.config import ProviderConfig
 from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
+from openctopus_server.services import messages
 from openctopus_server.services.messages import (
     capture_pending_for_turn,
     drain_pending_and_create_turn,
@@ -149,6 +151,13 @@ async def _wait_for_state_eviction(runtime: ChatRuntime, session_id: UUID) -> No
                 return
         await asyncio.sleep(0.01)
     raise AssertionError(f"runtime state was not evicted for {session_id}")
+
+
+async def _post_text(client, session_id: UUID, text: str):
+    return await client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": [{"type": "text", "text": text}], "attachments": []},
+    )
 
 
 async def test_get_empty_session_keeps_required_nullable_fields(
@@ -271,6 +280,345 @@ async def test_post_streams_and_get_recovers_canonical_history(
     assert call["effort"] == Effort.HIGH
     assert call["messages"][0]["content"][0]["text"].startswith("<runtime>\n")
     assert call["messages"][0]["content"][1] == {"type": "text", "text": "Hi"}
+    await runtime.close()
+
+
+async def test_transient_handoff_error_retries_queued_turn_without_replaying_first(
+    user_client, test_app, pg_engine, monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "first answer"}],
+                 started=first_started, release=release_first),
+        FakeStep(content=[{"type": "text", "text": "second answer"}]),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    original_reserve = chat_runner.reserve_pending_turn
+    calls = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary database error")
+        return await original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(chat_runner, "reserve_pending_turn", fail_once)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    await _wait_for_pending(user_client, str(session_id), 1)
+    release_first.set()
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=4,
+    )
+
+    assert calls == 3  # the successful second handoff and final empty check
+    assert len(provider.calls) == 2
+    assert [event["status"] for event in _events(first_response)
+            if event["type"] == "turn_finished"] == ["completed"]
+    assert [event["status"] for event in _events(second_response)
+            if event["type"] == "turn_finished"] == ["completed"]
+    assert runtime._live_web_streams == 0
+    await runtime.close()
+
+
+async def test_terminal_handoff_error_closes_stream_but_keeps_pending_message(
+    user_client, test_app, pg_engine, monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "first answer"}],
+                 started=first_started, release=release_first),
+        FakeStep(content=[{"type": "text", "text": "recovered answer"}]),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    original_reserve = chat_runner.reserve_pending_turn
+    attempts = 0
+
+    async def fail_handoff(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(chat_runner, "reserve_pending_turn", fail_handoff)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    pending = await _wait_for_pending(user_client, str(session_id), 1)
+    queued_id = pending["pending_messages"][0]["id"]
+    release_first.set()
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=4,
+    )
+
+    assert first_response.status_code == second_response.status_code == 200
+    assert [event["type"] for event in _events(second_response)] == ["message_accepted"]
+    assert attempts == chat_runner._HANDOFF_RESERVE_ATTEMPTS
+    assert len(provider.calls) == 1
+    assert runtime._live_web_streams == 0
+    assert (await user_client.get(f"/api/sessions/{session_id}/messages")).json()["pending_count"] == 1
+
+    monkeypatch.setattr(chat_runner, "reserve_pending_turn", original_reserve)
+    third_response = await _post_text(user_client, session_id, "third")
+    started = next(event for event in _events(third_response) if event["type"] == "turn_started")
+    assert started["message_ids"][0] == queued_id
+    assert len(started["message_ids"]) == 2
+    assert len(provider.calls) == 2
+    assert (await user_client.get(f"/api/sessions/{session_id}/messages")).json()["pending_count"] == 0
+    await runtime.close()
+
+
+async def test_lost_handoff_commit_ack_adopts_only_its_unstarted_turn(
+    user_client, test_app, pg_engine, monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "first answer"}],
+                 started=first_started, release=release_first),
+        FakeStep(content=[{"type": "text", "text": "second answer"}]),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    original_reserve = chat_runner.reserve_pending_turn
+    calls = 0
+
+    async def lose_first_ack(*args, **kwargs):
+        nonlocal calls
+        turn = await original_reserve(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            assert turn is not None
+            raise RuntimeError("commit acknowledgement lost")
+        return turn
+
+    monkeypatch.setattr(chat_runner, "reserve_pending_turn", lose_first_ack)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    await _wait_for_pending(user_client, str(session_id), 1)
+    release_first.set()
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=4,
+    )
+
+    assert first_response.status_code == second_response.status_code == 200
+    assert calls >= 2
+    assert len(provider.calls) == 2
+    assert [event["status"] for event in _events(second_response)
+            if event["type"] == "turn_finished"] == ["completed"]
+    assert (await user_client.get(f"/api/sessions/{session_id}/messages")).json()["pending_count"] == 0
+    await runtime.close()
+
+
+async def test_committed_handoff_with_lost_ack_recovers_on_next_post(
+    user_client, test_app, pg_engine, monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "first answer"}],
+                 started=first_started, release=release_first),
+        FakeStep(content=[{"type": "text", "text": "second answer"}]),
+        FakeStep(content=[{"type": "text", "text": "third answer"}]),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    original_reserve = chat_runner.reserve_pending_turn
+    attempts = 0
+
+    async def lose_ack_then_outage(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            turn = await original_reserve(*args, **kwargs)
+            assert turn is not None
+            raise RuntimeError("commit acknowledgement lost")
+        if attempts <= chat_runner._HANDOFF_RESERVE_ATTEMPTS:
+            raise RuntimeError("database temporarily unavailable")
+        return await original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(chat_runner, "reserve_pending_turn", lose_ack_then_outage)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    pending = await _wait_for_pending(user_client, str(session_id), 1)
+    queued_id = pending["pending_messages"][0]["id"]
+    release_first.set()
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=4,
+    )
+    assert first_response.status_code == second_response.status_code == 200
+    assert [event["type"] for event in _events(second_response)] == ["message_accepted"]
+    assert len(provider.calls) == 1
+
+    third_response = await asyncio.wait_for(
+        _post_text(user_client, session_id, "third"), timeout=4,
+    )
+    assert third_response.status_code == 200
+    assert len(provider.calls) == 3
+    history = (await user_client.get(f"/api/sessions/{session_id}/messages")).json()
+    assert history["pending_count"] == 0
+    assert sum(message["id"] == queued_id for message in history["messages"]) == 1
+    await runtime.close()
+
+
+async def test_message_stream_caps_reject_before_acceptance(
+    user_client, test_app, pg_engine, monkeypatch,
+):
+    await _configure_provider(pg_engine)
+    monkeypatch.setattr(chat_runner, "_MAX_LIVE_WEB_STREAMS", 2)
+    monkeypatch.setattr(chat_runner, "_MAX_QUEUED_WEB_STREAMS_PER_SESSION", 1)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "first answer"}],
+                 started=first_started, release=release_first),
+        FakeStep(content=[{"type": "text", "text": "second answer"}]),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    await _wait_for_pending(user_client, str(session_id), 1)
+
+    same_session = await _post_text(user_client, session_id, "rejected")
+    other_session_id = uuid4()
+    other_session = await _post_text(user_client, other_session_id, "also rejected")
+    foreign_session_id = uuid4()
+    foreign_user_id = uuid4()
+    async with AsyncSession(pg_engine) as db:
+        db.add(User(
+            id=foreign_user_id,
+            email="foreign-stream@test.com",
+            password_hash="unused",
+            name="Foreign",
+        ))
+        await db.flush()
+        db.add(Session(
+            id=foreign_session_id,
+            user_id=foreign_user_id,
+            session_key=f"web:{foreign_session_id}",
+            channel="web",
+            chat_id=str(foreign_session_id),
+            title="Foreign",
+        ))
+        await db.commit()
+    foreign_session = await _post_text(user_client, foreign_session_id, "private")
+    assert same_session.status_code == other_session.status_code == 429
+    assert same_session.json()["code"] == other_session.json()["code"] == "chat_stream_busy"
+    assert foreign_session.status_code == 404
+    assert (await user_client.get(f"/api/sessions/{session_id}/messages")).json()["pending_count"] == 1
+    assert (await user_client.get(f"/api/sessions/{other_session_id}/messages")).status_code == 404
+    assert runtime._live_web_streams == 2
+
+    release_first.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=4)
+    assert runtime._live_web_streams == 0
+
+    async def reject_accept(*args, **kwargs):
+        raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
+
+    monkeypatch.setattr(messages, "accept_message", reject_accept)
+    rejected = await _post_text(user_client, uuid4(), "not accepted")
+    assert rejected.status_code == 404
+    assert runtime._live_web_streams == 0
+    await runtime.close()
+
+
+async def test_recovered_turn_and_late_activation_run_once(pg_engine):
+    runtime = ChatRuntime(pg_engine)
+    session_id = uuid4()
+    turn_id = uuid4()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    async with AsyncSession(pg_engine) as db:
+        db.add(User(
+            id=uuid4(), email="recovered-turn@test.com", password_hash="unused", name="User",
+        ))
+        await db.flush()
+        user_id = (await db.scalars(select(User.id).where(
+            User.email == "recovered-turn@test.com"
+        ))).one()
+        db.add(Session(
+            id=session_id, user_id=user_id, session_key=f"web:{session_id}",
+            channel="web", chat_id=str(session_id), title="Recovered",
+        ))
+        await db.flush()
+        db.add(TurnRun(
+            id=turn_id, session_id=session_id, runner_instance_id=runtime.runner_instance_id,
+            status="running", tool_profile="owner_full", input_message_ids=[],
+        ))
+        await db.commit()
+
+    async def hold_execution(state, turn):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    runtime._execute_chain = hold_execution  # type: ignore[method-assign]
+    turn = TurnStart(session_id=session_id, turn_id=turn_id, message_ids=(), effort=None)
+    await runtime._schedule_recovered_turn(turn)
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await runtime._schedule_turn(turn)
+    assert calls == 1
+    release.set()
+    await _wait_for_state_eviction(runtime, session_id)
+    await runtime.close()
+
+
+async def test_deleting_account_cancels_active_and_queued_chat_streams(
+    user_client, test_app, pg_engine,
+):
+    await _configure_provider(pg_engine)
+    first_started = asyncio.Event()
+    provider = FakeProvider([
+        FakeStep(content=[{"type": "text", "text": "must not persist"}],
+                 started=first_started, release=asyncio.Event()),
+    ])
+    runtime = _install_fake_runtime(test_app, pg_engine, provider)
+    session_id = uuid4()
+    first = asyncio.create_task(_post_text(user_client, session_id, "first"))
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    second = asyncio.create_task(_post_text(user_client, session_id, "second"))
+    await _wait_for_pending(user_client, str(session_id), 1)
+
+    deletion = await asyncio.wait_for(user_client.delete("/api/me"), timeout=4)
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=4,
+    )
+    assert deletion.status_code == 204
+    assert [event["type"] for event in _events(first_response)][-1] == "session_deleted"
+    assert [event["type"] for event in _events(second_response)][-1] == "session_deleted"
+    assert len(provider.calls) == 1
+    assert runtime._live_web_streams == 0
+    async with AsyncSession(pg_engine) as db:
+        assert await db.get(Session, session_id) is None
+        assert (await db.execute(select(PendingMessage).where(
+            PendingMessage.session_id == session_id
+        ))).scalar_one_or_none() is None
+
+    await runtime.schedule(AcceptedMessage(
+        session_id=session_id,
+        message_id=uuid4(),
+        accepted_at=datetime.now(UTC),
+        disposition="started",
+        created_session=False,
+        turn=TurnStart(session_id=session_id, turn_id=uuid4(), message_ids=(), effort=None),
+    ))
+    await _wait_for_state_eviction(runtime, session_id)
     await runtime.close()
 
 
@@ -1536,13 +1884,13 @@ async def test_cancel_before_registration_still_starts_and_drains_runner(
     register_entered = asyncio.Event()
     block_first_registration = True
 
-    async def register_after_barrier(accepted):
+    async def register_after_barrier(accepted, *, on_close=None):
         nonlocal block_first_registration
         if block_first_registration:
             block_first_registration = False
             register_entered.set()
             await asyncio.Event().wait()
-        return await original_register(accepted)
+        return await original_register(accepted, on_close=on_close)
 
     monkeypatch.setattr(runtime, "register", register_after_barrier)
     session_id = "8bd4a7e8-4010-4dc3-b2e4-021a8fac60a7"

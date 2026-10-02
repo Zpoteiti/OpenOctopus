@@ -226,7 +226,14 @@ def _thinking_controls(effort: Effort | None) -> dict[str, Any]:
 
 def _contains_images(messages: list[dict[str, Any]]) -> bool:
     return any(
-        block.get("type") == "image" for message in messages for block in message.get("content", [])
+        block.get("type") == "image"
+        or (
+            block.get("type") == "tool_result"
+            and isinstance(block.get("content"), list)
+            and any(item.get("type") == "image" for item in block["content"])
+        )
+        for message in messages
+        for block in message.get("content", [])
     )
 
 
@@ -235,7 +242,14 @@ def _strip_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             **message,
             "content": [
-                block for block in message.get("content", []) if block.get("type") != "image"
+                {
+                    **block,
+                    "content": [item for item in block["content"] if item.get("type") != "image"],
+                }
+                if block.get("type") == "tool_result" and isinstance(block.get("content"), list)
+                else block
+                for block in message.get("content", [])
+                if block.get("type") != "image"
             ],
         }
         for message in messages

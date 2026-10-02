@@ -242,6 +242,7 @@ async def reserve_pending_turn(
     *,
     session_id: UUID,
     runner_instance_id: UUID,
+    reservation_turn_id: UUID | None = None,
 ) -> TurnStart | None:
     try:
         await lock_uuid_identity(db, session_id)
@@ -253,6 +254,23 @@ async def reserve_pending_turn(
             )
         ).scalar_one_or_none()
         if running is not None:
+            if (
+                reservation_turn_id is not None
+                and running.id == reservation_turn_id
+                and running.runner_instance_id == runner_instance_id
+            ):
+                pending_rows = await _pending_rows(db, session_id=session_id, for_update=True)
+                message_ids = tuple(UUID(value) for value in running.input_message_ids)
+                if message_ids and tuple(row.id for row in pending_rows[:len(message_ids)]) == message_ids:
+                    effort = _effort_from_pending(pending_rows[len(message_ids) - 1])
+                    await db.commit()
+                    return TurnStart(
+                        session_id=session_id,
+                        turn_id=running.id,
+                        message_ids=message_ids,
+                        effort=effort,
+                        tool_profile=_stored_tool_profile(running.tool_profile),
+                    )
             await db.commit()
             return None
         pending_rows = await _pending_rows(db, session_id=session_id, for_update=True)
@@ -264,6 +282,45 @@ async def reserve_pending_turn(
             session_id=session_id,
             runner_instance_id=runner_instance_id,
             pending_rows=pending_rows,
+            turn_id=reservation_turn_id,
+        )
+        await db.commit()
+        return turn
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def recover_unstarted_turn(
+    db: AsyncSession,
+    *,
+    session_id: UUID,
+    runner_instance_id: UUID,
+) -> TurnStart | None:
+    """Resume only this process's reservation before its input was promoted."""
+    try:
+        await lock_uuid_identity(db, session_id)
+        running = (
+            await db.execute(
+                select(TurnRun)
+                .where(TurnRun.session_id == session_id, TurnRun.status == "running")
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if running is None or running.runner_instance_id != runner_instance_id:
+            await db.commit()
+            return None
+        pending_rows = await _pending_rows(db, session_id=session_id, for_update=True)
+        message_ids = tuple(UUID(value) for value in running.input_message_ids)
+        if not message_ids or tuple(row.id for row in pending_rows[:len(message_ids)]) != message_ids:
+            await db.commit()
+            return None
+        turn = TurnStart(
+            session_id=session_id,
+            turn_id=running.id,
+            message_ids=message_ids,
+            effort=_effort_from_pending(pending_rows[len(message_ids) - 1]),
+            tool_profile=_stored_tool_profile(running.tool_profile),
         )
         await db.commit()
         return turn
@@ -1010,8 +1067,9 @@ def _create_turn(
     tool_profile: ToolProfile,
     failed_delivery_targets: list[dict[str, Any]] | None = None,
     started_at: datetime | None = None,
+    turn_id: UUID | None = None,
 ) -> TurnStart:
-    turn_id = uuid.uuid4()
+    turn_id = turn_id or uuid.uuid4()
     db.add(
         TurnRun(
             id=turn_id,
@@ -1061,6 +1119,7 @@ async def _reserve_fresh_pending_locked(
     runner_instance_id: UUID,
     pending_rows: list[PendingMessage],
     started_at: datetime | None = None,
+    turn_id: UUID | None = None,
 ) -> TurnStart | None:
     remaining = pending_rows
     next_started_at = started_at
@@ -1077,6 +1136,7 @@ async def _reserve_fresh_pending_locked(
                     captured_rows[0].ingress_tool_profile
                 ),
                 started_at=next_started_at,
+                turn_id=turn_id,
             )
         await _close_revoked_pending(
             db,
