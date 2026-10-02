@@ -376,6 +376,31 @@ class RuntimeAdmission:
     def waiting_count(self) -> int:
         return self._waiting_count
 
+    async def admit_now(
+        self,
+        user_id: UUID,
+        start: Callable[[AdmissionLease], object],
+    ) -> IssuedAdmission:
+        """Issue a conversation call immediately or reject it without queueing."""
+
+        async with self._coordinator._lock:
+            if not self._accepting or self._coordinator._closed:
+                raise ServerMcpUnavailableError
+            if (
+                self.reserved_count >= self.max_concurrent_calls
+                or self._coordinator._active + self._coordinator._draining >= GLOBAL_MAX_RESERVED
+                or not self._coordinator._can_reserve_for_user_locked(user_id)
+            ):
+                raise ServerMcpBusyError
+            lease = self._coordinator._reserve_locked(self, user_id)
+            now = self._coordinator.clock.now()
+            try:
+                invocation = start(lease)
+            except BaseException:
+                self._coordinator._rollback_start_locked(lease)
+                raise
+            return IssuedAdmission(invocation, lease, now, now, now + PUBLIC_DEADLINE_SECONDS)
+
     async def submit(
         self,
         user_id: UUID,

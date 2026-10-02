@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -82,37 +81,15 @@ class ServerMcpRuntimeError(BaseModel):
     message: str
 
 
-class ServerMcpRuntimeStatus(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    state: Literal[
-        "starting",
-        "discovering",
-        "ready",
-        "unavailable",
-        "backoff",
-        "drifted",
-        "draining",
-        "cleanup_blocked",
-    ]
-    origin: Literal["persisted", "candidate"]
-    config_revision: int | None
-    catalog_digest: str | None
-    runtime_generation: UUID | None
-    max_concurrent_calls: int
-    active_calls: int
-    waiting_calls: int
-    draining_calls: int
-    restart_attempt: int
-    last_error: ServerMcpRuntimeError | None
-
-
 class ServerMcpRuntimeSlot(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     configured: bool
-    active: ServerMcpRuntimeStatus | None
-    draining: ServerMcpRuntimeStatus | None
+    active_sessions: int
+    idle_sessions: int
+    closing_sessions: int
+    active_calls: int
+    last_error: ServerMcpRuntimeError | None
 
 
 class ServerMcpAdminResponse(BaseModel):

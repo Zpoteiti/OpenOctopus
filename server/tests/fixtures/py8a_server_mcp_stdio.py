@@ -5,11 +5,19 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("py8a-stdio")
+_counter = 0
 
 
 @mcp.tool(name="echo", description="Echo one text value through stdio.")
 def echo(text: str) -> str:
     return f"stdio:{text}"
+
+
+@mcp.tool(name="counter", description="Increment this stdio process counter.")
+def counter() -> str:
+    global _counter
+    _counter += 1
+    return f"stdio-counter:{_counter}"
 
 
 @mcp.resource(

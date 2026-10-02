@@ -3,7 +3,9 @@ from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from openctopus_server.api.sessions import get_chat_runtime
 from openctopus_server.auth.dependencies import get_current_user
+from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import User
 from openctopus_server.db.session import get_db
 from openctopus_server.devices.dependencies import get_device_registry
@@ -57,11 +59,13 @@ async def delete_me(
     db: AsyncSession = Depends(get_db),
     workspace_fs: WorkspaceFS = Depends(get_workspace_fs),
     device_registry: DeviceRegistry = Depends(get_device_registry),
+    runtime: ChatRuntime = Depends(get_chat_runtime),
 ) -> Response:
     await users.delete_user(
         db,
         user,
         workspace_fs=workspace_fs,
         device_registry=device_registry,
+        runtime=runtime,
     )
     return Response(status_code=204)

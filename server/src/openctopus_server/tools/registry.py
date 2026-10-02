@@ -136,6 +136,7 @@ class ServerMcpDispatcher(Protocol):
         *,
         route: FrozenServerMcpEntryRoute,
         user_id: UUID,
+        session_id: UUID,
         name: str,
         args: dict[str, object],
         on_issued: Callable[[], None] | None = None,
@@ -991,6 +992,7 @@ async def _execute_mcp_on_server(
         return await dispatcher.dispatch_server_mcp(
             route=route,
             user_id=ctx.user_id,
+            session_id=ctx.session_id,
             name=name,
             args=args,
             on_issued=mark_issued,

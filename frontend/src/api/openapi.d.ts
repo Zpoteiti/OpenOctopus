@@ -3198,18 +3198,20 @@ export interface paths {
         /**
          * Read shared Server MCP config, catalog, and runtime state
          * @description Returns the authoritative PostgreSQL config revision, redacted complete
-         *     config, last-good four-surface discovery projection, and a matching
-         *     process-local runtime snapshot. Stdio env and remote header keys remain
-         *     visible but every value is `"<redacted>"`. Runtime unavailability is
-         *     degraded state: schemas remain visible and `/health` continues to
-         *     depend only on PostgreSQL and RustFS.
+         *     config, the installation-time four-surface discovery preview, and
+         *     aggregate conversation-owned runtime counts. Stdio env and remote
+         *     header keys remain visible but every value is `"<redacted>"`. The
+         *     preview is not used as the current tool catalog: each tool-enabled
+         *     Provider iteration connects and discovers the configured services for
+         *     that conversation, then applies the administrator's capability
+         *     allowlist. Conversation clients are retained for up to 10 idle minutes.
+         *     Runtime failures do not affect `/health`, which continues to depend only
+         *     on PostgreSQL and RustFS.
          *
-         *     Each runtime name has separate `active` and `draining` slots so a
-         *     replacement is not overwritten in diagnostics. A deleted name remains
-         *     with `configured=false` only while its old generation is draining.
-         *     Runtime error messages are bounded OpenOctopus-authored text and never
-         *     expose command args, URL query, env/header values, stderr, response
-         *     bodies, or third-party exception data.
+         *     Runtime counts are aggregate and expose no user or conversation
+         *     identifiers. Runtime error messages are bounded OpenOctopus-authored
+         *     text and never expose command args, URL query, env/header values,
+         *     stderr, response bodies, or third-party exception data.
          */
         get: {
             parameters: {
@@ -3234,24 +3236,28 @@ export interface paths {
         };
         /**
          * Validate and atomically replace all shared Server MCP config
-         * @description Whole-list replacement with required `base_config_revision`. Stale CAS
-         *     and a same-name generation still draining return
-         *     `409 server_mcp_config_conflict`. The revision is checked before remote
-         *     work and again in the final transaction.
+         * @description Whole-list replacement with required `base_config_revision`. A stale
+         *     revision returns `409 server_mcp_config_conflict`. The revision is
+         *     checked before remote work and again in the final transaction.
          *
          *     Every added or effectively modified server completes a real FastMCP
          *     initialize plus bounded discovery of tools, static resources, resource
-         *     templates, and prompts before anything is saved. Pure deletion does not
-         *     require the removed endpoint to be reachable. A precise no-op neither
-         *     initializes nor increments the revision. Config, next revision, and the
-         *     complete last-good catalog commit in one JSONB envelope before the new
-         *     runtime is published.
+         *     templates, and prompts using a temporary validation client. That client
+         *     is closed after discovery; no conversation runtime is created by
+         *     validation. Pure deletion does not require the removed endpoint to be
+         *     reachable. Saving an unchanged nonempty configuration revalidates its
+         *     services and refreshes the installation preview. The revision stays
+         *     unchanged when both configuration and catalog are identical. Config,
+         *     next revision, and the installation preview commit together in one
+         *     JSONB envelope.
          *
          *     `"<redacted>"` retains an existing secret only for the same name,
          *     transport, sink, and key; new or changed sinks require real values.
          *     Existing Device MCP never blocks an admin candidate. A committed Server
-         *     name shadows the same Device namespace, while Server enabled schemas
-         *     consume the Provider MCP budget before deterministic Device selection.
+         *     name shadows the same Device namespace. At each Provider iteration,
+         *     conversation-discovered Server schemas are filtered by the saved admin
+         *     allowlist and consume the Provider MCP budget before deterministic
+         *     Device selection.
          */
         put: {
             parameters: {
@@ -4554,7 +4560,7 @@ export interface components {
             transport: "sse";
         };
         /**
-         * @description Py8a admin shared-service config. Input may omit
+         * @description Administrator-installed Server MCP config. Input may omit
          *     `max_concurrent_calls`; successful responses and PostgreSQL storage
          *     always include its effective value (stdio 1, remote 8).
          */
@@ -4654,27 +4660,13 @@ export interface components {
             /** @description Sanitized OpenOctopus-authored diagnostic; never third-party text. */
             message: string;
         };
-        ServerMcpRuntimeStatus: {
-            /** @enum {string} */
-            state: "starting" | "discovering" | "ready" | "unavailable" | "backoff" | "drifted" | "draining" | "cleanup_blocked";
-            /** @enum {string} */
-            origin: "persisted" | "candidate";
-            /** Format: int64 */
-            config_revision: number | null;
-            catalog_digest: string | null;
-            /** Format: uuid */
-            runtime_generation: string | null;
-            max_concurrent_calls: number;
-            active_calls: number;
-            waiting_calls: number;
-            draining_calls: number;
-            restart_attempt: number;
-            last_error: components["schemas"]["ServerMcpRuntimeError"] | null;
-        };
         ServerMcpRuntimeSlot: {
             configured: boolean;
-            active: components["schemas"]["ServerMcpRuntimeStatus"] | null;
-            draining: components["schemas"]["ServerMcpRuntimeStatus"] | null;
+            active_sessions: number;
+            idle_sessions: number;
+            closing_sessions: number;
+            active_calls: number;
+            last_error: components["schemas"]["ServerMcpRuntimeError"] | null;
         };
         ServerMcpResponse: {
             /** Format: int64 */

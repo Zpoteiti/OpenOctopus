@@ -37,7 +37,7 @@ jobs:
           set -o pipefail
           python scripts/server_mcp_capacity_harness.py \
             --users 500 \
-            --runtime-concurrency 8 \
+            --max-clients 8 \
             | tee server-mcp-capacity-500.json
 
       - name: Upload capacity evidence

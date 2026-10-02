@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     chat_context_max_concurrency_per_user: Annotated[int, Field(ge=1, le=255)]
     chat_context_queue_timeout_seconds: Annotated[float, Field(ge=0.1, le=300)]
 
+    # Conversation-scoped Server MCP clients; opening and cleanup count toward these caps.
+    server_mcp_max_clients: Annotated[int, Field(ge=1, le=4096)] = 256
+    server_mcp_max_stdio_clients: Annotated[int, Field(ge=1, le=1024)] = 32
+    server_mcp_max_starting: Annotated[int, Field(ge=1, le=256)] = 8
+
     # Device pending-call admission — all required
     device_pending_calls_max: Annotated[int, Field(ge=64, le=65536)]
     device_pending_calls_max_per_user: Annotated[int, Field(ge=1, le=1024)]
@@ -104,6 +109,10 @@ class Settings(BaseSettings):
             raise ValueError("per-user web concurrency must be below the global limit")
         if self.chat_context_max_concurrency_per_user >= self.chat_context_max_concurrency:
             raise ValueError("per-user context concurrency must be below the global limit")
+        if self.server_mcp_max_stdio_clients > self.server_mcp_max_clients:
+            raise ValueError("Server MCP stdio limit must not exceed the client limit")
+        if self.server_mcp_max_starting > self.server_mcp_max_clients:
+            raise ValueError("Server MCP starting limit must not exceed the client limit")
         if self.device_pending_calls_max_per_user >= self.device_pending_calls_max:
             raise ValueError("per-user device pending calls must be below the global limit")
         if self.device_pending_bytes_max_per_user >= self.device_pending_bytes_max:

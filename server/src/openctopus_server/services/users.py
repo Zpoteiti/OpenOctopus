@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import uuid
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -32,6 +33,9 @@ from openctopus_server.services.workspace_deletions import (
     try_finalize_workspace_deletions,
 )
 from openctopus_server.workspace.fs import WorkspaceTarget
+
+if TYPE_CHECKING:
+    from openctopus_server.chat.runner import ChatRuntime
 
 
 async def create_user(
@@ -131,6 +135,7 @@ async def delete_user(
     *,
     workspace_fs: WorkspaceLifecycle,
     device_registry: DeviceRegistry,
+    runtime: "ChatRuntime | None" = None,
 ) -> None:
     if user.is_admin:
         await db.execute(
@@ -209,7 +214,11 @@ async def delete_user(
         try:
             await db.close()
         finally:
-            await device_registry.remove_devices(device_ids)
+            try:
+                await device_registry.remove_devices(device_ids)
+            finally:
+                if runtime is not None:
+                    await runtime.forget_mcp_user(user_id=user.id)
 
     invalidation = asyncio.create_task(commit_release_and_invalidate_devices())
     await await_future_cancellation_safe(invalidation)

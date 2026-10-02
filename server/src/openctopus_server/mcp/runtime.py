@@ -468,6 +468,45 @@ class RuntimeGeneration:
         self.config_revision = config_revision
         self.catalog_digest = catalog_digest
 
+    def bind_private_catalog(
+        self,
+        persisted: PersistedMcpServerCatalog,
+        *,
+        config_revision: int,
+        catalog_digest: str,
+    ) -> None:
+        source = self._source_catalog
+        if source is None or self.state not in {RuntimeState.DISCOVERING, RuntimeState.READY}:
+            raise RuntimeError("Server MCP generation has not completed discovery")
+        self._routes = bind_server_entries(source, persisted)
+        self.config_revision = config_revision
+        self.catalog_digest = catalog_digest
+        self.state = RuntimeState.READY
+        self.last_error = None
+
+    async def rediscover(self) -> SourceMcpServerCatalog:
+        client = self._client
+        if client is None or self.state is not RuntimeState.READY:
+            raise RuntimeError("Server MCP generation is not ready for rediscovery")
+        self.state = RuntimeState.DISCOVERING
+        self._routes.clear()
+        try:
+            async with asyncio.timeout(self._discovery_timeout):
+                source = await self._await_transport_operation(
+                    self._discoverer(self.config.name, client.session)
+                )
+        except asyncio.CancelledError:
+            self.state = RuntimeState.UNAVAILABLE
+            raise
+        except Exception as exc:
+            effective_error = self._effective_terminal_error(exc) or exc
+            failure = _safe_failure(self.config.name, "discovery", effective_error)
+            self.last_error = failure
+            self.state = RuntimeState.UNAVAILABLE
+            raise RuntimeOpenError(failure) from None
+        self._source_catalog = source
+        return source
+
     def mark_backoff(self, *, restart_attempt: int, failure: RuntimeFailure) -> None:
         self.restart_attempt = restart_attempt
         self.last_error = failure

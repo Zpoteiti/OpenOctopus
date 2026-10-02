@@ -249,7 +249,7 @@ describe('admin pages', () => {
       mcp_servers: [{ name: 'calculator', transport: 'stdio', command: 'python', args: ['-m', 'calculator_mcp'], cwd: null, env: {}, enabled_capabilities: [], max_concurrent_calls: 1 }],
       mcp_catalog_digest: 'c'.repeat(64),
       mcp_discovered: {},
-      runtimes: { calculator: { configured: true, active: { state: 'ready', origin: 'persisted', config_revision: 4, catalog_digest: 'c'.repeat(64), runtime_generation: null, max_concurrent_calls: 1, active_calls: 0, waiting_calls: 0, draining_calls: 0, restart_attempt: 0, last_error: null }, draining: null } },
+      runtimes: { calculator: { configured: true, active_sessions: 1, idle_sessions: 0, closing_sessions: 0, active_calls: 0, last_error: null } },
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === 'PUT') {
@@ -262,17 +262,15 @@ describe('admin pages', () => {
     renderPage(<AdminMcpPage />)
     const user = userEvent.setup()
     expect(await screen.findByText('calculator')).toBeInTheDocument()
-    expect(screen.getByText('Ready')).toBeInTheDocument()
+    expect(screen.getByText('1 active · 0 idle · 0 closing · 0 active calls')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Delete calculator' }))
     await user.click(screen.getByRole('button', { name: 'Save shared MCP' }))
 
     await waitFor(() => expect(puts).toEqual([{ base_config_revision: 4, mcp_servers: [] }]))
   })
 
-  it('renders active and draining runtime slots, preserves redacted secrets, and freezes the draft revision', async () => {
+  it('renders aggregate conversation runtime counts without per-conversation details, preserves redacted secrets, and freezes the draft revision', async () => {
     const puts: Array<Record<string, unknown>> = []
-    const active = { state: 'ready', origin: 'persisted', config_revision: 4, catalog_digest: 'c'.repeat(64), runtime_generation: null, max_concurrent_calls: 8, active_calls: 1, waiting_calls: 2, draining_calls: 0, restart_attempt: 0, last_error: null }
-    const draining = { ...active, state: 'draining', active_calls: 0, waiting_calls: 0, draining_calls: 1 }
     const response = {
       config_revision: 4,
       mcp_servers: [
@@ -282,8 +280,8 @@ describe('admin pages', () => {
       mcp_catalog_digest: 'c'.repeat(64),
       mcp_discovered: { company_search: { tools: [{ raw_name: 'search', final_name: 'mcp_company_search_search', enabled: true }], resources: [], resource_templates: [], prompts: [] } },
       runtimes: {
-        company_search: { configured: true, active, draining },
-        old_search: { configured: false, active: null, draining },
+        company_search: { configured: true, active_sessions: 2, idle_sessions: 3, closing_sessions: 1, active_calls: 4, last_error: null },
+        old_search: { configured: false, active_sessions: 0, idle_sessions: 0, closing_sessions: 1, active_calls: 0, last_error: { code: 'mcp_cleanup', message: 'A connection is still closing.' } },
       },
     }
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -298,7 +296,10 @@ describe('admin pages', () => {
     const user = userEvent.setup()
     expect(await screen.findByText('mcp_company_search_search')).toBeInTheDocument()
     expect(screen.getByText('old_search')).toBeInTheDocument()
-    expect(screen.getAllByText('Draining')).toHaveLength(2)
+    expect(screen.getByText('2 active · 3 idle · 1 closing · 4 active calls')).toBeInTheDocument()
+    expect(screen.getByText('0 active · 0 idle · 1 closing · 0 active calls')).toBeInTheDocument()
+    expect(screen.getByText('A connection is still closing.')).toBeInTheDocument()
+    expect(screen.queryByText(/user-\d|conversation id/i)).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Edit company_search' }))
     expect(screen.getByLabelText(/Request headers/)).toHaveValue('Authorization=<redacted>')
     await user.click(screen.getByRole('button', { name: 'Delete unused_search' }))

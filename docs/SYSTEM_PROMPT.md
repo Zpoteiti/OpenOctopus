@@ -380,11 +380,13 @@ the public DTO layer does not own a second grammar.
 - Online/offline state and last-seen timestamps are volatile, server-authoritative
   execution state. Tool dispatch checks them out of band and reports failure;
   they do not churn the system-prompt prefix.
-- Dynamic MCP schema comes from persisted last-good Server and Device catalogs.
-  Runtime availability and Device Protocol v3 registration are out-of-band
-  state, so MCP crash/recovery or Device connect/disconnect does not remove or
-  add names in the prompt prefix. Server MCP entries use install site `server`;
-  authoritative Server names may hide equal-named Device entries.
+- Dynamic MCP schema comes from the current conversation's Server MCP discovery
+  and the paired Device catalog. Server discovery refreshes before each
+  tool-enabled model step and follows the administrator's capability allowlist;
+  the saved Server catalog is an installation preview. Runtime availability
+  and Device Protocol v3 registration are out-of-band state. Server MCP entries
+  use install site `server`; authoritative Server names may hide equal-named
+  Device entries.
 - **No explicit tool listing** — the agent's tool schemas already enumerate which tools exist and their `device` enum tells the agent which devices each tool can target.
 
 ### Operating Notes
