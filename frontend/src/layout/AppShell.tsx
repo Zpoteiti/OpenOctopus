@@ -12,6 +12,7 @@ import { deleteSession, loadSessions, renameSession } from '../chat/chatApi'
 const NAV_ITEMS = [
   { to: '/chat', icon: 'C', labelKey: 'nav.chat' },
   { to: '/workspace', icon: 'W', labelKey: 'nav.workspace' },
+  { to: '/memory', icon: 'M', labelKey: 'nav.memory' },
   { to: '/devices', icon: 'D', labelKey: 'nav.devices' },
   { to: '/automations', icon: 'A', labelKey: 'nav.automations' },
   { to: '/channels', icon: 'H', labelKey: 'nav.channels' },

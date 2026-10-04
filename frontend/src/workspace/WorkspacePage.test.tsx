@@ -171,7 +171,7 @@ describe('WorkspacePage', () => {
     expect(screen.getByRole('button', { name: /laptop-cn.*Online/ })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /offline-laptop/ })).not.toBeInTheDocument()
     expect(await screen.findByText('Agent identity')).toBeInTheDocument()
-    expect(screen.getByText('Long-term memory')).toBeInTheDocument()
+    expect(screen.queryByText('Long-term memory')).not.toBeInTheDocument()
     expect(screen.getByText('Skills')).toBeInTheDocument()
     expect(screen.getByText('Attachments')).toBeInTheDocument()
     const header = container.querySelector('.oo-workspace-file-header')
@@ -187,7 +187,7 @@ describe('WorkspacePage', () => {
     expect(skills.querySelector('.oo-workspace-file-icon')).toHaveClass('directory')
     expect(screen.getByRole('button', { name: /\.attachments.*Folder/i }).closest('li')).toHaveAttribute('data-special', 'attachments')
     expect(screen.getByRole('button', { name: /SOUL\.md.*File/i }).closest('li')).toHaveAttribute('data-special', 'soul')
-    expect(screen.getByRole('button', { name: /MEMORY\.md.*File/i }).closest('li')).toHaveAttribute('data-special', 'memory')
+    expect(screen.getByRole('button', { name: /MEMORY\.md.*File/i }).closest('li')).not.toHaveAttribute('data-special')
     expect(screen.getByRole('button', { name: /projects.*Folder/i }).closest('li')).not.toHaveAttribute('data-special')
     expect(screen.queryByText(/MIME|modified/i)).not.toBeInTheDocument()
   })
@@ -266,19 +266,19 @@ describe('WorkspacePage', () => {
     expect(await screen.findByText('File saved.')).toBeInTheDocument()
   })
 
-  it('opens a personal agent file from an account-page deep link', async () => {
+  it('opens a personal identity file from an account-page deep link', async () => {
     vi.stubGlobal('fetch', baseFetch((url, init) => {
-      if (url === '/api/workspace/files/MEMORY.md?openoctopus_device=server' && !init?.method) {
-        return new Response('Remember concise answers.', { headers: { ETag: '"memory-etag"' } })
+      if (url === '/api/workspace/files/SOUL.md?openoctopus_device=server' && !init?.method) {
+        return new Response('Use concise answers.', { headers: { ETag: '"memory-etag"' } })
       }
       return undefined
     }))
 
-    renderPage('/workspace?path=MEMORY.md')
+    renderPage('/workspace?path=SOUL.md')
 
     expect(await screen.findByRole('textbox', { name: 'File content' }))
-      .toHaveValue('Remember concise answers.')
-    expect(screen.getByRole('heading', { name: 'MEMORY.md' })).toBeInTheDocument()
+      .toHaveValue('Use concise answers.')
+    expect(screen.getByRole('heading', { name: 'SOUL.md' })).toBeInTheDocument()
   })
 
   it('creates a missing personal agent file from its account-page deep link', async () => {

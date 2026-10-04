@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -17,16 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openctopus_server.automations.heartbeat import (
     HEARTBEAT_MAX_BYTES,
     HEARTBEAT_MAX_CODEPOINTS,
-    HEARTBEAT_QUEUE_CAPACITY,
-    HEARTBEAT_USER_PAGE_SIZE,
-    HEARTBEAT_WORKERS,
     HeartbeatEvaluation,
     HeartbeatPhaseTwoRequest,
     HeartbeatPulse,
     build_heartbeat_phase_two_text,
     extract_active_tasks,
     load_heartbeat_document,
-    next_heartbeat_boundary,
     parse_heartbeat_tasks,
 )
 from openctopus_server.chat.runner import ChatRuntime
@@ -233,38 +229,8 @@ def test_parse_heartbeat_tasks_rejects_unbounded_task_sets(section: str) -> None
         parse_heartbeat_tasks("## Active Tasks\n" + section)
 
 
-@pytest.mark.parametrize(
-    ("now", "expected"),
-    [
-        (
-            datetime(2026, 9, 1, 10, 12, tzinfo=UTC),
-            datetime(2026, 9, 1, 10, 30, tzinfo=UTC),
-        ),
-        (
-            datetime(2026, 9, 1, 10, 30, tzinfo=UTC),
-            datetime(2026, 9, 1, 11, 0, tzinfo=UTC),
-        ),
-        (
-            datetime(2026, 9, 1, 10, 30, 0, 1, tzinfo=UTC),
-            datetime(2026, 9, 1, 11, 0, tzinfo=UTC),
-        ),
-        (
-            datetime(2026, 9, 1, 10, 59, 59, tzinfo=UTC),
-            datetime(2026, 9, 1, 11, 0, tzinfo=UTC),
-        ),
-    ],
-)
-def test_next_heartbeat_boundary_is_strictly_future(
-    now: datetime,
-    expected: datetime,
-) -> None:
-    assert next_heartbeat_boundary(now) == expected
 
 
-def test_heartbeat_scan_bounds_are_fixed() -> None:
-    assert HEARTBEAT_USER_PAGE_SIZE == 100
-    assert HEARTBEAT_WORKERS == 32
-    assert HEARTBEAT_QUEUE_CAPACITY == 64
 
 
 def test_heartbeat_phase_two_message_contains_only_selected_tasks_and_times() -> None:
@@ -285,187 +251,14 @@ def test_heartbeat_phase_two_message_contains_only_selected_tasks_and_times() ->
     assert "HEARTBEAT.md" not in text
 
 
-async def test_heartbeat_pulse_start_waits_for_strictly_future_boundary() -> None:
-    now = datetime(2026, 9, 1, 10, 12, tzinfo=UTC)
-    waiting = asyncio.Event()
-    targets: list[datetime] = []
-
-    async def wait_until(target: datetime, stop: asyncio.Event) -> bool:
-        targets.append(target)
-        waiting.set()
-        await stop.wait()
-        return True
-
-    pulse = HeartbeatPulse(
-        engine=SimpleNamespace(),  # type: ignore[arg-type]
-        runtime=SimpleNamespace(),  # type: ignore[arg-type]
-        workspace_service=SimpleNamespace(),  # type: ignore[arg-type]
-        publish_phase_two=SimpleNamespace(),  # type: ignore[arg-type]
-        now_utc=lambda: now,
-        wait_until=wait_until,
-    )
-
-    pulse.start()
-    await waiting.wait()
-    assert targets == [datetime(2026, 9, 1, 10, 30, tzinfo=UTC)]
-    await pulse.close()
 
 
-async def test_heartbeat_pulse_does_not_catch_up_a_missed_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    current = [datetime(2026, 9, 1, 10, 12, tzinfo=UTC)]
-    next_wait = asyncio.Event()
-    targets: list[datetime] = []
-    scans = 0
-
-    async def wait_until(target: datetime, stop: asyncio.Event) -> bool:
-        targets.append(target)
-        if len(targets) == 1:
-            current[0] = datetime(2026, 9, 1, 10, 31, tzinfo=UTC)
-            return False
-        next_wait.set()
-        await stop.wait()
-        return True
-
-    async def scan(self: HeartbeatPulse) -> None:
-        nonlocal scans
-        del self
-        scans += 1
-
-    monkeypatch.setattr(HeartbeatPulse, "run_scan", scan)
-    pulse = HeartbeatPulse(
-        engine=SimpleNamespace(),  # type: ignore[arg-type]
-        runtime=SimpleNamespace(),  # type: ignore[arg-type]
-        workspace_service=SimpleNamespace(),  # type: ignore[arg-type]
-        publish_phase_two=SimpleNamespace(),  # type: ignore[arg-type]
-        now_utc=lambda: current[0],
-        wait_until=wait_until,
-    )
-
-    pulse.start()
-    await next_wait.wait()
-    assert targets == [
-        datetime(2026, 9, 1, 10, 30, tzinfo=UTC),
-        datetime(2026, 9, 1, 11, 0, tzinfo=UTC),
-    ]
-    assert scans == 0
-    await pulse.close()
 
 
-async def test_heartbeat_pulse_does_not_reenter_scan(monkeypatch: pytest.MonkeyPatch) -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def blocked_scan(self: HeartbeatPulse) -> None:
-        del self
-        started.set()
-        await release.wait()
-
-    monkeypatch.setattr(HeartbeatPulse, "run_scan", blocked_scan)
-    pulse = HeartbeatPulse(
-        engine=SimpleNamespace(),  # type: ignore[arg-type]
-        runtime=SimpleNamespace(),  # type: ignore[arg-type]
-        workspace_service=SimpleNamespace(),  # type: ignore[arg-type]
-        publish_phase_two=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-    assert pulse.trigger_scan(datetime(2026, 9, 1, 10, 30, tzinfo=UTC))
-    await started.wait()
-    assert not pulse.trigger_scan(datetime(2026, 9, 1, 11, 0, tzinfo=UTC))
-
-    release.set()
-    await pulse.wait_for_scan()
-    assert pulse.trigger_scan(datetime(2026, 9, 1, 11, 30, tzinfo=UTC))
-    release.set()
-    await pulse.wait_for_scan()
 
 
-async def test_heartbeat_pulse_contains_scan_failure_and_allows_next_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    first_finished = asyncio.Event()
-    second_finished = asyncio.Event()
-    calls = 0
-
-    async def scan(self: HeartbeatPulse) -> None:
-        nonlocal calls
-        del self
-        calls += 1
-        if calls == 1:
-            first_finished.set()
-            raise RuntimeError("must not reach the event loop")
-        second_finished.set()
-
-    monkeypatch.setattr(HeartbeatPulse, "run_scan", scan)
-    pulse = HeartbeatPulse(
-        engine=SimpleNamespace(),  # type: ignore[arg-type]
-        runtime=SimpleNamespace(),  # type: ignore[arg-type]
-        workspace_service=SimpleNamespace(),  # type: ignore[arg-type]
-        publish_phase_two=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-    assert pulse.trigger_scan(datetime(2026, 9, 1, 10, 30, tzinfo=UTC))
-    await first_finished.wait()
-    await pulse.wait_for_scan()
-    assert "heartbeat scan failed" in caplog.text
-    assert "must not reach the event loop" not in caplog.text
-
-    assert pulse.trigger_scan(datetime(2026, 9, 1, 11, 0, tzinfo=UTC))
-    await second_finished.wait()
-    await pulse.wait_for_scan()
-    assert calls == 2
 
 
-async def test_heartbeat_scan_pages_users_bounds_workers_and_isolates_failures(
-    pg_engine: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    users = [
-        User(
-            id=uuid4(),
-            email=f"heartbeat-{index}@test.example",
-            password_hash="hash",
-            name=f"User {index}",
-            timezone="UTC",
-        )
-        for index in range(205)
-    ]
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        db.add_all(users)
-        await db.commit()
-
-    active = 0
-    peak = 0
-    seen: set[Any] = set()
-    failed_id = users[73].id
-
-    async def process_user(self: HeartbeatPulse, user: Any) -> None:
-        nonlocal active, peak
-        del self
-        active += 1
-        peak = max(peak, active)
-        try:
-            await asyncio.sleep(0)
-            seen.add(user.id)
-            if user.id == failed_id:
-                raise RuntimeError("isolated")
-        finally:
-            active -= 1
-
-    monkeypatch.setattr(HeartbeatPulse, "_process_user", process_user)
-    pulse = HeartbeatPulse(
-        engine=pg_engine,
-        runtime=SimpleNamespace(),  # type: ignore[arg-type]
-        workspace_service=SimpleNamespace(),  # type: ignore[arg-type]
-        publish_phase_two=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-    await pulse.run_scan()
-
-    assert seen == {user.id for user in users}
-    assert peak <= HEARTBEAT_WORKERS
 
 
 async def test_heartbeat_phase_one_logs_bounded_diagnostics(
@@ -500,7 +293,8 @@ async def test_heartbeat_phase_one_logs_bounded_diagnostics(
         publish_phase_two=AsyncMock(),
     )
 
-    await pulse.run_scan()
+    from openctopus_server.automations.heartbeat import _HeartbeatUser
+    await pulse._process_user(_HeartbeatUser(user.id, user.created_at, user.timezone))
 
     record = next(
         record for record in caplog.records
@@ -613,10 +407,9 @@ async def test_heartbeat_phase_two_rechecks_busy_and_missing_owner(pg_engine: An
         runtime,  # type: ignore[arg-type]
         request,
     )
+    assert await publish_heartbeat_phase_two(pg_engine, runtime, request)
     assert not await publish_heartbeat_phase_two(
-        pg_engine,
-        runtime,  # type: ignore[arg-type]
-        request,
+        pg_engine, runtime, replace(request, now_utc=request.now_utc + timedelta(minutes=30)),
     )
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         await db.execute(delete(User).where(User.id == user.id))

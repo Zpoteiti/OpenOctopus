@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,7 @@ class ProviderConfig:
     max_concurrent_requests: int
     max_context_tokens: int | None
     compaction_threshold_tokens: int | None = None
+    protocol: Literal["anthropic", "openai", "openrouter"] = "anthropic"
 
 
 async def load_provider_config(db: AsyncSession) -> ProviderConfig:
@@ -29,6 +30,7 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
                     "llm_endpoint",
                     "llm_api_key",
                     "llm_model",
+                    "llm_protocol",
                     "llm_max_output_tokens",
                     "llm_max_concurrent_requests",
                     "llm_max_context_tokens",
@@ -41,6 +43,9 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
     endpoint = rows.get("llm_endpoint")
     api_key = rows.get("llm_api_key")
     model = rows.get("llm_model")
+    protocol = rows.get("llm_protocol", "anthropic")
+    if protocol not in {"anthropic", "openai", "openrouter"}:
+        raise ChatError(ErrorCode.PROVIDER_NOT_CONFIGURED, "llm_protocol is invalid")
     if not (
         isinstance(endpoint, str)
         and endpoint
@@ -99,4 +104,5 @@ async def load_provider_config(db: AsyncSession) -> ProviderConfig:
         max_concurrent_requests=max_concurrent_requests,
         max_context_tokens=max_context_tokens,
         compaction_threshold_tokens=compaction_threshold_tokens,
+        protocol=protocol,
     )

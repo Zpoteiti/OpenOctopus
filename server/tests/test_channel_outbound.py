@@ -9,11 +9,10 @@ from openctopus_server.channels.outbound import ChannelOutbound
 from openctopus_server.channels.router import ChannelDeliveryResult
 from openctopus_server.chat.runner import (
     ChatRuntime,
-    _CompletedProviderTurn,
     _SessionState,
 )
 from openctopus_server.chat.types import TurnStart
-from openctopus_server.db.models import Message, Session, TurnRun, User
+from openctopus_server.db.models import Message, Session, SystemConfig, TurnRun, User
 
 
 class _Router:
@@ -152,7 +151,6 @@ async def test_runtime_delivers_persisted_external_final_before_finishing_turn(
 ) -> None:
     del user_client
     turn = _turn()
-    assistant = _assistant(turn)
     generation = uuid4()
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         user = (await db.scalars(select(User).where(User.email == "user@test.com"))).one()
@@ -172,13 +170,20 @@ async def test_runtime_delivers_persisted_external_final_before_finishing_turn(
             runner_instance_id=uuid4(),
             status="running",
             tool_profile="owner_full",
-            input_message_ids=[],
+            input_message_ids=[str(turn.message_ids[0])],
             failed_delivery_targets=[],
             started_at=datetime.now(UTC),
         )
         db.add(run)
         await db.flush()
-        db.add(assistant)
+        from test_channel_ingress import _discord_config
+        await _discord_config(db, user, binding_generation=generation)
+        db.add_all([SystemConfig(key=key, value=value) for key, value in {
+            "llm_endpoint": "http://fixture.test", "llm_model": "fixture", "llm_api_key": "fixture",
+        }.items()])
+        db.add(Message(id=turn.message_ids[0], session_id=session.id, message_kind="human",
+                       content=[{"type": "text", "text": "reply"}], sender_id="owner-1", sender_classification="owner",
+                       ingress_tool_profile="owner_full", channel_binding_generation=generation))
         await db.commit()
 
     observed: list[tuple[str, str]] = []
@@ -186,31 +191,21 @@ async def test_runtime_delivers_persisted_external_final_before_finishing_turn(
     class _FinalDelivery:
         async def deliver_final(self, **kwargs: object) -> None:
             async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-                persisted = await db.get(Message, assistant.id)
+                persisted = await db.get(Message, kwargs["assistant"].id)
                 run = await db.get(TurnRun, turn.turn_id)
             assert persisted is not None
             assert run is not None
             observed.append((run.status, str(kwargs["channel"])))
 
-    runtime = ChatRuntime(pg_engine, channel_final_delivery=_FinalDelivery())
-    completed = _CompletedProviderTurn(
-        turn=turn,
-        assistant=assistant,
-        user_id=user.id,
-        device_targets={},
-        mcp_snapshot=None,  # type: ignore[arg-type]
-        current_channel="discord",
-        current_chat_id="external-chat",
-        current_binding_generation=generation,
-    )
-
-    async def completed_iteration(
-        _state: _SessionState,
-        _turn: TurnStart,
-    ) -> _CompletedProviderTurn:
-        return completed
-
-    runtime._invoke_provider_iteration = completed_iteration  # type: ignore[method-assign]
+    from pydantic_ai.models.function import FunctionModel
+    async def stream(messages, info):
+        yield "persisted answer"
+    class Provider:
+        def native_model(self, config):
+            return FunctionModel(stream_function=stream)
+        async def close(self):
+            pass
+    runtime = ChatRuntime(pg_engine, provider_factory=lambda _: Provider(), channel_final_delivery=_FinalDelivery())
     try:
         await runtime._execute_chain(_SessionState(turn.session_id), turn)
     finally:

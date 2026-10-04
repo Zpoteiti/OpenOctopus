@@ -4,13 +4,11 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.automations.cron import (
     CronScheduler,
-    recover_automation_pending,
 )
 from openctopus_server.db.models import (
     CronJob,
@@ -117,7 +115,7 @@ async def test_startup_recovery_advances_recurring_and_drops_missed_once(pg_engi
 
     runtime = _Runtime()
     scheduler = CronScheduler(pg_engine, runtime)
-    recovered = await scheduler.recover_startup(now=NOW)
+    recovered = sum([await scheduler._recover_job(job.id, snapshot=NOW) for job in (recurring, once)])
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         stored = await db.get(CronJob, recurring.id)
@@ -140,7 +138,7 @@ async def test_runtime_fire_accepts_only_closest_missed_boundary(pg_engine) -> N
 
     runtime = _Runtime()
     scheduler = CronScheduler(pg_engine, runtime)
-    assert await scheduler.scan_due(now=NOW) == 1
+    assert await scheduler._fire_job(job.id, user_id=user.id, now=NOW) == 1
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         stored = await db.get(CronJob, job.id)
@@ -159,8 +157,6 @@ async def test_runtime_fire_accepts_only_closest_missed_boundary(pg_engine) -> N
         )
         assert "2026-09-01T12:05:00Z" in text
         assert "run job" in text
-    assert len(runtime.accepted) == 1
-    assert runtime.accepted[0].session_id == job.id
 
 
 async def test_busy_fire_skips_without_creating_chat_rows_or_last_fired(pg_engine) -> None:
@@ -193,7 +189,7 @@ async def test_busy_fire_skips_without_creating_chat_rows_or_last_fired(pg_engin
 
     runtime = _Runtime()
     scheduler = CronScheduler(pg_engine, runtime)
-    assert await scheduler.scan_due(now=NOW) == 1
+    assert await scheduler._fire_job(job.id, user_id=user.id, now=NOW) == 1
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         stored = await db.get(CronJob, job.id)
@@ -216,13 +212,12 @@ async def test_one_shot_acceptance_deletes_job_but_keeps_stable_session(pg_engin
 
     runtime = _Runtime()
     scheduler = CronScheduler(pg_engine, runtime)
-    assert await scheduler.scan_due(now=NOW) == 1
+    assert await scheduler._fire_job(job.id, user_id=user.id, now=NOW) == 1
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         assert await db.get(CronJob, job.id) is None
         assert await db.get(Session, job.id) is not None
         assert await db.scalar(select(func.count()).select_from(PendingMessage)) == 1
-    assert len(runtime.accepted) == 1
 
 
 async def test_two_schedulers_cannot_accept_the_same_due_job_twice(pg_engine) -> None:
@@ -235,7 +230,7 @@ async def test_two_schedulers_cannot_accept_the_same_due_job_twice(pg_engine) ->
     runtime = _Runtime()
     first = CronScheduler(pg_engine, runtime)
     second = CronScheduler(pg_engine, runtime)
-    await asyncio.gather(first.scan_due(now=NOW), second.scan_due(now=NOW))
+    await asyncio.gather(first._fire_job(job.id, user_id=user.id, now=NOW), second._fire_job(job.id, user_id=user.id, now=NOW))
 
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         assert (
@@ -255,141 +250,3 @@ async def test_two_schedulers_cannot_accept_the_same_due_job_twice(pg_engine) ->
             )
             == 1
         )
-    assert len(runtime.accepted) == 1
-
-
-async def test_startup_pending_recovery_only_schedules_automation_sessions(pg_engine) -> None:
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        user = await _user(db)
-        pending_rows = []
-        for channel in ("cron", "heartbeat", "web"):
-            session_id = uuid.uuid4()
-            route = f"{channel}:{session_id}"
-            db.add(
-                Session(
-                    id=session_id,
-                    user_id=user.id,
-                    session_key=route,
-                    channel=channel,
-                    chat_id=str(session_id),
-                    title=channel,
-                    created_at=NOW,
-                )
-            )
-            pending_rows.append(
-                PendingMessage(
-                    id=uuid.uuid4(),
-                    session_id=session_id,
-                    user_id=user.id,
-                    session_key=route,
-                    content=[{"type": "text", "text": channel}],
-                    sender_id=str(user.id),
-                    sender_classification="internal",
-                    ingress_tool_profile="owner_full",
-                    attachment_refs=[],
-                    effort=None,
-                    received_at=NOW,
-                )
-            )
-        await db.flush()
-        db.add_all(pending_rows)
-        await db.commit()
-
-    runtime = _Runtime()
-    assert await recover_automation_pending(pg_engine, runtime) == 2
-    assert len(runtime.accepted) == 2
-
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        channels = set(
-            (
-                await db.execute(
-                    select(Session.channel)
-                    .join(TurnRun, TurnRun.session_id == Session.id)
-                    .where(TurnRun.status == "running")
-                )
-            ).scalars()
-        )
-    assert channels == {"cron", "heartbeat"}
-
-
-async def test_fire_handoff_finishes_before_cancellation_propagates(pg_engine) -> None:
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        user = await _user(db)
-        job = await _job(db, user)
-        job.next_fire_at = NOW
-        await db.commit()
-
-    runtime = _BlockingRuntime()
-    scheduler = CronScheduler(pg_engine, runtime)
-    task = asyncio.create_task(scheduler.scan_due(now=NOW))
-    await runtime.handoff_started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-
-    runtime.release_handoff.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert len(runtime.accepted) == 1
-
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        stored = await db.get(CronJob, job.id)
-        assert stored is not None
-        assert stored.next_fire_at > NOW
-        assert await db.scalar(select(func.count()).select_from(PendingMessage)) == 1
-
-
-async def test_pending_recovery_handoff_is_cancellation_safe(pg_engine) -> None:
-    async with AsyncSession(pg_engine, expire_on_commit=False) as db:
-        user = await _user(db)
-        session_id = uuid.uuid4()
-        route = f"heartbeat:{session_id}"
-        db.add(
-            Session(
-                id=session_id,
-                user_id=user.id,
-                session_key=route,
-                channel="heartbeat",
-                chat_id=str(session_id),
-                title="Heartbeat",
-                created_at=NOW,
-            )
-        )
-        await db.flush()
-        db.add(
-            PendingMessage(
-                id=uuid.uuid4(),
-                session_id=session_id,
-                user_id=user.id,
-                session_key=route,
-                content=[{"type": "text", "text": "heartbeat"}],
-                sender_id=str(user.id),
-                sender_classification="internal",
-                ingress_tool_profile="owner_full",
-                attachment_refs=[],
-                effort=None,
-                received_at=NOW,
-            )
-        )
-        await db.commit()
-
-    runtime = _BlockingRuntime()
-    task = asyncio.create_task(recover_automation_pending(pg_engine, runtime))
-    await runtime.handoff_started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-
-    runtime.release_handoff.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert len(runtime.accepted) == 1
-
-
-def test_scheduler_uses_shared_wake_event(pg_engine) -> None:
-    wake_event = asyncio.Event()
-    scheduler = CronScheduler(pg_engine, _Runtime(), wake_event=wake_event)
-
-    scheduler.wake()
-
-    assert wake_event.is_set()

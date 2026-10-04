@@ -64,7 +64,6 @@
 .chat-message p { margin: 7px 0; }
 .chat-message pre, .chat-tool-block pre { background: var(--field); border: 1px solid var(--line); border-radius: 8px; max-width: 100%; overflow: auto; padding: 10px; white-space: pre-wrap; }
 .chat-message-pending, .chat-message-live { opacity: .82; }
-.chat-message-compacted { opacity: .62; }
 .chat-turn { display: contents; }
 .chat-work-log {
   background: var(--panel-soft);

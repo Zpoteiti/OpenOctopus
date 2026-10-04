@@ -1,10 +1,4 @@
-from unittest.mock import Mock
-
-
 async def test_cron_rest_crud_and_pagination(user_client, test_app) -> None:
-    scheduler = Mock()
-    test_app.state.cron_scheduler = scheduler
-
     created = await user_client.post(
         "/api/cron",
         json={
@@ -45,7 +39,6 @@ async def test_cron_rest_crud_and_pagination(user_client, test_app) -> None:
     missing = await user_client.get(f"/api/cron/{payload['id']}")
     assert missing.status_code == 404
     assert missing.json()["code"] == "cron_job_not_found"
-    assert scheduler.wake.call_count == 3
 
 
 async def test_cron_rest_is_owner_scoped(async_client) -> None:

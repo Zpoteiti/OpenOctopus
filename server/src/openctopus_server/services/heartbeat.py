@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -13,6 +14,7 @@ from openctopus_server.automations.heartbeat import (
     build_heartbeat_phase_two_text,
 )
 from openctopus_server.chat.types import AcceptedMessage
+from openctopus_server.db.models import Message, PendingMessage
 from openctopus_server.services.inbound import heartbeat_inbound, lock_inbound_identity
 from openctopus_server.services.messages import publish_inbound_locked
 
@@ -54,10 +56,14 @@ async def _publish_heartbeat_phase_two(
                     }
                 ],
             )
+            message_id = uuid5(request.user_id, "heartbeat:" + request.now_utc.isoformat())
+            inbound = replace(inbound, message_id=message_id, source_message_id=str(message_id))
             try:
                 if await lock_inbound_identity(db, inbound) is None:
                     await db.rollback()
                     return False
+                if await db.get(Message, message_id) is not None or await db.get(PendingMessage, message_id) is not None:
+                    return True
                 accepted = await publish_inbound_locked(
                     db,
                     inbound=inbound,

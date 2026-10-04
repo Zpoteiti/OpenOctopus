@@ -1,5 +1,11 @@
 export const en = {
   translation: {
+    memory: {
+      title: 'Memory', description: 'Your agent and background memory updates share these notes. You can read and edit them here.',
+      notes: 'Memory notes', newPath: 'Note path', open: 'Open note', content: 'Note content', save: 'Save',
+      reload: 'Reload saved version', delete: 'Delete note', more: 'More notes', saved: 'Memory saved.',
+      failed: 'Could not load memory.', conflict: 'This note changed while you were editing. Your draft is kept here. Copy it before reloading the saved version.',
+    },
     common: {
       cancel: 'Cancel',
       delete: 'Delete',
@@ -55,6 +61,7 @@ export const en = {
     nav: {
       chat: 'Chat',
       workspace: 'Workspace',
+      memory: 'Memory',
       devices: 'Devices',
       automations: 'Automations',
       channels: 'Channels',
@@ -94,6 +101,7 @@ export const en = {
       send: 'Send message',
     },
     chat: {
+      delegateReadOnly: 'This delegate runs independently. Continue the task in its parent conversation.',
       readOnly: 'This conversation came from {{channel}} and is read-only in the browser.',
       notFound: 'This conversation was not found, or your account cannot access it.',
       streamReplaced: 'The message was queued. A newer request replaced this live preview, so the saved conversation will be reloaded.',
@@ -137,7 +145,6 @@ export const en = {
       recoveryPaused: 'Live recovery polling paused. Refresh to continue checking the task.',
       historyLoadFailed: 'Could not load the conversation history.',
       you: 'You',
-      compactionSummary: 'Context summary',
       generatedFile: 'Generated file: {{filename}}',
       callTool: 'Tool call: {{tool}}',
       unknownTool: 'Unknown tool',
@@ -148,7 +155,8 @@ export const en = {
       progressFinished: 'Completed',
       workDetails_one: 'Work details · {{count}} step',
       workDetails_other: 'Work details · {{count}} steps',
-      workInProgress: 'Working…',
+      waitingForModel: 'Message received · Waiting for model response…',
+      thinkingInProgress: 'Thinking…',
       currentWork: 'Working · {{tool}}',
       tooManyAttachments: 'A message can contain at most 10 attachments.',
       imagesTooLarge: 'Attachment images can contain at most 8 MiB in total.',
@@ -429,7 +437,8 @@ export const en = {
       loading: 'Loading system configuration…',
       provider: 'LLM Provider',
       providerDescription: 'The Server validates Provider identity before saving. Leave API Key empty to retain the current secret.',
-      apiBaseUrl: 'API base URL',
+      protocol: 'Model API protocol',
+      apiBaseUrl: 'API base URL (without /v1)',
       apiKey: 'API Key',
       apiKeyConfigured: 'Configured; leave empty to retain',
       apiKeyMissing: 'Not configured',
@@ -515,9 +524,9 @@ export const en = {
       useDetectedTimezone: 'Use detected timezone: {{timezone}}',
       saveTimezone: 'Save timezone',
       agentFiles: 'Personal agent files',
-      agentFilesDescription: 'Edit the identity and long-term memory stored in your personal Workspace.',
+      agentFilesDescription: 'Edit your identity in Workspace and your notes in Memory.',
       editSoul: 'Edit SOUL.md',
-      editMemory: 'Edit MEMORY.md',
+      editMemory: 'Edit memory',
       session: 'Sign-in state',
       logout: 'Sign out',
       deleteTitle: 'Delete account',
@@ -531,6 +540,12 @@ export const en = {
 
 export const zhCN = {
   translation: {
+    memory: {
+      title: '记忆', description: '代理和后台记忆整理使用同一份笔记。你可以在这里查看和编辑。',
+      notes: '记忆笔记', newPath: '笔记路径', open: '打开笔记', content: '笔记内容', save: '保存',
+      reload: '重新载入已保存版本', delete: '删除笔记', more: '更多笔记', saved: '记忆已保存。',
+      failed: '无法读取记忆。', conflict: '编辑期间笔记已有更新，当前草稿已保留。请先复制草稿，再重新载入已保存版本。',
+    },
     common: { cancel: '取消', delete: '删除', loading: '正在加载…', retry: '重试', requestFailed: '请求失败', save: '保存', refresh: '刷新', edit: '编辑', online: '在线', offline: '离线', normal: '正常' },
     brand: { caption: '你的设备，一个 Agent。' },
     language: { label: '语言', english: 'English', chinese: '简体中文' },
@@ -544,18 +559,20 @@ export const zhCN = {
       submitting: '提交中…', login: '登录', hasAccount: '已有账号？', noAccount: '还没有账号？', backToLogin: '返回登录', registerNow: '立即注册',
     },
     nav: {
-      chat: '对话', workspace: '工作区', devices: '设备', automations: '自动化', channels: '渠道', admin: '管理设置', mainLabel: '主导航', newChat: '新建对话', recentChats: '最近对话', manageChats: '管理会话', sessionActions: '{{title}} 的操作', selectChat: '选择 {{title}}', selectAll: '全选', clearSelection: '清除选择', deleteSelected: '删除所选（{{count}}）', confirmBulkDelete_one: '确认删除 {{count}} 个会话', confirmBulkDelete_other: '确认删除 {{count}} 个会话', bulkDeleteFailed_one: '{{count}} 个会话删除失败。', bulkDeleteFailed_other: '{{count}} 个会话删除失败。', unread: '有未读消息',
+      chat: '对话', workspace: '工作区',
+      memory: '记忆', devices: '设备', automations: '自动化', channels: '渠道', admin: '管理设置', mainLabel: '主导航', newChat: '新建对话', recentChats: '最近对话', manageChats: '管理会话', sessionActions: '{{title}} 的操作', selectChat: '选择 {{title}}', selectAll: '全选', clearSelection: '清除选择', deleteSelected: '删除所选（{{count}}）', confirmBulkDelete_one: '确认删除 {{count}} 个会话', confirmBulkDelete_other: '确认删除 {{count}} 个会话', bulkDeleteFailed_one: '{{count}} 个会话删除失败。', bulkDeleteFailed_other: '{{count}} 个会话删除失败。', unread: '有未读消息',
       loadingChats: '正在加载…', noChats: '暂无对话', member: '普通用户', administrator: '管理员', neverAsked: '尚未提问', askedRecently: '最近提问：刚刚',
       askedMinutes: '最近提问：{{count}} 分钟前', askedHours: '最近提问：{{count}} 小时前', askedDate: '最近提问：{{date}}',
     },
     draftChat: { eyebrow: 'OPENOCTOPUS AGENT', crumb: '新对话', heading: '今天想让 Agent 做什么？', description: '让 Agent 在 Server Workspace 或已连接设备上完成任务。', message: '消息', placeholder: '描述任务，或附上文件…', attachment: '附件', send: '发送消息' },
     chat: {
+      delegateReadOnly: '子代理独立运行。请回到父会话继续任务。',
       readOnly: '此会话来自 {{channel}}，只能在浏览器中查看。', notFound: '找不到此会话，或当前账户无权访问。', streamReplaced: '消息已排队；实时预览已由新的请求接管，将重新读取已保存会话。',
       sendFailed: '发送失败，请稍后重试。', renameFailed: '重命名失败。', cancelRequested: '已请求在下一个可停止点停止。', nothingRunning: '当前没有正在运行的任务。', cancelFailed: '停止请求失败。', deleteFailed: '删除失败。',
       stop: '停止', rename: '重命名', confirmDelete: '确认删除', sessionTitle: '会话标题', historyLimit: '当前仅显示最近 200 条已保存消息。', pending: '等待处理', thinking: '思考过程', reasoningEffort: '思考强度', effortOff: '关闭', effortLow: '低', effortMedium: '中', effortHigh: '高', effortXHigh: '超高', effortMax: '最大', generating: '生成中', toolRunning: '正在执行：{{tool}}{{progress}}',
       devicesOnline_one: '{{count}} 台设备在线', devicesOnline_other: '{{count}} 台设备在线', noDevices: '暂无设备', remove: '移除', selectAttachments: '选择附件', pendingAttachments: '待发送附件', thisComputer: '这台电脑', serverWorkspaces: 'Server Workspace', serverWorkspace: 'Server Workspace', chooseExistingAttachment: '选择现有文件', attachmentUploading: '上传中', attachmentReady: '就绪', attachmentFailed: '上传失败', attachmentUploadFailed: '附件上传失败。', file: '文件', recoveryPaused: '实时恢复轮询已暂停，请刷新页面继续检查任务状态。', historyLoadFailed: '无法加载会话记录。',
-      you: '你', compactionSummary: '上下文摘要', generatedFile: '已生成文件：{{filename}}', callTool: '调用工具：{{tool}}', unknownTool: '未知工具', toolFailed: '工具执行失败', toolResult: '工具结果', image: '[图片]', progressStarted: '运行中', progressFinished: '已完成',
-      workDetails_one: '工作过程 · {{count}} 步', workDetails_other: '工作过程 · {{count}} 步', workInProgress: '正在处理…', currentWork: '正在处理 · {{tool}}',
+      you: '你', generatedFile: '已生成文件：{{filename}}', callTool: '调用工具：{{tool}}', unknownTool: '未知工具', toolFailed: '工具执行失败', toolResult: '工具结果', image: '[图片]', progressStarted: '运行中', progressFinished: '已完成',
+      workDetails_one: '工作过程 · {{count}} 步', workDetails_other: '工作过程 · {{count}} 步', waitingForModel: '消息已收到 · 等待模型响应…', thinkingInProgress: '正在思考…', currentWork: '正在处理 · {{tool}}',
       tooManyAttachments: '每条消息最多上传 10 个附件。', imagesTooLarge: '附件图片总大小不能超过 8 MiB。', acceptedDisconnected: '消息已由 Server 接收，但实时连接已中断；正在重新读取已保存记录。', confirmationDisconnected: 'Server 确认前连接中断；消息可能已接收，未自动重试，请刷新会话确认。',
       senderOwner: '主人', senderAllowed: '允许的用户', senderId: '渠道用户 ID：{{id}}', sourceMessageId: '来源消息：{{id}}',
       channelContext_one: '引用了此前 {{count}} 条群聊消息', channelContext_other: '引用了此前 {{count}} 条群聊消息', untrustedContext: '来自渠道的不可信背景信息',
@@ -664,7 +681,7 @@ export const zhCN = {
       enableAll: '全部启用', disableAll: '全部禁用', exact: '精确选择', exactNames: '最终能力名称（逗号分隔）', maxConcurrency: '最大并发调用', addDraft: '加入配置草稿', editNamed: '编辑 {{name}}', exactRequired: '请至少选择一个已发现能力。', reenterSecrets: '已保存的密钥不会显示。只有需要替换时才重新输入。', tools: '工具', resources: '资源', resourceTemplates: '资源模板', prompts: '提示词', exactCount_one: '精确启用 {{count}} 项', exactCount_other: '精确启用 {{count}} 项',
     },
     admin: {
-      settings: '系统配置', settingsDescription: '默认 Agent 身份、Provider、Workspace 配额与 Server Web Fetch 策略分别保存。', loading: '正在读取系统配置…', provider: 'LLM Provider', providerDescription: '保存前 Server 会验证 Provider 身份配置；API Key 留空会保留现有密钥。', apiBaseUrl: 'API 基础 URL', apiKey: 'API Key', apiKeyConfigured: '已配置；留空保留', apiKeyMissing: '尚未配置', model: '模型名称', contextWindow: '上下文窗口', compactionThreshold: 'Compaction 触发余量', maxConcurrent: '最大并发请求', unlimited: '0 表示不限制。', maxOutput: '最大输出 Token', saveProvider: '验证并保存 Provider',
+      settings: '系统配置', settingsDescription: '默认 Agent 身份、Provider、Workspace 配额与 Server Web Fetch 策略分别保存。', loading: '正在读取系统配置…', provider: 'LLM Provider', providerDescription: '保存前 Server 会验证 Provider 身份配置；API Key 留空会保留现有密钥。', protocol: '模型 API 协议', apiBaseUrl: 'API 基础 URL（不含 /v1）', apiKey: 'API Key', apiKeyConfigured: '已配置；留空保留', apiKeyMissing: '尚未配置', model: '模型名称', contextWindow: '上下文窗口', compactionThreshold: 'Compaction 触发余量', maxConcurrent: '最大并发请求', unlimited: '0 表示不限制。', maxOutput: '最大输出 Token', saveProvider: '验证并保存 Provider',
       quotas: 'Workspace 配额', quotasDescription: '单位为 MiB；个人配额是每个用户的有效上限，共享配额是单个共享 Workspace 的上限。', personalQuota: '个人 Workspace 配额', sharedQuota: '共享 Workspace 上限', saveQuotas: '保存配额', webFetch: 'Server Web Fetch 网络策略', webFetchDescription: '完整替换 Server 侧 web_fetch 的 SSRF 拒绝列表；合法配置保存后热生效。', denylist: '拒绝列表', denylistHelp: '每行一个 CIDR、IP、hostname 或 host:port；显式空列表允许所有其他合法目标。', saveNetwork: '保存网络策略',
       defaultSoul: '默认 SOUL', defaultSoulDescription: '用户没有个人 SOUL.md 时使用；个人文件会从下一轮 Agent 任务起优先生效。', saveDefaultSoul: '保存默认 SOUL',
       jevTitle: 'Jev 决策服务', jevDescription: 'Dream 和 Heartbeat 使用 Jev 判断是否执行检查。API Key 会保密；留空会保留当前密钥。', jevEndpoint: 'Jev API 基础 URL', jevApiKey: 'Jev API Key', saveJev: '保存 Jev 设置', checkJev: '检查 Jev 连接', jevCheckFailed: '无法检查 Jev。请检查 URL 和连接后重试。', jevAvailability: 'Jev 状态：{{state}}。', jevCheckedAt: '上次检查时间：{{time}}。', dreamUnavailable: 'Dream is not available', heartbeatJevHelp: 'Heartbeat 第一阶段也需要 Jev。配置并连通 Jev 后才能使用 Heartbeat。', heartbeatJevCheckHelp: 'Heartbeat 第一阶段也需要 Jev。请检查连接以确认服务可用。', jevState: { not_configured: '未配置', unchecked: '尚未检查', available: '可用', unreachable: '无法连接', unauthorized: '凭据被拒绝', invalid_response: '响应无效', unavailable: '暂时不可用' }, jevReason: { not_configured: '请配置 Jev URL 和 API Key 以启用 Dream。', unchecked: '请检查 Jev 连接以确认服务可用。', available: 'Jev 已就绪，可供 Dream 和 Heartbeat 使用。', unreachable: '无法连接 Jev，请检查 URL 和网络连接。', unauthorized: 'Jev 拒绝了 API Key，请检查配置的密钥。', invalid_response: 'Jev 返回无效响应，请检查服务配置。', unavailable: 'Jev 暂时不可用，请稍后重试。' },
@@ -672,7 +689,7 @@ export const zhCN = {
       sharedMcp: '共享 MCP', sharedMcpDescription: '所有用户均可使用。每个对话使用独立连接，空闲最多保留 10 分钟。同名配置优先于 Device MCP。', saveSharedMcp: '保存共享 MCP', runtimeUnconfigured: '运行时未配置', runtimeStats: '活跃 {{active}} · 空闲 {{idle}} · 正在关闭 {{closing}} · 活跃调用 {{calls}}', installationPreview: '安装预览。每个模型步骤都会刷新可用能力。', addSharedMcp: '添加或替换共享 MCP', addSharedMcpHelp: '新增配置只在真实 initialize 与 discovery 成功后保存。', adminPages: '管理页面',
     },
     account: {
-      eyebrow: '账户', title: '账户', description: '管理个人资料、登录状态与账号数据。', profile: '个人资料', newPassword: '新密码', passwordPlaceholder: '留空则不修改', saveProfile: '保存个人资料', preferences: '偏好设置', preferencesDescription: '语言和外观保存在当前浏览器中；时区保存到账户。', languageDescription: '选择界面使用的语言。', appearance: '外观', appearanceDescription: '跟随系统主题，或选择浅色、深色模式。', timezone: '时区', timezoneDescription: '用于 Heartbeat 判断，并作为新 Cron 任务的默认时区。', useDetectedTimezone: '使用检测到的时区：{{timezone}}', saveTimezone: '保存时区', agentFiles: '个人 Agent 文件', agentFilesDescription: '编辑个人 Workspace 中保存的身份与长期记忆。', editSoul: '编辑 SOUL.md', editMemory: '编辑 MEMORY.md', session: '登录状态', logout: '退出登录', deleteTitle: '删除账号', deleteDescription: '会删除个人设备、会话与个人 Workspace；共享 Workspace 会为其他成员保留。', irreversible: '此操作不可撤销。', confirmDelete: '确认删除账号', deleteMine: '删除我的账号',
+      eyebrow: '账户', title: '账户', description: '管理个人资料、登录状态与账号数据。', profile: '个人资料', newPassword: '新密码', passwordPlaceholder: '留空则不修改', saveProfile: '保存个人资料', preferences: '偏好设置', preferencesDescription: '语言和外观保存在当前浏览器中；时区保存到账户。', languageDescription: '选择界面使用的语言。', appearance: '外观', appearanceDescription: '跟随系统主题，或选择浅色、深色模式。', timezone: '时区', timezoneDescription: '用于 Heartbeat 判断，并作为新 Cron 任务的默认时区。', useDetectedTimezone: '使用检测到的时区：{{timezone}}', saveTimezone: '保存时区', agentFiles: '个人 Agent 文件', agentFilesDescription: '在 Workspace 中编辑身份，在记忆页面编辑长期笔记。', editSoul: '编辑 SOUL.md', editMemory: '编辑记忆', session: '登录状态', logout: '退出登录', deleteTitle: '删除账号', deleteDescription: '会删除个人设备、会话与个人 Workspace；共享 Workspace 会为其他成员保留。', irreversible: '此操作不可撤销。', confirmDelete: '确认删除账号', deleteMine: '删除我的账号',
     },
   },
 } as const

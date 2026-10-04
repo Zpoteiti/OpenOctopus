@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, Literal, Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from openctopus_server.db.models import PendingMessage, TurnRun, User
+from openctopus_server.db.models import PendingMessage, TurnRun
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.provider.jev import JevChoiceQuestion, JevState
 
@@ -24,15 +23,11 @@ HEARTBEAT_MAX_CODEPOINTS = 32_000
 HEARTBEAT_MAX_TASKS = 8
 HEARTBEAT_MAX_TASK_CODEPOINTS = 500
 HEARTBEAT_MAX_TOTAL_TASK_CODEPOINTS = 2_000
-HEARTBEAT_USER_PAGE_SIZE = 100
-HEARTBEAT_WORKERS = 32
-HEARTBEAT_QUEUE_CAPACITY = 64
 
 _FENCE_START = re.compile(r"^(`{3,}|~{3,})")
 _ATX_LEVEL_ONE_OR_TWO = re.compile(r"^#{1,2}(?:\s+|$)")
 _TASK_MARKER = re.compile(r"^(?:[-*+]|\d+[.)])\s+(.*)$")
 _LOGGER = logging.getLogger(__name__)
-_PULSE_LATE_GRACE = timedelta(seconds=5)
 
 
 class HeartbeatWorkspace(Protocol):
@@ -272,15 +267,6 @@ def build_heartbeat_phase_two_text(request: HeartbeatPhaseTwoRequest) -> str:
     )
 
 
-def next_heartbeat_boundary(now: datetime) -> datetime:
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("Heartbeat clock must be timezone-aware")
-    utc_now = now.astimezone(UTC)
-    minute = 30 if utc_now.minute < 30 else 60
-    base = utc_now.replace(second=0, microsecond=0)
-    if minute == 30:
-        return base.replace(minute=30)
-    return base.replace(minute=0) + timedelta(hours=1)
 
 
 class HeartbeatPulse:
@@ -292,175 +278,14 @@ class HeartbeatPulse:
         workspace_service: HeartbeatWorkspace,
         publish_phase_two: HeartbeatPhaseTwoPublisher,
         now_utc: Callable[[], datetime] | None = None,
-        wait_until: Callable[[datetime, asyncio.Event], Awaitable[bool]] | None = None,
     ) -> None:
         self._engine = engine
         self._runtime = runtime
         self._workspace_service = workspace_service
         self._publish_phase_two = publish_phase_two
         self._now_utc = now_utc or (lambda: datetime.now(UTC))
-        self._wait_until = wait_until or self._default_wait_until
-        self._stop = asyncio.Event()
-        self._loop_task: asyncio.Task[None] | None = None
-        self._scan_task: asyncio.Task[None] | None = None
-        self._last_boundary: datetime | None = None
 
-    def start(self) -> None:
-        if self._loop_task is not None:
-            raise RuntimeError("Heartbeat pulse is already started")
-        self._loop_task = asyncio.create_task(self._run(), name="heartbeat-pulse")
-
-    async def close(self) -> None:
-        self._stop.set()
-        tasks = [task for task in (self._loop_task, self._scan_task) if task is not None]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._loop_task = None
-        self._scan_task = None
-
-    def trigger_scan(self, boundary: datetime) -> bool:
-        if self._stop.is_set():
-            return False
-        scan = self._scan_task
-        if scan is not None and not scan.done():
-            _LOGGER.info("heartbeat pulse skipped because the previous scan is active")
-            return False
-        self._last_boundary = boundary
-        self._scan_task = asyncio.create_task(
-            self._run_scan_guarded(),
-            name=f"heartbeat-scan-{boundary.isoformat()}",
-        )
-        return True
-
-    async def wait_for_scan(self) -> None:
-        scan = self._scan_task
-        if scan is not None:
-            await scan
-
-    async def run_scan(self) -> None:
-        upper = await self._user_upper_bound()
-        if upper is None:
-            return
-        queue: asyncio.Queue[_HeartbeatUser | None] = asyncio.Queue(
-            maxsize=HEARTBEAT_QUEUE_CAPACITY
-        )
-        workers = [
-            asyncio.create_task(self._worker(queue), name=f"heartbeat-worker-{index}")
-            for index in range(HEARTBEAT_WORKERS)
-        ]
-        try:
-            await self._produce_users(queue, upper=upper)
-            for _ in workers:
-                await queue.put(None)
-            failures = sum(await asyncio.gather(*workers))
-            if failures:
-                _LOGGER.warning(
-                    "heartbeat scan completed with user_failures=%d",
-                    failures,
-                )
-        finally:
-            for worker in workers:
-                if not worker.done():
-                    worker.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-
-    async def _run_scan_guarded(self) -> None:
-        try:
-            await self.run_scan()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _LOGGER.error("heartbeat scan failed")
-
-    async def _run(self) -> None:
-        boundary = next_heartbeat_boundary(self._now_utc())
-        while not self._stop.is_set():
-            if await self._wait_until(boundary, self._stop):
-                return
-            now = self._now_utc().astimezone(UTC)
-            if boundary <= now <= boundary + _PULSE_LATE_GRACE:
-                self.trigger_scan(boundary)
-            if self._last_boundary is not None and boundary <= self._last_boundary:
-                boundary = next_heartbeat_boundary(self._last_boundary)
-            else:
-                boundary = next_heartbeat_boundary(now)
-
-    async def _user_upper_bound(self) -> tuple[datetime, UUID] | None:
-        async with AsyncSession(self._engine, expire_on_commit=False) as db:
-            row = (
-                await db.execute(
-                    select(User.created_at, User.id)
-                    .order_by(User.created_at.desc(), User.id.desc())
-                    .limit(1)
-                )
-            ).one_or_none()
-        return None if row is None else (row.created_at, row.id)
-
-    async def _produce_users(
-        self,
-        queue: asyncio.Queue[_HeartbeatUser | None],
-        *,
-        upper: tuple[datetime, UUID],
-    ) -> None:
-        cursor: tuple[datetime, UUID] | None = None
-        while True:
-            async with AsyncSession(self._engine, expire_on_commit=False) as db:
-                query = select(User.id, User.created_at, User.timezone).where(
-                    or_(
-                        User.created_at < upper[0],
-                        and_(User.created_at == upper[0], User.id <= upper[1]),
-                    )
-                )
-                if cursor is not None:
-                    query = query.where(
-                        or_(
-                            User.created_at > cursor[0],
-                            and_(User.created_at == cursor[0], User.id > cursor[1]),
-                        )
-                    )
-                rows = (
-                    (
-                        await db.execute(
-                            query.order_by(User.created_at, User.id).limit(
-                                HEARTBEAT_USER_PAGE_SIZE
-                            )
-                        )
-                    )
-                    .all()
-                )
-            if not rows:
-                return
-            for row in rows:
-                await queue.put(
-                    _HeartbeatUser(
-                        id=row.id,
-                        created_at=row.created_at,
-                        timezone=row.timezone,
-                    )
-                )
-            last = rows[-1]
-            cursor = (last.created_at, last.id)
-            if len(rows) < HEARTBEAT_USER_PAGE_SIZE:
-                return
-            await asyncio.sleep(0)
-
-    async def _worker(self, queue: asyncio.Queue[_HeartbeatUser | None]) -> int:
-        failures = 0
-        while True:
-            user = await queue.get()
-            try:
-                if user is None:
-                    return failures
-                try:
-                    await self._process_user(user)
-                except Exception:
-                    failures += 1
-            finally:
-                queue.task_done()
-
-    async def _process_user(self, user: _HeartbeatUser) -> None:
+    async def _process_user(self, user: _HeartbeatUser, *, now: datetime | None = None) -> None:
         if await self._session_is_busy(user.id):
             return
         async with AsyncSession(self._engine, expire_on_commit=False) as db:
@@ -471,7 +296,7 @@ class HeartbeatPulse:
             )
         if loaded.content is None or extract_active_tasks(loaded.content) is None:
             return
-        now = self._now_utc().astimezone(UTC)
+        now = (now or self._now_utc()).astimezone(UTC)
         phase_one_started = monotonic()
         evaluation = await self._runtime.evaluate_heartbeat_decision(
             document=loaded.content,
@@ -520,13 +345,6 @@ class HeartbeatPulse:
             )
             return running_id is not None
 
-    async def _default_wait_until(self, target: datetime, stop: asyncio.Event) -> bool:
-        delay = max(0.0, (target - self._now_utc().astimezone(UTC)).total_seconds())
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=delay)
-        except TimeoutError:
-            return False
-        return True
 
 
 def _remove_html_comments(document: str) -> str:

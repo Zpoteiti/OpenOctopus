@@ -117,6 +117,8 @@ async def _delete_owned_transition(
                 user_id=user_id,
                 session_id=session_id,
             )
+            from openctopus_server.chat.cancellation import record_session_cancellation
+            await record_session_cancellation(db, session_id)
             detached = await runtime.detach_session(session_id)
             await db.delete(session)
             await db.commit()
@@ -134,10 +136,14 @@ async def _delete_owned_transition(
                             )
                         )
                         await await_future_cancellation_safe(recovery)
+                        if runtime.durable.started:
+                            await runtime.durable.apply_cancellations()
             finally:
                 if detached is not None:
                     runtime.finalize_detached_session(detached, deleted=False)
             raise
+        if runtime.durable.started:
+            await runtime.durable.apply_cancellations()
         await runtime.forget_mcp_session(user_id=user_id, session_id=session_id)
 
 
@@ -147,6 +153,8 @@ async def _abandon_interrupted_turns(
     session_id: UUID,
 ) -> None:
     async with AsyncSession(engine, expire_on_commit=False) as db:
+        from openctopus_server.chat.cancellation import record_session_cancellation
+        await record_session_cancellation(db, session_id)
         now = datetime.now(UTC)
         await db.execute(
             update(TurnRun)
@@ -196,6 +204,7 @@ def _response(session: Session, *, unread: bool) -> SessionResponse:
     return SessionResponse(
         id=session.id,
         user_id=session.user_id,
+        parent_session_id=session.parent_session_id,
         session_key=session.session_key,
         channel=session.channel,
         chat_id=session.chat_id,

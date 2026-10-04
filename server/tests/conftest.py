@@ -198,3 +198,48 @@ async def user_client(async_client):
         json={"email": "user@test.com", "password": "testpassword"},
     )
     return async_client
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _inline_workflow_transport(monkeypatch):
+    """Product unit scenarios use an inline queue; subprocess tests exercise DBOS itself."""
+    import asyncio
+
+    from openctopus_server.chat import durable
+    from openctopus_server.db.models import TurnRun
+
+    locks = {}
+    tasks = set()
+    submitted = set()
+
+    async def accept(db, turn):
+        run = await db.get(TurnRun, turn.turn_id)
+        run.workflow_id = str(turn.turn_id)
+
+    async def start(host):
+        return None
+
+    async def submit(host, turn):
+        key = (host.runtime.runner_instance_id, turn.turn_id)
+        if key in submitted:
+            return
+        submitted.add(key)
+        lock = locks.setdefault(turn.session_id, asyncio.Lock())
+        async def run():
+            async with lock:
+                if not await host.runtime._turn_is_running(turn.turn_id):
+                    return
+                async with host.runtime._lease_state(turn.session_id) as state:
+                    await host.runtime._run_session(state, initial_turn=turn)
+        task = asyncio.create_task(run())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    monkeypatch.setattr(durable, "enqueue_transaction", AsyncMock())
+    monkeypatch.setattr(durable, "enqueue_turn", accept)
+    monkeypatch.setattr(durable.DurableHost, "start", start)
+    monkeypatch.setattr(durable.DurableHost, "submit", submit)
+    yield
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

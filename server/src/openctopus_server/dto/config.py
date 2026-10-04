@@ -24,6 +24,7 @@ NonEmptyString = Annotated[str, Field(min_length=1)]
 CompactionThreshold = Annotated[int, Field(ge=4001)]
 ConcurrencyLimit = Annotated[int, Field(ge=0, le=1_000_000)]
 OutputTokenLimit = Annotated[int, Field(ge=1, le=1_000_000)]
+ModelProtocol = Literal["anthropic", "openai", "openrouter"]
 DefaultSoul = Annotated[str, Field(min_length=1, max_length=32_000, pattern=r".*\S.*")]
 
 
@@ -65,6 +66,10 @@ class JevStatus(BaseModel):
 class ConfigPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    llm_protocol: ModelProtocol | SkipJsonSchema[None] = Field(
+        default=None, description="Model API protocol used by the configured endpoint.",
+    )
+
     quota_bytes: PositiveInt | SkipJsonSchema[None] = Field(
         default=None,
         description="Per-user personal workspace quota in bytes.",
@@ -77,7 +82,7 @@ class ConfigPatch(BaseModel):
     )
     llm_endpoint: NonEmptyString | SkipJsonSchema[None] = Field(
         default=None,
-        description="Unversioned Anthropic-compatible API base URL; omit /v1.",
+        description="Unversioned model API base URL; omit /v1. OpenRouter uses https://openrouter.ai/api.",
         examples=["https://api.siliconflow.cn"],
     )
     llm_api_key: NonEmptyString | SkipJsonSchema[None] = Field(
@@ -137,6 +142,8 @@ class ConfigPatch(BaseModel):
 class AdminConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    llm_protocol: ModelProtocol = Field(description="Model API protocol used by the configured endpoint.")
+
     quota_bytes: int = Field(
         description="Per-user personal workspace quota in bytes.",
         examples=[524_288_000],
@@ -146,7 +153,7 @@ class AdminConfig(BaseModel):
         examples=[524_288_000],
     )
     llm_endpoint: str | None = Field(
-        description="Unversioned Anthropic-compatible API base URL; omit /v1.",
+        description="Unversioned model API base URL; omit /v1. OpenRouter uses https://openrouter.ai/api.",
         examples=["https://api.siliconflow.cn"],
     )
     llm_api_key: str | None = Field(

@@ -27,7 +27,7 @@ async def _running_message_turn(pg_engine) -> tuple[TurnStart, Message]:
             }
         ],
         delivery_refs=[],
-        is_compacted=False,
+
         created_at=datetime.now(UTC),
     )
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:

@@ -152,10 +152,10 @@ async def test_prompt_loads_workspace_identity_memory_skills_and_shared_refs(pg_
         )
 
     assert "## SOUL\n\nBe precise." in prompt
-    assert "## MEMORY\n\nAlice likes concise answers." in prompt
+    assert "Alice likes concise answers." not in prompt
     assert "### reviewer (always-on)\n\nInspect tests first." in prompt
-    assert "research — Find primary sources" in prompt
-    assert "skills/research/SKILL.md" in prompt
+    assert "research — Find primary sources" not in prompt
+    assert "skills/research/SKILL.md" not in prompt
     assert "/team@abcdef12/" in prompt
     assert "Relative server paths mean the personal workspace" in prompt
     assert "Use `message` to deliver files" in prompt
@@ -406,7 +406,7 @@ async def test_prompt_caps_optional_files_with_a_read_file_marker(pg_engine) -> 
             skills_cache=SkillsCache(),
         )
 
-    soul = prompt.split("## MEMORY", 1)[0]
+    soul = prompt.split("## Identity", 1)[0]
     assert soul.count("x") == 32_000
     assert "truncated; use read_file for SOUL.md" in soul
 
@@ -442,7 +442,7 @@ async def test_prompt_tolerates_a_bounded_read_ending_inside_utf8_codepoint(pg_e
             skills_cache=SkillsCache(),
         )
 
-    soul = prompt.split("## MEMORY", 1)[0]
+    soul = prompt.split("## Identity", 1)[0]
     assert soul.count("😀") == 32_000
     assert "truncated; use read_file for SOUL.md" in soul
 

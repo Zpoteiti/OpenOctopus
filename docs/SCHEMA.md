@@ -6,7 +6,7 @@ semantics. Python bootstrap uses SQLAlchemy declarative models/metadata with
 `create_all()`; Alembic or equivalent migration framework is deferred until
 production launch after frontend completion (ADR-057, ADR-069).
 
-**Sixteen tables.** Account deletion fences affected workspaces, then commits
+**Twenty-five OO tables**, plus tables managed by Harness Memory and DBOS. Account deletion fences affected workspaces, then commits
 the user deletion and durable object-cleanup intents together. RustFS purge is
 idempotent and may finish after that logical deletion. Every user-referencing
 FK has `ON DELETE CASCADE` defined inline (ADR-058), with one explicit exception
@@ -37,14 +37,15 @@ unsupported keys return `400 Bad Request`):
 |---|---|---|---|
 | `quota_bytes` | int | ADR-046 | Per-user workspace quota. Missing means the effective default is 500 MiB (`524288000`). |
 | `shared_workspace_quota_bytes` | int | ADR-108 | Quota ceiling that any single shared workspace may request at create or rename time. Missing means the effective default is 500 MiB (`524288000`). |
-| `llm_endpoint` | string | ADR-101 | Unversioned base URL of an Anthropic-compatible Messages API; do not include `/v1`. |
+| `llm_protocol` | string | Harness runtime | `anthropic`, `openai`, or `openrouter`; selects the official SDK Provider. |
+| `llm_endpoint` | string | ADR-101 | Provider base URL before `/v1`; OpenRouter uses its `/api` base. |
 | `llm_api_key` | string | ADR-101 | Bearer credential for outbound LLM calls; redacted in admin API responses. |
-| `llm_model` | string | ADR-101 | Model name passed in the Anthropic Messages request body. |
+| `llm_model` | string | ADR-101 | Model name passed to the selected official Provider. |
 | `jev_endpoint` | string or JSON null | ADR-138 | Unversioned HTTP(S) base URL for Jev `POST /v1/systemone`; omit `/v1`. Explicit null clears the endpoint. |
 | `jev_api_key` | string | ADR-138 | Separate bearer credential for mandatory Heartbeat Phase 1 and Dream decisions; redacted in admin API responses. Omitted/blank PATCH values retain the current key. |
 | `llm_max_context_tokens` | int | ADR-101 | LLM context window in tokens (e.g. `128000` for gpt-4o). Counted with the configured-model Python tokenizer strategy (ADR-025, ADR-101). |
-| `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to Anthropic Messages. Missing means the effective default is 16384. Admin-editable; changes apply to the next provider turn, not an already-running request. |
-| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Py3 compaction headroom trigger. Missing disables compaction; when configured, `llm_max_context_tokens` is required and the value must be `4001 <= threshold < max_context_tokens`. |
+| `llm_max_output_tokens` | int | ADR-101, ADR-125 | Maximum output tokens passed to the selected Provider. Missing means the effective default is 16384. Admin-editable; changes apply to new logical runs; recovered work retains its captured model revision. |
+| `llm_compaction_threshold_tokens` | int | ADR-028, ADR-101, ADR-126 | Reserved context headroom: Harness compacts at `max_context_tokens - threshold`. Missing uses Harness's 80% threshold; when configured, `llm_max_context_tokens` is required and `4001 <= threshold < max_context_tokens`. |
 | `llm_max_concurrent_requests` | int | ADR-101 | Optional in-process semaphore for outbound LLM calls. A configured `0` means unlimited and creates no semaphore. A positive integer caps concurrent in-flight LLM calls; negative values and values above the server maximum are invalid. If missing at server startup, only the runtime limiter treats it as `0`; no row is persisted. |
 | `web_fetch_denylist` | array of strings | ADR-133 | Effective Server `web_fetch` denylist. Missing uses the private/reserved/metadata default; explicit `[]` allows all otherwise-valid HTTP(S) targets. PATCH validates and canonicalizes the complete list before writing, and later fetches read the current value without a restart. |
 
@@ -161,7 +162,7 @@ CREATE TABLE IF NOT EXISTS users (
   check is only a storage invariant. Existing jobs keep their stored effective
   timezone when this profile value changes.
 - `is_admin` — true for any user who registered with the `OPENOCTOPUS_ADMIN_TOKEN`. Admin APIs protect the last remaining admin from deletion.
-- **No `soul`, `memory_text`, or user-level SSRF policy columns** — workspace-file-only per ADR-060.
+- **No `soul`, `memory_text`, or user-level SSRF policy columns** — SOUL is a workspace file; Memory uses the official PostgreSQL store; SSRF policy is administrator-managed.
 - **No inline channel fields** — Discord and DingTalk live in their own tables
   (ADR-090, ADR-136).
 - **No `bytes_used` column** — workspace usage is computed on demand by `workspace_fs` summing paged RustFS object metadata under the workspace prefix.
@@ -267,6 +268,7 @@ state instead of inventing platform profile data.
 CREATE TABLE IF NOT EXISTS sessions (
     id                UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id           UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_session_id UUID         REFERENCES sessions(id) ON DELETE CASCADE,
     session_key       TEXT         NOT NULL,
     channel           TEXT         NOT NULL,
     chat_id           TEXT         NOT NULL,
@@ -295,11 +297,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_user_session_key ON sessions(user
 - `title` is the human-facing mutable session name. It defaults to `"New chat"` and never affects `id`, `chat_id`, or `session_key`.
 - `last_inbound_at` — bumped on every new InboundMessage; powers session-list ordering in the UI.
 - `last_read_at` — browser inbox read marker. Updated by `PATCH /api/sessions/{id}` with `read_through_message_id`; the update sets the marker to the greater of the current value and the target canonical message's `created_at`. `GET /api/sessions` derives `unread` by checking for user-visible messages newer than this timestamp. `GET /api/sessions/{id}/messages` does not mutate this marker, so prefetching and polling do not accidentally mark a session as read.
-- `cancel_requested` — set true by `POST /api/sessions/{id}/cancel` only when a runner is active (ADR-035), observed at the next safe boundary, then cleared. Cancel on an idle session is a no-op and must not leave this flag true. If an in-flight provider request returns a final response with no tools, normal completion wins and clears the flag without a stop marker (ADR-129).
+- `parent_session_id` identifies delegated child histories. Children are readable by the same owner; user continuation goes through the parent.
+- `cancel_requested` is the local safe-boundary signal. `workflow_cancellations` durably records cancellation of the main run and descendants, including background children after the parent becomes idle. Startup applies these intents before resuming DBOS work.
 - `DELETE /api/sessions/{id}` removes session rows after terminating any
-  in-memory runner/streams. `ON DELETE CASCADE` removes that session's
-  `turn_runs`, `messages`, `pending_messages`, channel deliveries, and their
-  actions. Channel receipts retain their source idempotency key with
+  active workflow tree and streams. `ON DELETE CASCADE` removes child sessions,
+  contexts, overflow, task records, request reservations, tool receipts,
+  `turn_runs`, `messages`, `pending_messages`, channel deliveries, and their actions.
+  Durable cancellation intents survive deletion to fence restart recovery. Channel receipts retain their source idempotency key with
   `session_id=NULL`; channel configuration and Cron job rows are not tied to
   Session deletion. A later accepted Cron fire or
   Heartbeat Phase 2 recreates its route with the same stable UUID and empty
@@ -319,8 +323,7 @@ CREATE TABLE IF NOT EXISTS messages (
                                  'assistant',
                                  'tool_result',
                                  'synthetic_tool_result',
-                                 'synthetic_assistant_error',
-                                 'compaction_summary'
+                                 'synthetic_assistant_error'
                              )),
     content                  JSONB        NOT NULL,
     attachment_refs          JSONB        NOT NULL DEFAULT '[]'::jsonb,
@@ -340,7 +343,6 @@ CREATE TABLE IF NOT EXISTS messages (
     channel_context          JSONB        NOT NULL DEFAULT '[]'::jsonb
                                           CHECK (jsonb_typeof(channel_context) = 'array'),
     llm_fingerprint          TEXT,
-    is_compacted             BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     CHECK (
         message_kind <> 'human' OR
@@ -367,7 +369,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
 ```
 
 - `content` — JSONB array of Anthropic Messages content blocks (ADR-059, ADR-101, ADR-117). Block shapes mirror what the LLM will receive after provider-layer projection, except optional OpenOctopus `tool_result.code` metadata is retained for storage/public diagnostics and stripped from the strict provider request. Supported persisted block types are `text`, `image`, `tool_use`, `tool_result`, `thinking`, and `redacted_thinking`. **Images** are stored as Anthropic `image` blocks with base64 data inline. **Tool results** store `content` as a safe block array; real tool output starts with the server-generated untrusted-result warning block, while server-authored synthetic tool results use the same array shape for diagnostic text. **Non-image files** (PDFs, CSVs, audio, ...) stay at their referenced Workspace or Client location; the DB carries provider-visible path-text markers and the agent reaches bytes via `read_file`. A later Client read failure is persisted as the normal tool-result error; message acceptance does not invent a remote-read failure marker.
-- `attachment_refs` — provider-hidden JSONB sidecar for normalized browser attachment identities (ADR-135). Server refs retain the virtual Workspace path. Client refs retain `(device name, immutable device UUID, path)` without reading or copying Client bytes during message acceptance. Active human rows plus the captured pending prefix provide a conservative name-level UUID fence for device tool routing, Device MCP authority, and System-prompt Device metadata; conflicting UUIDs for one name disable that target while leaving its name in fixed built-in Provider schemas. A compacted source row keeps its historical sidecar, but the generated summary receives `[]` and does not preserve an actionable attachment capability.
+- `attachment_refs` — provider-hidden JSONB sidecar for normalized browser attachment identities (ADR-135). Server refs retain the virtual Workspace path. Client refs retain `(device name, immutable device UUID, path)` without reading or copying Client bytes during message acceptance. Active human rows plus the captured pending prefix provide a conservative name-level UUID fence for device tool routing, Device MCP authority, and System-prompt Device metadata; conflicting UUIDs for one name disable that target while leaving its name in fixed built-in Provider schemas. Harness compaction changes `agent_contexts`, while original message sidecars remain available for authorization and history.
 - `delivery_refs` — JSONB array of user-visible file delivery references for channel adapters, ignored by provider replay. The web `message(media=...)` tool uses this sidecar for file chips/download links so `messages.content` can stay Anthropic-compatible. Each ref links to its generating `tool_use_id`. Server workspace refs are durable and retain the virtual path plus immutable workspace ID/workspace-relative path so a frontend can recover from a shared-workspace rename. Device refs are online-only pointers to immutable `(device_id, captured device name, path)` identity; a later relay must reject rename/delete/name-reuse drift instead of reading from another device. Device refs do not cause a device read or RustFS write when the message is sent.
 - Human rows persist their authoritative sender identity, classification, and
   ingress tool profile. Owners and internal synthesizers use `owner_full`;
@@ -379,8 +381,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_created
   read-only background snapshot; Provider projection wraps it as untrusted
   context, and it cannot grant tools or change the persisted profile.
 - `llm_fingerprint` — nullable model/provider fingerprint for assistant rows that contain opaque thinking state. Provider replay may use raw `thinking` / `redacted_thinking` blocks only when this matches the current compatible model segment.
-- `message_kind` — stored OpenOctopus semantic discriminator: `human` for external/user-marker rows, `assistant` for normal provider responses, `tool_result` for real server/device tool results, `synthetic_tool_result` for restart/cancel/unreachable repair rows, `synthetic_assistant_error` for exhausted provider failures, or `compaction_summary` for provider-compatible summary rows. Provider projection derives `role='user'` for `human`, `tool_result`, and `synthetic_tool_result`; it derives `role='assistant'` for the other three kinds. This avoids JSONB inspection and prevents invalid stored role/kind pairs (ADR-089, ADR-126).
-- `is_compacted` — provider/compaction context membership. `FALSE` means the row participates in normal provider replay and may be input to a later compaction. `TRUE` means the row remains available for canonical history/audit but is excluded from both. A `compaction_summary` begins `FALSE` and may later become `TRUE` when absorbed into a newer summary.
+- `message_kind` distinguishes `human`, `assistant`, `tool_result`,
+  `synthetic_tool_result`, and `synthetic_assistant_error`. Public projection
+  keeps the existing content-block contract; the native SDK history lives in
+  `agent_contexts`. Private `_sdk` reasoning metadata never enters public DTOs.
+- Original transcript rows are retained when Harness summarizes effective
+  context. There is no compaction membership flag or summary transcript kind.
 - The `idx_messages_session_created` index powers the `GET /api/sessions/{id}/messages` cursor scan.
 - Runtime block (ADR-094) is prepended into the user-row's `content` JSONB at
   ingress time; not a separate column. Public history projection inspects only
@@ -397,6 +403,7 @@ CREATE TABLE IF NOT EXISTS pending_messages (
     id                UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id        UUID         NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     user_id           UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_session_id UUID         REFERENCES sessions(id) ON DELETE CASCADE,
     session_key       TEXT         NOT NULL,
     content           JSONB        NOT NULL,
     attachment_refs   JSONB        NOT NULL DEFAULT '[]'::jsonb,
@@ -433,7 +440,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
     ON pending_messages(session_key, received_at, id);
 ```
 
-- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Every row carries the same sender/profile/source/binding/context authority fields that will be copied into its canonical human row. Before preflight, a continuation captures only the oldest consecutive prefix with one `ingress_tool_profile`; a later row with a different profile stays pending for a separate Turn. This prevents an owner row and an allow-listed non-owner row from sharing one Provider/tool authority boundary. Browser HTTP stream ownership remains process-local and keyed to captured message IDs. `effort` is nullable; `NULL` and `off` send `thinking.type=disabled`; non-off values send `thinking.type=adaptive` plus Anthropic `output_config.effort`.
+- `pending_messages` stores inbound user messages that are durable but not yet provider-visible. Every row carries the same sender/profile/source/binding/context authority fields that will be copied into its canonical human row. Before preflight, a continuation captures only the oldest consecutive prefix with one `ingress_tool_profile`; a later row with a different profile stays pending for a separate Turn. This prevents an owner row and an allow-listed non-owner row from sharing one Provider/tool authority boundary. Browser HTTP stream ownership remains process-local and keyed to captured message IDs. `effort` is nullable and maps through the selected official Provider settings. Anthropic uses adaptive thinking for non-off values; OpenAI/OpenRouter use their native reasoning settings.
 - `attachment_refs` is copied unchanged into the promoted human `messages` row. It is returned in pending/history APIs but excluded from Provider messages; its separately persisted path marker is sent to the Provider and omitted from public `content` projections.
 - `session_key` is stored alongside `session_id` so channel/session routing can recover pending work without recomputing the key.
 - At the safe boundary, the worker captures the current rows for the session
@@ -449,24 +456,15 @@ CREATE INDEX IF NOT EXISTS idx_pending_messages_session_key_received
   tool-less Py2, the boundary follows persistence of the current complete
   assistant response and terminal run state. From Py3 onward, the current
   assistant tool batch must also be fully addressed (ADR-034, ADR-125).
-  When an idle Py3 runner finds no Stage 1 work, it performs this promotion
-  immediately. When Stage 1 triggers, summary generation runs while the new
-  user batch remains pending; the commit marks all selected active source rows
-  `is_compacted=TRUE`, inserts the new active summary, and only then promotes
-  the pending rows. Canonical active order is `S1, U11` without backdating.
-  `GET /api/sessions/{id}/messages` returns these rows separately as
-  `pending_messages` until they drain; its public projection removes a valid
-  server-generated first runtime block without mutating the row. The stable
-  `id` lets the frontend reconcile the pending item with the eventual canonical
-  message. When neither a session run nor boundary compaction is in flight,
-  this table should normally be empty.
-- A process restart drops live token previews and in-memory stream subscribers.
-  Startup reconciles only stale `turn_runs` lifecycle rows; it does not drain or
-  reorder `pending_messages`. The next inbound POST/channel activity rebuilds
-  from PostgreSQL and drains durable pending rows at the next safe boundary. If
-  there is no running turn, that new inbound is first inserted as pending and
-  drained with the older rows in `(received_at, id)` order before the recovered
-  provider turn starts; it must not leapfrog the surviving queue.
+  Harness summarizes the native context independently of this ordered input
+  promotion. `GET /api/sessions/{id}/messages` returns undrained rows separately
+  as `pending_messages`, stripping only the valid server-authored runtime
+  block. Stable message IDs reconcile pending and canonical frontend rows.
+- Input acceptance and DBOS workflow enqueue share one PostgreSQL transaction.
+  After a restart, DBOS automatically resumes accepted work and drains the
+  remaining queue at the same boundaries without another inbound message.
+  Live token previews and browser subscribers are rebuilt; committed history
+  is replayed by stable IDs.
 
 ---
 
@@ -489,6 +487,8 @@ CREATE TABLE IF NOT EXISTS turn_runs (
     tool_profile        TEXT         NOT NULL CHECK (
                                       tool_profile IN ('owner_full', 'message_only')
                                   ),
+    effort              TEXT,
+    workflow_id         TEXT,
     input_message_ids   JSONB        NOT NULL DEFAULT '[]'::jsonb
                                       CHECK (jsonb_typeof(input_message_ids) = 'array'),
     failed_delivery_targets JSONB    NOT NULL DEFAULT '[]'::jsonb
@@ -521,19 +521,19 @@ CREATE INDEX IF NOT EXISTS idx_turn_runs_session_started
   safe-boundary cancellation updates it to `cancelled`. The next provider call
   in the same ReAct chain creates another row and public `turn_id`, so one
   external user request can produce several run rows (ADR-126).
-- The partial unique index is the durable backstop for one active
-  provider-call/tool-batch run per session. The in-memory reservation remains
-  the fast scheduler path.
-- The server process creates one boot-scoped `runner_instance_id`. During
-  startup, before accepting traffic, it performs one indexed reconciliation
-  update that marks leftover `status='running'` rows from the prior process as
-  `abandoned` and sets `finished_at`. Partial tokens were never durable; pending
-  user rows remain available for the next normal recovery/drain.
+- The partial unique index backs one active provider/tool batch per session;
+  DBOS's partitioned queue owns execution order. `workflow_id` links the
+  product projection to its durable execution, and `effort` freezes the input
+  setting. It has an index for cancellation and recovery lookups.
+- The boot-scoped `runner_instance_id` identifies the current executor.
+  Restart resumes prior work through DBOS instead of abandoning running rows.
+  Stable turn IDs let repeated steps reconcile existing product state.
 - `GET /api/sessions/{id}/messages` derives its public status from the latest
   run: `running`/`failed`/`abandoned` map directly; no run, `completed`, or
   `cancelled` maps to `idle`. `active_turn_id` is present only for `running`.
 - Run rows are lifecycle/audit state, not provider messages. They are never
-  projected into Anthropic history.
+  projected into model history. `active_delegate_count` is derived from running
+  `agent_tasks` so an idle parent can still expose Stop for its children.
 
 ---
 
@@ -837,7 +837,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
   PendingMessage/TurnRun in one transaction. Deleting a job preserves any
   Session/history; deleting the Session preserves the job and permits later
   JIT recreation with the same UUID.
-- **No `kind` column** — Heartbeat and Dream have their own lifecycle tickers (ADR-054, ADR-138).
+- **No `kind` column** — Heartbeat and Dream use their own DBOS schedules; this table owns user Cron configuration.
 
 ---
 
@@ -850,7 +850,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
 | `status` | text | `pending`, `skipped`, `unchanged`, `updated`, `failed`, `restoring`, `restored`. |
 | `source` | JSONB | Bounded message excerpts while processing; message/session/speaker provenance and text offsets after completion. |
 | `before`, `after` | nullable text | Actual proposed memory change; each bounded to 64,000 UTF-8 bytes by the workflow. |
-| `before_etag`, `after_etag` | nullable text | Conditional write/undo revision checks. |
+| `before_version`, `after_version` | nullable text | Official Memory CAS write/undo revision checks. |
 | `error` | nullable text | Sanitized local reason code, never remote response content. |
 | `started_at` | timestamptz | Attempt start. |
 | `finished_at` | nullable timestamptz | Terminal processing time. |
@@ -858,10 +858,10 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_fire
 
 A partial unique index allows only one `pending` or `restoring` record per user.
 The supported single-process runtime shares one per-user lock for processing
-and undo. Proposed before/after contents are committed before the object write;
-completion and input progress commit together afterward. Restart recovery
-reconciles prepared changes against the current memory rather than asking the
-models to generate the same update again. Failed, unprepared work retains its
+and undo. Proposed before/after contents are committed before the official Memory write;
+completion and input progress commit together afterward. DBOS resumes the
+workflow; prepared updates use official Memory operation receipts and version
+checks to avoid applying the same write twice. Failed, unprepared work retains its
 input and retries after an hour. An interrupted undo remains recoverable.
 
 ## 18. `dream_progress` — consumed text positions (ADR-138)
@@ -878,6 +878,38 @@ global timestamp cursor that could lose messages from active Sessions or delayed
 turns. Undo leaves consumed offsets unchanged. User deletion cascades runs and,
 through Sessions/messages, progress. Deleting a Session removes its progress;
 owned memory-change history survives separately.
+
+---
+
+## 19. Harness runtime state
+
+These seven OO tables are created by SQLAlchemy alongside the product tables.
+All `session_id` foreign keys below cascade on deletion, except the explicit
+cancellation tombstone, which must survive removal of its session.
+
+| Table | Columns / key | Purpose |
+|---|---|---|
+| `model_configurations` | `id` text PK; `value` JSONB | Private immutable model configuration revisions, including credentials. DBOS parameters contain only the revision ID; REST never exposes this table. |
+| `tool_operations` | `id` UUID PK; `session_id` FK; `arguments_hash` text | Stable external-dispatch intent. The corresponding message ID is the saved result receipt; an unconfirmed non-idempotent dispatch is reported as unknown. |
+| `workflow_cancellations` | `workflow_id` text PK; indexed `session_id` UUID without FK | Persistent stop intents applied before restart recovery, including deleted sessions. |
+| `agent_tasks` | `session_id` PK/FK; `authority_message_id` FK messages CASCADE; indexed `parent_session_id` FK; unique `workflow_id`; indexed `root_workflow_id`; `status` text; `background` boolean | Owned child execution and its original server-validated authority. |
+| `agent_requests` | `id` UUID PK; indexed `root_workflow_id` text; `session_id` FK | Idempotent shared model-request budget reservations; restart does not reset the tree's budget. |
+| `agent_contexts` | `session_id` PK/FK; `tool_profile` text; `messages` JSONB; `through_message_id` UUID | Native SDK message history and transcript cursor. Changing authority profile invalidates the snapshot before preparing the next model request. |
+| `tool_overflow` | composite PK (`session_id` FK, `handle` text); `data` bytea | Official OverflowStore adapter, bounded to 16 MiB per result and authorized by session ownership. |
+
+Harness `PostgresMemoryStore` owns `agent_memory`, `agent_memory_operations`,
+`agent_memory_metadata`, and the `agent_memory_versions` sequence. OO invokes
+its public read/list/write/delete APIs; the authenticated user's namespace is
+`<user UUID>/main`. CAS versions and operation receipts prevent conflicting
+edits and duplicate writes. Account deletion fences new writes and queues a
+recoverable purge through the same public store; session deletion retains the
+owner's long-term memory.
+
+DBOS owns its execution schema, step outputs, queued/delayed work, and schedules
+in this same database. Application acceptance and enqueue commit together.
+The exact DBOS table shapes belong to the pinned SDK; OO does not mirror or
+manually edit its execution log. Fixed-version restart is supported. SDK
+upgrades require draining active work before changing workflow definitions.
 
 ---
 

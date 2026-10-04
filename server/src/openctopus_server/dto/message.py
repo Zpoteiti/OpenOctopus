@@ -187,7 +187,6 @@ class MessageResponse(BaseModel):
         "tool_result",
         "synthetic_tool_result",
         "synthetic_assistant_error",
-        "compaction_summary",
     ]
     content: list[ContentBlock]
     attachment_refs: list[MessageAttachmentRef]
@@ -198,7 +197,7 @@ class MessageResponse(BaseModel):
         default_factory=ChannelContextResponse
     )
     deliveries: list[ChannelDeliveryResponse] = Field(default_factory=list)
-    is_compacted: bool
+
     created_at: datetime
 
 
@@ -227,4 +226,5 @@ class MessagesResponse(BaseModel):
     active_turn_id: UUID | None
     last_message_id: UUID | None
     pending_count: int
+    active_delegate_count: int
     has_more_before: bool

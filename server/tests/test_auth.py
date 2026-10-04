@@ -19,7 +19,7 @@ async def test_register_returns_201_and_sets_cookie(async_client):
     assert COOKIE_NAME in set_cookie
 
 
-async def test_register_creates_personal_soul_and_memory_files(async_client, test_app):
+async def test_register_creates_personal_soul_and_leaves_memory_to_the_store(async_client, test_app):
     workspace = Mock()
     workspace.write = AsyncMock()
     test_app.dependency_overrides[get_workspace_service] = lambda: workspace
@@ -46,16 +46,11 @@ async def test_register_creates_personal_soul_and_memory_files(async_client, tes
     )
     assert response.status_code == 201
 
-    assert workspace.write.await_count == 2
+    assert workspace.write.await_count == 1
     soul = workspace.write.await_args_list[0].kwargs
-    memory = workspace.write.await_args_list[1].kwargs
     assert soul["path"] == "SOUL.md"
     assert soul["data"] == b"# Company Agent\nBe clear and practical."
     assert soul["if_none_match"] is True
-    assert memory["path"] == "MEMORY.md"
-    assert b"how they would like to be addressed" in memory["data"]
-    assert b"what they would like to call you" in memory["data"]
-    assert memory["if_none_match"] is True
 
 
 async def test_register_duplicate_email_returns_409(async_client):

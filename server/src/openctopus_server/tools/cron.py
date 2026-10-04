@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from copy import deepcopy
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -102,11 +101,8 @@ class CronTool(Tool):
     def __init__(
         self,
         engine: AsyncEngine,
-        *,
-        wake: Callable[[], None] | None = None,
     ) -> None:
         self._engine = engine
-        self._wake = wake
 
     def name(self) -> str:
         return "cron"
@@ -143,7 +139,6 @@ class CronTool(Tool):
                             tz=parsed.tz,
                         ),
                     )
-                    self._notify_scheduler()
                     return ToolResult(
                         content=json.dumps(
                             {"job": job.model_dump(mode="json")},
@@ -171,7 +166,6 @@ class CronTool(Tool):
                     user_id=ctx.user_id,
                     job_id=parsed.job_id,
                 )
-                self._notify_scheduler()
                 return ToolResult(
                     content="Future triggers stopped; existing history retained."
                 )
@@ -179,10 +173,6 @@ class CronTool(Tool):
             return _service_error(exc)
         except Exception:
             return _error(ErrorCode.TOOL_DB_ERROR, "Cron storage is unavailable")
-
-    def _notify_scheduler(self) -> None:
-        if self._wake is not None:
-            self._wake()
 
 
 def _service_error(exc: OpenOctopusError) -> ToolResult:

@@ -44,7 +44,7 @@ describe('admin pages', () => {
       shared_workspace_quota_bytes: 524288000,
       llm_endpoint: 'https://api.siliconflow.cn',
       llm_api_key: '<redacted>',
-      llm_model: 'Qwen/Qwen3.5-4B',
+      llm_protocol: 'anthropic', llm_model: 'Qwen/Qwen3.5-4B',
       llm_max_context_tokens: 131072,
       llm_compaction_threshold_tokens: 16000,
       llm_max_concurrent_requests: 8,
@@ -75,7 +75,7 @@ describe('admin pages', () => {
 
     await waitFor(() => expect(patches).toHaveLength(1))
     expect(patches[0]).not.toHaveProperty('llm_api_key')
-    expect(patches[0]).toMatchObject({ llm_endpoint: 'https://api.siliconflow.cn', llm_model: 'Qwen/Qwen3.5-4B' })
+    expect(patches[0]).toMatchObject({ llm_endpoint: 'https://api.siliconflow.cn', llm_protocol: 'anthropic', llm_model: 'Qwen/Qwen3.5-4B' })
   })
 
   it('omits every blank optional Provider field instead of submitting null', async () => {
@@ -85,7 +85,7 @@ describe('admin pages', () => {
       shared_workspace_quota_bytes: 524288000,
       llm_endpoint: null,
       llm_api_key: null,
-      llm_model: null,
+      llm_protocol: 'anthropic', llm_model: null,
       llm_max_context_tokens: null,
       llm_compaction_threshold_tokens: null,
       llm_max_concurrent_requests: null,
@@ -97,14 +97,14 @@ describe('admin pages', () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === 'PATCH') {
         patches.push(JSON.parse(String(init.body)))
-        return json({ ...config, llm_endpoint: 'https://provider.example', llm_api_key: '<redacted>', llm_model: 'model-1' })
+        return json({ ...config, llm_endpoint: 'https://provider.example', llm_api_key: '<redacted>', llm_protocol: 'anthropic', llm_model: 'model-1' })
       }
       return json(config)
     }))
 
     renderPage(<AdminSettingsPage />)
     const user = userEvent.setup()
-    await user.type(await screen.findByLabelText('API base URL'), 'https://provider.example')
+    await user.type(await screen.findByLabelText('API base URL (without /v1)'), 'https://provider.example')
     await user.type(screen.getByLabelText('API Key'), 'secret')
     await user.type(screen.getByLabelText('Model'), 'model-1')
     await user.click(screen.getByRole('button', { name: 'Validate and save Provider' }))
@@ -113,7 +113,7 @@ describe('admin pages', () => {
     expect(patches[0]).toEqual({
       llm_endpoint: 'https://provider.example',
       llm_api_key: 'secret',
-      llm_model: 'model-1',
+      llm_protocol: 'anthropic', llm_model: 'model-1',
       llm_max_output_tokens: 16384,
     })
   })
@@ -122,7 +122,7 @@ describe('admin pages', () => {
     const patches: Array<Record<string, unknown>> = []
     const config = {
       quota_bytes: 524288000, shared_workspace_quota_bytes: 524288000,
-      llm_endpoint: null, llm_api_key: null, llm_model: null, llm_max_context_tokens: null,
+      llm_endpoint: null, llm_api_key: null, llm_protocol: 'anthropic', llm_model: null, llm_max_context_tokens: null,
       llm_compaction_threshold_tokens: null, llm_max_concurrent_requests: null,
       llm_max_output_tokens: 16384, default_soul: 'Default identity', web_fetch_denylist: [],
       jev_endpoint: 'https://jev.example', jev_api_key: '<redacted>',
@@ -160,7 +160,7 @@ describe('admin pages', () => {
       shared_workspace_quota_bytes: 524288000,
       llm_endpoint: null,
       llm_api_key: null,
-      llm_model: null,
+      llm_protocol: 'anthropic', llm_model: null,
       llm_max_context_tokens: null,
       llm_compaction_threshold_tokens: null,
       llm_max_concurrent_requests: null,

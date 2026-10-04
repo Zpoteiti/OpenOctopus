@@ -247,8 +247,11 @@ def test_messages_response_runtime_schema_is_structured() -> None:
         "active_turn_id",
         "last_message_id",
         "pending_count",
+        "active_delegate_count",
         "has_more_before",
     }
+    static = _static_openapi()["components"]["schemas"]["MessagesResponse"]
+    assert set(static["required"]) == set(schema["required"])
 
 
 def test_admin_config_schema_exposes_every_structured_control() -> None:

@@ -506,18 +506,11 @@ paths:
         message is written directly to provider-visible `messages`; active-run
         overlap is written to `pending_messages`. Beginning with Py3, every
         accepted user message is first durable in `pending_messages`. An idle
-        runner promotes it immediately when Stage 1 compaction is unnecessary.
-        When Stage 1 triggers, the incoming batch remains pending while active
-        prior history is summarized; one commit marks the selected source rows
-        compacted, inserts the active summary, then promotes the captured
-        pending-human prefix. This preserves active order `S1, U11` without
-        backdating. Messages accepted after preflight captures its ordered
-        the preflight boundary remain pending for the next provider call. During
-        an existing tool run, pending rows drain only after the current
-        assistant tool batch is fully addressed.
-        If pending rows survived a restart but no turn is running, the new
-        input joins them and the entire ordered queue drains before the
-        recovered turn starts.
+        runner promotes the captured input prefix at a safe boundary. The SDK
+        compacts its private context; canonical messages remain available unchanged.
+        Input acceptance and DBOS enqueue commit together. Main and child workflows
+        resume on process restart without a new message. Messages accepted after
+        the captured prefix wait for the following provider call.
 
         Pending browser messages use latest-wins streaming. The newest queued
         POST response may stay open as the live preview subscriber for the next
@@ -1825,25 +1818,20 @@ paths:
             outbound LLM requests. Write-only in admin API responses: once
             configured, GET/PATCH responses return `"<redacted>"` instead of
             the raw key. ADR-101.
-          - `llm_model` (string) — model name passed in the Anthropic Messages
-            request body. ADR-101.
+          - `llm_model` (string) — model name passed to the configured official Provider. ADR-101.
           - `llm_max_context_tokens` (int) — LLM context window in tokens
             (e.g. `128000`). OO estimates the full request locally with its
             packaged `o200k_base` tokenizer; the configured Provider remains
             authoritative for the actual model limit. ADR-025, ADR-101.
-          - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
-            trigger. Missing disables compaction. When configured,
-            `llm_max_context_tokens` is required and the threshold must be
-            strictly smaller than that context window. The trigger compares
-            `llm_max_context_tokens − local_token_estimate(prompt)` with
-            `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-            = `threshold − 4000`. At most one eligible compaction stage runs
-            before a final request; the endpoint does not need a count-tokens
-            route. ADR-025, ADR-028, ADR-101, ADR-126.
+          - `llm_compaction_threshold_tokens` (int) — reserved context headroom.
+            When set, SDK summarization triggers at the configured context window
+            minus this value. When absent, the official capability uses 80% of
+            the configured or model-reported context window. Summaries and tool
+            pairing are maintained by Harness, independently of original history.
           - `llm_max_concurrent_requests` (int) — optional
             in-process semaphore in the shared LLM provider layer. A configured
             `0` means unlimited and creates no semaphore. A positive integer
-            caps concurrent in-flight Anthropic Messages calls made through
+            caps concurrent in-flight model calls made through
             the shared provider adapter, including chat, cron, heartbeat,
             compaction, and future autonomous flows. If missing at server
             startup, only the runtime limiter treats it as `0`; no row is
@@ -1953,6 +1941,10 @@ paths:
                   { type: integer, format: int64, minimum: 1, example: 524288000, description: Per-user personal workspace quota in bytes. }
                 shared_workspace_quota_bytes:
                   { type: integer, format: int64, minimum: 1, example: 524288000, description: Maximum quota for one shared workspace in bytes. }
+                llm_protocol:
+                  type: string
+                  enum: [anthropic, openai, openrouter]
+                  description: Model API protocol used by the configured endpoint.
                 llm_endpoint:
                   { type: string, minLength: 1, example: https://api.siliconflow.cn, description: Unversioned Anthropic-compatible API base URL; omit /v1. }
                 llm_api_key:
@@ -2246,6 +2238,129 @@ paths:
       description: Explicit connection check using one small Jev decision request. Returns
         observed status without credentials or remote response bodies.
 
+  /api/memory:
+    get:
+      tags:
+      - Memory
+      summary: List Notes
+      operationId: list_notes_api_memory_get
+      parameters:
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          default: 100
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryPage'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/memory/{path}:
+    get:
+      tags:
+      - Memory
+      summary: Read Note
+      operationId: read_note_api_memory__path__get
+      parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Path
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryNote'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      tags:
+      - Memory
+      summary: Write Note
+      operationId: write_note_api_memory__path__put
+      parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEdit'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryNote'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - Memory
+      summary: Delete Note
+      operationId: delete_note_api_memory__path__delete
+      parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Path
+      - name: expected_version
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          title: Expected Version
+      responses:
+        '204':
+          description: Successful Response
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   securitySchemes:
     cookieAuth:
@@ -2296,6 +2411,59 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   schemas:
+    MemoryEdit:
+      properties:
+        content:
+          type: string
+          maxLength: 65536
+          title: Content
+        expected_version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Expected Version
+      additionalProperties: false
+      type: object
+      required:
+      - content
+      - expected_version
+      title: MemoryEdit
+    MemoryNote:
+      properties:
+        path:
+          type: string
+          title: Path
+        content:
+          type: string
+          title: Content
+        version:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Version
+      type: object
+      required:
+      - path
+      - content
+      - version
+      title: MemoryNote
+    MemoryPage:
+      properties:
+        paths:
+          items:
+            type: string
+          type: array
+          title: Paths
+        next_offset:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Next Offset
+      type: object
+      required:
+      - paths
+      - next_offset
+      title: MemoryPage
     Error:
       type: object
       required: [code, message]
@@ -2342,7 +2510,7 @@ components:
     AdminConfig:
       type: object
       additionalProperties: false
-      required: [quota_bytes, shared_workspace_quota_bytes, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, default_soul, web_fetch_denylist, jev_endpoint, jev_api_key, jev_status]
+      required: [quota_bytes, shared_workspace_quota_bytes, llm_protocol, llm_endpoint, llm_api_key, llm_model, llm_max_context_tokens, llm_compaction_threshold_tokens, llm_max_concurrent_requests, llm_max_output_tokens, default_soul, web_fetch_denylist, jev_endpoint, jev_api_key, jev_status]
       description: |
         Admin-visible effective config. Quota keys are always present because
         missing rows default to 500 MiB (`524288000`).
@@ -2360,10 +2528,14 @@ components:
           format: int64
           example: 524288000
           description: Effective quota ceiling for a single shared workspace. Defaults to 500 MiB when no row is configured.
+        llm_protocol:
+          type: string
+          enum: [anthropic, openai, openrouter]
+          description: Model API protocol used by the configured endpoint. Defaults to anthropic.
         llm_endpoint:
           type: [string, "null"]
           example: https://api.siliconflow.cn
-          description: Unversioned Anthropic-compatible API base URL; do not include /v1.
+          description: Unversioned model API base URL; omit /v1. OpenRouter uses https://openrouter.ai/api.
         llm_api_key:
           type: [string, "null"]
           example: <redacted>
@@ -2457,6 +2629,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         user_id: { type: string, format: uuid }
+        parent_session_id: { type: [string, "null"], format: uuid }
         session_key:
           type: string
           description: Composite key; usually `{channel}:{chat_id}` (ADR-006). Browser sessions use `web:{session_id}` and clients cannot set or rename it.
@@ -2480,7 +2653,7 @@ components:
     Message:
       type: object
       additionalProperties: false
-      required: [id, session_id, role, message_kind, is_compacted, content, attachment_refs, delivery_refs, created_at]
+      required: [id, session_id, role, message_kind, content, attachment_refs, delivery_refs, created_at]
       properties:
         id: { type: string }
         session_id: { type: string }
@@ -2492,19 +2665,12 @@ components:
             projection convenience, not a stored `messages` database column.
         message_kind:
           type: string
-          enum: [human, assistant, tool_result, synthetic_tool_result, synthetic_assistant_error, compaction_summary]
+          enum: [human, assistant, tool_result, synthetic_tool_result, synthetic_assistant_error]
           description: |
             Stored OpenOctopus semantic discriminator for rendering, audit,
             recovery, and provider request folding. `human`, `tool_result`,
             and `synthetic_tool_result` derive provider role `user`; the other
-            three kinds derive `assistant`.
-        is_compacted:
-          type: boolean
-          description: |
-            If true, the row remains in canonical history/audit but is excluded
-            from provider replay and future compaction input. Summary identity
-            is represented by `message_kind=compaction_summary`; an active
-            summary is false and can later become true when absorbed.
+            two kinds derive `assistant`.
         content:
           type: array
           items: { $ref: '#/components/schemas/ContentBlock' }
@@ -2666,13 +2832,12 @@ components:
 
     MessagesResponse:
       type: object
-      required: [messages, pending_messages, status, active_turn_id, last_message_id, pending_count, has_more_before]
+      required: [messages, pending_messages, status, active_turn_id, last_message_id, pending_count, active_delegate_count, has_more_before]
       description: |
         Canonical PostgreSQL-backed chat state. This response never includes
         in-flight token deltas from a running assistant response. The
-        `messages` array is cursor-paginated canonical history, including rows
-        retained with `is_compacted=true`; provider replay independently
-        selects only active rows. The
+        `messages` array is cursor-paginated original history. The compacted
+        model context is stored separately. The
         `pending_messages` array is the full durable pending queue for this
         session and is not counted against `limit`.
       properties:
@@ -2693,6 +2858,10 @@ components:
           type: string
           enum: [idle, running, failed, abandoned]
           description: Current session/turn state derived from persisted run/lease state.
+        active_delegate_count:
+          type: integer
+          minimum: 0
+          description: Running child agents belonging to this conversation, including while the parent is idle.
         active_turn_id:
           type: string
           nullable: true

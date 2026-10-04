@@ -830,8 +830,6 @@ async def test_shutdown_drains_publish_and_schedule_before_runtime_close(
         _close_lifespan_resources(
             channel_ingress=ingress,
             channel_manager=None,
-            heartbeat_pulse=None,
-            cron_scheduler=None,
             server_mcp_supervisor=None,
             runtime=runtime,  # type: ignore[arg-type]
             device_registry=None,

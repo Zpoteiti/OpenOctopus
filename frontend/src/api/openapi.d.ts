@@ -618,18 +618,11 @@ export interface paths {
          *     message is written directly to provider-visible `messages`; active-run
          *     overlap is written to `pending_messages`. Beginning with Py3, every
          *     accepted user message is first durable in `pending_messages`. An idle
-         *     runner promotes it immediately when Stage 1 compaction is unnecessary.
-         *     When Stage 1 triggers, the incoming batch remains pending while active
-         *     prior history is summarized; one commit marks the selected source rows
-         *     compacted, inserts the active summary, then promotes the captured
-         *     pending-human prefix. This preserves active order `S1, U11` without
-         *     backdating. Messages accepted after preflight captures its ordered
-         *     the preflight boundary remain pending for the next provider call. During
-         *     an existing tool run, pending rows drain only after the current
-         *     assistant tool batch is fully addressed.
-         *     If pending rows survived a restart but no turn is running, the new
-         *     input joins them and the entire ordered queue drains before the
-         *     recovered turn starts.
+         *     runner promotes the captured input prefix at a safe boundary. The SDK
+         *     compacts its private context; canonical messages remain available unchanged.
+         *     Input acceptance and DBOS enqueue commit together. Main and child workflows
+         *     resume on process restart without a new message. Messages accepted after
+         *     the captured prefix wait for the following provider call.
          *
          *     Pending browser messages use latest-wins streaming. The newest queued
          *     POST response may stay open as the live preview subscriber for the next
@@ -2972,25 +2965,20 @@ export interface paths {
          *         outbound LLM requests. Write-only in admin API responses: once
          *         configured, GET/PATCH responses return `"<redacted>"` instead of
          *         the raw key. ADR-101.
-         *       - `llm_model` (string) — model name passed in the Anthropic Messages
-         *         request body. ADR-101.
+         *       - `llm_model` (string) — model name passed to the configured official Provider. ADR-101.
          *       - `llm_max_context_tokens` (int) — LLM context window in tokens
          *         (e.g. `128000`). OO estimates the full request locally with its
          *         packaged `o200k_base` tokenizer; the configured Provider remains
          *         authoritative for the actual model limit. ADR-025, ADR-101.
-         *       - `llm_compaction_threshold_tokens` (int) — Py3 compaction headroom
-         *         trigger. Missing disables compaction. When configured,
-         *         `llm_max_context_tokens` is required and the threshold must be
-         *         strictly smaller than that context window. The trigger compares
-         *         `llm_max_context_tokens − local_token_estimate(prompt)` with
-         *         `llm_compaction_threshold_tokens`; summary `max_output_tokens`
-         *         = `threshold − 4000`. At most one eligible compaction stage runs
-         *         before a final request; the endpoint does not need a count-tokens
-         *         route. ADR-025, ADR-028, ADR-101, ADR-126.
+         *       - `llm_compaction_threshold_tokens` (int) — reserved context headroom.
+         *         When set, SDK summarization triggers at the configured context window
+         *         minus this value. When absent, the official capability uses 80% of
+         *         the configured or model-reported context window. Summaries and tool
+         *         pairing are maintained by Harness, independently of original history.
          *       - `llm_max_concurrent_requests` (int) — optional
          *         in-process semaphore in the shared LLM provider layer. A configured
          *         `0` means unlimited and creates no semaphore. A positive integer
-         *         caps concurrent in-flight Anthropic Messages calls made through
+         *         caps concurrent in-flight model calls made through
          *         the shared provider adapter, including chat, cron, heartbeat,
          *         compaction, and future autonomous flows. If missing at server
          *         startup, only the runtime limiter treats it as `0`; no row is
@@ -3122,6 +3110,11 @@ export interface paths {
                          * @example 524288000
                          */
                         shared_workspace_quota_bytes?: number;
+                        /**
+                         * @description Model API protocol used by the configured endpoint.
+                         * @enum {string}
+                         */
+                        llm_protocol?: "anthropic" | "openai" | "openrouter";
                         /**
                          * @description Unversioned Anthropic-compatible API base URL; omit /v1.
                          * @example https://api.siliconflow.cn
@@ -3509,10 +3502,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Notes */
+        get: operations["list_notes_api_memory_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Note */
+        get: operations["read_note_api_memory__path__get"];
+        /** Write Note */
+        put: operations["write_note_api_memory__path__put"];
+        post?: never;
+        /** Delete Note */
+        delete: operations["delete_note_api_memory__path__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** MemoryEdit */
+        MemoryEdit: {
+            /** Content */
+            content: string;
+            /** Expected Version */
+            expected_version: string | null;
+        };
+        /** MemoryNote */
+        MemoryNote: {
+            /** Path */
+            path: string;
+            /** Content */
+            content: string;
+            /** Version */
+            version: string | null;
+        };
+        /** MemoryPage */
+        MemoryPage: {
+            /** Paths */
+            paths: string[];
+            /** Next Offset */
+            next_offset: number | null;
+        };
         Error: {
             /**
              * @description Stable error code from `openoctopus_server/errors/`.
@@ -3571,7 +3623,12 @@ export interface components {
              */
             shared_workspace_quota_bytes: number;
             /**
-             * @description Unversioned Anthropic-compatible API base URL; do not include /v1.
+             * @description Model API protocol used by the configured endpoint. Defaults to anthropic.
+             * @enum {string}
+             */
+            llm_protocol: "anthropic" | "openai" | "openrouter";
+            /**
+             * @description Unversioned model API base URL; omit /v1. OpenRouter uses https://openrouter.ai/api.
              * @example https://api.siliconflow.cn
              */
             llm_endpoint: string | null;
@@ -3658,6 +3715,8 @@ export interface components {
             id: string;
             /** Format: uuid */
             user_id: string;
+            /** Format: uuid */
+            parent_session_id?: string | null;
             /** @description Composite key; usually `{channel}:{chat_id}` (ADR-006). Browser sessions use `web:{session_id}` and clients cannot set or rename it. */
             session_key: string;
             channel: string;
@@ -3689,17 +3748,10 @@ export interface components {
              * @description Stored OpenOctopus semantic discriminator for rendering, audit,
              *     recovery, and provider request folding. `human`, `tool_result`,
              *     and `synthetic_tool_result` derive provider role `user`; the other
-             *     three kinds derive `assistant`.
+             *     two kinds derive `assistant`.
              * @enum {string}
              */
-            message_kind: "human" | "assistant" | "tool_result" | "synthetic_tool_result" | "synthetic_assistant_error" | "compaction_summary";
-            /**
-             * @description If true, the row remains in canonical history/audit but is excluded
-             *     from provider replay and future compaction input. Summary identity
-             *     is represented by `message_kind=compaction_summary`; an active
-             *     summary is false and can later become true when absorbed.
-             */
-            is_compacted: boolean;
+            message_kind: "human" | "assistant" | "tool_result" | "synthetic_tool_result" | "synthetic_assistant_error";
             /**
              * @description Sanitized Anthropic content blocks. Normal `thinking.thinking`
              *     blocks are returned when present so the frontend can decide whether
@@ -3824,9 +3876,8 @@ export interface components {
         /**
          * @description Canonical PostgreSQL-backed chat state. This response never includes
          *     in-flight token deltas from a running assistant response. The
-         *     `messages` array is cursor-paginated canonical history, including rows
-         *     retained with `is_compacted=true`; provider replay independently
-         *     selects only active rows. The
+         *     `messages` array is cursor-paginated original history. The compacted
+         *     model context is stored separately. The
          *     `pending_messages` array is the full durable pending queue for this
          *     session and is not counted against `limit`.
          */
@@ -3847,6 +3898,8 @@ export interface components {
              * @enum {string}
              */
             status: "idle" | "running" | "failed" | "abandoned";
+            /** @description Running child agents belonging to this conversation, including while the parent is idle. */
+            active_delegate_count: number;
             /** @description Running provider-call/tool-batch id when one currently owns the session. */
             active_turn_id: string | null;
             /** @description Most recent persisted canonical message id in the whole session. */
@@ -5014,6 +5067,135 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JevStatus"];
+                };
+            };
+        };
+    };
+    list_notes_api_memory_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryPage"];
+                };
+            };
+            /** @description Invalid request. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    read_note_api_memory__path__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryNote"];
+                };
+            };
+            /** @description Invalid request. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    write_note_api_memory__path__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryEdit"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryNote"];
+                };
+            };
+            /** @description Invalid request. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    delete_note_api_memory__path__delete: {
+        parameters: {
+            query: {
+                expected_version: string;
+            };
+            header?: never;
+            path: {
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid request. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

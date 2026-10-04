@@ -29,13 +29,7 @@ async def _owner(pg_engine) -> User:
 
 async def test_cron_tool_add_list_and_remove(pg_engine) -> None:
     owner = await _owner(pg_engine)
-    wakes = 0
-
-    def wake() -> None:
-        nonlocal wakes
-        wakes += 1
-
-    tool = CronTool(pg_engine, wake=wake)
+    tool = CronTool(pg_engine)
     context = ToolContext(user_id=owner.id, session_id=uuid.uuid4())
 
     added = await tool.execute(
@@ -69,7 +63,6 @@ async def test_cron_tool_add_list_and_remove(pg_engine) -> None:
     )
     assert not removed.is_error
     assert removed.content == "Future triggers stopped; existing history retained."
-    assert wakes == 2
 
 
 async def test_cron_tool_list_is_fixed_twenty_item_page(pg_engine) -> None:

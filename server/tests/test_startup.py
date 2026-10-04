@@ -43,6 +43,7 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     pulse = SimpleNamespace(start=Mock(), close=AsyncMock())
     pending_recovery = AsyncMock()
+    monkeypatch.setattr("openctopus_server.main.bind_automations", Mock())
     monkeypatch.setattr("openctopus_server.main.initialize_token_estimator", Mock())
     monkeypatch.setattr("openctopus_server.main.get_content_converter", lambda: converter)
     monkeypatch.setattr(
@@ -54,8 +55,8 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         AsyncMock(return_value=empty_server_mcp_envelope()),
     )
     monkeypatch.setattr(
-        "openctopus_server.main.CronScheduler",
-        Mock(return_value=scheduler),
+        "openctopus_server.main.start_schedules",
+        scheduler.start,
     )
     monkeypatch.setattr(
         "openctopus_server.main.HeartbeatPulse",
@@ -77,7 +78,8 @@ def _startup_dependencies(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 def _app_with_runtime() -> tuple[FastAPI, SimpleNamespace]:
     app = FastAPI()
     device_registry = SimpleNamespace(close=AsyncMock())
-    runtime = SimpleNamespace(runner_instance_id=uuid4(), close=AsyncMock())
+    runtime = SimpleNamespace(runner_instance_id=uuid4(), close=AsyncMock(),
+                              durable=SimpleNamespace(start=AsyncMock()), memory=SimpleNamespace(store=Mock()))
     runtime.device_registry = device_registry
     app.state.chat_runtime = runtime
     return app, runtime
@@ -194,7 +196,6 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
             "openctopus_server.main.recover_workspace_deletions",
             new_callable=AsyncMock,
         ) as recover_deletions,
-        patch("openctopus_server.main.abandon_running_turns", new_callable=AsyncMock),
     ):
         async with _lifespan(app):
             storage.probe_startup.assert_awaited_once()
@@ -205,18 +206,14 @@ async def test_lifespan_runs_storage_probe_and_closes_storage(
             assert app.state.server_mcp_supervisor is (
                 _startup_dependencies.supervisor
             )
-            assert app.state.cron_scheduler is _startup_dependencies.scheduler
             assert app.state.heartbeat_pulse is _startup_dependencies.pulse
 
     _startup_dependencies.scheduler.start.assert_awaited_once()
-    _startup_dependencies.pulse.start.assert_called_once_with()
 
     assert connection.execute.await_count == 2
     connection.run_sync.assert_awaited_once()
     runtime.close.assert_awaited_once()
     assert events == [
-        "heartbeat-close",
-        "cron-stop",
         "mcp-begin",
         "chat-close",
         "mcp-close",
@@ -288,24 +285,21 @@ async def test_channel_recovery_startup_and_two_phase_shutdown_order(
             "openctopus_server.main.recover_workspace_deletions",
             new_callable=AsyncMock,
         ),
-        patch("openctopus_server.main.abandon_running_turns", side_effect=abandon),
+        patch.object(runtime.durable, "start", side_effect=abandon),
     ):
         async with _lifespan(app):
-            assert events[:6] == [
+            assert events[:5] == [
                 "turn-repair",
                 "pending-repair",
                 "delivery-repair",
                 "channel-start",
                 "cron-start",
-                "heartbeat-start",
             ]
 
-    assert events[6:] == [
+    assert events[5:] == [
         "ingress-close",
         "ingress-drain",
         "channel-begin",
-        "heartbeat-close",
-        "cron-stop",
         "mcp-begin",
         "chat-close",
         "channel-stop",
@@ -323,6 +317,8 @@ async def test_lifespan_builds_and_publishes_the_default_channel_stack(
     device_registry = SimpleNamespace(close=AsyncMock())
     runtime = SimpleNamespace(
         runner_instance_id=uuid4(),
+        durable=SimpleNamespace(start=AsyncMock()),
+        memory=SimpleNamespace(store=Mock()),
         device_registry=device_registry,
         close=AsyncMock(),
     )
@@ -365,7 +361,6 @@ async def test_lifespan_builds_and_publishes_the_default_channel_stack(
         patch("openctopus_server.main.ChannelOutbound", return_value=outbound),
         patch("openctopus_server.main.ChannelIngress", return_value=ingress),
         patch("openctopus_server.main._ChannelCredentialValidator", return_value=validator),
-        patch("openctopus_server.main.abandon_running_turns", new_callable=AsyncMock),
     ):
         async with _lifespan(app):
             assert app.state.chat_runtime is runtime
@@ -499,8 +494,8 @@ async def test_lifespan_cleans_resources_when_turn_recovery_fails() -> None:
             "openctopus_server.main.recover_workspace_deletions",
             new_callable=AsyncMock,
         ),
-        patch(
-            "openctopus_server.main.abandon_running_turns",
+        patch.object(
+            runtime.durable, "start",
             new_callable=AsyncMock,
             side_effect=RuntimeError("recovery failed"),
         ),

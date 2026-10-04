@@ -18,12 +18,10 @@ function MessageRow({ message }: { message: ChatMessage }): ReactNode {
       ? t('chat.you', { defaultValue: 'You' })
       : 'OpenOctopus'
   return (
-    <article className={`chat-message chat-message-${isHuman ? 'user' : 'assistant'}${message.is_compacted ? ' chat-message-compacted' : ''}`}>
+    <article className={`chat-message chat-message-${isHuman ? 'user' : 'assistant'}`}>
       <header>
         <MessageAuthor sender={isHuman ? message.sender : null} fallback={label} />
-        <span>{message.message_kind === 'compaction_summary'
-          ? t('chat.compactionSummary', { defaultValue: 'Context summary' })
-          : formatTime(message.created_at, i18n.resolvedLanguage)}</span>
+        <span>{formatTime(message.created_at, i18n.resolvedLanguage)}</span>
       </header>
       <ContentBlocks blocks={message.content} />
       <AttachmentRefs refs={message.attachment_refs} />
@@ -53,7 +51,8 @@ export function MessageAuthor({
   fallback: string
 }): ReactNode {
   const { t } = useTranslation()
-  if (!sender || sender.classification === 'internal') return <strong>{fallback}</strong>
+  if (!sender) return <strong>{fallback}</strong>
+  if (sender.classification === 'internal') return <strong>{sender.display_name || fallback}</strong>
   return (
     <span className="chat-message-author">
       <strong>{sender.display_name || sender.id}</strong>
@@ -165,44 +164,32 @@ export function Transcript({
   messages,
   running,
   toolProgress,
+  streamingChannel,
 }: {
   messages: ChatMessage[]
   running: boolean
   toolProgress: string | null
+  streamingChannel: 'thinking' | 'text' | null
 }): ReactNode {
   const { t } = useTranslation()
   const groups: ChatMessage[][] = []
 
   for (const message of messages) {
-    if (message.message_kind === 'compaction_summary') {
-      groups.push([message])
-      continue
-    }
     if (message.message_kind === 'human' || groups.length === 0) {
       groups.push([message])
       continue
     }
     const current = groups.at(-1)
-    if (!current || current[0]?.message_kind === 'compaction_summary') {
+    if (!current) {
       groups.push([message])
     } else {
       current.push(message)
     }
   }
 
-  let activeGroupIndex = -1
-  for (let index = groups.length - 1; index >= 0; index -= 1) {
-    if (groups[index]?.[0]?.message_kind !== 'compaction_summary') {
-      activeGroupIndex = index
-      break
-    }
-  }
+  const activeGroupIndex = groups.length - 1
 
   return groups.map((group, groupIndex) => {
-    if (group.length === 1 && group[0]?.message_kind === 'compaction_summary') {
-      return <MessageRow key={group[0].id} message={group[0]} />
-    }
-
     const human = group[0]?.message_kind === 'human' ? group[0] : null
     const responses = human ? group.slice(1) : group
     let finalIndex = -1
@@ -215,11 +202,14 @@ export function Transcript({
     const finalReply = finalIndex >= 0 ? responses[finalIndex] : null
     const process = responses.filter((_, index) => index !== finalIndex)
     const active = running && groupIndex === activeGroupIndex
+      && (!finalReply || finalIndex < responses.length - 1)
     const latestTool = findLatestTool(process)
     const summary = active
-      ? toolProgress ?? (latestTool
+      ? streamingChannel === 'text' ? t('chat.generating')
+        : streamingChannel === 'thinking' ? t('chat.thinkingInProgress')
+        : toolProgress ?? (latestTool
           ? t('chat.currentWork', { tool: latestTool, defaultValue: 'Working · {{tool}}' })
-          : t('chat.workInProgress', { defaultValue: 'Working…' }))
+          : t('chat.waitingForModel'))
       : t('chat.workDetails', {
           count: process.length,
           defaultValue: 'Work details · {{count}} steps',
@@ -228,7 +218,7 @@ export function Transcript({
     return (
       <div className="chat-turn" key={human?.id ?? group[0]?.id ?? groupIndex}>
         {human ? <MessageRow message={human} /> : null}
-        {process.length ? (
+        {process.length || active ? (
           <details className={`chat-work-log${active ? ' chat-work-log-active' : ''}`}>
             <summary><span aria-hidden="true" className="chat-work-status" />{summary}</summary>
             <div className="chat-work-log-messages">

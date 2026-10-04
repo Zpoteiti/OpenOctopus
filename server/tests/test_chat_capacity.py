@@ -1,9 +1,11 @@
+
 import asyncio
 import json
 from collections import defaultdict
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from native_provider_fixture import NativeProviderFixture
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,13 +18,13 @@ from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Message, PendingMessage, SystemConfig, TurnRun
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ToolError
-from openctopus_server.provider.anthropic import (
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.runtime import (
     DeltaCallback,
     ProviderResult,
     provider_fingerprint,
 )
-from openctopus_server.provider.config import ProviderConfig
-from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.registry import ToolRegistry
 from openctopus_server.workspace.file_content import DocumentParser
@@ -30,7 +32,7 @@ from openctopus_server.workspace.file_content import DocumentParser
 _SESSION_COUNT = 500
 
 
-class CapacityProvider:
+class CapacityProvider(NativeProviderFixture):
     def __init__(self, expected_calls: int) -> None:
         self.expected_calls = expected_calls
         self.started = 0

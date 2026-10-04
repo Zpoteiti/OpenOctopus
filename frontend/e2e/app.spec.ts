@@ -39,7 +39,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await expect(page.locator('.page-scroll').getByLabel('Language')).toBeVisible()
   await expect(page.locator('.page-scroll').getByRole('button', { name: 'Theme: System' })).toBeVisible()
   await expect(page.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
-  await expect(page.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+  await expect(page.getByRole('link', { name: 'Edit memory' })).toHaveAttribute('href', '/memory')
   await page.getByLabel('Timezone').fill('Asia/Shanghai')
   const timezoneSaved = page.waitForResponse((response) => (
     response.url().endsWith('/api/me')
@@ -59,6 +59,17 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await page.getByRole('button', { name: 'Sign in' }).click()
   await expect(page).toHaveURL(/\/chat$/)
 
+  await page.getByRole('link', { name: 'Memory', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Memory', exact: true })).toBeVisible()
+  await expectSinglePaneToFillWorkspace(page)
+  await page.getByLabel('Note content').fill('Browser memory survives reload.')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.getByRole('status')).toHaveText('Memory saved.')
+  await page.reload()
+  await expect(page.getByLabel('Note content')).toHaveValue('Browser memory survives reload.')
+  await page.getByRole('button', { name: 'Delete note', exact: true }).click()
+  await expect(page.getByLabel('Note content')).toHaveValue('')
+
   await page.getByRole('link', { name: 'Channels' }).click()
   await expect(page).toHaveURL(/\/channels$/)
   await expect(page.getByRole('heading', { name: 'Channels' })).toBeVisible()
@@ -71,9 +82,9 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await expectSinglePaneToFillWorkspace(page)
   await expect(page.getByLabel('Default SOUL')).toHaveValue("You are OpenOctopus, the user's personal AI partner.")
   await expectFieldsToAlign(page, 'Maximum concurrent requests', 'Maximum output tokens')
-  await page.getByLabel('API base URL', { exact: true }).fill('http://127.0.0.1:18080')
+  await page.getByLabel('API base URL (without /v1)', { exact: true }).fill('http://127.0.0.1:18080')
   await page.getByLabel('API Key', { exact: true }).fill('frontend-e2e-key')
-  await page.getByLabel('Model').fill('openoctopus-e2e-model')
+  await page.getByLabel('Model', { exact: true }).fill('openoctopus-e2e-model')
   await page.getByLabel('Context window').fill('131072')
   await page.getByLabel('Compaction headroom').fill('16000')
   await page.getByLabel('Maximum concurrent requests').fill('2')
@@ -90,7 +101,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
     llm_api_key: '<redacted>',
     llm_model: 'openoctopus-e2e-model',
   })
-  await expect(page.getByLabel('API base URL', { exact: true })).toHaveValue('http://127.0.0.1:18080')
+  await expect(page.getByLabel('API base URL (without /v1)', { exact: true })).toHaveValue('http://127.0.0.1:18080')
 
   await page.getByRole('link', { name: 'Automations' }).click()
   await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible()
@@ -189,6 +200,7 @@ test('admin can configure and use the browser application', async ({ page }) => 
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Reply using the configured test Provider.')
   await page.getByRole('button', { name: 'Send message' }).click()
   await expect(page.getByText('Smoke reply from test provider.')).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByText('Only the most recent 200 saved messages are shown.')).toHaveCount(0)
 })
 
 async function expectSinglePaneToFillWorkspace(page: Page): Promise<void> {

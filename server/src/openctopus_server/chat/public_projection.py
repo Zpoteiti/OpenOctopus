@@ -24,6 +24,7 @@ def public_content(
     if human and projected and runtime_matches_session(projected[0], session=session):
         projected = projected[1:]
     for block in projected:
+        block.pop("_sdk", None)
         if block.get("type") == "thinking":
             block.pop("signature", None)
         elif block.get("type") == "redacted_thinking":
@@ -54,7 +55,7 @@ def message_response(
         source_message_id=message.source_message_id,
         channel_context=_channel_context_response(message.channel_context),
         deliveries=deliveries or [],
-        is_compacted=message.is_compacted,
+
         created_at=message.created_at,
     )
 
@@ -88,7 +89,6 @@ def provider_role(message_kind: str) -> str:
     if message_kind in {
         "assistant",
         "synthetic_assistant_error",
-        "compaction_summary",
     }:
         return "assistant"
     raise ValueError(f"Unsupported message kind: {message_kind}")

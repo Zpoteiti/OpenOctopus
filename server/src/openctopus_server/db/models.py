@@ -31,6 +31,73 @@ class SystemConfig(Base):
     )
 
 
+class ModelConfiguration(Base):
+    """Private model revisions referenced by durable work; never journal credentials."""
+
+    __tablename__ = "model_configurations"
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+
+class ToolOperation(Base):
+    """A dispatch receipt closes the uncertain external-effect replay window."""
+
+    __tablename__ = "tool_operations"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False,
+    )
+    arguments_hash: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class WorkflowCancellation(Base):
+    """Durable product stop intent, retained even after its session is deleted."""
+
+    __tablename__ = "workflow_cancellations"
+    workflow_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_tasks"
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True)
+    authority_message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
+    parent_session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    workflow_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    root_workflow_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="running")
+    background: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
+class AgentRequest(Base):
+    """Idempotent request reservations enforce one budget across a durable tree."""
+    __tablename__ = "agent_requests"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    root_workflow_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+
+
+class AgentContext(Base):
+    """The SDK's effective history, separate from the immutable product transcript."""
+
+    __tablename__ = "agent_contexts"
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True,
+    )
+    tool_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    through_message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+
+class ToolOverflow(Base):
+    __tablename__ = "tool_overflow"
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True,
+    )
+    handle: Mapped[str] = mapped_column(Text, primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -175,6 +242,9 @@ class Session(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    parent_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), index=True,
+    )
     session_key: Mapped[str] = mapped_column(Text, nullable=False)
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     chat_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -218,16 +288,13 @@ class Message(Base):
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     llm_fingerprint: Mapped[str | None] = mapped_column(Text)
-    is_compacted: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("FALSE")
-    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
         CheckConstraint(
-            "message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error','compaction_summary')",
+            "message_kind IN ('human','assistant','tool_result','synthetic_tool_result','synthetic_assistant_error')",
             name="check_message_kind",
         ),
         CheckConstraint(
@@ -283,8 +350,8 @@ class DreamRun(Base):
     source: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     before: Mapped[str | None] = mapped_column(Text)
     after: Mapped[str | None] = mapped_column(Text)
-    before_etag: Mapped[str | None] = mapped_column(Text)
-    after_etag: Mapped[str | None] = mapped_column(Text)
+    before_version: Mapped[str | None] = mapped_column(Text)
+    after_version: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -393,6 +460,8 @@ class TurnRun(Base):
     runner_instance_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     tool_profile: Mapped[str] = mapped_column(Text, nullable=False)
+    effort: Mapped[str | None] = mapped_column(Text)
+    workflow_id: Mapped[str | None] = mapped_column(Text, index=True)
     input_message_ids: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )

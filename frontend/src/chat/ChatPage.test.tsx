@@ -35,6 +35,7 @@ function history(overrides: Record<string, unknown> = {}): Record<string, unknow
     active_turn_id: null,
     last_message_id: null,
     pending_count: 0,
+    active_delegate_count: 0,
     has_more_before: false,
     ...overrides,
   }
@@ -242,15 +243,30 @@ describe('ChatPage', () => {
     await waitFor(() => expect(composer).not.toBeDisabled())
   })
 
-  it('keeps live reasoning inside the assistant turn after the pending user message', async () => {
+  it('shows reasoning deltas immediately, allows folding them, and folds saved reasoning after completion', async () => {
     await i18n.changeLanguage('en')
     let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+    let finished = false
+    const finalMessage = {
+      id: 'assistant-final', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
+      content: [{ type: 'thinking', thinking: 'Checking sources carefully' }, { type: 'text', text: 'Draft answer' }],
+      attachment_refs: [], delivery_refs: [], created_at: new Date().toISOString(),
+    }
     const encoder = new TextEncoder()
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
       if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
       if (url === '/api/devices') return jsonResponse([])
-      if (url.endsWith('/messages?limit=200')) return jsonResponse(history())
+      if (url.includes(`/api/sessions/${baseSession.id}/messages?`)) {
+        return jsonResponse(history(finished ? {
+          messages: [{
+            ...finalMessage, id: 'message-user', role: 'user', message_kind: 'human',
+            content: [{ type: 'text', text: 'Latest question' }],
+            created_at: new Date(Date.parse(finalMessage.created_at) - 1_000).toISOString(),
+          }, finalMessage],
+          last_message_id: finalMessage.id,
+        } : {}))
+      }
       if (url === `/api/sessions/${baseSession.id}/messages` && init?.method === 'POST') {
         return new Response(new ReadableStream<Uint8Array>({
           start(controller) { streamController = controller },
@@ -260,15 +276,23 @@ describe('ChatPage', () => {
     }))
     const user = userEvent.setup()
 
-    renderChat(`/chat/${baseSession.id}`)
+    renderChat(`/chat/${baseSession.id}`, 60_000)
     await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Latest question')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     await waitFor(() => expect(streamController).toBeDefined())
     await act(async () => {
       streamController?.enqueue(encoder.encode([
         '{"type":"message_accepted","message_id":"message-user","disposition":"started","created_session":false}',
+        '{"type":"turn_started","turn_id":"turn-1","message_ids":["message-user"]}',
+        '',
+      ].join('\n')))
+    })
+    expect(screen.getByText('Message received · Waiting for model response…')).toBeInTheDocument()
+    expect(screen.queryByText('Reasoning')).not.toBeInTheDocument()
+
+    await act(async () => {
+      streamController?.enqueue(encoder.encode([
         '{"type":"token_delta","turn_id":"turn-1","channel":"thinking","text":"Checking sources"}',
-        '{"type":"token_delta","turn_id":"turn-1","channel":"text","text":"Draft answer"}',
         '',
       ].join('\n')))
     })
@@ -276,14 +300,132 @@ describe('ChatPage', () => {
     const userMessage = screen.getByText('Latest question').closest('article')
     const reasoning = screen.getByText('Reasoning')
     const assistantMessage = reasoning.closest('article')
+    const details = reasoning.closest('details')
     expect(userMessage).not.toBeNull()
+    expect(details).toHaveAttribute('open')
+    expect(screen.getByText('Checking sources')).toBeVisible()
+    expect(userMessage?.closest('.chat-turn')?.querySelector('.chat-work-log > summary')).toHaveTextContent('Thinking…')
+    expect(screen.queryByText('Message received · Waiting for model response…')).not.toBeInTheDocument()
     expect(assistantMessage).toHaveClass('chat-message-assistant', 'chat-message-live')
-    expect(assistantMessage).toContainElement(screen.getByText('Draft answer'))
     expect(assistantMessage).toContainElement(screen.getByText('OpenOctopus'))
     expect(userMessage?.compareDocumentPosition(assistantMessage as Node) ?? 0)
       .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
 
+    await user.click(reasoning)
+    expect(details).not.toHaveAttribute('open')
+    await act(async () => {
+      streamController?.enqueue(encoder.encode([
+        '{"type":"token_delta","turn_id":"turn-1","channel":"thinking","text":" carefully"}',
+        '{"type":"token_delta","turn_id":"turn-1","channel":"text","text":"Draft answer"}',
+        '',
+      ].join('\n')))
+    })
+    expect(details).toHaveTextContent('Checking sources carefully')
+    expect(details).not.toHaveAttribute('open')
+    expect(assistantMessage).toContainElement(screen.getByText('Draft answer'))
+    expect(userMessage?.closest('.chat-turn')?.querySelector('.chat-work-log > summary')).toHaveTextContent('Generating')
+    await user.click(reasoning)
+    expect(screen.getByText('Checking sources carefully')).toBeVisible()
+
+    finished = true
+    finalMessage.created_at = new Date().toISOString()
+    await act(async () => {
+      streamController?.enqueue(encoder.encode([
+        JSON.stringify({ type: 'message_persisted', turn_id: 'turn-1', message: finalMessage }),
+        '{"type":"turn_finished","turn_id":"turn-1","status":"completed","final_message_id":"assistant-final"}',
+        '',
+      ].join('\n')))
+    })
+    expect(screen.getAllByText('Checking sources carefully')).toHaveLength(1)
+    expect(screen.getByText('Reasoning').closest('details')).not.toHaveAttribute('open')
+    expect(screen.getByText('Draft answer')).toBeVisible()
     await act(async () => streamController?.close())
+  })
+
+  it('keeps current work below the started user message while the response is streaming', async () => {
+    await i18n.changeLanguage('en')
+    const saved = [
+      { id: 'old-user', role: 'user', message_kind: 'human', content: [{ type: 'text', text: 'Pair another device' }] },
+      { id: 'old-tool', role: 'assistant', message_kind: 'assistant', content: [{ type: 'tool_use', id: 'old-call', name: 'load_capability', input: {} }] },
+      { id: 'old-result', role: 'user', message_kind: 'tool_result', content: [{ type: 'tool_result', tool_use_id: 'old-call', content: 'Device setup' }] },
+      { id: 'old-final', role: 'assistant', message_kind: 'assistant', content: [{ type: 'text', text: 'Open Devices to pair a device' }] },
+    ].map((message, index) => ({
+      ...message, session_id: baseSession.id, attachment_refs: [], delivery_refs: [],
+      created_at: `2026-08-26T10:00:0${index}Z`,
+    }))
+    const current = [
+      { id: 'current-user', role: 'user', message_kind: 'human', content: [{ type: 'text', text: 'Configure a new MCP server' }] },
+      { id: 'current-tool', role: 'assistant', message_kind: 'assistant', content: [{ type: 'tool_use', id: 'current-call', name: 'load_capability', input: {} }] },
+      { id: 'current-result', role: 'user', message_kind: 'tool_result', content: [{ type: 'tool_result', tool_use_id: 'current-call', content: 'MCP setup' }] },
+      { id: 'current-final', role: 'assistant', message_kind: 'assistant', content: [{ type: 'text', text: 'Open Manage Device MCP' }] },
+    ].map((message, index) => ({
+      ...message, session_id: baseSession.id, attachment_refs: [], delivery_refs: [],
+      created_at: new Date(Date.now() + index * 1_000).toISOString(),
+    }))
+    const encoder = new TextEncoder()
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    let finished = false
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes(`/api/sessions/${baseSession.id}/messages?`)) {
+        return jsonResponse(history({
+          messages: finished ? [...saved, ...current] : saved,
+          last_message_id: finished ? 'current-final' : 'old-final',
+        }))
+      }
+      if (url.endsWith('/messages') && init?.method === 'POST') {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(streamController) { controller = streamController },
+        }), { headers: { 'Content-Type': 'application/x-ndjson' } })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    const push = async (...events: unknown[]): Promise<void> => {
+      await act(async () => controller?.enqueue(encoder.encode(events.map((event) => JSON.stringify(event)).join('\n') + '\n')))
+    }
+    const user = userEvent.setup()
+    renderChat(`/chat/${baseSession.id}`)
+    expect(await screen.findByText('Open Devices to pair a device')).toBeInTheDocument()
+    const previousTurn = screen.getByText('Pair another device').closest('.chat-turn')!
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Configure a new MCP server')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(controller).toBeDefined())
+
+    await push({ type: 'message_accepted', message_id: 'current-user', disposition: 'started', created_session: false })
+    expect(within(previousTurn as HTMLElement).getByText('Work details · 2 steps')).toBeInTheDocument()
+    expect(screen.getByText('Configure a new MCP server').closest('article')).toHaveClass('chat-message-pending')
+
+    await push({ type: 'turn_started', turn_id: 'current-turn', message_ids: ['current-user'] })
+    const userMessage = screen.getByText('Configure a new MCP server').closest('article')!
+    const currentTurn = userMessage.closest('.chat-turn')!
+    expect(userMessage).not.toHaveClass('chat-message-pending')
+    await push(
+      { type: 'message_persisted', turn_id: 'current-turn', message: current[1] },
+      { type: 'message_persisted', turn_id: 'current-turn', message: current[2] },
+      { type: 'tool_progress', turn_id: 'current-turn', kind: 'tool_started', tool_call_id: 'current-call', tool_name: 'load_capability' },
+    )
+    const work = currentTurn.querySelector('.chat-work-log')!
+    expect(work).toHaveClass('chat-work-log-active')
+    expect(userMessage.compareDocumentPosition(work)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(within(previousTurn as HTMLElement).getByText('Work details · 2 steps')).toBeInTheDocument()
+    expect(previousTurn.querySelector('.chat-work-log')).not.toHaveClass('chat-work-log-active')
+
+    // A tool continuation has no new inputs and stays below the same user message.
+    await push({ type: 'turn_started', turn_id: 'continuation-turn', message_ids: [] })
+    expect(screen.getAllByText('Configure a new MCP server')).toHaveLength(1)
+    expect(currentTurn.querySelector('summary')).toHaveTextContent('Working · load_capability')
+    finished = true
+    await push(
+      { type: 'message_persisted', turn_id: 'continuation-turn', message: current[3] },
+      { type: 'turn_finished', turn_id: 'continuation-turn', status: 'completed', final_message_id: 'current-final' },
+    )
+    await act(async () => controller?.close())
+    expect(await screen.findByText('Open Manage Device MCP')).toBeInTheDocument()
+    expect(screen.getAllByText('Configure a new MCP server')).toHaveLength(1)
+    expect(currentTurn.querySelector('summary')).toHaveTextContent('Work details · 2 steps')
+    expect(currentTurn.querySelector('.chat-message-pending')).toBeNull()
   })
 
   it('restores the draft when the Server rejects a message before accepting it', async () => {
@@ -665,7 +807,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'human-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
-            content: [{ type: 'text', text: 'Use these files' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'Use these files' }], delivery_refs: [],
             attachment_refs: [
               { openoctopus_device: 'server', path: '/Marketing@a4f7e2d1/brief.pdf' },
               { openoctopus_device: 'laptop-cn', device_id: 'device-1', path: 'reports/current.csv' },
@@ -678,6 +820,7 @@ describe('ChatPage', () => {
             received_at: '2026-08-26T10:00:02Z',
           }],
           pending_count: 0,
+    active_delegate_count: 0,
           last_message_id: 'human-1',
         }))
       }
@@ -708,6 +851,65 @@ describe('ChatPage', () => {
 
     expect(await screen.findByText('此会话来自 discord，只能在浏览器中查看。')).toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: '消息' })).not.toBeInTheDocument()
+  })
+
+  it('shows a delegate transcript and keeps its composer read-only', async () => {
+    await i18n.changeLanguage('en')
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([{ ...baseSession, parent_session_id: 'parent-1', session_key: 'agent:child-1' }])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/messages?limit=200')) return jsonResponse(history())
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    renderChat(`/chat/${baseSession.id}`)
+    expect(await screen.findByText('This delegate runs independently. Continue the task in its parent conversation.')).toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument()
+  })
+
+  it('can stop background delegates after the parent reply has finished', async () => {
+    await i18n.changeLanguage('en')
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.endsWith('/cancel')) return jsonResponse({ cancel_requested: true })
+      if (url.includes('/messages?limit=200')) return jsonResponse(history({ active_delegate_count: 1 }))
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderChat(`/chat/${baseSession.id}`)
+    await userEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/cancel'))).toBe(true)
+  })
+
+  it('keeps reading an idle parent until its background delegate reports back', async () => {
+    await i18n.changeLanguage('en')
+    let historyReads = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === '/api/sessions?limit=200') return jsonResponse([baseSession])
+      if (url === '/api/devices') return jsonResponse([])
+      if (url.includes('/messages?limit=200')) {
+        historyReads += 1
+        return jsonResponse(history(historyReads === 1 ? { active_delegate_count: 1 } : {
+          messages: [{
+            id: 'delegate-report', session_id: baseSession.id, role: 'user', message_kind: 'human',
+            sender: { id: 'openoctopus:delegate', display_name: 'Delegate', classification: 'internal' },
+            content: [{ type: 'text', text: 'The background task finished' }], delivery_refs: [],
+            created_at: '2026-08-26T10:00:02Z',
+          }],
+          last_message_id: 'delegate-report',
+        }))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+    renderChat(`/chat/${baseSession.id}`)
+    expect(await screen.findByText('The background task finished')).toBeInTheDocument()
+    expect(screen.getByText('Delegate')).toBeInTheDocument()
+    expect(screen.queryByText('You')).not.toBeInTheDocument()
+    expect(historyReads).toBe(2)
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
   })
 
   it('keeps Stop outside the narrow-screen optional controls for a running external session', async () => {
@@ -766,7 +968,7 @@ describe('ChatPage', () => {
                 included_count: 2,
                 omitted_count: 1,
               },
-              deliveries: [], is_compacted: false, created_at: '2026-08-26T10:00:01Z',
+              deliveries: [], created_at: '2026-08-26T10:00:01Z',
             },
             {
               id: 'assistant-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
@@ -793,8 +995,7 @@ describe('ChatPage', () => {
                   total_actions: 1, visible_sent_actions: 0, error_code: 'CHANNEL_DELIVERY_UNKNOWN',
                   error_message: null, created_at: '2026-08-26T10:00:04Z',
                 },
-              ],
-              is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+              ], created_at: '2026-08-26T10:00:02Z',
             },
           ],
           last_message_id: 'assistant-1',
@@ -834,8 +1035,7 @@ describe('ChatPage', () => {
           messages: [{
             id: 'human-omitted-context', session_id: baseSession.id, role: 'user', message_kind: 'human',
             content: [{ type: 'text', text: 'Use the available channel context.' }], delivery_refs: [],
-            channel_context: { entries: [], included_count: 0, omitted_count: 2 },
-            is_compacted: false, created_at: '2026-08-26T10:00:01Z',
+            channel_context: { entries: [], included_count: 0, omitted_count: 2 }, created_at: '2026-08-26T10:00:01Z',
           }],
           last_message_id: 'human-omitted-context',
         }))
@@ -887,12 +1087,12 @@ describe('ChatPage', () => {
           messages: [
             {
               id: 'message-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
-              content: [{ type: 'text', text: 'Earlier question' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Earlier question' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:01Z',
             },
             {
               id: 'message-2', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'Latest answer' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Latest answer' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:02Z',
             },
           ],
@@ -922,7 +1122,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'Running answer' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'Running answer' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           status: 'running', active_turn_id: 'turn-1', last_message_id: 'message-1',
@@ -945,7 +1145,7 @@ describe('ChatPage', () => {
       finishSecondPage?.(jsonResponse(history({
         messages: [{
           id: 'message-2', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-          content: [{ type: 'text', text: 'Finished answer' }], delivery_refs: [], is_compacted: false,
+          content: [{ type: 'text', text: 'Finished answer' }], delivery_refs: [],
           created_at: '2026-08-26T10:00:02Z',
         }],
         last_message_id: 'message-2',
@@ -965,7 +1165,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'tool-result-1', session_id: baseSession.id, role: 'user', message_kind: 'tool_result',
-            content: [{ type: 'text', text: 'Device command output' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'Device command output' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           last_message_id: 'tool-result-1',
@@ -993,7 +1193,7 @@ describe('ChatPage', () => {
           messages: [
             {
               id: 'human-1', session_id: baseSession.id, role: 'user', message_kind: 'human',
-              content: [{ type: 'text', text: 'Inspect the API' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Inspect the API' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:01Z',
             },
             {
@@ -1001,17 +1201,17 @@ describe('ChatPage', () => {
               content: [
                 { type: 'thinking', thinking: 'I should fetch the schema.' },
                 { type: 'tool_use', name: 'web_fetch', input: { url: 'https://example.com' } },
-              ], delivery_refs: [], is_compacted: false,
+              ], delivery_refs: [],
               created_at: '2026-08-26T10:00:02Z',
             },
             {
               id: 'tool-result', session_id: baseSession.id, role: 'user', message_kind: 'tool_result',
-              content: [{ type: 'tool_result', content: 'OpenAPI schema' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'tool_result', content: 'OpenAPI schema' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:03Z',
             },
             {
               id: 'assistant-final', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'The API exposes four endpoints.' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'The API exposes four endpoints.' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:04Z',
             },
           ],
@@ -1046,7 +1246,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'assistant-tool', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'tool_use', name: 'web_fetch', input: {} }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'tool_use', name: 'web_fetch', input: {} }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           status: 'running', active_turn_id: 'turn-1', last_message_id: 'assistant-tool',
@@ -1076,7 +1276,7 @@ describe('ChatPage', () => {
           return jsonResponse(history({
             messages: [{
               id: 'message-2', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'finished' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'finished' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:02Z',
             }],
             last_message_id: 'message-2',
@@ -1085,7 +1285,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'first' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'first' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           status: 'running', active_turn_id: 'turn-1', last_message_id: 'message-1',
@@ -1096,7 +1296,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-2', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'finished' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'finished' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:02Z',
           }],
           last_message_id: 'message-2',
@@ -1128,8 +1328,7 @@ describe('ChatPage', () => {
         channel: 'discord', chat_id: 'dm-1', origin: 'final', status,
         total_actions: 1, visible_sent_actions: status === 'sent' ? 1 : 0,
         error_code: null, error_message: null, created_at: '2026-08-26T10:00:02Z',
-      }],
-      is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+      }], created_at: '2026-08-26T10:00:02Z',
     })
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -1175,7 +1374,7 @@ describe('ChatPage', () => {
           messages: [{
             id: 'assistant-refresh', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
             content: [{ type: 'text', text: fullReads === 1 ? 'Before refresh' : 'After refresh' }],
-            delivery_refs: [], is_compacted: false, created_at: '2026-08-26T10:00:02Z',
+            delivery_refs: [], created_at: '2026-08-26T10:00:02Z',
           }],
           last_message_id: 'assistant-refresh',
         }))
@@ -1231,7 +1430,7 @@ describe('ChatPage', () => {
       finishSecondHistory?.(jsonResponse(history({
         messages: [{
           id: 'message-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-          content: [{ type: 'text', text: 'Queued answer' }], delivery_refs: [], is_compacted: false,
+          content: [{ type: 'text', text: 'Queued answer' }], delivery_refs: [],
           created_at: '2026-08-26T10:00:02Z',
         }],
         last_message_id: 'message-1',
@@ -1582,7 +1781,6 @@ describe('ChatPage', () => {
       message_kind: 'assistant',
       content: [{ type: 'text', text: `chunk ${index + 1}` }],
       delivery_refs: [],
-      is_compacted: false,
       created_at: `2026-08-26T10:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}Z`,
     }))
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -1636,7 +1834,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-1', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'visible answer' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'visible answer' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           last_message_id: 'message-400',
@@ -1647,7 +1845,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-400', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'latest answer' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'latest answer' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:02Z',
           }],
           last_message_id: 'message-400',
@@ -1733,7 +1931,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'message-b', session_id: sessionB.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'B canonical answer' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'B canonical answer' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:01Z',
           }],
           last_message_id: 'message-b',
@@ -1764,7 +1962,7 @@ describe('ChatPage', () => {
 
     await act(async () => {
       streamController?.enqueue(encoder.encode('{"type":"token_delta","turn_id":"turn-a","channel":"text","text":"A leaked preview"}\n'))
-      streamController?.enqueue(encoder.encode(`{"type":"message_persisted","turn_id":"turn-a","message":{"id":"assistant-a","session_id":"${sessionA.id}","role":"assistant","message_kind":"assistant","content":[{"type":"text","text":"A persisted answer"}],"attachment_refs":[],"delivery_refs":[],"is_compacted":false,"created_at":"2026-08-26T10:00:02Z"}}\n`))
+      streamController?.enqueue(encoder.encode(`{"type":"message_persisted","turn_id":"turn-a","message":{"id":"assistant-a","session_id":"${sessionA.id}","role":"assistant","message_kind":"assistant","content":[{"type":"text","text":"A persisted answer"}],"attachment_refs":[],"delivery_refs":[],"created_at":"2026-08-26T10:00:02Z"}}\n`))
     })
 
     expect(screen.queryByText('A leaked preview')).not.toBeInTheDocument()
@@ -1783,7 +1981,7 @@ describe('ChatPage', () => {
         return jsonResponse(history({
           messages: [{
             id: 'anchor', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-            content: [{ type: 'text', text: 'Earlier answer' }], delivery_refs: [], is_compacted: false,
+            content: [{ type: 'text', text: 'Earlier answer' }], delivery_refs: [],
             created_at: '2026-08-26T10:00:00Z',
           }],
           last_message_id: 'anchor',
@@ -1794,12 +1992,12 @@ describe('ChatPage', () => {
           messages: [
             {
               id: 'human-message', session_id: baseSession.id, role: 'user', message_kind: 'human',
-              content: [{ type: 'text', text: 'Keep my question' }], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Keep my question' }], delivery_refs: [],
               created_at: '2026-08-26T10:00:01Z',
             },
             {
               id: 'assistant-message', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [],
               created_at: '2026-08-26T10:00:02Z',
             },
           ],
@@ -1814,7 +2012,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'assistant-message', session_id: baseSession.id, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'Canonical answer' }], attachment_refs: [], delivery_refs: [],
               created_at: '2026-08-26T10:00:02Z',
             },
           },
@@ -1871,7 +2069,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'message-assistant', session_id: sessionId, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'draft answer' }], attachment_refs: [], delivery_refs: [], is_compacted: false,
+              content: [{ type: 'text', text: 'draft answer' }], attachment_refs: [], delivery_refs: [],
               created_at: '2026-08-26T10:00:01Z',
             },
           },
@@ -1879,7 +2077,7 @@ describe('ChatPage', () => {
             type: 'message_persisted', turn_id: 'turn-1',
             message: {
               id: 'message-assistant', session_id: sessionId, role: 'assistant', message_kind: 'assistant',
-              content: [{ type: 'text', text: 'final answer' }], attachment_refs: [], delivery_refs: [{ type: 'workspace_file', filename: 'report.txt' }], is_compacted: false,
+              content: [{ type: 'text', text: 'final answer' }], attachment_refs: [], delivery_refs: [{ type: 'workspace_file', filename: 'report.txt' }],
               created_at: '2026-08-26T10:00:01Z',
             },
           },

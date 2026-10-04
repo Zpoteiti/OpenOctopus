@@ -49,7 +49,7 @@ def _message(
         source_message_id="trigger-1",
         channel_binding_generation=uuid4(),
         channel_context=[],
-        is_compacted=False,
+
         created_at=datetime.now(UTC),
     )
 

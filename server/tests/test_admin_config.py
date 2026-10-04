@@ -313,10 +313,10 @@ async def test_patch_config_llm_success(admin_client, monkeypatch):
     original = validate_llm_identity
     captured: dict[str, str] = {}
 
-    async def mock_validate(endpoint, api_key, model, *, client=None):
+    async def mock_validate(endpoint, api_key, model, *, protocol="anthropic", client=None):
         mock_transport = _mock_models_response(model, captured=captured)
         mock_client = httpx.AsyncClient(transport=mock_transport)
-        await original(endpoint, api_key, model, client=mock_client)
+        await original(endpoint, api_key, model, protocol=protocol, client=mock_client)
         await mock_client.aclose()
 
     monkeypatch.setattr(
@@ -459,10 +459,10 @@ async def test_concurrent_token_limit_updates_keep_pair_valid(admin_client, monk
 async def test_patch_config_llm_non_200_returns_400(admin_client, monkeypatch):
     original = validate_llm_identity
 
-    async def mock_validate(endpoint, api_key, model, *, client=None):
+    async def mock_validate(endpoint, api_key, model, *, protocol="anthropic", client=None):
         mock_transport = _mock_models_response(model, status=500)
         mock_client = httpx.AsyncClient(transport=mock_transport)
-        await original(endpoint, api_key, model, client=mock_client)
+        await original(endpoint, api_key, model, protocol=protocol, client=mock_client)
         await mock_client.aclose()
 
     monkeypatch.setattr(
@@ -484,10 +484,10 @@ async def test_patch_config_llm_non_200_returns_400(admin_client, monkeypatch):
 async def test_patch_config_llm_model_absent_returns_400(admin_client, monkeypatch):
     original = validate_llm_identity
 
-    async def mock_validate(endpoint, api_key, model, *, client=None):
+    async def mock_validate(endpoint, api_key, model, *, protocol="anthropic", client=None):
         mock_transport = _mock_models_missing(model)
         mock_client = httpx.AsyncClient(transport=mock_transport)
-        await original(endpoint, api_key, model, client=mock_client)
+        await original(endpoint, api_key, model, protocol=protocol, client=mock_client)
         await mock_client.aclose()
 
     monkeypatch.setattr(
@@ -519,3 +519,24 @@ async def test_non_admin_get_config_returns_403(user_client):
     response = await user_client.get("/api/admin/config")
     assert response.status_code == 403
     assert response.json()["code"] == "auth_forbidden"
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai", "openrouter"])
+async def test_model_identity_protocol_headers_and_exact_model_id(protocol):
+    captured = []
+    def respond(request):
+        captured.append(request)
+        return httpx.Response(200, json={"data": [{"id": "exact-model"}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        await validate_llm_identity("https://enterprise.test/api", "test-key", "exact-model", protocol=protocol, client=client)
+        from openctopus_server.errors.exceptions import ConfigError
+        with pytest.raises(ConfigError):
+            await validate_llm_identity("https://enterprise.test/api", "test-key", "model", protocol=protocol, client=client)
+    request = captured[0]
+    assert request.url.path == "/api/v1/models"
+    if protocol == "anthropic":
+        assert request.headers["x-api-key"] == "test-key"
+        assert "authorization" not in request.headers
+    else:
+        assert request.headers["authorization"] == "Bearer test-key"
+        assert "x-api-key" not in request.headers
