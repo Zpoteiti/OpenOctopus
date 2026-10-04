@@ -94,6 +94,11 @@ does not introduce a second admission acquisition for directory children.
 
 ## Client tools
 
+The [tray Client design](specs/2026-10-04-tray-client-design.zh.md) is a draft
+for a tray application, saved connection settings, and native installation
+packages. Implementation is pending user review; the current Client behavior
+described below remains the baseline.
+
 [`tools/dispatcher.py`](../client/src/openoctopus_client/tools/dispatcher.py)
 validates arguments, selects the implementation, applies time limits, and maps
 errors to tool results. Implementations live in:
