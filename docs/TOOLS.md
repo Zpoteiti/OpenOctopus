@@ -1746,7 +1746,7 @@ The agent sees errors as normal tool results and adapts on the next iteration (A
 ## What is explicitly NOT in the tool surface
 
 - **Server-side `exec` / `python` / `eval`** — by design, the server is not a code execution environment for the agent (ADR-072). Anything that needs to run is run on a client device.
-- **`save_memory` / `edit_memory` / `update_soul`** — specialty tools dropped per Appendix A principle 1 ("generic over specialty"). MEMORY.md and SOUL.md are files, edited via `edit_file` / `write_file`.
+- **Identity and memory** — `SOUL.md` remains a workspace file. Long-term notes use the official Harness `write_memory`, `read_memory`, `delete_memory`, and `search_memory` tools and the Memory editor; workspace file tools do not edit that store.
 - **`install_skill`** — dropped per ADR-084. Skills are installed via `file_transfer` from a client (where the user runs the installer) or via the web UI.
 - **`read_skill`** — same. Skills are read via `read_file`.
 - **`bulk_*` operations** — there is no general bulk mutation surface.
@@ -1771,3 +1771,31 @@ When adding, removing, or modifying a tool:
 4. If the implementation deviates from the doc/ADR during coding, fix one or the other before merging.
 
 The catalog and the ADRs are the source of truth. Code is always downstream.
+
+
+## Harness capabilities
+
+OO tool implementations are exposed as native Pydantic AI tools with JSON Schema
+validation. Device selection, ownership checks, connection generations, and dispatch
+receipts stay in OO. Plain text results enter the model as text; mixed media becomes
+native SDK content, while the public transcript retains OO content blocks.
+
+The runtime additionally exposes official `load_capability`, Memory tools,
+`search_conversation_history`, `read_tool_result`, and `delegate_task`. Their schemas
+come from the pinned Harness release. History search and overflow handles are scoped
+to the current authenticated conversation. Conditional skills have `builtin-` IDs
+for packaged skills and unprefixed personal IDs. Always-on skill bodies remain in the
+product prompt. Large text results use the official overflow mechanism with a
+session-owned PostgreSQL store (16 MiB per result).
+
+`delegate_task` targets the configured `worker`; OO's `delegate_background` starts
+that same worker as a durable child and returns its conversation ID. A finished
+background child publishes one durable report and wakes its parent. A root has at
+most eight children, each child has fifty model requests, and the tree shares a
+two-hundred-request budget. Children cannot delegate further. Restricted channel
+participants cannot delegate or access private Memory or skills.
+
+Completed operations replay from DBOS. An OO external tool with dispatch intent but
+no saved result returns an uncertain-outcome result after recovery, rather than
+repeating an arbitrary command. Stop cancels the workflow tree and preserves the
+existing remote-operation cancellation and late-result handling.

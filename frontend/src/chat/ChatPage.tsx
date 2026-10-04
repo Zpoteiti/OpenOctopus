@@ -107,7 +107,7 @@ export function ChatPage({
   const activeViewSession = useRef<string | null>(sessionId ?? locallyCreatedSessionId)
 
   const isLocalWebSession = sessionId !== undefined && sessionId === locallyCreatedSessionId
-  const writable = sessionId === undefined || session?.channel === 'web' || isLocalWebSession
+  const writable = sessionId === undefined || (session?.channel === 'web' && !session.parent_session_id) || isLocalWebSession
   const title = session?.title && session.title !== 'New chat' ? session.title : t('nav.newChat')
   const viewSessionId = sessionId ?? locallyCreatedSessionId
   const renderedLastMessageId = history?.messages.at(-1)?.id ?? null
@@ -244,7 +244,28 @@ export function ChatPage({
 
     if (event.type === 'turn_started') {
       setToolProgress(null)
-      updateHistory(targetSessionId, (current) => ({ ...current, status: 'running', active_turn_id: event.turn_id }))
+      const startedIds = new Set(event.message_ids)
+      updateHistory(targetSessionId, (current) => {
+        const startedMessages = current.pending_messages.filter((message) => startedIds.has(message.id))
+        const messages = startedMessages.reduce((saved, message) => (
+          saved.some((existing) => existing.id === message.id) ? saved : upsertMessage(saved, {
+            ...message,
+            role: 'user',
+            message_kind: 'human',
+            delivery_refs: [],
+            created_at: message.received_at,
+          })
+        ), current.messages)
+        return {
+          ...current,
+          status: 'running',
+          active_turn_id: event.turn_id,
+          messages,
+          pending_messages: current.pending_messages.filter((message) => !startedIds.has(message.id)),
+          pending_count: Math.max(0, current.pending_count - startedMessages.length),
+          last_message_id: messages.at(-1)?.id ?? current.last_message_id,
+        }
+      })
       return
     }
 
@@ -596,7 +617,9 @@ export function ChatPage({
     }
   }
 
-  const readOnlyMessage = session && session.channel !== 'web'
+  const readOnlyMessage = session?.parent_session_id
+    ? t('chat.delegateReadOnly', { defaultValue: 'This delegate runs independently. Continue the task in its parent conversation.' })
+    : session && session.channel !== 'web'
     ? t('chat.readOnly', {
         channel: session.channel,
         defaultValue: 'This {{channel}} conversation is read-only in the browser.',
@@ -631,7 +654,7 @@ export function ChatPage({
               className="chat-secondary-button chat-session-control-optional"
               onClick={() => requestHistoryReload(true)}
             >{t('common.refresh')}</button>
-            {history?.status === 'running' || session?.cancel_requested ? (
+            {history?.status === 'running' || (history && history.active_delegate_count > 0) || session?.cancel_requested ? (
               <button type="button" className="chat-secondary-button" onClick={() => void handleCancel()}>
                 {t('chat.stop', { defaultValue: 'Stop' })}
               </button>
@@ -689,6 +712,7 @@ export function ChatPage({
                 messages={history.messages}
                 running={history.status === 'running'}
                 toolProgress={toolProgress}
+                streamingChannel={showingStream ? liveText ? 'text' : liveThinking ? 'thinking' : null : null}
               />
             ) : null}
             {renderedLastMessageId ? <span ref={latestMessageMarker} className="chat-latest-marker" aria-hidden="true" /> : null}
@@ -705,9 +729,9 @@ export function ChatPage({
             ))}
             {showingStream && (liveThinking || liveText) ? (
               <article className="chat-message chat-message-assistant chat-message-live">
-                <header><strong>OpenOctopus</strong><span>{t('chat.generating', { defaultValue: 'Generating' })}</span></header>
+                <header><strong>OpenOctopus</strong><span>{t(liveText ? 'chat.generating' : 'chat.thinkingInProgress')}</span></header>
                 {liveThinking ? (
-                  <details className="chat-thinking">
+                  <details className="chat-thinking" open>
                     <summary>{t('chat.thinking', { defaultValue: 'Thinking' })}</summary>
                     <p>{liveThinking}</p>
                   </details>

@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 from collections import deque
@@ -12,10 +13,11 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import pytest_asyncio
+from native_provider_fixture import NativeProviderFixture
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-import openctopus_server.chat.runner as chat_runner
+import openctopus_server.chat.agent as chat_agent
 from openctopus_server.admission import KeyedAdmission
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Device, Session, SystemConfig, TurnRun, User
@@ -23,14 +25,14 @@ from openctopus_server.devices.protocol import ToolResultFrame
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.provider.anthropic import (
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.runtime import (
     DeltaCallback,
     ProviderInvocationError,
     ProviderResult,
     provider_fingerprint,
 )
-from openctopus_server.provider.config import ProviderConfig
-from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.services import messages as message_service
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult, ToolRoutingMode
@@ -54,7 +56,7 @@ class _ProviderStep:
     error: ProviderInvocationError | None = None
 
 
-class _ScriptedProvider:
+class _ScriptedProvider(NativeProviderFixture):
     def __init__(self, steps: list[_ProviderStep]) -> None:
         self.steps = deque(steps)
         self.calls: list[dict[str, Any]] = []
@@ -168,6 +170,11 @@ class _ExecTool(_ScriptedTool):
 
     def name(self) -> str:
         return "exec"
+
+    def schema(self) -> dict[str, Any]:
+        return {"name": self.name(), "input_schema": {
+            "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"],
+        }}
 
 
 class _SelfCancellingTool(_ScriptedTool):
@@ -437,7 +444,7 @@ async def test_normal_agent_turn_builds_workspace_prompt_once(
     response = await _post(user_client, uuid4(), "start")
 
     assert response.status_code == 200
-    assert workspace.read_paths == ["SOUL.md", "MEMORY.md"]
+    assert workspace.read_paths == ["SOUL.md"]
     assert workspace.list_calls == 1
 
 
@@ -493,10 +500,7 @@ async def test_web_fetch_runs_end_to_end_through_the_agent_loop(
         assert len(provider.calls) == 2
         provider_result = provider.calls[1]["messages"][-1]["content"][0]
         assert provider_result["tool_use_id"] == "web-1"
-        assert provider_result["content"] == [
-            {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-            {"type": "text", "text": "Tokyo weather: 20 C"},
-        ]
+        assert provider_result["content"] == UNTRUSTED_TOOL_RESULT_WARNING + "\nTokyo weather: 20 C"
         history = await _history(user_client, session_id)
         assert [message["message_kind"] for message in history["messages"]] == [
             "human",
@@ -549,8 +553,8 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
         response = await _post(user_client, uuid4(), "save a note")
 
         assert response.status_code == 200
-        assert [schema["name"] for schema in provider.calls[0]["tools"]] == [
-            "web_fetch",
+        assert {schema["name"] for schema in provider.calls[0]["tools"]} == {
+            "load_capability", "delegate_task", "delegate_background", "web_fetch",
             "message",
             "cron",
             "file_transfer",
@@ -564,11 +568,13 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
             "find_files",
             "grep",
             "notebook_edit",
-        ]
+            "search_conversation_history", "read_tool_result",
+            "write_memory", "read_memory", "delete_memory", "search_memory",
+        }
         assert workspace.writes and workspace.writes[0][1:] == ("notes/a.txt", b"hello")
         provider_result = provider.calls[1]["messages"][-1]["content"][0]
         assert provider_result["tool_use_id"] == "write-1"
-        assert json.loads(provider_result["content"][1]["text"]) == {
+        assert json.loads(provider_result["content"].split("\n", 1)[1]) == {
             "ok": True,
             "operation": "write_file",
             "device": "server",
@@ -576,7 +582,7 @@ async def test_py4_workspace_tool_and_prompt_run_end_to_end_through_agent_loop(
             "canonical_path": "~/notes/a.txt",
             "bytes_written": 5,
         }
-        assert workspace.read_paths == ["SOUL.md", "MEMORY.md"] * 2
+        assert workspace.read_paths == ["SOUL.md"] * 2
         assert workspace.list_calls == 1
     finally:
         await runtime.close()
@@ -623,7 +629,7 @@ async def test_provider_schema_includes_only_the_session_owners_paired_devices(
         response = await _post(user_client, uuid4(), "show my tools")
 
         assert response.status_code == 200
-        schema = provider.calls[0]["tools"][0]
+        schema = next(t for t in provider.calls[0]["tools"] if t["name"] == "test_tool")
         assert schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"] == [
             "server",
             "owner-laptop",
@@ -776,7 +782,7 @@ async def test_normalized_tool_failure_is_provider_data_and_loop_continues(
     assert provider_result["type"] == "tool_result"
     assert provider_result["is_error"] is True
     assert "code" not in provider_result
-    assert provider_result["content"] == [
+    assert json.loads(provider_result["content"]) == [
         {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
         {"type": "text", "text": "boom"},
     ]
@@ -840,8 +846,9 @@ async def test_pending_during_tool_waits_for_complete_pairing(
     assert followup_starts[0]["message_ids"] == [pending_id]
 
     messages = provider.calls[1]["messages"]
-    assert [message["role"] for message in messages[-2:]] == ["user", "user"]
-    assert [block["tool_use_id"] for block in messages[-2]["content"]] == [
+    assert messages[-1]["role"] == "user"
+    # The SDK normalizes adjacent requests; pairing and input ordering remain intact.
+    assert [block["tool_use_id"] for block in messages[-1]["content"] if block["type"] == "tool_result"] == [
         "tool-1",
         "tool-2",
     ]
@@ -888,7 +895,7 @@ async def test_post_boundary_subscriber_waits_for_its_captured_turn(
         return subscriber
 
     monkeypatch.setattr(runtime, "register", track_queued_registration)
-    original_finish = chat_runner.finish_tool_batch_and_continue
+    original_finish = chat_agent.finish_tool_batch_and_continue
 
     async def pause_after_boundary(*args: Any, **kwargs: Any):
         next_turn = await original_finish(*args, **kwargs)
@@ -896,7 +903,7 @@ async def test_post_boundary_subscriber_waits_for_its_captured_turn(
         await release_handoff.wait()
         return next_turn
 
-    monkeypatch.setattr(chat_runner, "finish_tool_batch_and_continue", pause_after_boundary)
+    monkeypatch.setattr(chat_agent, "finish_tool_batch_and_continue", pause_after_boundary)
     session_id = uuid4()
 
     first_task = asyncio.create_task(_post(user_client, session_id, "first"))
@@ -961,19 +968,19 @@ async def test_pending_promoted_during_preflight_claims_newest_stream(
             _ProviderStep(content=[{"type": "text", "text": "second done"}]),
         ]
     )
-    count_calls = 0
+    runtime = install_runtime(provider, _ScriptedTool([]))
+    original_prepare = runtime._prepare_turn
+    prepare_calls = 0
 
-    async def blocking_count_tokens(**kwargs: Any) -> int:
-        nonlocal count_calls
-        del kwargs
-        count_calls += 1
-        if count_calls == 2:
+    async def block_second_prepare(turn, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 2:
             second_count_started.set()
             await release_second_count.wait()
-        return 1
+        return await original_prepare(turn, **kwargs)
 
-    monkeypatch.setattr(provider, "estimate_tokens", blocking_count_tokens)
-    runtime = install_runtime(provider, _ScriptedTool([]))
+    monkeypatch.setattr(runtime, "_prepare_turn", block_second_prepare)
     original_register = runtime.register
 
     async def delayed_queued_registration(accepted, *, on_close=None):
@@ -1016,7 +1023,7 @@ async def test_pending_promoted_during_preflight_claims_newest_stream(
     ]
 
 
-async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
+async def test_preparation_promotes_only_captured_pending_prefix(
     user_client,
     pg_engine,
     install_runtime,
@@ -1028,28 +1035,27 @@ async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
     provider = _ScriptedProvider(
         [
             _ProviderStep(content=[{"type": "text", "text": "warm"}]),
-            _ProviderStep(content=[{"type": "text", "text": "summary"}]),
             _ProviderStep(content=[{"type": "text", "text": "first done"}]),
             _ProviderStep(content=[{"type": "text", "text": "second done"}]),
         ]
     )
-    install_runtime(provider, _ScriptedTool([]))
+    runtime = install_runtime(provider, _ScriptedTool([]))
     session_id = uuid4()
     warmup = await _post(user_client, session_id, "warmup")
     assert warmup.status_code == 200
     await _enable_compaction(pg_engine)
 
-    count_messages: list[list[dict[str, Any]]] = []
+    original_prepare = runtime._prepare_turn
+    prepared_inputs = []
 
-    async def count_tokens(**kwargs: Any) -> int:
-        count_messages.append(deepcopy(kwargs["messages"]))
-        if len(count_messages) == 1:
+    async def block_prepare(turn, **kwargs):
+        prepared_inputs.append(turn.message_ids)
+        if len(prepared_inputs) == 1:
             count_started.set()
             await release_count.wait()
-            return 99_000
-        return 1
+        return await original_prepare(turn, **kwargs)
 
-    monkeypatch.setattr(provider, "estimate_tokens", count_tokens)
+    monkeypatch.setattr(runtime, "_prepare_turn", block_prepare)
     first_task = asyncio.create_task(_post(user_client, session_id, "first"))
     await asyncio.wait_for(count_started.wait(), timeout=2)
     second_task = asyncio.create_task(_post(user_client, session_id, "second"))
@@ -1066,14 +1072,7 @@ async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
         timeout=2,
     )
 
-    first_count_text = [
-        block.get("text")
-        for message in count_messages[0]
-        for block in message["content"]
-        if block.get("type") == "text"
-    ]
-    assert "first" in first_count_text
-    assert "second" not in first_count_text
+    assert UUID(second_id) not in prepared_inputs[0]
     first_started = next(
         event for event in _events(first_response) if event["type"] == "turn_started"
     )
@@ -1082,7 +1081,7 @@ async def test_stage_one_counts_and_promotes_only_captured_pending_prefix(
     )
     assert second_id not in first_started["message_ids"]
     assert second_started["message_ids"] == [second_id]
-    assert len(provider.calls) == 4
+    assert len(provider.calls) == 3
 
 
 async def test_oversized_request_without_eligible_history_is_sent_once_to_provider(
@@ -1174,8 +1173,9 @@ async def test_two_hundred_always_on_skills_reach_provider_and_safe_rejection_re
     assert [event["status"] for event in _events(response) if event["type"] == "turn_finished"] == [
         "failed"
     ]
-    assert estimates == 1
+    assert estimates == 0
     assert len(provider.calls) == 1
+    assert provider.calls[0]["system"].count("(always-on)") == 200
     persisted = next(event for event in _events(response) if event["type"] == "message_persisted")
     text = persisted["message"]["content"][0]["text"]
     assert text.startswith("[provider_unavailable]")
@@ -1272,12 +1272,12 @@ async def test_context_admission_is_held_while_failure_is_persisted(
         original_prepare_turn = runtime._prepare_turn
         prepare_calls = 0
 
-        async def fail_first_preflight(pending_turn):
+        async def fail_first_preflight(pending_turn, **kwargs):
             nonlocal prepare_calls
             prepare_calls += 1
             if prepare_calls == 1:
                 raise RuntimeError("preflight failed")
-            return await original_prepare_turn(pending_turn)
+            return await original_prepare_turn(pending_turn, **kwargs)
 
         original_fail_preflight = runtime._fail_preflight
 
@@ -1434,70 +1434,6 @@ async def test_context_admission_is_released_before_tool_execution(
     assert len(provider.calls) == 3
     assert admission.entry_count == 0
     await runtime.close()
-
-
-async def test_stage_two_stale_pending_recaptures_as_stage_one_boundary(
-    user_client,
-    pg_engine,
-    install_runtime,
-    monkeypatch,
-):
-    await _configure_provider(pg_engine)
-    await _enable_compaction(pg_engine)
-    stage_two_summary_started = asyncio.Event()
-    release_stage_two_summary = asyncio.Event()
-    provider = _ScriptedProvider(
-        [
-            _ProviderStep(content=[_tool_use("tool-1", "one")]),
-            _ProviderStep(
-                content=[{"type": "text", "text": "discarded stage two"}],
-                started=stage_two_summary_started,
-                release=release_stage_two_summary,
-            ),
-            _ProviderStep(content=[{"type": "text", "text": "stage one"}]),
-            _ProviderStep(content=[{"type": "text", "text": "done"}]),
-        ]
-    )
-    counts = deque([1, 99_000, 99_000, 1])
-
-    async def count_tokens(**kwargs: Any) -> int:
-        del kwargs
-        return counts.popleft()
-
-    monkeypatch.setattr(provider, "estimate_tokens", count_tokens)
-    install_runtime(
-        provider,
-        _ScriptedTool([_ToolStep(result=ToolResult(content="result"))]),
-    )
-    session_id = uuid4()
-
-    first_task = asyncio.create_task(_post(user_client, session_id, "first"))
-    await asyncio.wait_for(stage_two_summary_started.wait(), timeout=2)
-    second_task = asyncio.create_task(_post(user_client, session_id, "second"))
-    pending = await _wait_for_pending(user_client, session_id, 1)
-    second_id = pending["pending_messages"][0]["id"]
-    release_stage_two_summary.set()
-
-    first_response, second_response = await asyncio.wait_for(
-        asyncio.gather(first_task, second_task),
-        timeout=2,
-    )
-
-    assert any(event["type"] == "stream_replaced" for event in _events(first_response))
-    second_started = [
-        event for event in _events(second_response) if event["type"] == "turn_started"
-    ]
-    assert second_started[0]["message_ids"] == [second_id]
-    assert len(provider.calls) == 4
-    history = await _history(user_client, session_id)
-    summaries = [
-        message
-        for message in history["messages"]
-        if message["message_kind"] == "compaction_summary"
-    ]
-    assert len(summaries) == 1
-    assert summaries[0]["content"] == [{"type": "text", "text": "stage one"}]
-    assert counts == deque()
 
 
 async def test_unexpected_tool_exception_repairs_ambiguous_dispatch_and_drains_pending(

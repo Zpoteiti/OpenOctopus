@@ -122,7 +122,7 @@ export function AccountPage({ user }: { user: User }): ReactNode {
         <Card title={t('account.agentFiles')} description={t('account.agentFilesDescription')}>
           <div className="form-actions">
             <Link className="secondary-button" to="/workspace?path=SOUL.md">{t('account.editSoul')}</Link>
-            <Link className="secondary-button" to="/workspace?path=MEMORY.md">{t('account.editMemory')}</Link>
+            <Link className="secondary-button" to="/memory">{t('account.editMemory')}</Link>
           </div>
         </Card>
         <Card title={t('account.session')}><button className="secondary-button" onClick={() => logout.mutate()} disabled={logout.isPending}>{t('account.logout')}</button></Card>

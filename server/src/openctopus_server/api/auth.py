@@ -16,18 +16,6 @@ from openctopus_server.workspace.service import WorkspaceService, get_workspace_
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-INITIAL_MEMORY = """# Getting started
-
-No personal profile has been recorded yet. In an early conversation, ask the user:
-
-- how they would like to be addressed;
-- what they would like to call you and what role or personality they want you to have;
-- which stable preferences and personal facts they want you to remember.
-
-Update SOUL.md and MEMORY.md with their answers.
-"""
-
-
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
@@ -64,13 +52,6 @@ async def register(
         user_id=user.id,
         path="SOUL.md",
         data=config.default_soul.encode(),
-        if_none_match=True,
-    )
-    await workspace.write(
-        db,
-        user_id=user.id,
-        path="MEMORY.md",
-        data=INITIAL_MEMORY.encode(),
         if_none_match=True,
     )
     token = create_jwt(user.id)

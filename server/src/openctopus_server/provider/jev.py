@@ -6,14 +6,20 @@ import asyncio
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
+import httpx2
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.models.decision import ChoiceQuestion, DecisionRequest
+from pydantic_ai.models.typesafe import TypeSafeModel
+from pydantic_ai.providers.typesafe import TypeSafeProvider
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
 
 from openctopus_server.db.models import SystemConfig
 from openctopus_server.dto.config import JevStatus, JevStatusState
@@ -96,6 +102,33 @@ async def lock_jev_config(db: AsyncSession) -> None:
     )
 
 
+class _BoundedTransport(httpx2.AsyncBaseTransport):
+    """Reuse OO's HTTP pool while applying byte and strict-response limits to SDK I/O."""
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self.client = client
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        payload = await request.aread()
+        if len(payload) > JEV_MAX_REQUEST_BYTES:
+            raise JevError("input_limit")
+        async with self.client.stream(
+            request.method, str(request.url), headers=request.headers.raw,
+            content=payload, timeout=10.0, follow_redirects=False,
+        ) as response:
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > JEV_MAX_RESPONSE_BYTES:
+                    raise JevError("invalid_response")
+                body.extend(chunk)
+            if response.status_code == 200:
+                try:
+                    _Response.model_validate_json(body)
+                except ValidationError:
+                    raise JevError("invalid_response") from None
+            return httpx2.Response(response.status_code, headers=response.headers, content=bytes(body))
+
+
 class JevService:
     def __init__(
         self,
@@ -175,9 +208,16 @@ class JevService:
         try:
             async with asyncio.timeout(JEV_TIMEOUT_SECONDS), self._slots:
                 answers = await self._request(config, payload, questions)
-        except (TimeoutError, httpx.HTTPError):
+        except (TimeoutError, httpx.HTTPError, ModelAPIError) as exc:
+            if isinstance(exc, ModelHTTPError):
+                reason: JevStatusState = "unauthorized" if exc.status_code in {401, 403} else "unavailable"
+                await self._observe(config, reason)
+                raise JevError(reason) from None
             await self._observe(config, "unreachable")
             raise JevError("unreachable") from None
+        except UnexpectedModelBehavior:
+            await self._observe(config, "invalid_response")
+            raise JevError("invalid_response") from None
         except JevError as exc:
             # Local input failures occur before this request boundary.
             await self._observe(config, exc.reason)  # type: ignore[arg-type]
@@ -191,30 +231,23 @@ class JevService:
         payload: bytes,
         questions: dict[str, JevChoiceQuestion],
     ) -> dict[str, JevChoiceAnswer]:
-        async with self._client.stream(
-            "POST",
-            f"{config.endpoint.rstrip('/')}/v1/systemone",
-            headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
-            content=payload,
-            timeout=10.0,
-            follow_redirects=False,
-        ) as response:
-            if response.status_code in {401, 403}:
-                raise JevError("unauthorized")
-            if response.status_code != 200:
-                raise JevError("unavailable")
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                if len(body) + len(chunk) > JEV_MAX_RESPONSE_BYTES:
-                    raise JevError("invalid_response")
-                body.extend(chunk)
+        request = json.loads(payload)
+        async with AsyncTypeSafeClient(
+            api_key=config.api_key, base_url=config.endpoint, retry=RetryPolicy(max_retries=0),
+            transport=_BoundedTransport(self._client), timeout=10.0,
+        ) as client:
+            model = TypeSafeModel("jev-latest", provider=TypeSafeProvider(typesafe_client=client))
+            result = await model.decide(DecisionRequest(
+                state=request["state"], questions={name: ChoiceQuestion(instructions=question.instructions,
+                    criteria={key: value for key, value in question.criteria.items()}) for name, question in questions.items()},
+            ), {"timeout": 10.0})
         try:
-            parsed = _Response.model_validate_json(body)
+            answers = {name: JevChoiceAnswer.model_validate(asdict(answer)) for name, answer in result.answers.items()}
         except ValidationError:
             raise JevError("invalid_response") from None
-        if set(parsed.answers) != set(questions):
+        if set(answers) != set(questions):
             raise JevError("invalid_response")
-        for answer in parsed.answers.values():
+        for answer in answers.values():
             probabilities = answer.probabilities
             if (
                 set(probabilities) != {"run", "skip"}
@@ -223,7 +256,7 @@ class JevService:
                 or probabilities[answer.choice] < max(probabilities.values())
             ):
                 raise JevError("invalid_response")
-        return parsed.answers
+        return answers
 
     async def check(self) -> JevStatus:
         try:

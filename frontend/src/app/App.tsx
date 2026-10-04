@@ -10,6 +10,7 @@ import { DeviceDetailPage, DeviceListPage, DeviceMcpPage } from '../devices/Devi
 import { ChatPage } from '../chat'
 import { ChannelsPage } from '../channels/Channels'
 import { AppShell } from '../layout/AppShell'
+import { MemoryPage } from '../memory/MemoryPage'
 import { ThemeProvider } from '../theme/ThemeToggle'
 import { WorkspacePage } from '../workspace/WorkspacePage'
 
@@ -25,6 +26,7 @@ export function AppRoutes(): ReactNode {
             <Route path="/chat" element={<ChatPage />} />
             <Route path="/chat/:sessionId" element={<ChatPage />} />
             <Route path="/workspace" element={<WorkspacePage />} />
+            <Route path="/memory" element={<MemoryPage />} />
             <Route path="/workspace/:workspaceRef" element={<WorkspacePage />} />
             <Route path="/devices" element={<DeviceListPage />} />
             <Route path="/devices/:name" element={<DeviceDetailPage />} />

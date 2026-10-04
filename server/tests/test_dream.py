@@ -1,12 +1,12 @@
 import asyncio
 import hashlib
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic_ai_harness.memory import MemoryConflictError, MemoryFile, MemoryMutation
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,9 +30,8 @@ from openctopus_server.db.models import (
 )
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.provider.anthropic import ProviderResult
 from openctopus_server.provider.jev import JevChoiceAnswer, JevError
-from openctopus_server.workspace.storage import StoredObject
+from openctopus_server.provider.runtime import ProviderResult
 
 NOW = datetime(2026, 9, 30, tzinfo=UTC)
 
@@ -46,19 +45,23 @@ class Memory:
     def etag(self):
         return hashlib.sha256(self.data).hexdigest()
 
-    async def stat(self, *args, **kwargs):
-        return SimpleNamespace(size=len(self.data), etag=self.etag)
+    async def read(self, path, *, max_chars):
+        content = self.data.decode()
+        return MemoryFile(content[:max_chars], self.etag, None, len(content) > max_chars)
 
-    async def read_with_metadata(self, *args, **kwargs):
-        return StoredObject(data=self.data, etag=self.etag, truncated=False)
-
-    async def write(self, *args, data, if_match, if_none_match=False, **kwargs):
-        assert kwargs["path"] == "MEMORY.md"
-        if if_none_match or if_match != self.etag:
-            raise WorkspaceError(ErrorCode.WORKSPACE_FILE_CHANGED, "changed")
-        self.data = data
-        self.writes.append(data)
-        return SimpleNamespace(etag=self.etag)
+    async def write(self, path, content, *, expected_version, operation=None):
+        receipts = getattr(self, "receipts", {})
+        if operation and operation.id in receipts:
+            return receipts[operation.id]
+        if expected_version != self.etag:
+            raise MemoryConflictError("changed")
+        self.data = content.encode()
+        self.writes.append(self.data)
+        result = MemoryMutation(self.etag, False, True)
+        if operation:
+            receipts[operation.id] = result
+            self.receipts = receipts
+        return result
 
 
 class Gate:
@@ -162,7 +165,7 @@ async def conversation(
 def service(engine):
     memory, gate, writer = Memory(), Gate(), Writer()
     return (
-        DreamService(engine=engine, workspace=memory, jev=gate, writer=writer),
+        DreamService(engine=engine, memory=memory, jev=gate, writer=writer),
         memory,
         gate,
         writer,
@@ -185,14 +188,12 @@ async def test_unconfigured_jev_does_not_start_dream_and_resumes_when_configured
     _, message = await conversation(pg_engine, owner)
     dream, memory, gate, writer = service(pg_engine)
     gate.config_state = "not_configured"
-    original_stat = memory.stat
-    original_read = memory.read_with_metadata
+    original_read = memory.read
 
     async def forbidden(*args, **kwargs):
         raise AssertionError("unconfigured Dream read memory")
 
-    monkeypatch.setattr(memory, "stat", forbidden)
-    monkeypatch.setattr(memory, "read_with_metadata", forbidden)
+    monkeypatch.setattr(memory, "read", forbidden)
     for hours in (0, 1, 24, 48):
         assert await dream.process_user(owner.id, now=NOW + timedelta(hours=hours)) is None
     assert not gate.calls and not writer.calls
@@ -201,8 +202,7 @@ async def test_unconfigured_jev_does_not_start_dream_and_resumes_when_configured
         assert await db.get(DreamProgress, message.id) is None
 
     gate.config_state = "unchecked"
-    monkeypatch.setattr(memory, "stat", original_stat)
-    monkeypatch.setattr(memory, "read_with_metadata", original_read)
+    monkeypatch.setattr(memory, "read", original_read)
     resumed = await dream.process_user(owner.id, now=NOW + timedelta(hours=49))
     assert resumed.status == "updated"
     assert len(gate.calls) == len(writer.calls) == 1
@@ -221,7 +221,7 @@ async def test_all_channels_and_speakers_are_preserved_but_other_users_today_and
         pg_engine, owner, sender="allowed_non_owner", content="My name is someone else"
     )
     await conversation(
-        pg_engine, owner, role="compaction_summary", content="Do not repeat summaries"
+        pg_engine, owner, role="synthetic_assistant_error", content="Do not repeat summaries"
     )
     await conversation(pg_engine, owner, at=NOW, content="today")
     await conversation(pg_engine, other, content="private other user")
@@ -472,54 +472,36 @@ async def test_dream_requires_auth(async_client):
     assert (await async_client.post(f"/api/dream/{uuid4()}/restore")).status_code == 401
 
 
-@pytest.mark.skipif(
-    os.environ.get("RUN_RUSTFS_INTEGRATION") != "1",
-    reason="requires configured RustFS",
-)
-async def test_real_storage_dream_update_restore_and_manual_edit_fence(pg_engine):
-    from openctopus_server.config import get_settings
-    from openctopus_server.workspace.fs import WorkspaceFS, WorkspaceTarget
-    from openctopus_server.workspace.service import WorkspaceService
-    from openctopus_server.workspace.storage import build_object_storage
+async def test_postgres_memory_dream_update_restore_and_manual_edit_fence(pg_engine):
+    from openctopus_server.chat.memory import MemoryDatabase, memory_path
 
     owner = await user(pg_engine)
-    storage = build_object_storage(get_settings())
-    fs = WorkspaceFS(storage)
-    workspace = WorkspaceService(fs)
+    memory = MemoryDatabase(pg_engine)
+    path = memory_path(owner.id)
     gate, writer = Gate(), Writer()
-    dream = DreamService(engine=pg_engine, workspace=workspace, jev=gate, writer=writer)
+    dream = DreamService(engine=pg_engine, memory=memory.store, jev=gate, writer=writer)
     try:
-        async with AsyncSession(pg_engine) as db:
-            await workspace.write(
-                db, user_id=owner.id, path="MEMORY.md", data=b"Existing memory.\n"
-            )
+        await memory.store.write(path, "Existing memory.\n", expected_version=None)
         await conversation(pg_engine, owner)
         run = await dream.process_user(owner.id, now=NOW)
-        assert run.status == "updated" and run.after_etag != run.before_etag
-        actual = await fs.read_with_metadata(WorkspaceTarget.personal(owner.id), "MEMORY.md")
-        assert actual.data == run.after.encode() and actual.etag == run.after_etag
+        assert run.status == "updated" and run.after_version != run.before_version
+        actual = await memory.store.read(path, max_chars=64000)
+        assert actual.content == run.after and actual.version == run.after_version
         restored = await dream.restore(owner.id, run.id)
         assert restored.status == "restored"
-        assert (
-            await fs.read(WorkspaceTarget.personal(owner.id), "MEMORY.md") == b"Existing memory.\n"
-        )
+        assert (await memory.store.read(path, max_chars=64000)).content == "Existing memory.\n"
         await conversation(pg_engine, owner, content="My next durable preference")
 
         async def manual_edit():
-            async with AsyncSession(pg_engine) as db:
-                await workspace.write(
-                    db, user_id=owner.id, path="MEMORY.md", data=b"New manual edit.\n"
-                )
+            current = await memory.store.read(path, max_chars=64000)
+            await memory.store.write(path, "New manual edit.\n", expected_version=current.version)
 
         writer.before_return = manual_edit
         conflicted = await dream.process_user(owner.id, now=NOW)
         assert conflicted.error == "workspace_file_changed"
-        assert (
-            await fs.read(WorkspaceTarget.personal(owner.id), "MEMORY.md") == b"New manual edit.\n"
-        )
+        assert (await memory.store.read(path, max_chars=64000)).content == "New manual edit.\n"
     finally:
-        await fs.purge_workspace(WorkspaceTarget.personal(owner.id))
-        await storage.close()
+        await memory.close()
 
 
 async def test_old_unprepared_run_failure_waits_an_hour_from_failure(pg_engine):

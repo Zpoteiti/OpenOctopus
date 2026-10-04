@@ -227,4 +227,6 @@ async def cancel_session(
             user_id=user.id,
             session_id=session_id,
         )
+        if cancel_requested and runtime.durable.started:
+            await runtime.durable.apply_cancellations()
     return {"cancel_requested": cancel_requested}

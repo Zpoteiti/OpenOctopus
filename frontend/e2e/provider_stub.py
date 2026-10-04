@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 HOST = "127.0.0.1"
 PORT = 18080
@@ -53,13 +54,13 @@ class ProviderHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        if self.path == "/v1/models":
+        if urlsplit(self.path).path == "/v1/models":
             self._send_json({"data": [{"id": MODEL}]})
             return
         self.send_error(404)
 
     def do_POST(self) -> None:
-        if self.path != "/v1/messages":
+        if urlsplit(self.path).path != "/v1/messages":
             self.send_error(404)
             return
         length = int(self.headers.get("content-length", "0"))

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Message, PendingMessage, Session, SystemConfig, TurnRun
-from openctopus_server.provider.anthropic import ProviderInvocationError, ProviderResult
+from openctopus_server.provider.runtime import ProviderInvocationError, ProviderResult
 
 
 @pytest.mark.parametrize("input_tokens", [25, 901])

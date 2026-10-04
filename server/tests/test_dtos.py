@@ -76,7 +76,7 @@ def test_message_response():
         content=[{"type": "text", "text": "hi"}],
         attachment_refs=[],
         delivery_refs=[],
-        is_compacted=False,
+
         created_at=datetime.now(UTC),
     )
     assert msg.role == "user"

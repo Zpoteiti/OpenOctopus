@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.auth.dependencies import get_current_user
@@ -40,12 +40,10 @@ async def list_cron_jobs(
 )
 async def create_cron_job(
     body: CronCreateRequest,
-    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CronJobResponse:
     result = await cron.create_owned(db, user_id=user.id, request=body)
-    _wake_scheduler(request)
     return result
 
 
@@ -62,7 +60,6 @@ async def get_cron_job(
 async def patch_cron_job(
     job_id: UUID,
     body: CronPatchRequest,
-    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CronJobResponse:
@@ -72,23 +69,14 @@ async def patch_cron_job(
         job_id=job_id,
         request=body,
     )
-    _wake_scheduler(request)
     return result
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_cron_job(
     job_id: UUID,
-    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     await cron.delete_owned(db, user_id=user.id, job_id=job_id)
-    _wake_scheduler(request)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-def _wake_scheduler(request: Request) -> None:
-    scheduler = getattr(request.app.state, "cron_scheduler", None)
-    if scheduler is not None:
-        scheduler.wake()

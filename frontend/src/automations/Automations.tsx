@@ -331,7 +331,7 @@ function DreamSection({
       {availability && availability.state !== 'available' && availability.state !== 'unchecked' ? <p className="field-help" role="status"><strong>{t('admin.dreamUnavailable')}</strong> {t(`admin.jevReason.${availability.state}`)}</p> : null}
       <div className="heartbeat-meta">
         <span>{t('automations.dreamSchedule', { timezone })}</span>
-        <Link to="/workspace?path=MEMORY.md">{t('automations.dreamMemory')}</Link>
+        <Link to="/memory">{t('automations.dreamMemory')}</Link>
         {nextRun ? <span>{t('automations.dreamNextRun')} <Timestamp value={nextRun} timezone={timezone} language={i18n.resolvedLanguage} /></span> : null}
         {latest ? <span>{t('automations.dreamLastRun')} <Timestamp value={latest.finished_at ?? latest.started_at} timezone={timezone} language={i18n.resolvedLanguage} /></span> : null}
       </div>

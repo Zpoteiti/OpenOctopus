@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.async_utils import await_future_cancellation_safe
@@ -20,6 +20,7 @@ from openctopus_server.chat.runtime_context import build_runtime_block
 from openctopus_server.chat.types import AcceptedMessage, TurnStart
 from openctopus_server.db.advisory import lock_uuid_identity
 from openctopus_server.db.models import (
+    AgentTask,
     ChannelDelivery,
     CronJob,
     DingTalkConfig,
@@ -198,6 +199,8 @@ async def publish_inbound_locked(
         started_at=now,
     )
     assert turn is not None
+    from openctopus_server.chat.durable import enqueue_turn
+    await enqueue_turn(db, turn)
     return AcceptedMessage(
         session_id=inbound.session_id,
         message_id=inbound.message_id,
@@ -257,7 +260,6 @@ async def reserve_pending_turn(
             if (
                 reservation_turn_id is not None
                 and running.id == reservation_turn_id
-                and running.runner_instance_id == runner_instance_id
             ):
                 pending_rows = await _pending_rows(db, session_id=session_id, for_update=True)
                 message_ids = tuple(UUID(value) for value in running.input_message_ids)
@@ -482,17 +484,23 @@ async def persist_assistant(
 ) -> Message:
     try:
         await lock_uuid_identity(db, turn.session_id)
+        message_id = uuid.uuid5(turn.turn_id, "error" if failed else "assistant")
+        existing = await db.get(Message, message_id)
+        if existing is not None:
+            if existing.session_id != turn.session_id or existing.content != content:
+                raise RuntimeError("Assistant replay does not match its persisted result")
+            return existing
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         now = datetime.now(UTC)
         message = Message(
-            id=uuid.uuid4(),
+            id=message_id,
             session_id=turn.session_id,
             message_kind=("synthetic_assistant_error" if failed else "assistant"),
             content=content,
             delivery_refs=[],
             llm_fingerprint=fingerprint,
-            is_compacted=False,
+
             created_at=now,
         )
         db.add(message)
@@ -525,6 +533,13 @@ async def persist_tool_result(
 
     try:
         await lock_uuid_identity(db, turn.session_id)
+        message_id = uuid.uuid5(turn.turn_id, f"tool:{block['tool_use_id']}")
+        existing = await db.get(Message, message_id)
+        if existing is not None:
+            if existing.session_id != turn.session_id or existing.content != [block]:
+                raise RuntimeError("Tool replay does not match its persisted result")
+            assistant = await db.get(Message, assistant_message_id) if assistant_message_id else None
+            return assistant, existing
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         updated_assistant: Message | None = None
@@ -536,7 +551,7 @@ async def persist_tool_result(
                         Message.id == assistant_message_id,
                         Message.session_id == turn.session_id,
                         Message.message_kind == "assistant",
-                        Message.is_compacted.is_(False),
+
                     )
                     .with_for_update()
                 )
@@ -566,12 +581,12 @@ async def persist_tool_result(
             ]
 
         message = Message(
-            id=uuid.uuid4(),
+            id=message_id,
             session_id=turn.session_id,
             message_kind="synthetic_tool_result" if synthetic else "tool_result",
             content=[block],
             delivery_refs=[],
-            is_compacted=False,
+
             created_at=datetime.now(UTC),
         )
         db.add(message)
@@ -590,10 +605,14 @@ async def persist_human_marker(
 ) -> Message:
     try:
         await lock_uuid_identity(db, turn.session_id)
+        message_id = uuid.uuid5(turn.turn_id, f"marker:{text_content}")
+        existing = await db.get(Message, message_id)
+        if existing is not None:
+            return existing
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         message = Message(
-            id=uuid.uuid4(),
+            id=message_id,
             session_id=turn.session_id,
             message_kind="human",
             content=[{"type": "text", "text": text_content}],
@@ -602,7 +621,7 @@ async def persist_human_marker(
             sender_display_name="OpenOctopus",
             sender_classification="internal",
             ingress_tool_profile=turn.tool_profile,
-            is_compacted=False,
+
             created_at=datetime.now(UTC),
         )
         db.add(message)
@@ -616,6 +635,9 @@ async def persist_human_marker(
 async def finish_final_turn(db: AsyncSession, *, turn: TurnStart) -> None:
     try:
         await lock_uuid_identity(db, turn.session_id)
+        existing = await db.get(TurnRun, turn.turn_id)
+        if existing is not None and existing.status == "completed":
+            return
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         run.status = "completed"
@@ -637,6 +659,15 @@ async def finish_tool_batch_and_continue(
 ) -> TurnStart:
     try:
         await lock_uuid_identity(db, turn.session_id)
+        next_id = uuid.uuid5(turn.turn_id, "next")
+        existing = await db.get(TurnRun, next_id)
+        if existing is not None:
+            return TurnStart(
+                session_id=existing.session_id, turn_id=existing.id,
+                message_ids=tuple(UUID(item) for item in existing.input_message_ids),
+                effort=Effort(existing.effort) if existing.effort else None,
+                tool_profile=_stored_tool_profile(existing.tool_profile),
+            )
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         now = datetime.now(UTC)
@@ -664,7 +695,11 @@ async def finish_tool_batch_and_continue(
                 dict(target) for target in run.failed_delivery_targets
             ],
             started_at=now,
+            turn_id=next_id,
         )
+        next_run = await db.get(TurnRun, next_id)
+        assert next_run is not None
+        next_run.workflow_id = run.workflow_id
         await db.commit()
         return next_turn
     except Exception:
@@ -681,6 +716,15 @@ async def cancel_tool_batch(
 ) -> tuple[list[Message], Message]:
     try:
         await lock_uuid_identity(db, turn.session_id)
+        marker_id = uuid.uuid5(turn.turn_id, "cancel")
+        existing = await db.get(Message, marker_id)
+        if existing is not None:
+            rows = list((await db.scalars(select(Message).where(
+                Message.id.in_([uuid.uuid5(turn.turn_id, f"tool:{call}")
+                                for call in (*outcome_unknown_tool_ids, *cancelled_tool_ids)]),
+            ))).all())
+            await db.commit()
+            return rows, existing
         run = await _running_turn(db, turn.turn_id)
         _require_turn_profile(turn, run)
         now = datetime.now(UTC)
@@ -699,7 +743,7 @@ async def cancel_tool_batch(
         )
         for index, (tool_id, code, text_content) in enumerate(outcomes):
             row = Message(
-                id=uuid.uuid4(),
+                id=uuid.uuid5(turn.turn_id, f"tool:{tool_id}"),
                 session_id=turn.session_id,
                 message_kind="synthetic_tool_result",
                 content=[
@@ -710,13 +754,13 @@ async def cancel_tool_batch(
                     )
                 ],
                 delivery_refs=[],
-                is_compacted=False,
+
                 created_at=now + timedelta(microseconds=index),
             )
             db.add(row)
             result_rows.append(row)
         marker = Message(
-            id=uuid.uuid4(),
+            id=marker_id,
             session_id=turn.session_id,
             message_kind="human",
             content=[{"type": "text", "text": "[User pressed stop]"}],
@@ -725,7 +769,7 @@ async def cancel_tool_batch(
             sender_display_name="OpenOctopus",
             sender_classification="internal",
             ingress_tool_profile=turn.tool_profile,
-            is_compacted=False,
+
             created_at=now + timedelta(microseconds=len(result_rows)),
         )
         db.add(marker)
@@ -783,14 +827,23 @@ async def _request_cancel_transition(
             raise ChatError(ErrorCode.NOT_FOUND, "Session not found")
         running = (
             await db.execute(
-                select(TurnRun.id).where(
+                select(TurnRun).where(
                     TurnRun.session_id == session_id,
                     TurnRun.status == "running",
                 )
             )
         ).scalar_one_or_none()
-        cancel_requested = running is not None
-        session.cancel_requested = cancel_requested
+        child = await db.scalar(select(AgentTask.session_id).where(
+            AgentTask.parent_session_id == session_id, AgentTask.status == "running",
+        ).limit(1))
+        cancel_requested = running is not None or child is not None
+        session.cancel_requested = running is not None
+        if cancel_requested:
+            from openctopus_server.chat.cancellation import record_session_cancellation
+            await record_session_cancellation(db, session_id)
+        if running is not None:
+            from openctopus_server.chat.cancellation import record_cancellation
+            await record_cancellation(db, session_id, running.workflow_id or str(running.id))
         await db.commit()
         if cancel_requested:
             _notify_cancel_waiters(session_id)
@@ -939,6 +992,9 @@ async def get_messages_response(
         if latest_run.status == "running":
             active_turn_id = latest_run.id
 
+    active_delegates = await db.scalar(select(func.count()).select_from(AgentTask).where(
+        AgentTask.parent_session_id == session_id, AgentTask.status == "running",
+    ))
     return MessagesResponse(
         messages=[
             message_response(
@@ -953,6 +1009,7 @@ async def get_messages_response(
         active_turn_id=active_turn_id,
         last_message_id=last_message_id,
         pending_count=len(pending_rows),
+        active_delegate_count=active_delegates or 0,
         has_more_before=has_more_before,
     )
 
@@ -1049,7 +1106,7 @@ async def _promote_pending_rows(
                 source_message_id=row.source_message_id,
                 channel_binding_generation=row.channel_binding_generation,
                 channel_context=[dict(item) for item in (row.channel_context or [])],
-                is_compacted=False,
+
                 created_at=promoted_at + timedelta(microseconds=index),
             )
         )
@@ -1077,6 +1134,7 @@ def _create_turn(
             runner_instance_id=runner_instance_id,
             status="running",
             tool_profile=tool_profile,
+            effort=effort.value if effort is not None else None,
             input_message_ids=[str(message_id) for message_id in message_ids],
             failed_delivery_targets=[
                 dict(target) for target in (failed_delivery_targets or [])
@@ -1162,7 +1220,7 @@ async def _valid_contiguous_profile_prefix(
     session = await db.get(Session, rows[0].session_id)
     if session is None:
         raise RuntimeError("Pending channel Session disappeared")
-    config = await _locked_channel_config(
+    config = await locked_channel_config(
         db,
         user_id=rows[0].user_id,
         channel=session.channel,
@@ -1171,7 +1229,7 @@ async def _valid_contiguous_profile_prefix(
     for row in rows:
         if row.ingress_tool_profile != profile:
             break
-        if not _pending_authority_is_current(
+        if not inbound_authority_is_current(
             row,
             channel=session.channel,
             config=config,
@@ -1181,7 +1239,7 @@ async def _valid_contiguous_profile_prefix(
     return captured
 
 
-async def _locked_channel_config(
+async def locked_channel_config(
     db: AsyncSession,
     *,
     user_id: UUID,
@@ -1206,8 +1264,8 @@ async def _locked_channel_config(
     return None
 
 
-def _pending_authority_is_current(
-    row: PendingMessage,
+def inbound_authority_is_current(
+    row: PendingMessage | Message,
     *,
     channel: str,
     config: DiscordConfig | DingTalkConfig | None,
@@ -1264,7 +1322,7 @@ async def _close_revoked_pending(
             content=[{"type": "text", "text": _CHANNEL_AUTHORITY_REVOKED_TEXT}],
             attachment_refs=[],
             delivery_refs=[],
-            is_compacted=False,
+
             created_at=terminal_at,
         )
     )

@@ -48,7 +48,8 @@ export function useRecoveredHistory(
         const pageCursor = incoming.messages.at(-1)?.id ?? after
         recoveryCursor.current = { sessionId, messageId: pageCursor }
         const caughtUp = incoming.last_message_id === null || pageCursor === incoming.last_message_id
-        const hasRecoveryWork = incoming.status === 'running' || incoming.pending_count > 0 || !caughtUp
+        const hasRecoveryWork = incoming.status === 'running' || incoming.active_delegate_count > 0
+          || incoming.pending_count > 0 || !caughtUp
         if (!hasRecoveryWork && after !== null && !terminalSnapshot) {
           await load(null, pollCount, true)
           return

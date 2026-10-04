@@ -23,13 +23,16 @@ macOS, and Windows computers.
   Streamable HTTP, or SSE, including tools, resources, templates, and prompts.
 - Connects one Discord Bot and one DingTalk Bot per user to the same durable
   conversation and Agent loop as the browser.
-- Uses an Anthropic-compatible Messages API as the LLM Provider.
+- Uses native Pydantic AI Providers for Anthropic Messages, OpenAI-compatible
+  Chat Completions, and OpenRouter.
+- Runs the Pydantic AI Harness with durable DBOS main and background child agents.
 - Ships six read-only built-in skill guides, available to every agent and in Workspace.
 - Runs scheduled jobs and Jev-gated Heartbeat checks. Dream reviews completed days'
-  conversation text and updates `MEMORY.md`, with change history and undo in Automations.
+  conversation text and updates the official Memory store, with change history and undo in Automations.
 
-New accounts receive editable `SOUL.md` and `MEMORY.md` files in their personal
-Workspace. Administrators can configure the default SOUL, Provider, Workspace
+New accounts receive an editable `SOUL.md` file in their personal Workspace.
+The Memory page edits the same versioned PostgreSQL notes used by agents and Dream.
+Administrators can configure the default SOUL, Provider, Workspace
 quotas, Jev decision service, Server Web Fetch policy, users, and shared Server MCP from the UI.
 
 ## See it in action
@@ -64,7 +67,7 @@ Browser
 OpenOctopus Server (one ASGI worker)
   |-- PostgreSQL: users, conversations, configuration, MCP catalogs
   |-- RustFS: Server Workspaces and uploaded attachments
-  |-- Anthropic-compatible LLM Provider
+  |-- Pydantic AI Harness + native model Providers + DBOS recovery
   |-- Jev decision API for Heartbeat Phase 1 and Dream
   |-- Discord Gateway + REST adapter
   |-- DingTalk Stream + OpenAPI adapter

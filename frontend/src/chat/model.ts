@@ -25,7 +25,6 @@ export interface ChatMessage {
   source_message_id?: string | null
   channel_context?: ChannelContext | null
   deliveries?: ChannelDelivery[]
-  is_compacted: boolean
   created_at: string
 }
 
@@ -81,6 +80,7 @@ export interface MessageHistory {
   active_turn_id: string | null
   last_message_id: string | null
   pending_count: number
+  active_delegate_count: number
   has_more_before: boolean
 }
 
@@ -91,6 +91,7 @@ export const emptyHistory = (): MessageHistory => ({
   active_turn_id: null,
   last_message_id: null,
   pending_count: 0,
+  active_delegate_count: 0,
   has_more_before: false,
 })
 
@@ -103,12 +104,18 @@ export function upsertMessage(messages: ChatMessage[], incoming: ChatMessage): C
 export function mergeHistory(current: MessageHistory, incoming: MessageHistory): MessageHistory {
   const messages = incoming.messages.reduce(upsertMessage, current.messages)
   const persistedIds = new Set(messages.map((message) => message.id))
+  const firstCurrent = current.messages[0]
+  const firstIncoming = incoming.messages[0]
+  // Cursor pages have earlier rows on the server that are already visible here.
+  // The oldest loaded page owns whether any history is actually missing.
+  const hasMoreBefore = firstCurrent && (!firstIncoming || compareMessages(firstCurrent, firstIncoming) <= 0)
+    ? current.has_more_before : incoming.has_more_before
 
   return {
     ...incoming,
     messages,
     pending_messages: incoming.pending_messages.filter((message) => !persistedIds.has(message.id)),
-    has_more_before: current.has_more_before || incoming.has_more_before,
+    has_more_before: hasMoreBefore,
   }
 }
 

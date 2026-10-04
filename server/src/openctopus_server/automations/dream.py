@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime, time, timedelta
@@ -11,26 +12,25 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic_ai_harness.memory import MemoryConflictError, MemoryFile, MemoryOperation, MemoryStore
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from openctopus_server.chat.memory import memory_path
 from openctopus_server.db.models import DreamProgress, DreamRun, Message, User
 from openctopus_server.dto.dream import DreamRunDetail, DreamRunResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import OpenOctopusError, WorkspaceError
-from openctopus_server.provider.anthropic import ProviderResult
 from openctopus_server.provider.jev import JevChoiceQuestion, JevError, JevService
+from openctopus_server.provider.runtime import ProviderResult
 from openctopus_server.workspace.locks import KeyedLockManager
-from openctopus_server.workspace.service import WorkspaceService
-from openctopus_server.workspace.storage import StoredObject
 
 MEMORY_PATH = "MEMORY.md"
 MAX_MEMORY_BYTES = 64_000
 MAX_SOURCE_MESSAGES = 16
 MAX_SOURCE_CHARS = 64_000
 SOURCE_CHUNK_CHARS = 16_000
-DREAM_WORKERS = 4
 DREAM_PROPOSAL_TIMEOUT_SECONDS = 120
 DREAM_RETRY_DELAY = timedelta(hours=1)
 _LOGGER = logging.getLogger(__name__)
@@ -171,49 +171,19 @@ class DreamService:
         self,
         *,
         engine: AsyncEngine,
-        workspace: WorkspaceService,
+        memory: MemoryStore,
         jev: JevService,
         writer: MemoryWriter,
     ) -> None:
         self.engine = engine
-        self.workspace = workspace
+        self.memory = memory
         self.jev = jev
         self.writer = writer
         self._locks = KeyedLockManager()
-        self._task: asyncio.Task[None] | None = None
 
-    def start(self) -> None:
-        self._task = asyncio.create_task(self._loop(), name="dream")
 
-    async def close(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
 
-    async def _loop(self) -> None:
-        while True:
-            try:
-                await self.tick(datetime.now(UTC))
-            except Exception as exc:
-                _LOGGER.warning("Dream scheduler failed (%s)", type(exc).__name__)
-            await asyncio.sleep(60)
 
-    async def tick(self, now: datetime) -> None:
-        # Keyset pages bound both resident users and concurrent model work.
-        after_id: UUID | None = None
-        while True:
-            async with AsyncSession(self.engine) as db:
-                statement = select(User.id).order_by(User.id).limit(DREAM_WORKERS)
-                if after_id is not None:
-                    statement = statement.where(User.id > after_id)
-                ids = list((await db.scalars(statement)).all())
-            if not ids:
-                return
-            async with asyncio.TaskGroup() as workers:
-                for user_id in ids:
-                    workers.create_task(self.process_user(user_id, now=now))
-            after_id = ids[-1]
 
     async def _source(self, db: AsyncSession, user: User, now: datetime) -> list[dict[str, Any]]:
         rows = (
@@ -254,22 +224,26 @@ class DreamService:
                 break
         return source
 
-    async def _memory(self, user_id: UUID) -> StoredObject:
-        async with AsyncSession(self.engine) as db:
-            try:
-                metadata = await self.workspace.stat(db, user_id=user_id, path=MEMORY_PATH)
-                if metadata.size > MAX_MEMORY_BYTES:
-                    raise ValueError("memory_too_large")
-                stored = await self.workspace.read_with_metadata(
-                    db, user_id=user_id, path=MEMORY_PATH
-                )
-            except WorkspaceError as exc:
-                if exc.code != ErrorCode.WORKSPACE_NOT_FOUND:
-                    raise
-                return StoredObject(data=b"", etag="", truncated=False)
-        if stored.truncated or len(stored.data) > MAX_MEMORY_BYTES:
+    async def _memory(self, user_id: UUID) -> MemoryFile:
+        stored = await self.memory.read(memory_path(user_id), max_chars=MAX_MEMORY_BYTES)
+        if stored is None:
+            return MemoryFile(content="", version="", operation_id=None, truncated=False)
+        if stored.truncated or len(stored.content.encode("utf-8")) > MAX_MEMORY_BYTES:
             raise ValueError("memory_too_large")
         return stored
+
+    async def _write_memory(self, run: DreamRun, *, restore: bool = False) -> str | None:
+        content = run.before if restore else run.after
+        version = run.after_version if restore else run.before_version
+        assert content is not None
+        path = memory_path(run.user_id)
+        fingerprint = hashlib.sha256(json.dumps([path, content, version]).encode()).hexdigest()
+        operation = MemoryOperation(id=f"dream:{run.id}:{'restore' if restore else 'update'}", fingerprint=fingerprint)
+        try:
+            result = await self.memory.write(path, content, expected_version=version, operation=operation)
+        except MemoryConflictError:
+            raise WorkspaceError(ErrorCode.WORKSPACE_FILE_CHANGED, "Memory changed during Dream") from None
+        return result.version
 
     async def _save(self, run: DreamRun) -> None:
         async with AsyncSession(self.engine) as db:
@@ -307,12 +281,16 @@ class DreamService:
             await db.merge(run)
             await db.commit()
 
-    async def process_user(self, user_id: UUID, *, now: datetime) -> DreamRun | None:
+    async def process_user(self, user_id: UUID, *, now: datetime, run_id: UUID | None = None) -> DreamRun | None:
         async with self._locks.hold(user_id):
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 user = await db.get(User, user_id)
                 if user is None:
                     return None
+                if run_id is not None:
+                    settled = await db.get(DreamRun, run_id)
+                    if settled is not None and settled.status not in {"pending", "restoring"}:
+                        return settled
                 run = await db.scalar(
                     select(DreamRun).where(
                         DreamRun.user_id == user_id,
@@ -337,6 +315,8 @@ class DreamService:
                     if not source:
                         return None
                     run = DreamRun(user_id=user_id, status="pending", source=source, started_at=now)
+                    if run_id is not None:
+                        run.id = run_id
                     db.add(run)
                     await db.commit()
             restoring = run.status == "restoring"
@@ -352,7 +332,7 @@ class DreamService:
                     await self._finish(run, "skipped", now)
                     return run
                 stored = await self._memory(user_id)
-                before = stored.data.decode("utf-8")
+                before = stored.content
                 state = {"current_memory": before, "conversations": run.source}
                 answers = await self.jev.evaluate(
                     state=state, questions={"memory": _DREAM_QUESTION}
@@ -377,7 +357,7 @@ class DreamService:
                 if after == before:
                     await self._finish(run, "unchanged", now)
                     return run
-                run.before, run.after, run.before_etag = before, after, stored.etag or None
+                run.before, run.after, run.before_version = before, after, stored.version or None
                 await self._save(run)  # Write-ahead record recovers a crash after the file write.
                 await self._commit_memory(run, now)
             except Exception as exc:
@@ -421,24 +401,7 @@ class DreamService:
 
     async def _commit_memory(self, run: DreamRun, now: datetime) -> None:
         assert run.after is not None
-        current = await self._memory(run.user_id)
-        if current.data != run.after.encode("utf-8"):
-            if (current.etag or None) != run.before_etag:
-                raise WorkspaceError(
-                    ErrorCode.WORKSPACE_FILE_CHANGED, "Memory changed during Dream"
-                )
-            async with AsyncSession(self.engine) as db:
-                metadata = await self.workspace.write(
-                    db,
-                    user_id=run.user_id,
-                    path=MEMORY_PATH,
-                    data=run.after.encode("utf-8"),
-                    if_match=run.before_etag,
-                    if_none_match=run.before_etag is None,
-                )
-                run.after_etag = metadata.etag
-        else:
-            run.after_etag = current.etag
+        run.after_version = await self._write_memory(run)
         await self._finish(run, "updated", now)
 
     async def restore(self, user_id: UUID, run_id: UUID) -> DreamRunDetail:
@@ -470,7 +433,7 @@ class DreamService:
                         ErrorCode.WORKSPACE_FILE_CHANGED, "Dream is still processing this memory"
                     )
                 current = await self._memory(user_id)
-                if current.etag != run.after_etag:
+                if current.version != run.after_version:
                     raise WorkspaceError(
                         ErrorCode.WORKSPACE_FILE_CHANGED,
                         "Memory has changed since this Dream update",
@@ -481,28 +444,13 @@ class DreamService:
 
     async def _restore(self, run: DreamRun, now: datetime) -> DreamRun:
         assert run.before is not None
-        current = await self._memory(run.user_id)
-        if current.data != run.before.encode("utf-8"):
-            if current.etag != run.after_etag:
+        try:
+            await self._write_memory(run, restore=True)
+        except WorkspaceError as exc:
+            if exc.code == ErrorCode.WORKSPACE_FILE_CHANGED:
                 run.status, run.error = "updated", "workspace_file_changed"
                 await self._save(run)
-                raise WorkspaceError(
-                    ErrorCode.WORKSPACE_FILE_CHANGED, "Memory has changed since this Dream update"
-                )
-            try:
-                async with AsyncSession(self.engine) as db:
-                    await self.workspace.write(
-                        db,
-                        user_id=run.user_id,
-                        path=MEMORY_PATH,
-                        data=run.before.encode("utf-8"),
-                        if_match=run.after_etag,
-                    )
-            except WorkspaceError as exc:
-                if exc.code == ErrorCode.WORKSPACE_FILE_CHANGED:
-                    run.status, run.error = "updated", "workspace_file_changed"
-                    await self._save(run)
-                raise
+            raise
         run.status, run.restored_at, run.error = "restored", now, None
         await self._save(run)
         return run

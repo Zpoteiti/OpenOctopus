@@ -8,10 +8,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from native_provider_fixture import NativeProviderFixture
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import openctopus_server.chat.runner as runner_module
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Device, Message, Session, SystemConfig, User
 from openctopus_server.devices.mcp_catalog import with_catalog_digest
@@ -22,13 +22,13 @@ from openctopus_server.devices.mcp_models import (
 )
 from openctopus_server.devices.protocol import ToolResultFrame, new_uuid7
 from openctopus_server.devices.registry import DeviceRegistry
-from openctopus_server.provider.anthropic import (
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.runtime import (
     DeltaCallback,
     ProviderResult,
     provider_fingerprint,
 )
-from openctopus_server.provider.config import ProviderConfig
-from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.registry import ToolRegistry, _owned_mcp_route_resolver
 
@@ -78,7 +78,7 @@ def _catalog() -> PersistedMcpCatalog:
     )
 
 
-class _McpProvider:
+class _McpProvider(NativeProviderFixture):
     def __init__(
         self,
         *,
@@ -131,58 +131,21 @@ class _McpProvider:
         return None
 
 
-class _CompactionMcpProvider:
-    def __init__(self) -> None:
+class _CompactionMcpProvider(_McpProvider):
+    def __init__(self):
+        super().__init__()
         self.summary_started = asyncio.Event()
         self.release_summary = asyncio.Event()
-        self.normal_calls: list[dict[str, Any]] = []
 
-    async def stream_turn(
-        self,
-        *,
-        config: ProviderConfig,
-        system: str,
-        messages: list[dict[str, Any]],
-        effort: Effort | None,
-        limiter: ProviderLimiter,
-        on_delta: DeltaCallback,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> ProviderResult:
-        del effort, limiter, on_delta
-        if tools == [] and system.startswith("Summarize the conversation state"):
+    def native_model(self, config):
+        from pydantic_ai.messages import ModelResponse, TextPart
+        from pydantic_ai.models.function import FunctionModel
+        base = super().native_model(config)
+        async def summarize(messages, info):
             self.summary_started.set()
             await self.release_summary.wait()
-            content = [{"type": "text", "text": "compacted"}]
-        else:
-            self.normal_calls.append(
-                {
-                    "system": system,
-                    "messages": deepcopy(messages),
-                    "tools": deepcopy(tools),
-                }
-            )
-            content = (
-                [
-                    {
-                        "type": "tool_use",
-                        "id": "mcp-call-after-compaction",
-                        "name": "mcp_demo_search",
-                        "input": {
-                            "query": "octopus",
-                            "openoctopus_device": "desktop",
-                        },
-                    }
-                ]
-                if len(self.normal_calls) == 1
-                else [{"type": "text", "text": "done"}]
-            )
-        return ProviderResult(
-            content=content,
-            fingerprint=provider_fingerprint(config),
-        )
-
-    async def close(self) -> None:
-        return None
+            return ModelResponse([TextPart('compacted')])
+        return FunctionModel(function=summarize, stream_function=base.stream_function)
 
 
 def _message(
@@ -208,7 +171,7 @@ def _message(
         content=[{"type": "text", "text": text}],
         delivery_refs=[],
         llm_fingerprint=None,
-        is_compacted=False,
+
         created_at=created_at,
         **authority,
     )
@@ -283,8 +246,8 @@ async def test_runner_freezes_durable_mcp_schema_and_route_for_dispatch(
 
     assert response.status_code == 200
     assert len(provider.calls) == 2
-    assert [tool["name"] for tool in provider.calls[0]["tools"]] == ["mcp_demo_search"]
-    assert provider.calls[0]["tools"][0]["input_schema"]["properties"][
+    assert [tool["name"] for tool in provider.calls[0]["tools"] if tool["name"].startswith("mcp_")] == ["mcp_demo_search"]
+    assert next(t for t in provider.calls[0]["tools"] if t["name"] == "mcp_demo_search")["input_schema"]["properties"][
         "openoctopus_device"
     ]["enum"] == ["laptop"]
     assert len(dispatched) == 1
@@ -375,7 +338,7 @@ async def test_runner_rejects_a_frozen_mcp_route_that_changed_before_send(
     assert dispatched is False
     tool_result = provider.calls[1]["messages"][-1]["content"][0]
     assert tool_result["is_error"] is True
-    assert "[tool_mcp_unavailable]" in tool_result["content"][1]["text"]
+    assert "[tool_mcp_unavailable]" in tool_result["content"]
 
 
 async def test_runner_uses_one_owner_device_snapshot_for_prompt_schema_and_route(
@@ -411,7 +374,8 @@ async def test_runner_uses_one_owner_device_snapshot_for_prompt_schema_and_route
 
     context_built = asyncio.Event()
     release_context = asyncio.Event()
-    original_build_context = runner_module.build_provider_context
+    from openctopus_server.chat import prompt as prompt_module
+    original_build_context = prompt_module.build_system_prompt
     context_calls = 0
 
     async def paused_build_context(*args: Any, **kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -423,7 +387,7 @@ async def test_runner_uses_one_owner_device_snapshot_for_prompt_schema_and_route
             await release_context.wait()
         return result
 
-    monkeypatch.setattr(runner_module, "build_provider_context", paused_build_context)
+    monkeypatch.setattr(prompt_module, "build_system_prompt", paused_build_context)
     dispatched: list[dict[str, object]] = []
     device_registry = DeviceRegistry()
 
@@ -487,7 +451,7 @@ async def test_runner_uses_one_owner_device_snapshot_for_prompt_schema_and_route
     first_call = provider.calls[0]
     assert "- laptop —" in first_call["system"]
     assert "- desktop —" not in first_call["system"]
-    assert first_call["tools"][0]["input_schema"]["properties"][
+    assert next(t for t in first_call["tools"] if t["name"] == "mcp_demo_search")["input_schema"]["properties"][
         "openoctopus_device"
     ]["enum"] == ["laptop"]
     assert len(dispatched) == 1
@@ -501,7 +465,7 @@ async def test_runner_uses_one_owner_device_snapshot_for_prompt_schema_and_route
     assert route.config_revision == 7
 
 
-async def test_compaction_recaptures_prompt_schema_and_route_as_one_owner_snapshot(
+async def test_native_compaction_preserves_captured_owner_snapshot(
     user_client,
     test_app,
     pg_engine,
@@ -545,17 +509,11 @@ async def test_compaction_recaptures_prompt_schema_and_route_as_one_owner_snapsh
             ]
         )
         await db.flush()
-        db.add_all(
-            [
-                _message(session_id, kind="human", text="U1", created_at=now),
-                _message(
-                    session_id,
-                    kind="assistant",
-                    text="A1",
-                    created_at=now + timedelta(microseconds=1),
-                ),
-            ]
-        )
+        db.add_all([
+            _message(session_id, kind="human" if i % 2 == 0 else "assistant",
+                     text="history " * 3000, created_at=now + timedelta(microseconds=i))
+            for i in range(12)
+        ])
         await db.commit()
 
     dispatched: list[dict[str, object]] = []
@@ -618,18 +576,18 @@ async def test_compaction_recaptures_prompt_schema_and_route_as_one_owner_snapsh
         await runtime.close()
 
     assert response.status_code == 200
-    first_call = provider.normal_calls[0]
-    assert "- desktop —" in first_call["system"]
-    assert "- laptop —" not in first_call["system"]
-    assert first_call["tools"][0]["input_schema"]["properties"][
+    first_call = provider.calls[0]
+    assert "- laptop —" in first_call["system"]
+    assert "- desktop —" not in first_call["system"]
+    assert next(t for t in first_call["tools"] if t["name"] == "mcp_demo_search")["input_schema"]["properties"][
         "openoctopus_device"
-    ]["enum"] == ["desktop"]
+    ]["enum"] == ["laptop"]
     assert len(dispatched) == 1
     assert len(execution_states) == 1
-    assert execution_states[0]["device_targets"] == {"desktop": device_id}
+    assert execution_states[0]["device_targets"] == {"laptop": device_id}
     frozen_snapshot = execution_states[0]["mcp_snapshot"]
-    assert frozen_snapshot.routes[0].device_name == "desktop"
-    assert frozen_snapshot.routes[0].config_revision == 8
+    assert frozen_snapshot.routes[0].device_name == "laptop"
+    assert frozen_snapshot.routes[0].config_revision == 7
     route = dispatched[0]["route"]
-    assert route.device_name == "desktop"
-    assert route.config_revision == 8
+    assert route.device_name == "laptop"
+    assert route.config_revision == 7

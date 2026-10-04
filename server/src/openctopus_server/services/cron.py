@@ -9,6 +9,7 @@ from sqlalchemy import Text, and_, cast, literal, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
+from openctopus_server.automations.durable import cancel_cron, enqueue_cron
 from openctopus_server.automations.schedule import (
     InvalidScheduleError,
     InvalidTimezoneError,
@@ -73,6 +74,8 @@ async def create_owned(
             created_at=write_time,
         )
         db.add(job)
+        await db.flush()
+        await enqueue_cron(db, job)
         await db.commit()
         return _job_response(job, session_id=None)
     except BaseException:
@@ -158,6 +161,9 @@ async def patch_owned(
             else job.message
         )
 
+        old_fire = job.next_fire_at
+        if schedule is not None and schedule.next_fire_at != old_fire:
+            await cancel_cron(db, job)
         job.name = new_name
         job.message = new_message
         if schedule is not None:
@@ -165,6 +171,7 @@ async def patch_owned(
             job.schedule_value = schedule.value
             job.timezone = schedule.timezone
             job.next_fire_at = schedule.next_fire_at
+        await enqueue_cron(db, job)
         await db.commit()
         session_id = await _history_session_id(db, job)
         return _job_response(job, session_id=session_id)
@@ -188,6 +195,7 @@ async def delete_owned(
         )
         if job is None:
             raise _not_found()
+        await cancel_cron(db, job)
         await db.delete(job)
         await db.commit()
     except BaseException:

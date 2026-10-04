@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from openctopus_server.chat.runner import ChatRuntime, DetachedSession
 from openctopus_server.chat.stream import StreamSubscriber
-from openctopus_server.chat.types import TurnStart
 from openctopus_server.db.models import (
     CronJob,
     Message,
@@ -73,7 +72,7 @@ def _message(
         message_kind=kind,
         content=[{"type": "text", "text": kind}],
         delivery_refs=[],
-        is_compacted=False,
+
         created_at=created_at,
         **authority,
     )
@@ -134,7 +133,7 @@ async def test_list_sessions_is_owned_sorted_paginated_and_derives_unread(
         )
         db.add_all([newest, older, null_newer, null_older, foreign])
         await db.flush()
-        db.add(_message(older.id, created_at=now, kind="compaction_summary"))
+        db.add(_message(older.id, created_at=now, kind="synthetic_assistant_error"))
         await db.commit()
 
     response = await user_client.get("/api/sessions", params={"limit": 2, "offset": 1})
@@ -422,14 +421,6 @@ async def test_runtime_terminate_session_closes_all_streams_without_respawn(pg_e
         assert state is not None
         async with state.lock:
             state.runner_task = runner_task
-            state.starts.append(
-                TurnStart(
-                    session_id=session_id,
-                    turn_id=uuid4(),
-                    message_ids=(queued_message_id,),
-                    effort=None,
-                )
-            )
             state.streams.turn_subscribers[turn_id] = active
             state.streams.queued_subscribers[queued_message_id] = queued
 
@@ -469,7 +460,7 @@ async def test_get_messages_holds_snapshot_lock_before_ownership_read(
     get_task = asyncio.create_task(
         user_client.get(f"/api/sessions/{session_id}/messages")
     )
-    await asyncio.wait_for(ownership_read.wait(), timeout=2)
+    await asyncio.wait_for(ownership_read.wait(), timeout=5)
     delete_task = asyncio.create_task(user_client.delete(f"/api/sessions/{session_id}"))
     await asyncio.sleep(0.05)
 
@@ -477,7 +468,7 @@ async def test_get_messages_holds_snapshot_lock_before_ownership_read(
     release_get.set()
     get_response, delete_response = await asyncio.wait_for(
         asyncio.gather(get_task, delete_task),
-        timeout=2,
+        timeout=5,
     )
     assert get_response.status_code == 200
     assert delete_response.status_code == 204

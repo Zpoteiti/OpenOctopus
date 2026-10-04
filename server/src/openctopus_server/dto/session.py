@@ -39,6 +39,7 @@ class SessionResponse(BaseModel):
 
     id: UUID
     user_id: UUID
+    parent_session_id: UUID | None = None
     session_key: str
     channel: str
     chat_id: str

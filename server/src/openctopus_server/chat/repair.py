@@ -29,7 +29,7 @@ async def repair_unpaired_tool_uses(
                     select(Message)
                     .where(
                         Message.session_id == session_id,
-                        Message.is_compacted.is_(False),
+
                     )
                     .order_by(Message.created_at, Message.id)
                     .with_for_update()
@@ -61,7 +61,7 @@ async def repair_unpaired_tool_uses(
                     )
                 ],
                 delivery_refs=[],
-                is_compacted=False,
+
                 created_at=created_at + timedelta(microseconds=index),
             )
             db.add(message)

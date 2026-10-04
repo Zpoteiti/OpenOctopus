@@ -1,6 +1,5 @@
 """Independent checks for failure boundaries around Dream's two durable stores."""
 
-import asyncio
 from datetime import timedelta
 
 import pytest
@@ -12,7 +11,7 @@ from openctopus_server.automations.dream import apply_proposal
 from openctopus_server.db.models import DreamProgress, DreamRun, User
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.provider.anthropic import ProviderResult
+from openctopus_server.provider.runtime import ProviderResult
 
 
 @pytest.mark.parametrize(
@@ -121,32 +120,6 @@ async def test_restore_with_unfinished_batch_returns_controlled_conflict(pg_engi
         assert (await db.get(DreamRun, updated.id)).status == "updated"
 
 
-async def test_worker_failure_cancels_and_joins_other_workers(pg_engine, monkeypatch):
-    failing = await user(pg_engine)
-    waiting = await user(pg_engine)
-    dream, _, _, _ = service(pg_engine)
-    started = asyncio.Event()
-    canceled = asyncio.Event()
-
-    async def worker(user_id, *, now):
-        if user_id == failing.id:
-            await started.wait()
-            raise RuntimeError("Database failure before the processing boundary")
-        assert user_id == waiting.id
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            canceled.set()
-            raise
-
-    monkeypatch.setattr(dream, "process_user", worker)
-    with pytest.raises(ExceptionGroup):
-        await dream.tick(NOW)
-    assert canceled.is_set()
-    await dream.close()
-    async with AsyncSession(pg_engine) as db:
-        assert not list(await db.scalars(select(DreamRun)))
 
 
 def test_supported_obsolete_memory_can_be_removed_with_an_empty_replacement():

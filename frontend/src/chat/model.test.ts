@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { mergeHistory, upsertMessage, type ChatMessage, type MessageHistory } from './model'
+import { emptyHistory, mergeHistory, upsertMessage, type ChatMessage, type MessageHistory } from './model'
 
 function message(id: string, text: string, createdAt: string): ChatMessage {
   return {
@@ -11,7 +11,6 @@ function message(id: string, text: string, createdAt: string): ChatMessage {
     content: [{ type: 'text', text }],
     attachment_refs: [],
     delivery_refs: [],
-    is_compacted: false,
     created_at: createdAt,
   }
 }
@@ -38,6 +37,7 @@ describe('chat history reconciliation', () => {
       status: 'running',
       active_turn_id: 'turn-1',
       last_message_id: 'message-1',
+      active_delegate_count: 0,
       pending_count: 1,
       has_more_before: false,
     }
@@ -47,6 +47,7 @@ describe('chat history reconciliation', () => {
       status: 'idle',
       active_turn_id: null,
       last_message_id: 'message-2',
+      active_delegate_count: 0,
       pending_count: 0,
       has_more_before: true,
     }
@@ -56,7 +57,15 @@ describe('chat history reconciliation', () => {
       pending_messages: [],
       status: 'idle',
       last_message_id: 'message-2',
-      has_more_before: true,
+      has_more_before: false,
     })
+  })
+
+  it('keeps the missing-history boundary when a full page arrives after a live message', () => {
+    const live = { ...emptyHistory(), messages: [message('last', 'live', '2026-08-26T11:00:00Z')] }
+    const earlier = { ...emptyHistory(), messages: [message('first', 'older', '2026-08-26T10:00:00Z')], has_more_before: true }
+    const merged = mergeHistory(live, earlier)
+    expect(merged.has_more_before).toBe(true)
+    expect(mergeHistory(merged, { ...emptyHistory(), has_more_before: false }).has_more_before).toBe(true)
   })
 })

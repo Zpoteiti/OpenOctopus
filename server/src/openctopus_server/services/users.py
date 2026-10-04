@@ -201,6 +201,12 @@ async def delete_user(
             workspace = await db.get(Workspace, workspace_id)
             if workspace is not None:
                 await db.delete(workspace)
+        from openctopus_server.chat.cancellation import record_session_cancellation
+        for session_id in session_ids:
+            await record_session_cancellation(db, session_id)
+        from openctopus_server.chat.durable import enqueue_transaction
+        await enqueue_transaction(db, {"workflow_name": "oo.cleanup_memory", "workflow_id": f"memory-delete:{user.id}",
+                                       "queue_name": "oo-maintenance", "app_version": "oo-harness-1"}, user.id)
         await db.delete(user)
     except BaseException:
         for target in retired_targets:
@@ -228,6 +234,9 @@ async def delete_user(
                     await device_registry.remove_devices(device_ids)
                 finally:
                     if runtime is not None:
+                        if runtime.durable.started:
+                            await runtime.durable.apply_cancellations()
+                        await runtime.memory.purge(user.id)
                         await runtime.forget_mcp_user(user_id=user.id)
 
     invalidation = asyncio.create_task(commit_release_and_invalidate_devices())

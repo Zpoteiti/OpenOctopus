@@ -5,7 +5,7 @@ server-authoritative execution state are deliberately separate:
 
 - **Cacheable system configuration snapshot** — rendered in a stable order and
   reused byte-for-byte while its source configuration is unchanged. It may
-  legitimately change between turns when SOUL, MEMORY, channels, skills,
+  legitimately change between turns when SOUL, channels, skills,
   workspace membership, or device capabilities change.
 - **Runtime context block** — generated once at message ingress and prepended
   to that user message. It contains per-message facts such as time, inbound
@@ -20,23 +20,24 @@ server-authoritative execution state are deliberately separate:
 
 ## Section order
 
-The cacheable system configuration snapshot is assembled in this order:
+OO assembles the product prompt in this order. Harness adds Memory, conditional
+Skills, compaction receipts, and delegation instructions through its capabilities:
 
 1. **SOUL** — personality (contents of personal SOUL.md)
-2. **MEMORY** — personal long-term memory (contents of personal MEMORY.md)
-3. **Identity** — partner relationship + trust rules
-4. **Channels** — current Web route + paired owner destinations
-5. **Skills** — always-on full bodies, then conditional one-liners
-6. **Workspaces** — file trees the agent can read/write
-7. **Devices** — configured execution targets and stable capabilities
-8. **Operating Notes** — meta rules on paths and boundaries
+2. **Identity** — partner relationship + trust rules
+3. **Channels** — current Web route + paired owner destinations
+4. **Skills** — always-on full bodies
+5. **Workspaces** — file trees the agent can read/write
+6. **Devices** — configured execution targets and stable capabilities
+7. **Operating Notes** — meta rules on paths and boundaries
 
 Rationale for this order: identity feeds channel handling (put them adjacent); skills live inside the personal workspace (put them adjacent to the workspaces section).
 
-Per ADR-023, mode branching is absent. Web, Cron, Heartbeat Phase 2, Discord,
-and DingTalk use the same system prompt builder. Owner/internal Turns receive
-the owner tool catalog; an exact-ID allow-listed non-owner receives the same
-complete system prompt but only the restricted `message` schema. The persisted
+Web, Cron, Heartbeat Phase 2, Discord,
+and DingTalk share the authorized prompt assembly. Owner/internal Turns receive
+the owner tool catalog; an exact-ID allow-listed non-owner receives a minimal channel prompt and
+the restricted `message` tool. Private Memory, skills, workspace contents,
+and owner-only history are not included. The persisted
 Turn profile and dispatch gate, not prompt text, are authoritative. Heartbeat
 Phase 1 uses the mandatory administrator-configured Jev Choice API. It receives
 the bounded Heartbeat document, parsed original task bodies, time, and timezone;
@@ -59,18 +60,6 @@ User: Alice, account `a4f7e2d1-e29b-41d4-a716-446655440000`. Channels: Discord +
 You are OpenOctopus, Alice's personal AI partner. Tone: direct,
 professional, conversational. Prefer terse responses. Always
 confirm before destructive operations on shared workspaces.
-
----
-
-## MEMORY
-
-(contents of /a4f7e2d1-e29b-41d4-a716-446655440000/MEMORY.md)
-
-- Alice prefers morning standups at 09:00 EST.
-- Currently leading Q4 product launch, target ship 2026-12-01.
-- Allergic to peanuts. Never suggest peanut-containing recipes.
-- Alice's title: Engineering Manager.
-- Team uses /production-department@a4f7e2d1/sprint.md for current sprint state.
 
 ---
 
@@ -99,22 +88,9 @@ target channel + chat_id.
 
 ## Skills
 
-### Conditional skills
+### Always-on: team-style
 
-- builtin/create-skill — Create or install a personal skill. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/create-skill/SKILL.md")
-- builtin/connect-mcp — Connect an MCP server. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/connect-mcp/SKILL.md")
-- builtin/pair-client — Pair a client device. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/pair-client/SKILL.md")
-- builtin/connect-channel — Connect an external channel. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/connect-channel/SKILL.md")
-- builtin/manage-cron — Create and manage scheduled jobs. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/manage-cron/SKILL.md")
-- builtin/manage-heartbeat — Edit proactive task checks. Load:
-  read_file(openoctopus_device="server", path="/builtin/skills/manage-heartbeat/SKILL.md")
-- morning-standup — Generate a morning standup summary from team sprint state.
-  Load: read_file(openoctopus_device="server", path="skills/morning-standup/SKILL.md")
+(complete body of Alice's always-on team-style skill)
 
 ---
 
@@ -126,7 +102,7 @@ the `name@suffix` form shown next to each entry — both parts must
 match exactly when used in tool paths.
 
 ### Personal — /a4f7e2d1-e29b-41d4-a716-446655440000/
-Default for relative paths. Holds your SOUL.md, MEMORY.md, skills/,
+Default for relative paths. Holds your SOUL.md, skills/,
 .attachments/, and Alice's personal files. Strictly private.
 Quota policy: personal workspace quota applies. Current usage is checked by
 workspace tools, not embedded in this snapshot.
@@ -215,7 +191,10 @@ Current connectivity is checked at tool execution time.
 
 ### Runtime context block — lives on the USER message, NOT in the system prompt
 
-The system snapshot above stops at Operating Notes. Per-message facts are
+The OO system snapshot above stops at Operating Notes. Harness additionally
+supplies the user's versioned Memory notes and a conditional skill catalog.
+For example, `load_capability(id="builtin-create-skill")` loads the built-in
+skill from the captured run snapshot. Per-message facts are
 prepended as a server-generated text block on the user-role message, not
 appended to the system prompt. This preserves a long reusable prefix without
 pretending that user configuration is immutable.
@@ -299,7 +278,7 @@ the public DTO layer does not own a second grammar.
 
 | Surface | Contains | Does not contain |
 |---|---|---|
-| System configuration snapshot | OpenOctopus identity, user SOUL and MEMORY, stable trust rules, paired owner channel destinations, skill names/descriptions, full always-on skill bodies, workspace catalog/policies, registered device capabilities, operating notes | Current time, inbound sender, current connectivity/last-seen, current quota usage, locks, active run state |
+| System configuration snapshot | OpenOctopus identity, user SOUL, stable trust rules, paired owner channel destinations, skill names/descriptions, full always-on skill bodies, workspace catalog/policies, registered device capabilities, operating notes | Current time, inbound sender, current connectivity/last-seen, current quota usage, locks, active run state |
 | User-message runtime block | Ingress time, current channel/chat ID, channel-namespaced sender ID, and trust classification | Full channel/device/workspace catalogs, secrets, authorization decisions |
 | Channel context/message wrappers | Bounded JSON-escaped background messages and allow-listed non-owner text marked as untrusted | Tool profile, target authority, attachment bytes, secrets |
 | Tool-result safety prefix | Server-authored provenance and the untrusted-tool-result instruction before external tool output | User runtime metadata, channel directory, tool credentials |
@@ -313,16 +292,21 @@ the public DTO layer does not own a second grammar.
 - Inlined verbatim from `/<user_id>/SOUL.md`.
 - If the file is missing (shouldn't happen post-registration), the section renders the heading only and an empty body. Non-fatal.
 
-### MEMORY
-- Inlined verbatim from `/<user_id>/MEMORY.md`.
-- Counts against the cacheable window; agents editing MEMORY.md during a turn do NOT get fresh memory until the next inbound message (new turn → new context build → new system prompt).
-- Only ever loaded from personal workspace. Shared workspaces have no MEMORY.md; collaborative knowledge lives in regular files the team maintains (e.g., `milestone.md`).
+### Memory capability
+- Official Harness Memory injects the current user's notebook from PostgreSQL.
+  Its `MEMORY.md` name is a logical note, independent of workspace files.
+- The authenticated owner UUID supplies the namespace. Authorized child agents
+  share this notebook; restricted channel participants have no Memory capability.
+- Native tools, the Memory editor, and Dream use the same versioned store.
+  Writes use the official operation receipts during workflow replay.
+- New accounts receive a personal `SOUL.md`. Memory notes start empty and are
+  created by the user or agent through the official store.
 
 ### Identity
 - Owner name + account ID (DB format, e.g. raw UUID).
 - Trust rules: authenticated owner input is authoritative; third-party content
-  is data. Owner and non-owner use the same complete snapshot, so wrappers are
-  not a prompt-secrecy or prompt-injection guarantee.
+  is data. Restricted participants receive their own minimal prompt; the
+  trusted server identity and current channel binding enforce authorization.
 - No OS/platform details — those don't matter to the agent.
 
 ### Channels
@@ -348,16 +332,18 @@ the public DTO layer does not own a second grammar.
   independently limited to 64 KiB UTF-8 and 16,000 estimated `o200k_base`
   tokens at write time and defensively at load time. A combined prompt that is
   too large is sent once and the Provider remains authoritative.
-- Conditional skills: only bounded YAML frontmatter is loaded into the snapshot;
-  the prompt renders one `name: description` line with the `read_file` path that
-  loads the full body on demand. Bodies are not downloaded, decoded, tokenized,
-  or cached during prompt construction.
+- Conditional skills are exposed through official Harness Skills and loaded with
+  `load_capability`. OO snapshots their source at run start for deterministic
+  replay (up to 256 KiB per manifest); their bodies enter model context on demand.
 - Concurrent cache misses for one user share a single immutable snapshot load;
   cache invalidation during that load prevents stale repopulation.
 - Built-ins are indexed once at startup, never copied into user workspaces.
-  Their `builtin/` display prefix separates them from personal names. Read-only
+  Built-in capability IDs use `builtin-`. Personal IDs use `personal-` plus a
+  bounded normalized name and stable digest, preserving OO's broader display
+  names without collisions with built-ins. The catalog retains the original
+  name and description. Read-only
   enforcement belongs to workspace authorization, not prompt instructions.
-  Registration seeds `SOUL.md` and `MEMORY.md`; it does not install a personal
+  Registration seeds `SOUL.md`; it does not install a personal
   `create_skill` skill.
 
 ### Workspaces
@@ -397,11 +383,11 @@ the public DTO layer does not own a second grammar.
 
 ## Change propagation
 
-Any source that feeds the system snapshot (SOUL/MEMORY edit, skill install,
+Any source that feeds the system snapshot (SOUL edit, skill install,
 channel configuration, registered-device capability change, or workspace
 membership change) invalidates the prefix on the next turn. Mere
 connect/disconnect, last-seen, quota-usage, or run-status changes do not. The
 render is cheap (single function per ADR-022); the provider re-caches when
-semantic configuration changes. Within one turn, context stays frozen—an agent
-editing MEMORY.md mid-turn sees the new memory only after the next inbound
-message rebuilds the snapshot.
+semantic configuration changes. A logical run captures model configuration and skill sources for recovery.
+Harness owns Memory injection and refresh; OO does not cache a workspace memory
+file inside the system prompt.

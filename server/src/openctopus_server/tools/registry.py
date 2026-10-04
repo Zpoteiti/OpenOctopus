@@ -456,7 +456,6 @@ class ToolRegistry:
         return ToolResult(
             content=normalize_tool_result(
                 result.content,
-                max_chars=tool.max_output_chars(),
             ),
             is_error=result.is_error,
             code=result.code,
@@ -504,7 +503,6 @@ def build_py4_registry(
     device_registry: DeviceRegistry | None = None,
     server_mcp_dispatcher: ServerMcpDispatcher | None = None,
     server_mcp_authority: ServerMcpAuthorityFence | None = None,
-    cron_wake: Callable[[], None] | None = None,
     message_target_resolver: MessageTargetResolver | None = None,
     message_delivery_router: MessageDeliveryRouter | None = None,
 ) -> ToolRegistry:
@@ -532,7 +530,7 @@ def build_py4_registry(
                 delivery_router=message_delivery_router,
                 device_registry=devices,
             ),
-            CronTool(engine, wake=cron_wake),
+            CronTool(engine),
             FileTransferTool(
                 engine,
                 workspace_service,

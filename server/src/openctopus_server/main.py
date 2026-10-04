@@ -12,8 +12,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from openctopus_server.api.router import router as api_router
-from openctopus_server.automations.cron import CronScheduler
 from openctopus_server.automations.dream import DreamService
+from openctopus_server.automations.durable import bind_automations, start_schedules
 from openctopus_server.automations.heartbeat import HeartbeatPulse
 from openctopus_server.channels.adapters.base import ChannelAdapter
 from openctopus_server.channels.adapters.dingtalk import (
@@ -70,7 +70,6 @@ from openctopus_server.provider.jev import JevService
 from openctopus_server.services.channels import ValidatedBotIdentity
 from openctopus_server.services.heartbeat import publish_heartbeat_phase_two
 from openctopus_server.services.server_mcp import load_envelope as load_server_mcp_envelope
-from openctopus_server.services.turn_runs import abandon_running_turns
 from openctopus_server.services.workspace_deletions import (
     WorkspaceDeletionWorker,
     recover_workspace_deletions,
@@ -177,15 +176,12 @@ async def _close_lifespan_resources(
     *,
     channel_ingress: ChannelIngress | None,
     channel_manager: ChannelManager | None,
-    heartbeat_pulse: HeartbeatPulse | None,
-    cron_scheduler: CronScheduler | None,
     server_mcp_supervisor: ServerMcpSupervisor | None,
     runtime: ChatRuntime | None,
     device_registry: DeviceRegistry | None,
     deletion_worker: WorkspaceDeletionWorker | None,
     object_storage: ObjectStorage | None,
     engine: AsyncEngine | None,
-    dream_service: DreamService | None = None,
     jev_service: JevService | None = None,
 ) -> None:
     try:
@@ -198,52 +194,39 @@ async def _close_lifespan_resources(
                 await channel_manager.begin_shutdown()
         finally:
             try:
-                try:
-                    if dream_service is not None:
-                        await dream_service.close()
-                finally:
-                    if heartbeat_pulse is not None:
-                        await heartbeat_pulse.close()
+                if server_mcp_supervisor is not None:
+                    await server_mcp_supervisor.begin_shutdown()
             finally:
                 try:
-                    if cron_scheduler is not None:
-                        await cron_scheduler.stop()
+                    try:
+                        if runtime is not None:
+                            await runtime.close()
+                    finally:
+                        if jev_service is not None:
+                            await jev_service.close()
                 finally:
                     try:
-                        if server_mcp_supervisor is not None:
-                            await server_mcp_supervisor.begin_shutdown()
+                        if channel_manager is not None:
+                            await channel_manager.shutdown()
                     finally:
                         try:
-                            try:
-                                if runtime is not None:
-                                    await runtime.close()
-                            finally:
-                                if jev_service is not None:
-                                    await jev_service.close()
+                            if server_mcp_supervisor is not None:
+                                await server_mcp_supervisor.shutdown()
                         finally:
                             try:
-                                if channel_manager is not None:
-                                    await channel_manager.shutdown()
+                                if device_registry is not None:
+                                    await device_registry.close()
                             finally:
                                 try:
-                                    if server_mcp_supervisor is not None:
-                                        await server_mcp_supervisor.shutdown()
+                                    if deletion_worker is not None:
+                                        await deletion_worker.close()
                                 finally:
                                     try:
-                                        if device_registry is not None:
-                                            await device_registry.close()
+                                        if object_storage is not None:
+                                            await object_storage.close()
                                     finally:
-                                        try:
-                                            if deletion_worker is not None:
-                                                await deletion_worker.close()
-                                        finally:
-                                            try:
-                                                if object_storage is not None:
-                                                    await object_storage.close()
-                                            finally:
-                                                if engine is not None:
-                                                    await engine.dispose()
-
+                                        if engine is not None:
+                                            await engine.dispose()
 
 async def _load_server_mcp_authority(engine: AsyncEngine) -> ServerMcpEnvelope:
     async with AsyncSession(engine, expire_on_commit=False) as db:
@@ -333,8 +316,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _close_lifespan_resources(
             channel_ingress=None,
             channel_manager=None,
-            heartbeat_pulse=None,
-            cron_scheduler=None,
             server_mcp_supervisor=None,
             runtime=None,
             device_registry=None,
@@ -382,7 +363,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     deletion_worker: WorkspaceDeletionWorker | None = None
     server_mcp_supervisor: ServerMcpSupervisor | None = None
-    cron_scheduler: CronScheduler | None = None
     heartbeat_pulse: HeartbeatPulse | None = None
     dream_service: DreamService | None = None
     jev_service = JevService(engine)
@@ -396,7 +376,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.server_mcp_authority = server_mcp_authority
     runtime = getattr(app.state, "chat_runtime", None)
     device_registry = getattr(runtime, "device_registry", None)
-    cron_wake_event = asyncio.Event()
     try:
         deletion_worker = WorkspaceDeletionWorker(
             engine,
@@ -513,7 +492,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     device_registry=device_registry,
                     server_mcp_dispatcher=server_mcp_supervisor,
                     server_mcp_authority=server_mcp_authority,
-                    cron_wake=cron_wake_event.set,
                     message_target_resolver=ChannelMessageTargetResolver(engine),
                     message_delivery_router=ChannelMessageDeliveryBridge(
                         channel_delivery_router
@@ -573,22 +551,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.channel_delivery_router = channel_delivery_router
             app.state.channel_ingress = channel_ingress
             app.state.channel_credential_validator = _ChannelCredentialValidator()
-        await abandon_running_turns(
-            engine,
-            runner_instance_id=runtime.runner_instance_id,
-        )
-        await close_obsolete_channel_pending(engine, runtime)
-        if channel_delivery_router is not None:
-            await channel_delivery_router.repair_incomplete_deliveries()
-        if channel_manager is not None:
-            await channel_manager.startup()
-        cron_scheduler = CronScheduler(
-            engine,
-            runtime,
-            wake_event=cron_wake_event,
-        )
-        await cron_scheduler.start()
-        app.state.cron_scheduler = cron_scheduler
         heartbeat_pulse = HeartbeatPulse(
             engine=engine,
             runtime=runtime,
@@ -599,21 +561,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 request,
             ),
         )
-        heartbeat_pulse.start()
         app.state.heartbeat_pulse = heartbeat_pulse
         dream_service = DreamService(
-            engine=engine, workspace=workspace_service, jev=jev_service, writer=runtime,
+            engine=engine, memory=runtime.memory.store, jev=jev_service, writer=runtime,
         )
         app.state.dream_service = dream_service
-        dream_service.start()
+        bind_automations(heartbeat_pulse, dream_service)
+        await runtime.durable.start()
+        await close_obsolete_channel_pending(engine, runtime)
+        if channel_delivery_router is not None:
+            await channel_delivery_router.repair_incomplete_deliveries()
+        if channel_manager is not None:
+            await channel_manager.startup()
+        await start_schedules()
     except BaseException:
         await _close_lifespan_resources(
             channel_ingress=channel_ingress,
             channel_manager=channel_manager,
-            heartbeat_pulse=heartbeat_pulse,
-            dream_service=dream_service,
             jev_service=jev_service,
-            cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,
             device_registry=device_registry,
@@ -629,10 +594,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _close_lifespan_resources(
             channel_ingress=channel_ingress,
             channel_manager=channel_manager,
-            heartbeat_pulse=heartbeat_pulse,
-            dream_service=dream_service,
             jev_service=jev_service,
-            cron_scheduler=cron_scheduler,
             server_mcp_supervisor=server_mcp_supervisor,
             runtime=runtime,
             device_registry=device_registry,

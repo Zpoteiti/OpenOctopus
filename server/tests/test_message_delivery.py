@@ -1,3 +1,4 @@
+
 import json
 from collections import deque
 from copy import deepcopy
@@ -9,11 +10,11 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import pytest
+from native_provider_fixture import NativeProviderFixture
 from pydantic import ValidationError
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from openctopus_server.chat.compaction import commit_stage_two, stage_two_source_ids
 from openctopus_server.chat.context import project_message_rows
 from openctopus_server.chat.runner import ChatRuntime
 from openctopus_server.db.models import Device, Message, Session, SystemConfig, User
@@ -21,13 +22,13 @@ from openctopus_server.devices.workspace import FileSourceProbe
 from openctopus_server.dto.message import MessageResponse
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
-from openctopus_server.provider.anthropic import (
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.runtime import (
     DeltaCallback,
     ProviderResult,
     provider_fingerprint,
 )
-from openctopus_server.provider.config import ProviderConfig
-from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
 from openctopus_server.tools.registry import build_py4_registry
@@ -40,7 +41,7 @@ class _ProviderStep:
     content: list[dict[str, Any]]
 
 
-class _ScriptedProvider:
+class _ScriptedProvider(NativeProviderFixture):
     def __init__(self, steps: list[_ProviderStep]) -> None:
         self.steps = deque(steps)
         self.calls: list[dict[str, Any]] = []
@@ -114,7 +115,7 @@ def test_message_response_rejects_incomplete_workspace_delivery_refs() -> None:
                     "online_only": False,
                 }
             ],
-            is_compacted=False,
+
             created_at=datetime.now(UTC),
         )
 
@@ -141,7 +142,7 @@ def test_message_response_rejects_device_delivery_ref_without_size() -> None:
                     "online_only": True,
                 }
             ],
-            is_compacted=False,
+
             created_at=datetime.now(UTC),
         )
 
@@ -167,7 +168,7 @@ def test_message_response_accepts_device_delivery_ref_with_known_size() -> None:
                 "online_only": True,
             }
         ],
-        is_compacted=False,
+
         created_at=datetime.now(UTC),
     )
 
@@ -195,7 +196,7 @@ def test_message_response_rejects_server_as_device_delivery_ref() -> None:
                     "online_only": True,
                 }
             ],
-            is_compacted=False,
+
             created_at=datetime.now(UTC),
         )
 
@@ -619,7 +620,7 @@ async def test_delivery_ref_update_rolls_back_when_tool_result_insert_fails(
         await runtime.close()
 
 
-async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
+async def test_canonical_delivery_refs_are_provider_hidden(
     pg_engine: AsyncEngine,
 ) -> None:
     fingerprint = "provider-fingerprint"
@@ -665,7 +666,7 @@ async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
                 sender_classification="owner",
                 ingress_tool_profile="owner_full",
                 delivery_refs=[],
-                is_compacted=False,
+
                 created_at=created_at,
             ),
             Message(
@@ -675,7 +676,7 @@ async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
                 content=[_message_use(tool_use_id, "Here", ["archive.txt"])],
                 delivery_refs=[delivery_ref],
                 llm_fingerprint=fingerprint,
-                is_compacted=False,
+
                 created_at=created_at + timedelta(microseconds=1),
             ),
             Message(
@@ -691,7 +692,7 @@ async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
                     }
                 ],
                 delivery_refs=[],
-                is_compacted=False,
+
                 created_at=created_at + timedelta(microseconds=2),
             ),
         ]
@@ -704,15 +705,4 @@ async def test_compaction_keeps_canonical_delivery_refs_provider_hidden(
 
         projection = project_message_rows(rows, current_fingerprint=fingerprint)
         assert "delivery_refs" not in json.dumps(projection)
-        source_ids = stage_two_source_ids(rows)
-        summary = await commit_stage_two(
-            db,
-            session_id=session_id,
-            source_ids=source_ids,
-            summary_content=[{"type": "text", "text": "Delivery completed."}],
-        )
-
-        await db.refresh(rows[1])
-        assert rows[1].is_compacted is True
         assert rows[1].delivery_refs == [delivery_ref]
-        assert summary.delivery_refs == []

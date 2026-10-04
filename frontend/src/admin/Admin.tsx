@@ -66,6 +66,7 @@ export function AdminSettingsPage(): ReactNode {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const body: Record<string, unknown> = { llm_max_output_tokens: Number(data.get('llm_max_output_tokens')) }
+    addText(body, 'llm_protocol', data.get('llm_protocol'))
     addText(body, 'llm_endpoint', data.get('llm_endpoint'))
     const apiKey = String(data.get('llm_api_key') ?? '')
     if (apiKey) body.llm_api_key = apiKey
@@ -117,6 +118,7 @@ export function AdminSettingsPage(): ReactNode {
         </Card>
         <Card title={t('admin.provider')} description={t('admin.providerDescription')}>
           <form className="form-grid" onSubmit={saveProvider}>
+            <label className="full-row">{t('admin.protocol')}<select name="llm_protocol" defaultValue={value.llm_protocol}><option value="anthropic">Anthropic Messages</option><option value="openai">OpenAI Chat Completions</option><option value="openrouter">OpenRouter</option></select></label>
             <label className="full-row">{t('admin.apiBaseUrl')}<input name="llm_endpoint" type="url" defaultValue={value.llm_endpoint ?? ''} placeholder="https://api.siliconflow.cn" /></label>
             <label>{t('admin.apiKey')}<input name="llm_api_key" type="password" placeholder={value.llm_api_key === '<redacted>' ? t('admin.apiKeyConfigured') : t('admin.apiKeyMissing')} autoComplete="off" /></label>
             <label>{t('admin.model')}<input name="llm_model" defaultValue={value.llm_model ?? ''} placeholder="Qwen/Qwen3.5-4B" /></label>

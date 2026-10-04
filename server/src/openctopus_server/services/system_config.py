@@ -10,7 +10,7 @@ from openctopus_server.db.advisory import (
     lock_shared_quota_write,
 )
 from openctopus_server.db.models import SystemConfig
-from openctopus_server.dto.config import AdminConfig, ConfigPatch
+from openctopus_server.dto.config import AdminConfig, ConfigPatch, ModelProtocol
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ConfigError, ToolError
 from openctopus_server.network_policy import (
@@ -32,6 +32,7 @@ _TOKEN_LIMIT_KEYS = {
 }
 
 _CONFIG_KEYS = {
+    "llm_protocol",
     "quota_bytes",
     "shared_workspace_quota_bytes",
     "llm_endpoint",
@@ -58,6 +59,7 @@ async def _get_all_rows(db: AsyncSession) -> dict[str, Any]:
 async def get_config_view(db: AsyncSession) -> AdminConfig:
     rows = await _get_all_rows(db)
     return AdminConfig(
+        llm_protocol=rows.get("llm_protocol", "anthropic"),
         quota_bytes=rows.get("quota_bytes", _QUOTA_DEFAULT),
         shared_workspace_quota_bytes=rows.get("shared_workspace_quota_bytes", _QUOTA_DEFAULT),
         llm_endpoint=rows.get("llm_endpoint"),
@@ -107,7 +109,7 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
         )
 
     # Validate LLM identity before opening the write transaction.
-    llm_identity_keys = {"llm_endpoint", "llm_api_key", "llm_model"}
+    llm_identity_keys = {"llm_endpoint", "llm_api_key", "llm_model", "llm_protocol"}
     if llm_identity_keys & data.keys():
         endpoint = data.get("llm_endpoint", existing.get("llm_endpoint"))
         api_key = data.get("llm_api_key", existing.get("llm_api_key"))
@@ -117,7 +119,10 @@ async def patch_config(db: AsyncSession, payload: ConfigPatch) -> AdminConfig:
                 ErrorCode.CONFIG_VALIDATION_FAILED,
                 "First-time LLM setup requires llm_endpoint, llm_api_key, and llm_model together",
             )
-        await validate_llm_identity(str(endpoint), str(api_key), str(model))
+        await validate_llm_identity(
+            str(endpoint), str(api_key), str(model),
+            protocol=data.get("llm_protocol", existing.get("llm_protocol", "anthropic")),
+        )
 
     if {"jev_endpoint", "jev_api_key"} & data.keys():
         await lock_jev_config(db)
@@ -211,6 +216,7 @@ async def validate_llm_identity(
     api_key: str,
     model: str,
     *,
+    protocol: ModelProtocol = "anthropic",
     client: httpx.AsyncClient | None = None,
 ) -> None:
     own_client = client is None
@@ -222,14 +228,21 @@ async def validate_llm_identity(
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
-            },
+            } if protocol == "anthropic" else {"Authorization": f"Bearer {api_key}"},
         )
         if response.status_code != 200:
             raise ConfigError(
                 ErrorCode.CONFIG_VALIDATION_FAILED,
                 f"LLM endpoint returned HTTP {response.status_code}",
             )
-        if model not in response.text:
+        try:
+            body = response.json()
+            found = isinstance(body, dict) and isinstance(body.get("data"), list) and any(
+                isinstance(item, dict) and item.get("id") == model for item in body["data"]
+            )
+        except ValueError:
+            found = False
+        if not found:
             raise ConfigError(
                 ErrorCode.CONFIG_VALIDATION_FAILED,
                 f"Model '{model}' not found in endpoint models response",

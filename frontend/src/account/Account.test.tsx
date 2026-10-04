@@ -65,7 +65,7 @@ describe('AccountPage', () => {
     )
 
     expect(screen.getByRole('link', { name: 'Edit SOUL.md' })).toHaveAttribute('href', '/workspace?path=SOUL.md')
-    expect(screen.getByRole('link', { name: 'Edit MEMORY.md' })).toHaveAttribute('href', '/workspace?path=MEMORY.md')
+    expect(screen.getByRole('link', { name: 'Edit memory' })).toHaveAttribute('href', '/memory')
     expect(container.querySelector('.settings-stack')?.querySelectorAll(':scope > .card')).toHaveLength(5)
   })
 

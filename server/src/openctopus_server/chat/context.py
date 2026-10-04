@@ -13,22 +13,15 @@ from openctopus_server.db.models import Message, PendingMessage, Session, User
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import ChatError
-from openctopus_server.provider.anthropic import provider_fingerprint
 from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.runtime import provider_fingerprint
 from openctopus_server.workspace.skills import SkillsCache
 
 from .prompt import PromptWorkspaceService
 
 _TOOL_RESULT_KINDS = {"tool_result", "synthetic_tool_result"}
-_COMPACTION_CONTINUATION: dict[str, Any] = {
-    "role": "user",
-    "content": [
-        {
-            "type": "text",
-            "text": "Continue the current task from the compacted state above.",
-        }
-    ],
-}
+class PendingSelectionChangedError(RuntimeError):
+    """Captured messages changed before a turn was prepared."""
 
 
 async def build_provider_context(
@@ -37,7 +30,7 @@ async def build_provider_context(
     session_id: UUID,
     config: ProviderConfig,
     include_pending: bool = False,
-    add_compaction_continuation: bool = True,
+
     workspace_service: PromptWorkspaceService | None = None,
     skills_cache: SkillsCache | None = None,
     device_registry: DeviceRegistry | None = None,
@@ -57,7 +50,7 @@ async def build_provider_context(
                 select(Message)
                 .where(
                     Message.session_id == session_id,
-                    Message.is_compacted.is_(False),
+
                 )
                 .order_by(Message.created_at, Message.id)
             )
@@ -82,7 +75,7 @@ async def build_provider_context(
         rows,
         current_fingerprint=provider_fingerprint(config),
         pending_rows=pending_rows,
-        add_compaction_continuation=add_compaction_continuation,
+
         channel_context_limits=channel_context_limits,
     )
 
@@ -103,7 +96,7 @@ def project_provider_messages(
     *,
     current_fingerprint: str,
     pending_rows: Sequence[PendingMessage] = (),
-    add_compaction_continuation: bool = True,
+
     channel_context_limits: Mapping[UUID, int] | None = None,
 ) -> list[dict[str, Any]]:
     projected = project_message_rows(
@@ -124,18 +117,6 @@ def project_provider_messages(
         }
         for row in pending_rows
     )
-    if (
-        add_compaction_continuation
-        and not pending_rows
-        and rows
-        and rows[-1].message_kind == "compaction_summary"
-    ):
-        projected.append(
-            {
-                "role": _COMPACTION_CONTINUATION["role"],
-                "content": [dict(block) for block in _COMPACTION_CONTINUATION["content"]],
-            }
-        )
     return projected
 
 

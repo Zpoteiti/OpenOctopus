@@ -20,7 +20,6 @@ def _message(
     kind: str,
     content: list[dict[str, object]],
     created_at: datetime,
-    compacted: bool = False,
     fingerprint: str | None = "current-fingerprint",
 ) -> Message:
     authority = (
@@ -39,7 +38,7 @@ def _message(
         content=content,
         delivery_refs=[],
         llm_fingerprint=fingerprint,
-        is_compacted=compacted,
+
         created_at=created_at,
         **authority,
     )
@@ -77,7 +76,6 @@ async def _seed_session(db: AsyncSession) -> tuple[User, Session]:
         ("synthetic_tool_result", "user"),
         ("assistant", "assistant"),
         ("synthetic_assistant_error", "assistant"),
-        ("compaction_summary", "assistant"),
     ],
 )
 def test_provider_role_is_derived_from_message_kind(kind: str, expected: str) -> None:
@@ -89,7 +87,7 @@ def test_provider_role_rejects_unknown_message_kind() -> None:
         provider_role("system")
 
 
-def test_message_dto_derives_role_and_exposes_compacted_audit_state() -> None:
+def test_message_dto_derives_role() -> None:
     session_id = uuid4()
     session = Session(
         id=session_id,
@@ -101,21 +99,18 @@ def test_message_dto_derives_role_and_exposes_compacted_audit_state() -> None:
     )
     row = _message(
         session_id,
-        kind="compaction_summary",
+        kind="assistant",
         content=[{"type": "text", "text": "older history"}],
         created_at=datetime.now(UTC),
-        compacted=True,
     )
 
     dto = message_response(row, session=session)
 
     assert dto.role == "assistant"
-    assert dto.message_kind == "compaction_summary"
-    assert dto.is_compacted is True
-    assert dto.model_dump(mode="json")["is_compacted"] is True
+    assert dto.message_kind == "assistant"
 
 
-async def test_provider_context_filters_compacted_rows(pg_engine) -> None:
+async def test_provider_context_preserves_original_rows(pg_engine) -> None:
     now = datetime.now(UTC)
     async with AsyncSession(pg_engine, expire_on_commit=False) as db:
         _, session = await _seed_session(db)
@@ -124,15 +119,14 @@ async def test_provider_context_filters_compacted_rows(pg_engine) -> None:
                 _message(
                     session.id,
                     kind="human",
-                    content=[{"type": "text", "text": "compacted-old"}],
+                    content=[{"type": "text", "text": "older"}],
                     created_at=now,
-                    compacted=True,
-                    fingerprint=None,
+                                fingerprint=None,
                 ),
                 _message(
                     session.id,
                     kind="human",
-                    content=[{"type": "text", "text": "active-new"}],
+                    content=[{"type": "text", "text": "newer"}],
                     created_at=now + timedelta(microseconds=1),
                     fingerprint=None,
                 ),
@@ -153,7 +147,7 @@ async def test_provider_context_filters_compacted_rows(pg_engine) -> None:
             ),
         )
 
-    assert messages == [{"role": "user", "content": [{"type": "text", "text": "active-new"}]}]
+    assert [m["content"][0]["text"] for m in messages] == ["older", "newer"]
 
 
 def test_adjacent_tool_results_collapse_and_strip_internal_codes() -> None:

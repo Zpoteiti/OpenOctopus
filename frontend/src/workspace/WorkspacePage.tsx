@@ -41,7 +41,7 @@ interface EditorState {
   etag: string | null
 }
 
-type SpecialEntryKind = 'attachments' | 'skills' | 'soul' | 'memory' | 'skill-definition'
+type SpecialEntryKind = 'attachments' | 'skills' | 'soul' | 'skill-definition'
 
 interface SpecialEntry {
   kind: SpecialEntryKind
@@ -125,7 +125,7 @@ export function WorkspacePage(): ReactNode {
         setDirectoryTruncated(page.truncated)
         if (
           location.workspace?.type !== 'personal'
-          || !['SOUL.md', 'MEMORY.md'].includes(agentFile ?? '')
+          || agentFile !== 'SOUL.md'
         ) return
         const existing = page.items.find((candidate) => candidate.path === agentFile)
         const entry = existing ?? {
@@ -695,7 +695,6 @@ function LocationButton({
 
 function specialEntry(entry: ListDirEntry, t: TFunction): SpecialEntry | null {
   if (entry.name === 'SOUL.md' && entry.kind === 'file') return { kind: 'soul', tag: t('workspace.specialSoul', { defaultValue: 'Agent identity' }) }
-  if (entry.name === 'MEMORY.md' && entry.kind === 'file') return { kind: 'memory', tag: t('workspace.specialMemory', { defaultValue: 'Long-term memory' }) }
   if (entry.name === 'skills' && entry.kind === 'directory') return { kind: 'skills', tag: t('workspace.specialSkills', { defaultValue: 'Skills' }) }
   if (entry.name === '.attachments' && entry.kind === 'directory') return { kind: 'attachments', tag: t('workspace.specialAttachments', { defaultValue: 'Attachments' }) }
   if (entry.name === 'SKILL.md' && entry.kind === 'file') return { kind: 'skill-definition', tag: t('workspace.specialSkillDefinition', { defaultValue: 'Skill definition' }) }

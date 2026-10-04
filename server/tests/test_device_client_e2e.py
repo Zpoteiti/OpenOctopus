@@ -26,6 +26,7 @@ import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from native_provider_fixture import NativeProviderFixture
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from websockets.asyncio.client import connect
@@ -41,13 +42,13 @@ from openctopus_server.devices.protocol import ToolResultFrame
 from openctopus_server.devices.registry import DeviceRegistry
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.http import register_error_handler
-from openctopus_server.provider.anthropic import (
+from openctopus_server.provider.config import ProviderConfig
+from openctopus_server.provider.limiter import ProviderLimiter
+from openctopus_server.provider.runtime import (
     DeltaCallback,
     ProviderResult,
     provider_fingerprint,
 )
-from openctopus_server.provider.config import ProviderConfig
-from openctopus_server.provider.limiter import ProviderLimiter
 from openctopus_server.provider.wire_types import Effort
 from openctopus_server.tools.base import Tool, ToolContext, ToolResult
 from openctopus_server.tools.device_field import DEVICE_FIELD_NAME
@@ -116,7 +117,7 @@ class _ProviderStep:
     content: list[dict[str, Any]]
 
 
-class _ScriptedProvider:
+class _ScriptedProvider(NativeProviderFixture):
     """Provider stub that still runs through ChatRuntime's full tool loop."""
 
     def __init__(self, steps: list[_ProviderStep]) -> None:
@@ -776,10 +777,7 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 {
                     "type": "tool_result",
                     "tool_use_id": "read-1",
-                    "content": [
-                        {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-                        {"type": "text", "text": "1|seed line"},
-                    ],
+                    "content": UNTRUSTED_TOOL_RESULT_WARNING + "\n1|seed line",
                     "is_error": False,
                 }
             ]
@@ -788,11 +786,8 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert first_write_result[0]["type"] == "tool_result"
             assert first_write_result[0]["tool_use_id"] == "write-1"
             assert first_write_result[0]["is_error"] is False
-            assert first_write_result[0]["content"][0] == {
-                "type": "text",
-                "text": UNTRUSTED_TOOL_RESULT_WARNING,
-            }
-            assert json.loads(first_write_result[0]["content"][1]["text"]) == {
+            assert first_write_result[0]["content"].startswith(UNTRUSTED_TOOL_RESULT_WARNING + "\n")
+            assert json.loads(first_write_result[0]["content"].split("\n", 1)[1]) == {
                 "ok": True,
                 "operation": "write_file",
                 "device": "owner-laptop",
@@ -823,6 +818,8 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             def assert_owned_device_enum(call: dict[str, Any]) -> None:
                 assert call["tools"] is not None
                 for schema in call["tools"]:
+                    if schema["name"] not in {"read_file", "write_file"}:
+                        continue
                     enum = schema["input_schema"]["properties"][DEVICE_FIELD_NAME]["enum"]
                     assert enum == ["server", "owner-laptop"]
                     assert "other-laptop" not in enum
@@ -834,23 +831,11 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert cross_response.status_code == 200, cross_response.text
             assert len(dispatch_calls) == 2
             cross_result = provider.calls[4]["messages"][-1]["content"]
-            assert cross_result == [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "cross-1",
-                    "content": [
-                        {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-                        {
-                            "type": "text",
-                            "text": (
-                                "[tool_device_unreachable] "
-                                "Tool install site is unavailable: other-laptop"
-                            ),
-                        },
-                    ],
-                    "is_error": True,
-                }
-            ]
+            assert len(cross_result) == 1
+            assert cross_result[0]["tool_use_id"] == "cross-1"
+            assert cross_result[0]["is_error"] is True
+            assert "Invalid arguments for write_file" in cross_result[0]["content"]
+            assert "other-laptop" in cross_result[0]["content"]
             assert not (other_workspace / "forbidden.txt").exists()
 
             assert owner_process is not None
@@ -870,13 +855,10 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
                 {
                     "type": "tool_result",
                     "tool_use_id": "offline-1",
-                    "content": [
+                    "content": json.dumps([
                         {"type": "text", "text": UNTRUSTED_TOOL_RESULT_WARNING},
-                        {
-                            "type": "text",
-                            "text": "[tool_device_unreachable] Tool install site became unavailable",
-                        },
-                    ],
+                        {"type": "text", "text": "[tool_device_unreachable] Tool install site became unavailable"},
+                    ]),
                     "is_error": True,
                 }
             ]

@@ -569,7 +569,7 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
             ]
             assert (
                 "py6-agent-output"
-                in provider.calls[1]["messages"][-1]["content"][0]["content"][-1]["text"]
+                in provider.calls[1]["messages"][-1]["content"][0]["content"]
             )
             agent_dispatch = next(
                 call for call in dispatch_calls if call["chat_session_id"] == agent_chat

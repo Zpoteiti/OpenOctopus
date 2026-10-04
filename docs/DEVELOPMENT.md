@@ -7,7 +7,11 @@ tool, and device protocol contracts remain in [API.yaml](API.yaml),
 ## Server chat
 
 [`chat/runner.py`](../server/src/openctopus_server/chat/runner.py) owns session
-scheduling, durable turn transitions, Provider calls, and tool execution.
+product turn transitions, authorized inputs, and routed tool execution.
+[`chat/agent.py`](../server/src/openctopus_server/chat/agent.py) composes the
+official Pydantic AI loop and Harness capabilities;
+[`chat/durable.py`](../server/src/openctopus_server/chat/durable.py) connects
+transactional ingress to DBOS queues and process recovery.
 [`chat/session_streams.py`](../server/src/openctopus_server/chat/session_streams.py)
 owns live preview subscribers, pending-message selection, and stream handoff.
 
@@ -21,9 +25,28 @@ Browser stream admission caps the process at 1,024 open streams and each session
 at 32 queued previews. Full capacity returns `429 chat_stream_busy` before
 message persistence. Completion, replacement, disconnect and cancellation release
 the slot. Pending-turn reservation retries database failures up to three times;
-exhausted attempts close queued previews and retain durable input for the next
-inbound activity, including after a restart. Account deletion cancels owned session
+accepted inputs and DBOS queue entries commit together and resume after restart. Account deletion cancels owned session
 runners and queued starts, closes their previews, and releases their MCP clients.
+
+The [Pydantic AI Harness runtime design](specs/2026-10-03-pydantic-ai-harness-runtime.md)
+describes the implemented loop, Memory, compaction, delegation, and scheduling.
+Run one ASGI process. Agent history lives in `agent_contexts`; original `messages`
+remain unchanged by compaction. Model configurations are private versioned records;
+workflow parameters contain revision IDs rather than API keys. DBOS owns its schema
+in the same PostgreSQL database. Official Memory tables are initialized by the store.
+Development schemas must be recreated for this change; no migration is supplied.
+
+`chat/delegation.py` wraps official foreground delegation and starts durable
+background workflows. Each root can create eight children, with fifty model requests
+per child and two hundred across the tree. The session list exposes child transcripts;
+users continue the task in the parent conversation. Stop/deletion intent is committed
+before cancelling DBOS workflows and survives restart. An issued external operation
+without a committed result is reported as outcome unknown, without automatic retry.
+
+`automations/durable.py` owns periodic schedules and delayed Cron queue entries.
+Cron expressions/time zones remain parsed by croniter; configuration and the next
+trigger commit in one transaction. Heartbeat and Dream queues deduplicate by user
+while work is pending. Accepted work resumes; missed pulses are skipped.
 
 ## Built-in skills and memory automation
 
@@ -31,13 +54,15 @@ runners and queued starts, closes their previews, and releases their MCP clients
 validates and indexes the packaged library; workspace authorization enforces its
 reserved read-only namespace. Packaged files are under `assets/builtin_skills/`.
 
-[`provider/jev.py`](../server/src/openctopus_server/provider/jev.py) owns bounded
+[`provider/jev.py`](../server/src/openctopus_server/provider/jev.py) uses the official TypeSafe provider for bounded
 HTTP decisions and configuration-revision-fenced availability. Heartbeat Phase 1
 selects existing parsed tasks through this service. Phase 2 uses the normal agent.
 
 [`automations/dream.py`](../server/src/openctopus_server/automations/dream.py)
 owns midnight eligibility, bounded text batches, durable progress, prepared
-memory changes and undo. `ChatRuntime.propose_memory_update` shares the normal
+memory changes and undo through the official PostgresMemoryStore.
+The `/memory` editor uses the same authenticated notebook with version-checked
+updates; workspace `MEMORY.md` files are ordinary files and are not injected. `ChatRuntime.propose_memory_update` shares the normal
 provider and limiter for a single constrained proposal; it never dispatches
 executable tools. Missing Jev configuration defers new decisions before run
 creation and memory reads, while prepared writes and restores remain recoverable.

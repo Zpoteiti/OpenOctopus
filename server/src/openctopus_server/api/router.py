@@ -9,6 +9,7 @@ from openctopus_server.api import (
     dream,
     health,
     me,
+    memory,
     sessions,
     workspace_files,
     workspaces,
@@ -24,6 +25,7 @@ router.include_router(channels.router)
 router.include_router(me.router)
 router.include_router(cron.router)
 router.include_router(dream.router)
+router.include_router(memory.router)
 router.include_router(sessions.collection_router)
 router.include_router(sessions.router)
 router.include_router(sessions.control_router)

@@ -12,8 +12,6 @@ from test_workspace_files_api import workspace_api as workspace_api
 from test_workspace_files_api import workspace_storage as workspace_storage
 from test_workspace_prompt import _PromptWorkspace
 
-from openctopus_server.chat.prompt import build_system_prompt
-from openctopus_server.db.models import Session, User
 from openctopus_server.errors.codes import ErrorCode
 from openctopus_server.errors.exceptions import WorkspaceError
 from openctopus_server.tools.base import ToolContext
@@ -239,52 +237,34 @@ async def test_rest_transfer_rejects_both_builtin_endpoints_without_effects(
     assert storage.objects == before
 
 
-async def test_prompt_discovers_builtins_outside_personal_limit_and_preserves_collision(
-    pg_engine,
-) -> None:
+async def test_harness_discovers_builtins_outside_personal_limit_and_preserves_collision(pg_engine):
+    from types import SimpleNamespace
+
+    from openctopus_server.chat.scope import active_run
+    from openctopus_server.chat.skills import personal_skill_id, skill_sources
     personal_files = {
-        f"skills/a{index:03}/SKILL.md": f"---\nname: a{index:03}\ndescription: Personal guide\n---\nprivate body".encode()
-        for index in range(201)
+        f"skills/a{i:03}/SKILL.md": f"---\nname: a{i:03}\ndescription: Personal guide\n---\nprivate body".encode()
+        for i in range(201)
     }
-    personal_files["skills/create-skill/SKILL.md"] = (
-        b"---\nname: create-skill\ndescription: Personal creation guide\n---\nprivate body"
-    )
-    user = User(id=uuid4(), name="User", email="prompt@test.com", password_hash="unused")
-    session = Session(
-        id=uuid4(),
-        user_id=user.id,
-        session_key="web:test",
-        channel="web",
-        chat_id="test",
-        title="Test",
-    )
-    async with AsyncSession(pg_engine) as db:
-        prompt = await build_system_prompt(
-            db,
-            user=user,
-            session=session,
-            workspace_service=_PromptWorkspace(personal_files),
-            skills_cache=SkillsCache(),
-        )
+    runtime = SimpleNamespace(workspace_service=_PromptWorkspace(personal_files), skills_cache=SkillsCache())
+    token = active_run.set(SimpleNamespace(user_id=uuid4(), runtime=runtime))
+    try:
+        files = await skill_sources()
         for skill in get_builtin_skill_library().skills:
-            assert f"builtin/{skill.name}" in prompt
-            assert skill.path in prompt
-        assert "a199 — Personal guide" in prompt
-        assert "a200 — Personal guide" not in prompt
-        collision = await build_system_prompt(
-            db,
-            user=user,
-            session=session,
-            workspace_service=_PromptWorkspace(
-                {"skills/create-skill/SKILL.md": personal_files["skills/create-skill/SKILL.md"]}
-            ),
-            skills_cache=SkillsCache(),
-        )
-    assert "builtin/create-skill —" in collision
-    assert "- create-skill — Personal creation guide" in collision
-    assert 'path="skills/create-skill/SKILL.md"' in collision
-    assert 'path="/builtin/skills/create-skill/SKILL.md"' in collision
-    assert "private body" not in collision
+            assert f"/skills/builtin-{skill.name}/SKILL.md" in files
+        assert f'/skills/{personal_skill_id("a199")}/SKILL.md' in files
+        assert f'/skills/{personal_skill_id("a200")}/SKILL.md' not in files
+        names = ('create-skill', 'builtin-create-skill', 'Review Guide_中文', 'a' * 64)
+        runtime.workspace_service = _PromptWorkspace({f'skills/{name}/SKILL.md':
+            f'---\nname: {name}\ndescription: Personal creation guide\n---\nprivate body'.encode() for name in names})
+        runtime.skills_cache = SkillsCache()
+        collision = await skill_sources()
+        assert '/skills/builtin-create-skill/SKILL.md' in collision
+        for name in names:
+            assert f'/skills/{personal_skill_id(name)}/SKILL.md' in collision
+        assert b'private body' not in collision['/skills/builtin-create-skill/SKILL.md']
+    finally:
+        active_run.reset(token)
 
 
 @pytest.mark.parametrize("failure", ["missing", "name", "always_on", "body"])
