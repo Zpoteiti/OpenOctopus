@@ -19,12 +19,13 @@ change this document's strict Protocol v3 wire version.
 
 ```
 GET /ws/device
-Authorization: Bearer <OPENOCTOPUS_DEVICE_TOKEN>
+Authorization: Bearer <device token>
 ```
 
 The token is looked up through the device row's SHA-256 `token_hash` (ADR-131).
 It is accepted only in the `Authorization` header, never in the URL. No
-additional handshake credentials.
+additional handshake credentials. The tray Client reads it from the operating
+system credential store and hands it to the core over their private pipe.
 
 ### 1.2 Handshake
 
