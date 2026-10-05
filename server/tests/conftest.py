@@ -22,6 +22,32 @@ from openctopus_server.workspace.storage import ObjectStorage, get_object_storag
 
 
 @pytest.fixture(autouse=True)
+def _no_environment_proxies(monkeypatch: pytest.MonkeyPatch):
+    """Keep the local-only test suite off ambient proxies.
+
+    The whole suite talks to in-process apps, localhost Uvicorn, and local
+    PostgreSQL/RustFS.  A developer machine with a TUN-mode proxy (for
+    example ALL_PROXY=socks://127.0.0.1:7897) otherwise breaks httpx client
+    construction and localhost routing inside the tests themselves.
+    """
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "ws_proxy",
+        "wss_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+
+@pytest.fixture(autouse=True)
 def _clear_settings_and_engine_cache():
     """Ensure singleton caches are cleared around every test."""
     get_settings.cache_clear()

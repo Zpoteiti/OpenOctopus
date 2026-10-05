@@ -311,7 +311,7 @@ async def _start_client(
         process.stdin.write(
             _startup_config_line(server_url, token, workspace).encode("utf-8")
         )
-        await process.drain()
+        await process.stdin.drain()
     return process
 
 
@@ -462,7 +462,10 @@ async def test_real_postgres_source_client_device_lifecycle(
             assert token not in repr(row)
 
             name = device["name"]
-            first_process = await _start_client(server_url, token, workspace=str(workspace))
+            # No local workspace pin: this scenario verifies that a
+            # Server-side reconfiguration moves the device Workspace, which
+            # only holds while the Client has no tray-chosen override.
+            first_process = await _start_client(server_url, token)
             client_processes.append(first_process)
             await _wait_online(http_client, jwt, name, online=True, process=first_process)
 
@@ -539,7 +542,7 @@ async def test_real_postgres_source_client_device_lifecycle(
             await _stop_client(first_process, expected_returncode=0)
             await _wait_online(http_client, jwt, new_name, online=False)
 
-            second_process = await _start_client(server_url, token, workspace=str(workspace))
+            second_process = await _start_client(server_url, token)
             client_processes.append(second_process)
             await _wait_online(http_client, jwt, new_name, online=True, process=second_process)
 

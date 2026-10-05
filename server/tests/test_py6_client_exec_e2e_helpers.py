@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import signal
@@ -71,7 +72,23 @@ async def test_frozen_client_start_uses_platform_group_and_clean_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    sentinel = cast(asyncio.subprocess.Process, object())
+
+    class _FakeStartupStdin:
+        def __init__(self) -> None:
+            self.written: list[bytes] = []
+
+        def write(self, payload: bytes) -> None:
+            self.written.append(payload)
+
+        async def drain(self) -> None:
+            return None
+
+    class _FakeStartedProcess:
+        def __init__(self) -> None:
+            self.stdin = _FakeStartupStdin()
+
+    started = _FakeStartedProcess()
+    sentinel = cast(asyncio.subprocess.Process, started)
 
     async def fake_create_subprocess_exec(
         *args: object, **kwargs: object
@@ -81,14 +98,25 @@ async def test_frozen_client_start_uses_platform_group_and_clean_environment(
 
     monkeypatch.setenv("OO_CLIENT_BIN", r"C:\bundle\openoctopus-client.exe")
     monkeypatch.setenv("PYTHONPATH", r"C:\editable-source")
+    monkeypatch.setenv("OPENOCTOPUS_DEVICE_TOKEN", "parent-must-not-leak")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
     process = await _start_client("http://127.0.0.1:1234", "test-token")
 
     assert process is sentinel
+    assert calls[0][0] == (r"C:\bundle\openoctopus-client.exe", "_core-run")
+    assert calls[0][1]["stdin"] == asyncio.subprocess.PIPE
     assert calls[0][1]["creationflags"] == _client_creationflags()
     environment = cast(dict[str, str], calls[0][1]["env"])
     assert "PYTHONPATH" not in environment
+    assert "OPENOCTOPUS_DEVICE_TOKEN" not in environment
+    startup = json.loads(started.stdin.written[0])
+    assert startup == {
+        "type": "startup-config",
+        "generation": 1,
+        "server_url": "http://127.0.0.1:1234",
+        "token": "test-token",
+    }
 
 
 class _FakeClientProcess:
