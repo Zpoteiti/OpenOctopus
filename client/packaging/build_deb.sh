@@ -48,7 +48,7 @@ Comment=OpenOctopus device tray client
 Exec=openoctopus-client
 Icon=openoctopus-client
 Terminal=false
-Categories=Utility;TrayIcon;
+Categories=Utility;
 StartupNotify=false
 X-GNOME-Autostart-enabled=false
 DESKTOP
