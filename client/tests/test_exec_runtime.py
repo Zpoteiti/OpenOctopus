@@ -8,7 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from openoctopus_client.config import load_config
+from openoctopus_client.config import ClientConfiguration, configuration_from_startup
 from openoctopus_client.connection import (
     ClientRuntime,
     CloseDisposition,
@@ -45,11 +45,10 @@ _EMPTY_MCP_CATALOG = PersistedMcpCatalog(
 _EMPTY_MCP_CATALOG_JSON = _EMPTY_MCP_CATALOG.model_dump(mode="json")
 
 
-def _environment() -> dict[str, str]:
-    return {
-        "OPENOCTOPUS_SERVER_URL": "https://openoctopus.example",
-        "OPENOCTOPUS_DEVICE_TOKEN": "openoctopus_dev_test-token",
-    }
+def _configuration() -> ClientConfiguration:
+    return configuration_from_startup(
+        "https://openoctopus.example", "openoctopus_dev_test-token"
+    )
 
 
 def _hello() -> Hello:
@@ -167,7 +166,7 @@ async def test_runtime_routes_exec_with_hidden_chat_owner_and_active_policy(
 ) -> None:
     manager = _RecordingExecManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -192,7 +191,7 @@ async def test_runtime_binds_file_calls_after_config_update_to_the_new_config(
 ) -> None:
     manager = _RecordingExecManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -251,7 +250,7 @@ async def test_exec_family_is_busy_immediately_during_config_activation(
 
     manager = _BlockingPolicyManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -307,7 +306,7 @@ async def test_exec_family_is_busy_immediately_during_config_activation(
 async def test_same_policy_reconnect_preserves_exec_manager_state(tmp_path: Path) -> None:
     manager = _RecordingExecManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -338,7 +337,7 @@ async def test_policy_activation_finishes_before_config_task_propagates_cancella
 
     manager = _BlockingPolicyManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -370,7 +369,7 @@ async def test_policy_cleanup_failure_is_sanitized_retryable_and_can_be_retried(
 
     manager = _FailOncePolicyManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         tool_dispatcher_factory=lambda *_: _LocalDispatcher(),
         shell_inventory=_SHELLS,
@@ -395,7 +394,7 @@ async def test_permanent_runtime_exit_shuts_down_all_exec_sessions() -> None:
             raise RuntimeError("permanent protocol failure")
 
     runtime = _PermanentFailureRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         shell_inventory=_SHELLS,
         exec_session_manager=manager,
@@ -414,7 +413,7 @@ async def test_incomplete_exec_shutdown_keeps_runtime_watchdog_armed() -> None:
 
     manager = _IncompleteManager()
     runtime = ClientRuntime(
-        load_config(_environment()),
+        _configuration(),
         hello_factory=_hello,
         shell_inventory=_SHELLS,
         exec_session_manager=manager,

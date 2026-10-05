@@ -31,6 +31,9 @@ def _assert_winpty_native_files(entries):
 
 datas = collect_data_files("magika", includes=["config/**", "models/**"])
 datas += copy_metadata("fastmcp-slim")
+# The tray reads credentials through the pinned keyring backends; their
+# metadata keeps entry-point discovery working inside the frozen bundle.
+datas += copy_metadata("keyring")
 binaries = collect_dynamic_libs("onnxruntime")
 if is_win:
     from PyInstaller.utils.hooks import collect_all
@@ -40,6 +43,11 @@ if is_win:
     binaries += winpty_binaries
 
 hiddenimports = winpty_hiddenimports if is_win else ["openoctopus_client.pty_worker"]
+hiddenimports += [
+    "keyring.backends.SecretService",
+    "keyring.backends.Windows",
+    "keyring.backends.macOS",
+]
 
 a = Analysis(
     ["src/openoctopus_client/__main__.py"],
@@ -52,12 +60,15 @@ a = Analysis(
 if is_win:
     _assert_winpty_native_files([*a.binaries, *a.datas])
 pyz = PYZ(a.pure)
+# ``console=False``: double-clicking the installed program starts the tray
+# without a terminal on Windows.  The internal core mode keeps working over
+# QProcess pipes, and the frozen smokes always redirect stdin/stdout.
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
     name="openoctopus-client",
-    console=True,
+    console=False,
 )
 coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas, name="openoctopus-client")

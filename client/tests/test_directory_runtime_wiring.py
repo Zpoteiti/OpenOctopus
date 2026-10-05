@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 
 import openoctopus_client.tools.directory_jobs as directory_jobs_module
-from openoctopus_client.config import load_config
+from openoctopus_client.config import ClientConfiguration, configuration_from_startup
 from openoctopus_client.connection import (
     ClientRuntime,
     _DirectoryControlWorker,
@@ -22,11 +22,10 @@ from openoctopus_client.tools.directory_jobs import DirectoryJobManager
 from openoctopus_client.tools.workspace_rest import DirectoryCommandResult
 
 
-def _environment() -> dict[str, str]:
-    return {
-        "OPENOCTOPUS_SERVER_URL": "https://openoctopus.example:8443",
-        "OPENOCTOPUS_DEVICE_TOKEN": "openoctopus_dev_secret-value",
-    }
+def _configuration() -> ClientConfiguration:
+    return configuration_from_startup(
+        "https://openoctopus.example:8443", "openoctopus_dev_secret-value"
+    )
 
 
 def _call(operation: str, *, route: McpRoute | None = None) -> ToolCall:
@@ -92,7 +91,7 @@ def test_directory_control_lane_is_not_blocked_by_the_ordinary_tool_lane() -> No
                 del raw_action
                 return DirectoryCommandResult(state="accepted", expected_digest="a" * 64)
 
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         writer = Writer()
         ordinary_worker = _ToolWorker(runtime, cast(Any, writer))
         directory_worker = _DirectoryControlWorker(runtime, cast(Any, writer))
@@ -157,7 +156,7 @@ def test_runtime_retires_config_bound_directory_managers_but_keeps_old_reconcile
     async def exercise() -> None:
         source = tmp_path / "source.txt"
         source.write_text("content", encoding="utf-8")
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         config = DeviceConfig(
             workspace_path=str(tmp_path),
             restrict_to_workspace=True,
@@ -266,7 +265,7 @@ def test_runtime_releases_retired_manager_after_its_lifecycle_expires(
     async def exercise() -> None:
         source = tmp_path / "source.txt"
         source.write_text("content", encoding="utf-8")
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         config = DeviceConfig(
             workspace_path=str(tmp_path),
             restrict_to_workspace=True,
@@ -337,7 +336,7 @@ def test_generation_retire_is_bounded_while_blocking_work_drains(
         source = tmp_path / "source"
         source.mkdir()
         (source / "file").write_text("content", encoding="utf-8")
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         config = DeviceConfig(
             workspace_path=str(tmp_path),
             restrict_to_workspace=True,

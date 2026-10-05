@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 COMMAND_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.02
@@ -146,6 +146,137 @@ def _run(
     )
 
 
+class _PipeResult(TypedDict):
+    return_code: int
+    stdout: str
+    stderr: str
+    seconds: float
+
+
+def _run_core_pipe(
+    binary: Path,
+    *,
+    startup_lines: list[bytes],
+    close_stdin_after: bool,
+    psutil: Any,
+) -> _PipeResult:
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                [str(binary), "_core-run"],
+                stdin=subprocess.PIPE,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except OSError as exc:
+            raise SmokeError(f"artifact could not start: {exc}") from exc
+        assert process.stdin is not None
+        try:
+            for line in startup_lines:
+                process.stdin.write(line)
+            process.stdin.flush()
+            if close_stdin_after:
+                process.stdin.close()
+            # The core must emit its terminal exit event and exit promptly.
+            return_code = process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            raise SmokeError("frozen core pipe did not terminate") from None
+        except BrokenPipeError:
+            return_code = process.wait(timeout=5)
+        finally:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+    return {
+        "return_code": return_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "seconds": time.monotonic() - started,
+    }
+
+
+def _run_tray_single_instance_check(binary: Path, psutil: Any) -> dict[str, object]:
+    """Start the frozen tray offscreen and verify the single-instance exit.
+
+    The first process must stay resident; a second launch must wake the
+    running program and exit with 0 without starting another core.
+    """
+
+    with tempfile.TemporaryDirectory() as temporary:
+        environment = {
+            **os.environ,
+            "QT_QPA_PLATFORM": "offscreen",
+            "HOME": temporary,
+            "XDG_CONFIG_HOME": str(Path(temporary) / "config"),
+            "XDG_CACHE_HOME": str(Path(temporary) / "cache"),
+        }
+        first = subprocess.Popen(
+            [str(binary)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+        )
+        second_return = -1
+        second_seconds = 0.0
+        try:
+            time.sleep(3.0)
+            if first.poll() is not None and first.returncode == 4:
+                return {
+                    "second_launch_seconds": 0.0,
+                    "second_launch_return_code": 0,
+                    "skipped": "tray-unavailable",
+                }
+            if first.poll() is not None:
+                raise SmokeError(
+                    f"tray exited early with {first.returncode}; the frozen GUI is broken"
+                )
+            second_started = time.monotonic()
+            second = subprocess.Popen(
+                [str(binary)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+            )
+            try:
+                second_return = second.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                second.kill()
+                second.wait(timeout=5)
+                raise SmokeError(
+                    "second tray launch did not exit; single-instance arbitration failed"
+                ) from None
+            second_seconds = time.monotonic() - second_started
+            if first.poll() is not None:
+                raise SmokeError("the resident tray died when the second launch arrived")
+        finally:
+            if first.poll() is None:
+                first.terminate()
+                try:
+                    first.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    first.kill()
+                    first.wait(timeout=5)
+    if second_return != 0:
+        raise SmokeError(
+            f"second tray launch must exit 0 after waking the running program; got {second_return}"
+        )
+    return {
+        "second_launch_seconds": round(second_seconds, 6),
+        "second_launch_return_code": second_return,
+    }
+
+
 def _required_path(name: str, *, kind: str) -> Path:
     value = os.environ.get(name)
     if not value:
@@ -168,9 +299,7 @@ def _runtime_smoke_payload(
     version_seconds: float,
     version_peak_rss: int,
     version_peak_processes: int,
-    run_seconds: float,
-    run_peak_rss: int,
-    run_peak_processes: int,
+    core_pipe_seconds: float,
     exec_seconds: float,
     exec_peak_rss: int,
     exec_peak_processes: int,
@@ -180,6 +309,7 @@ def _runtime_smoke_payload(
     conversion_seconds: float,
     conversion_peak_rss: int,
     conversion_peak_processes: int,
+    tray: dict[str, object],
 ) -> dict[str, object]:
     return {
         "bundle_bytes": _bundle_size(bundle),
@@ -188,10 +318,8 @@ def _runtime_smoke_payload(
             "sampled_process_tree_peak_processes": version_peak_processes,
             "sampled_process_tree_peak_rss_bytes": version_peak_rss,
         },
-        "run_cli": {
-            "seconds": round(run_seconds, 6),
-            "sampled_process_tree_peak_processes": run_peak_processes,
-            "sampled_process_tree_peak_rss_bytes": run_peak_rss,
+        "core_pipe": {
+            "seconds": round(core_pipe_seconds, 6),
         },
         "exec_backends": {
             "seconds": round(exec_seconds, 6),
@@ -208,6 +336,7 @@ def _runtime_smoke_payload(
             "sampled_process_tree_peak_processes": conversion_peak_processes,
             "sampled_process_tree_peak_rss_bytes": conversion_peak_rss,
         },
+        "tray_single_instance": tray,
     }
 
 
@@ -222,7 +351,7 @@ def main() -> int:
             _assert_winpty_native_bundle(binary)
         psutil = _psutil()
 
-        version = _run(binary, "version", psutil=psutil)
+        version = _run(binary, "_version", psutil=psutil)
         if (
             version.completed.returncode != 0
             or version.completed.stdout not in {"0.0.1\n", "0.0.1\r\n"}
@@ -234,20 +363,27 @@ def main() -> int:
         if version.completed.stderr:
             raise SmokeError(f"version wrote stderr: {version.completed.stderr!r}")
 
-        run_environment = dict(os.environ)
-        run_environment.pop("OPENOCTOPUS_SERVER_URL", None)
-        run_environment["OPENOCTOPUS_DEVICE_TOKEN"] = "openoctopus_dev_frozen_smoke_secret"
-        run = _run(binary, "run", env=run_environment, psutil=psutil)
+        # The private core pipe must exist, reject bad startup configs with a
+        # structured exit event, and never echo the token.  The old
+        # environment-variable ``run`` CLI contract is gone.
+        pipe = _run_core_pipe(
+            binary,
+            startup_lines=[b'{"type":"startup-config","generation":1,'
+            b'"server_url":"http://host/api","token":"openoctopus_dev_frozen_pipe_secret"}\n'],
+            close_stdin_after=False,
+            psutil=psutil,
+        )
+        pipe_stdout = pipe["stdout"]
+        events = [json.loads(line) for line in pipe_stdout.splitlines() if line.strip()]
         if (
-            run.completed.returncode != 78
-            or "OPENOCTOPUS_SERVER_URL is required" not in run.completed.stderr
-            or run.completed.stdout
-            or "frozen_smoke_secret" in run.completed.stderr
+            pipe["return_code"] != 78
+            or len(events) != 1
+            or events[0].get("type") != "exit"
+            or events[0].get("reason") != "startup_config_invalid"
+            or "frozen_pipe_secret" in pipe_stdout
+            or "frozen_pipe_secret" in pipe["stderr"]
         ):
-            raise SmokeError(
-                f"run CLI failed: returncode={run.completed.returncode}; "
-                f"stdout={run.completed.stdout!r}; stderr={run.completed.stderr!r}"
-            )
+            raise SmokeError(f"frozen core pipe rejected the config incorrectly: {pipe!r}")
 
         exec_backends = _run(binary, "_exec-backend-smoke", psutil=psutil)
         try:
@@ -313,6 +449,8 @@ def main() -> int:
                 "conversion did not show a child process; frozen multiprocessing path was not used"
             )
 
+        tray = _run_tray_single_instance_check(binary, psutil=psutil)
+
         print(
             json.dumps(
                 _runtime_smoke_payload(
@@ -320,9 +458,7 @@ def main() -> int:
                     version_seconds=version.seconds,
                     version_peak_rss=version.peak_rss_bytes,
                     version_peak_processes=version.peak_processes,
-                    run_seconds=run.seconds,
-                    run_peak_rss=run.peak_rss_bytes,
-                    run_peak_processes=run.peak_processes,
+                    core_pipe_seconds=pipe["seconds"],
                     exec_seconds=exec_backends.seconds,
                     exec_peak_rss=exec_backends.peak_rss_bytes,
                     exec_peak_processes=exec_backends.peak_processes,
@@ -332,6 +468,7 @@ def main() -> int:
                     conversion_seconds=conversion.seconds,
                     conversion_peak_rss=conversion.peak_rss_bytes,
                     conversion_peak_processes=conversion.peak_processes,
+                    tray=tray,
                 ),
                 sort_keys=True,
             )

@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import os
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -17,8 +16,11 @@ import pytest
 import openoctopus_client.connection as connection_module
 import openoctopus_client.tools.blocking as blocking_module
 import openoctopus_client.tools.file_tools as file_tools_module
-from openoctopus_client import cli
-from openoctopus_client.config import ConfigurationError, load_config
+from openoctopus_client.config import (
+    ClientConfiguration,
+    ConfigurationError,
+    configuration_from_startup,
+)
 from openoctopus_client.connection import (
     ClientRuntime,
     CloseDisposition,
@@ -86,6 +88,12 @@ def _environment() -> dict[str, str]:
         "OPENOCTOPUS_SERVER_URL": "https://openoctopus.example:8443",
         "OPENOCTOPUS_DEVICE_TOKEN": "openoctopus_dev_secret-value",
     }
+
+
+def _configuration() -> ClientConfiguration:
+    return configuration_from_startup(
+        "https://openoctopus.example:8443", "openoctopus_dev_secret-value"
+    )
 
 
 _TEST_SHELLS = ShellMetadata(default="bash", available=["bash", "sh"])
@@ -196,22 +204,22 @@ class _ConfigAppliedGate:
             await self._changed.wait_for(lambda: expected in self._applied)
 
 
-def test_load_config_consumes_secret_and_builds_device_websocket_url() -> None:
-    environment = _environment()
-
-    config = load_config(environment)
+def test_configuration_from_startup_builds_device_websocket_url() -> None:
+    config = configuration_from_startup(
+        "https://openoctopus.example:8443", "openoctopus_dev_secret-value"
+    )
 
     assert config.server_url == "https://openoctopus.example:8443"
     assert config.websocket_url == "wss://openoctopus.example:8443/ws/device"
     assert config.token.reveal() == "openoctopus_dev_secret-value"
-    assert "OPENOCTOPUS_DEVICE_TOKEN" not in environment
     assert "secret-value" not in repr(config.token)
+    assert "secret-value" not in str(config)
 
 
 def test_runtime_owns_shared_local_transfer_admission_and_drain_registry(
     tmp_path: Path,
 ) -> None:
-    runtime = ClientRuntime(load_config(_environment()))
+    runtime = ClientRuntime(_configuration())
     first = cast(
         dispatcher_module.ClientToolDispatcher,
         runtime._default_dispatcher(tmp_path, True, []),
@@ -229,7 +237,7 @@ def test_runtime_owns_shared_local_transfer_admission_and_drain_registry(
 
 def test_runtime_shutdown_waits_for_local_transfer_drains() -> None:
     async def exercise() -> None:
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         release = asyncio.Event()
         lease = runtime._local_transfer_admission.try_acquire()
         assert lease is not None
@@ -255,22 +263,20 @@ def test_runtime_shutdown_waits_for_local_transfer_drains() -> None:
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "server_url,token",
     [
-        ("OPENOCTOPUS_SERVER_URL", "http://host/api"),
-        ("OPENOCTOPUS_SERVER_URL", "https://user@host"),
-        ("OPENOCTOPUS_SERVER_URL", "ftp://host"),
-        ("OPENOCTOPUS_DEVICE_TOKEN", "wrong-prefix"),
+        ("http://host/api", "openoctopus_dev_secret-value"),
+        ("https://user@host", "openoctopus_dev_secret-value"),
+        ("ftp://host", "openoctopus_dev_secret-value"),
+        ("https://openoctopus.example", "wrong-prefix"),
+        ("https://openoctopus.example", "openoctopus_dev_"),
     ],
 )
-def test_load_config_rejects_invalid_values(field: str, value: str) -> None:
-    environment = _environment()
-    environment[field] = value
-
+def test_configuration_from_startup_rejects_invalid_values(
+    server_url: str, token: str
+) -> None:
     with pytest.raises(ConfigurationError):
-        load_config(environment)
-
-    assert "OPENOCTOPUS_DEVICE_TOKEN" not in environment
+        configuration_from_startup(server_url, token)
 
 
 def test_protocol_uses_active_py7_shapes_and_uuidv7_hello() -> None:
@@ -502,7 +508,7 @@ def test_replaced_client_exits_without_reporting_a_configuration_error(
         code = 4000
 
     async def exercise() -> int:
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
 
         async def fail() -> CloseDisposition:
             raise ReplacedError
@@ -515,27 +521,35 @@ def test_replaced_client_exits_without_reporting_a_configuration_error(
     assert "URL or protocol configuration" not in caplog.text
 
 
-def test_startup_unreachable_exits_after_one_retryable_attempt(
+def test_startup_unreachable_retries_until_the_user_stops(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    async def exercise() -> tuple[int, int]:
-        runtime = ClientRuntime(load_config(_environment()))
+    async def exercise() -> tuple[int, int, list[str]]:
+        runtime = ClientRuntime(_configuration())
         attempts = 0
+        states: list[str] = []
 
         async def fail() -> CloseDisposition:
             nonlocal attempts
             attempts += 1
+            if attempts == 2:
+                runtime.request_shutdown()
             raise OSError("network unavailable")
 
         monkeypatch.setattr(runtime, "_run_connection_attempt", fail)
-        return await asyncio.wait_for(runtime.run(), timeout=0.2), attempts
+        monkeypatch.setattr(connection_module, "reconnect_delay", lambda *a, **k: 0.001)
+        runtime._status_sink = lambda event: states.append(event.state.value)
+        return await asyncio.wait_for(runtime.run(), timeout=2), attempts, states
 
-    result, attempts = asyncio.run(exercise())
+    result, attempts, states = asyncio.run(exercise())
 
-    assert result == 1
-    assert attempts == 1
+    # The first failure is not a startup failure any more: the core keeps
+    # retrying with bounded backoff until the user stops it.
+    assert result == 0
+    assert attempts == 2
     assert "initial device connection" in caplog.text
+    assert states == ["connecting", "reconnecting", "connecting", "stopped"]
 
 
 def test_permanent_replacement_arms_watchdog_for_stuck_exec_cleanup(
@@ -559,7 +573,7 @@ def test_permanent_replacement_arms_watchdog_for_stuck_exec_cleanup(
             forced_event.set()
 
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             exec_session_manager=cast(Any, StuckExecManager()),
             hard_exit=hard_exit,
         )
@@ -581,7 +595,7 @@ def test_runtime_closes_and_rejects_a_malformed_handshake_frame() -> None:
         hello_id = UUID("0190d5a7-0000-7000-8000-000000000001")
         socket = _RecordingSocket(['{"type":"not-a-server-frame"}'])
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
 
@@ -612,7 +626,7 @@ def test_runtime_retries_a_malformed_frame_after_handshake() -> None:
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
 
@@ -667,7 +681,7 @@ def test_runtime_becomes_ready_only_after_matching_config_applied_ack(tmp_path: 
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         disposition = await runtime.run_connection(socket)
@@ -729,7 +743,7 @@ def test_connection_retains_slow_transfer_shutdown_across_reconnect(
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
 
@@ -792,7 +806,7 @@ def test_shutdown_cancels_watchdog_after_retained_transfer_drain_quiesces(
         ]
         socket = ShutdownSocket(frames)
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             hard_exit=forced.append,
         )
@@ -876,7 +890,7 @@ def test_runtime_acknowledges_config_update_after_local_activation(tmp_path: Pat
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         assert await runtime.run_connection(socket) is CloseDisposition.RETRY
@@ -1104,7 +1118,7 @@ def test_runtime_validates_promotes_registers_and_dispatches_mcp(tmp_path: Path)
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             mcp_supervisor=supervisor,
         )
@@ -1160,7 +1174,7 @@ def test_mcp_call_may_converge_after_its_connection_worker_stops() -> None:
 
         supervisor = Supervisor()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             mcp_supervisor=cast(McpSupervisor, supervisor),
         )
         writer = SerializedWriter()
@@ -1227,7 +1241,7 @@ def test_tool_worker_releases_a_queued_mcp_generation_lease_on_stop() -> None:
 
         supervisor = Supervisor()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             mcp_supervisor=cast(McpSupervisor, supervisor),
         )
         worker = _ToolWorker(runtime, SerializedWriter())
@@ -1379,7 +1393,7 @@ def test_runtime_handles_repeated_validation_cancellation_without_stale_suppress
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             mcp_supervisor=supervisor,
         )
@@ -1413,7 +1427,7 @@ def test_runtime_shutdown_wakes_recv_and_closes_with_1001(tmp_path: Path) -> Non
                 self.closed.append((code, reason))
 
         socket = BlockingSocket()
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         task = asyncio.create_task(runtime.run_connection(socket))
         await asyncio.sleep(0.01)
         runtime.request_shutdown()
@@ -1447,7 +1461,7 @@ def test_runtime_shutdown_cancels_a_writer_stuck_sending_hello(
                 self.closed.append((code, reason))
 
         socket = StuckSocket()
-        runtime = ClientRuntime(load_config(_environment()), hard_exit=lambda _code: None)
+        runtime = ClientRuntime(_configuration(), hard_exit=lambda _code: None)
         task = asyncio.create_task(runtime.run_connection(socket))
         await asyncio.wait_for(socket.send_started.wait(), timeout=1)
         runtime.request_shutdown()
@@ -1516,7 +1530,7 @@ def test_remote_eof_cancels_a_writer_stuck_sending_control(
                 del code, reason
 
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         return await runtime.run_connection(StuckSocket())
@@ -1587,7 +1601,7 @@ def test_dispatcher_failure_still_completes_connection_cleanup(tmp_path: Path) -
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=lambda workspace,
             restrict_to_workspace,
@@ -1668,7 +1682,7 @@ def test_remote_disconnect_bounds_cleanup_when_binary_send_blocks(
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         disposition = await asyncio.wait_for(runtime.run_connection(socket), timeout=0.5)
@@ -1754,7 +1768,7 @@ async def _run_fake_lifecycle(workspace: Path) -> tuple[_RecordingSocket, CloseD
             None,
         ]
     )
-    config = load_config(_environment())
+    config = _configuration()
     runtime = ClientRuntime(
         config,
         hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
@@ -1856,7 +1870,7 @@ def test_runtime_answers_ping_while_receiver_reservation_is_slow(
     async def exercise() -> tuple[list[str | bytes], CloseDisposition]:
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         try:
@@ -1954,7 +1968,7 @@ def test_runtime_acknowledges_peer_failure_during_slow_receiver_reservation(
     async def exercise() -> tuple[list[str | bytes], CloseDisposition]:
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         try:
@@ -2071,7 +2085,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         disposition = await runtime.run_connection(socket)
@@ -2094,7 +2108,7 @@ def test_runtime_routes_binary_transfer_frames_and_cleans_on_disconnect(tmp_path
 
 
 def test_runtime_rejects_tool_output_that_exceeds_result_credit(tmp_path: Path) -> None:
-    runtime = ClientRuntime(load_config(_environment()))
+    runtime = ClientRuntime(_configuration())
     asyncio.run(
         runtime._install_config(
             "device",
@@ -2207,7 +2221,7 @@ def test_tool_worker_keeps_control_frames_live_and_captures_config_snapshot(tmp_
 
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=(
                 lambda workspace, restrict_to_workspace, denylist: BlockingDispatcher(
@@ -2336,7 +2350,7 @@ def test_config_update_preparation_does_not_block_ping_or_bind_later_tool_to_old
         (tmp_path / "new").mkdir()
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
@@ -2454,7 +2468,7 @@ def test_concurrent_config_update_is_rejected_and_retryable(tmp_path: Path) -> N
         (tmp_path / "first").mkdir()
         (tmp_path / "second").mkdir()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
@@ -2515,7 +2529,7 @@ def test_peer_disconnect_waits_for_residual_tool_thread_before_retry(
         # the timeout path; the events below prove the residual thread exists.
         monkeypatch.setattr(dispatcher_module, "_timeout_for", lambda _name: 0.5)
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         socket = Socket()
@@ -2610,7 +2624,7 @@ def test_config_ack_wait_keeps_existing_transfers_live(tmp_path: Path) -> None:
         empty_digest = hashlib.sha256(b"").hexdigest()
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
         )
         connection = asyncio.create_task(runtime.run_connection(socket))
@@ -2752,7 +2766,7 @@ def test_config_update_orders_following_transfer_request_without_blocking_ping(
         (new_workspace / "source.txt").write_text("new source", encoding="utf-8")
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
@@ -2880,7 +2894,7 @@ def test_config_update_orders_following_transfer_begin_to_new_workspace(
         new_workspace.mkdir()
         socket = Socket()
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=make_dispatcher,
         )
@@ -2999,7 +3013,7 @@ def test_config_preparation_failure_is_sanitized_and_retryable(tmp_path: Path) -
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             tool_dispatcher_factory=reject,
         )
@@ -3047,7 +3061,7 @@ def test_tool_worker_waits_for_timed_out_thread_before_dequeuing_next_call(
         dispatcher = dispatcher_module.ClientToolDispatcher(
             tmp_path, restrict_to_workspace=True, ssrf_denylist=[]
         )
-        runtime = ClientRuntime(load_config(_environment()))
+        runtime = ClientRuntime(_configuration())
         writer = Writer()
         worker = _ToolWorker(runtime, cast(Any, writer))
         first = ToolCall(
@@ -3139,7 +3153,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_mutation(
             forced.set()
             released.set()
 
-        runtime = ClientRuntime(load_config(_environment()), hard_exit=hard_exit)
+        runtime = ClientRuntime(_configuration(), hard_exit=hard_exit)
         worker = _ToolWorker(runtime, SerializedWriter())
         call = ToolCall(
             id=UUID("0190d5a7-0000-7000-8000-000000000002"),
@@ -3191,7 +3205,7 @@ def test_shutdown_watchdog_bounds_a_blocking_filesystem_read(
             forced.set()
             released.set()
 
-        runtime = ClientRuntime(load_config(_environment()), hard_exit=hard_exit)
+        runtime = ClientRuntime(_configuration(), hard_exit=hard_exit)
         worker = _ToolWorker(runtime, SerializedWriter())
         call = ToolCall(
             id=UUID("0190d5a7-0000-7000-8000-000000000002"),
@@ -3262,7 +3276,7 @@ def test_shutdown_watchdog_bounds_blocking_workspace_config_preparation(
             ]
         )
         runtime = ClientRuntime(
-            load_config(_environment()),
+            _configuration(),
             hello_factory=lambda: _hello_with_id(hello_id, "0.0.1", "linux"),
             hard_exit=hard_exit,
         )
@@ -3289,7 +3303,7 @@ def test_incomplete_shutdown_keeps_the_hard_exit_watchdog_armed(
     monkeypatch.setattr("openoctopus_client.connection._SHUTDOWN_WATCHDOG_SECONDS", 1.0)
 
     async def exercise() -> bool:
-        runtime = ClientRuntime(load_config(_environment()), hard_exit=lambda _code: None)
+        runtime = ClientRuntime(_configuration(), hard_exit=lambda _code: None)
         runtime._shutdown_cleanup_incomplete = True
         runtime.request_shutdown()
 
@@ -3316,7 +3330,7 @@ def test_runtime_starts_exec_and_mcp_shutdown_concurrently() -> None:
                 await exec_started.wait()
 
         runtime = Runtime(
-            load_config(_environment()),
+            _configuration(),
             hard_exit=lambda _code: None,
         )
         runtime.request_shutdown()
@@ -3326,33 +3340,6 @@ def test_runtime_starts_exec_and_mcp_shutdown_concurrently() -> None:
             runtime._cancel_shutdown_watchdog()
 
     asyncio.run(exercise())
-
-
-def test_runtime_does_not_leave_device_token_in_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENOCTOPUS_SERVER_URL", "https://openoctopus.example")
-    monkeypatch.setenv("OPENOCTOPUS_DEVICE_TOKEN", "openoctopus_dev_secret-value")
-
-    load_config()
-
-    assert "OPENOCTOPUS_DEVICE_TOKEN" not in os.environ
-
-
-def test_cli_run_requires_environment_without_echoing_secret(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.delenv("OPENOCTOPUS_SERVER_URL", raising=False)
-    monkeypatch.setenv("OPENOCTOPUS_DEVICE_TOKEN", "openoctopus_dev_secret-value")
-    monkeypatch.setattr("sys.argv", ["openoctopus-client", "run"])
-
-    assert cli.main() == 78
-
-    captured = capsys.readouterr()
-    assert "OPENOCTOPUS_SERVER_URL is required" in captured.err
-    assert "secret-value" not in captured.err
-    assert "OPENOCTOPUS_DEVICE_TOKEN" not in os.environ
 
 
 def test_workspace_expands_only_current_user_home(

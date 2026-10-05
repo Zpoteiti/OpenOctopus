@@ -215,7 +215,7 @@ def main() -> int:
 
         version_durations: list[float] = []
         for _ in range(VERSION_RUNS):
-            result, elapsed, _ = _run(binary, "version", psutil=psutil)
+            result, elapsed, _ = _run(binary, "_version", psutil=psutil)
             if (
                 result.returncode != 0
                 or result.stdout not in {"0.0.1\n", "0.0.1\r\n"}

@@ -1023,54 +1023,6 @@ def test_dsr_write_failure_terminates_pty_session() -> None:
     assert cleanup_incomplete is False
 
 
-def test_cli_checks_configuration_before_pty_backend(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    import openoctopus_client.cli as cli
-
-    monkeypatch.delenv("OPENOCTOPUS_SERVER_URL", raising=False)
-    monkeypatch.setenv("OPENOCTOPUS_DEVICE_TOKEN", "openoctopus_dev_secret-sentinel")
-    monkeypatch.setattr(sys, "argv", ["openoctopus-client", "run"])
-    monkeypatch.setattr(
-        cli,
-        "validate_pty_backend",
-        lambda: (_ for _ in ()).throw(AssertionError("preflight ran too early")),
-    )
-
-    assert cli.main() == 78
-    captured = capsys.readouterr()
-    assert "OPENOCTOPUS_SERVER_URL is required" in captured.err
-    assert "secret-sentinel" not in captured.err
-    assert "Traceback" not in captured.err
-
-
-def test_cli_reports_sanitized_pty_preflight_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    import openoctopus_client.cli as cli
-
-    monkeypatch.setenv("OPENOCTOPUS_SERVER_URL", "https://openoctopus.example")
-    monkeypatch.setenv("OPENOCTOPUS_DEVICE_TOKEN", "openoctopus_dev_secret-sentinel")
-    monkeypatch.setattr(sys, "argv", ["openoctopus-client", "run"])
-    monkeypatch.setattr(
-        cli,
-        "validate_pty_backend",
-        lambda: (_ for _ in ()).throw(
-            process_module.PtyUnavailableError("backend-internal-secret")
-        ),
-    )
-
-    assert cli.main() == 78
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == "backend error: PTY backend is unavailable\n"
-    assert "secret-sentinel" not in captured.err
-    assert "backend-internal-secret" not in captured.err
-    assert "Traceback" not in captured.err
-
-
 def test_source_backend_smoke_exercises_pipe_and_pty() -> None:
     if os.name == "nt":
         pytest.skip("native Windows runs this through the frozen smoke harness")

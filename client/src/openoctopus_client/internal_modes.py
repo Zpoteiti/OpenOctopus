@@ -1,10 +1,15 @@
+"""Internal worker and frozen-build smoke entry points of the core binary.
+
+These modes are not user-facing commands.  The tray launches the core with
+``_core-run``; helpers and smokes are launched by the core itself or by the
+frozen smoke scripts.  None of them load the tray, read system credentials,
+or start a second GUI instance.
+"""
+
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
-import logging
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -12,9 +17,6 @@ from typing import Any, cast
 from mcp import types
 from pydantic import SecretStr
 
-from openoctopus_client import __version__
-from openoctopus_client.config import ConfigurationError, load_config
-from openoctopus_client.connection import ClientRuntime
 from openoctopus_client.document_convert import (
     ConversionError,
     conversion_worker_main,
@@ -26,16 +28,23 @@ from openoctopus_client.mcp.runtime import build_runtime_client
 from openoctopus_client.mcp.transport import BoundedStdioTransport
 from openoctopus_client.process import (
     ProcessBackendError,
-    PtyUnavailableError,
     frozen_backend_smoke,
-    validate_pty_backend,
 )
 
 _MCP_SMOKE_ENV_NAME = "MCP_FROZEN_SMOKE_SENTINEL"
 _MCP_SMOKE_ENV_VALUE = "openoctopus-mcp-stdio-smoke"
 
 
-async def _mcp_stdio_smoke(command: str, fixture: Path) -> None:
+def configure_utf8_stdio() -> None:
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            cast(Callable[..., Any], reconfigure)(encoding="utf-8", errors="strict")
+
+
+async def run_mcp_stdio_smoke(command: str, fixture: Path) -> None:
     client = build_runtime_client(
         StdioMcpServerConfig(
             name="frozen_smoke",
@@ -85,67 +94,29 @@ async def _mcp_stdio_smoke(command: str, fixture: Path) -> None:
         raise RuntimeError("MCP child cleanup did not converge")
 
 
-def _configure_utf8_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            cast(Callable[..., Any], reconfigure)(encoding="utf-8", errors="strict")
-
-
-def main() -> int:
-    _configure_utf8_stdio()
-    parser = argparse.ArgumentParser(prog="openoctopus-client")
-    commands = parser.add_subparsers(dest="command")
-    commands.add_parser("version")
-    commands.add_parser("run")
-    spike = commands.add_parser("_spike-convert", help=argparse.SUPPRESS)
-    spike.add_argument("path", type=Path)
-    spike.add_argument("--pages")
-    commands.add_parser("_conversion-worker", help=argparse.SUPPRESS)
-    commands.add_parser("_exec-backend-smoke", help=argparse.SUPPRESS)
-    mcp_smoke = commands.add_parser("_mcp-stdio-smoke", help=argparse.SUPPRESS)
-    mcp_smoke.add_argument("executable")
-    mcp_smoke.add_argument("fixture", type=Path)
-    arguments = parser.parse_args()
-    if arguments.command == "version":
-        print(__version__)
-        return 0
-    if arguments.command == "_conversion-worker":
-        return conversion_worker_main()
-    if arguments.command == "_exec-backend-smoke":
-        try:
-            payload = asyncio.run(frozen_backend_smoke())
-        except ProcessBackendError:
-            print(json.dumps({"code": "tool_exec_failed", "ok": False}, sort_keys=True))
-            return 1
-        print(json.dumps(payload, sort_keys=True))
-        return 0
-    if arguments.command == "_mcp-stdio-smoke":
-        try:
-            asyncio.run(_mcp_stdio_smoke(arguments.executable, arguments.fixture))
-        except Exception:
-            print(json.dumps({"code": "mcp_smoke_failed", "ok": False}, sort_keys=True))
-            return 1
-        print(json.dumps({"ok": True, "stdio_mcp": True}, sort_keys=True))
-        return 0
-    if arguments.command in {None, "run"}:
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-        try:
-            config = load_config()
-        except ConfigurationError as exc:
-            print(f"configuration error: {exc}", file=sys.stderr)
-            return 78
-        try:
-            validate_pty_backend()
-        except PtyUnavailableError:
-            print("backend error: PTY backend is unavailable", file=sys.stderr)
-            return 78
-        try:
-            return asyncio.run(ClientRuntime(config).run())
-        except KeyboardInterrupt:
-            return 0
+def exec_backend_smoke() -> int:
     try:
-        text = convert_path(arguments.path, pages=arguments.pages)
+        payload = asyncio.run(frozen_backend_smoke())
+    except ProcessBackendError:
+        print(json.dumps({"code": "tool_exec_failed", "ok": False}, sort_keys=True))
+        return 1
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def mcp_stdio_smoke(command: str, fixture: Path) -> int:
+    try:
+        asyncio.run(run_mcp_stdio_smoke(command, fixture))
+    except Exception:
+        print(json.dumps({"code": "mcp_smoke_failed", "ok": False}, sort_keys=True))
+        return 1
+    print(json.dumps({"ok": True, "stdio_mcp": True}, sort_keys=True))
+    return 0
+
+
+def spike_convert(path: Path, pages: str | None) -> int:
+    try:
+        text = convert_path(path, pages=pages)
     except ConversionError as exc:
         print(json.dumps({"code": exc.code, "message": exc.message, "ok": False}, sort_keys=True))
         return 1
@@ -163,3 +134,13 @@ def main() -> int:
         return 1
     print(json.dumps({"ok": True, "text": text}, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+__all__ = [
+    "configure_utf8_stdio",
+    "conversion_worker_main",
+    "exec_backend_smoke",
+    "mcp_stdio_smoke",
+    "run_mcp_stdio_smoke",
+    "spike_convert",
+]

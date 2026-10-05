@@ -13,7 +13,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 from mcp import types
 
-from openoctopus_client import cli, document_convert
+from openoctopus_client import document_convert, internal_modes
 from openoctopus_client.document_convert import ConversionError
 
 CLIENT_ROOT = Path(__file__).parents[1]
@@ -39,7 +39,7 @@ def _client(
 
 
 def test_version_is_stable() -> None:
-    result = _client("version")
+    result = _client("_version")
     assert result.returncode == 0
     assert result.stdout == "0.0.1\n"
     assert result.stderr == ""
@@ -108,11 +108,11 @@ async def test_mcp_stdio_smoke_rejects_incomplete_child_cleanup(
         return SimpleNamespace(tools=[SimpleNamespace(raw_name="environment")])
 
     fake_client = FakeClient()
-    monkeypatch.setattr(cli, "build_runtime_client", lambda config: fake_client)
-    monkeypatch.setattr(cli, "discover_server_catalog", fake_discover)
+    monkeypatch.setattr(internal_modes, "build_runtime_client", lambda config: fake_client)
+    monkeypatch.setattr(internal_modes, "discover_server_catalog", fake_discover)
 
     with pytest.raises(RuntimeError, match="cleanup"):
-        await cli._mcp_stdio_smoke(sys.executable, tmp_path / "fake-mcp.py")
+        await internal_modes.run_mcp_stdio_smoke(sys.executable, tmp_path / "fake-mcp.py")
 
 
 @pytest.mark.parametrize(
@@ -228,16 +228,18 @@ def test_invalid_pages_argument_returns_stable_json(filename: str, pages: str) -
     assert payload["code"] == "tool_invalid_args"
 
 
-def test_cli_normalizes_unexpected_failures(
+def test_internal_spike_convert_normalizes_unexpected_failures(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     def fail(_path: Path, *, pages: str | None) -> str:
         raise OSError("synthetic failure")
 
-    monkeypatch.setattr(cli, "convert_path", fail)
+    monkeypatch.setattr(internal_modes, "convert_path", fail)
     monkeypatch.setattr(sys, "argv", ["openoctopus-client", "_spike-convert", "sample.pdf"])
 
-    assert cli.main() == 1
+    from openoctopus_client.launch import main
+
+    assert main() == 1
     assert json.loads(capsys.readouterr().out) == {
         "code": "tool_content_conversion_failed",
         "message": "Document conversion failed",
