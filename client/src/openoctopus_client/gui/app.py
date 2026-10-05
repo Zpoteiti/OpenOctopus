@@ -38,6 +38,7 @@ from openoctopus_client.gui.settings_store import (
     SettingsError,
     SettingsStore,
     default_settings_directory,
+    default_workspace_root,
 )
 from openoctopus_client.gui.settings_window import SettingsWindow
 from openoctopus_client.gui.single_instance import SingleInstance
@@ -378,6 +379,7 @@ class TrayController(QObject):
                 generation=0,
                 server_url=server_url,
                 token=token,
+                workspace_root=str(default_workspace_root()),
             )
         )
         self._set_state(TrayState.CONNECTING)

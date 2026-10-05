@@ -126,17 +126,20 @@ jobs:
           python tests/frozen_smoke.py
           python tests/frozen_runtime_smoke.py
 
-      - name: Package bundle
+      - name: Package installer
         run: |
-          mkdir -p release
-          tar -C dist -czf \
-            "release/openoctopus-client-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" \
-            openoctopus-client
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "${{ matrix.platform }} in
+            linux) bash packaging/build_deb.sh dist/openoctopus-client "$VERSION" release ;;
+            macos) bash packaging/build_dmg.sh dist/openoctopus-client "$VERSION" release ;;
+          esac
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-client-${{ matrix.platform }}-${{ matrix.arch }}
-          path: client/release/*.tar.gz
+          path: |
+            client/release/*.deb
+            client/release/*.dmg
           if-no-files-found: error
 
   client-windows:
@@ -186,16 +189,17 @@ jobs:
           python tests/frozen_runtime_smoke.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package bundle
+      - name: Package per-user Windows installer
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/openoctopus-client `
-            -DestinationPath "release/openoctopus-client-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Choco-Install -PackageName nsis -NoProgress
+          $version = ($env:GITHUB_REF_NAME -replace '^v', '')
+          python packaging\build_windows_installer.py dist\openoctopus-client $version release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-client-windows-x64
-          path: client/release/*.zip
+          path: client/release/*-per-user.exe
           if-no-files-found: error
 
   server-verify:

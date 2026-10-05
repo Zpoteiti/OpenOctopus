@@ -231,6 +231,27 @@ async def _stop_server(
     await engine.dispose()
 
 
+def _client_command() -> list[str]:
+    executable = os.environ.get("OO_CLIENT_BIN")
+    if executable:
+        return [executable]
+    return [sys.executable, "-m", "openoctopus_client"]
+
+
+def _startup_config_line(server_url: str, token: str, workspace: str | None) -> str:
+    import json
+
+    payload: dict[str, object] = {
+        "type": "startup-config",
+        "generation": 1,
+        "server_url": server_url,
+        "token": token,
+    }
+    if workspace is not None:
+        payload["workspace_root"] = workspace
+    return json.dumps(payload) + "\n"
+
+
 def _client_environment(server_url: str, token: str) -> dict[str, str]:
     environment = os.environ.copy()
     for key in (
@@ -246,8 +267,10 @@ def _client_environment(server_url: str, token: str) -> dict[str, str]:
         "wss_proxy",
     ):
         environment.pop(key, None)
-    environment["OPENOCTOPUS_SERVER_URL"] = server_url
-    environment["OPENOCTOPUS_DEVICE_TOKEN"] = token
+    # The private core takes the startup configuration on stdin only;
+    # environment credentials no longer exist.
+    for key in ("OPENOCTOPUS_SERVER_URL", "OPENOCTOPUS_DEVICE_TOKEN"):
+        environment.pop(key, None)
     if environment.get("OO_CLIENT_BIN"):
         environment.pop("PYTHONPATH", None)
     else:
@@ -265,31 +288,31 @@ def _client_creationflags() -> int:
     return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
 
 
-async def _start_client(server_url: str, token: str) -> asyncio.subprocess.Process:
-    executable = os.environ.get("OO_CLIENT_BIN")
-    if executable:
-        return await asyncio.create_subprocess_exec(
-            executable,
-            "run",
-            cwd=_CLIENT_CWD,
-            env=_client_environment(server_url, token),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=_client_creationflags(),
-        )
-    return await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "openoctopus_client",
-        "run",
+async def _start_client(
+    server_url: str,
+    token: str,
+    *,
+    workspace: str | None = None,
+) -> asyncio.subprocess.Process:
+    # The core runs as a separate process fed by the startup config on
+    # stdin (the same contract the tray uses).  Callers close stdout to end
+    # ownership when the scenario reaches its stop step.
+    argv = [*_client_command(), "_core-run"]
+    process = await asyncio.create_subprocess_exec(
+        *argv,
         cwd=_CLIENT_CWD,
         env=_client_environment(server_url, token),
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=_client_creationflags(),
     )
+    if process.stdin is not None:
+        process.stdin.write(
+            _startup_config_line(server_url, token, workspace).encode("utf-8")
+        )
+        await process.drain()
+    return process
 
 
 async def _stop_client(
@@ -439,7 +462,7 @@ async def test_real_postgres_source_client_device_lifecycle(
             assert token not in repr(row)
 
             name = device["name"]
-            first_process = await _start_client(server_url, token)
+            first_process = await _start_client(server_url, token, workspace=str(workspace))
             client_processes.append(first_process)
             await _wait_online(http_client, jwt, name, online=True, process=first_process)
 
@@ -516,7 +539,7 @@ async def test_real_postgres_source_client_device_lifecycle(
             await _stop_client(first_process, expected_returncode=0)
             await _wait_online(http_client, jwt, new_name, online=False)
 
-            second_process = await _start_client(server_url, token)
+            second_process = await _start_client(server_url, token, workspace=str(workspace))
             client_processes.append(second_process)
             await _wait_online(http_client, jwt, new_name, online=True, process=second_process)
 
@@ -725,8 +748,8 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert other_device_response.status_code == 201, other_device_response.text
             other_token = other_device_response.json()["token"]
 
-            owner_process = await _start_client(server_url, owner_token)
-            other_process = await _start_client(server_url, other_token)
+            owner_process = await _start_client(server_url, owner_token, workspace=str(owner_workspace))
+            other_process = await _start_client(server_url, other_token, workspace=str(other_workspace))
             client_processes.extend((owner_process, other_process))
             client_secrets[id(owner_process)] = owner_token
             client_secrets[id(other_process)] = other_token

@@ -295,7 +295,7 @@ async def test_real_file_transfer_and_device_workspace_relay(
             created = create_response.json()
             token = created["token"]
             device_name = created["device"]["name"]
-            process = await _start_client(server_url, token)
+            process = await _start_client(server_url, token, workspace=str(device_workspace))
             client_processes.append(process)
             await _wait_online(
                 http_client,
@@ -885,6 +885,7 @@ async def test_real_distinct_clients_copy_move_and_failure_contracts(
                     reconnected_destination = await _start_client(
                         server_url,
                         destination_token,
+                        workspace=str(destination_workspace),
                     )
                     destination_process = reconnected_destination
                     clients.append((destination_process, destination_token))

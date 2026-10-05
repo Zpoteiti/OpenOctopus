@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import cast
 
 from openoctopus_client.config import ConfigurationError, configuration_from_startup
@@ -145,8 +146,32 @@ async def run_core(
         )
         return 78
     generation = startup.generation
+    workspace_root: Path | None = None
+    if startup.workspace_root:
+        workspace_root = Path(startup.workspace_root).expanduser()
+        try:
+            workspace_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _emit_stderr_diagnostic(
+                f"workspace directory could not be prepared: {type(exc).__name__}"
+            )
+            _write_event(
+                ExitResultMessage(
+                    type="exit",
+                    generation=generation,
+                    return_code=78,
+                    cleanup_complete=True,
+                    reason="startup_config_invalid",
+                )
+            )
+            return 78
+        workspace_root = workspace_root.resolve()
     try:
-        configuration = configuration_from_startup(startup.server_url, startup.token)
+        configuration = configuration_from_startup(
+            startup.server_url,
+            startup.token,
+            workspace_root=workspace_root,
+        )
     except ConfigurationError as exc:
         _emit_stderr_diagnostic(f"startup configuration rejected: {exc}")
         _write_event(
@@ -161,7 +186,11 @@ async def run_core(
         return 78
 
     if runtime_factory is None:
-        runtime = ClientRuntime(configuration, status_sink=emit_status)
+        runtime = ClientRuntime(
+            configuration,
+            status_sink=emit_status,
+            workspace_root=workspace_root,
+        )
     else:
         runtime = runtime_factory(emit_status)
     owner_gone = {"value": False}

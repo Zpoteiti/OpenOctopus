@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, Signal
+from PySide6.QtCore import QLockFile, QObject, QProcess, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 _LOCK_NAME = "tray.lock"
@@ -172,3 +173,22 @@ def send_activation(directory: Path) -> bool:
     socket.waitForBytesWritten(200)
     socket.disconnectFromServer()
     return True
+
+
+def wake_or_start(directory: Path) -> bool:
+    """Wake the running instance, or launch the program when none is up.
+
+    Used by the Windows per-user autostart entry so a logon that races a
+    manual launch never replaces the running device connection.
+    """
+
+    if send_activation(directory):
+        return True
+    program = (getattr(sys, "frozen", False) and sys.executable) or None
+    if program is None:
+        argv_zero = Path(sys.argv[0])
+        if argv_zero.is_file():
+            program = str(argv_zero)
+    if program is None:
+        return False
+    return QProcess.startDetached(program, [])[0]

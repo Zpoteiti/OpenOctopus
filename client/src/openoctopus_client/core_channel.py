@@ -67,6 +67,7 @@ class StartupConfigMessage(_StrictModel):
     generation: Annotated[int, Field(ge=0, le=2_147_483_647)]
     server_url: Annotated[str, Field(min_length=1, max_length=4096)]
     token: Annotated[str, Field(min_length=1, max_length=4096)]
+    workspace_root: Annotated[str, Field(min_length=1, max_length=4096)] | None = None
 
     def __repr__(self) -> str:
         return (

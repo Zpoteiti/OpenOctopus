@@ -55,7 +55,7 @@ jobs:
           mkdir -p metrics
           python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
 
-      - name: Smoke test frozen runtime, CLI, and multiprocessing child
+      - name: Smoke test frozen runtime, private core pipe, and tray
         env:
           OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
@@ -63,16 +63,14 @@ jobs:
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Package release-shaped bundle
-        run: |
-          mkdir -p release
-          tar -C dist -czf release/openoctopus-client-linux-x64.tar.gz openoctopus-client
+      - name: Build Debian installer
+        run: bash packaging/build_deb.sh dist/openoctopus-client 0.0.1 release
 
-      - name: Upload release-shaped bundle
+      - name: Upload Debian installer
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-linux-x64
-          path: client/release/openoctopus-client-linux-x64.tar.gz
+          name: openoctopus-client-linux-x64-deb
+          path: client/release/openoctopus-client_0.0.1_amd64.deb
           if-no-files-found: error
 
       - name: Upload smoke metrics
@@ -144,16 +142,14 @@ jobs:
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Package native release-shaped bundle
-        run: |
-          mkdir -p release
-          tar -C dist -czf release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz openoctopus-client
+      - name: Build disk image
+        run: bash packaging/build_dmg.sh dist/openoctopus-client 0.0.1 release
 
-      - name: Upload native release-shaped bundle
+      - name: Upload disk image
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-macos-${{ matrix.arch }}
-          path: client/release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz
+          name: openoctopus-client-macos-${{ matrix.arch }}-dmg
+          path: client/release/OpenOctopusClient-0.0.1.dmg
           if-no-files-found: error
 
       - name: Upload native smoke metrics
@@ -219,16 +215,17 @@ jobs:
           python tests/frozen_runtime_smoke.py | Tee-Object -FilePath metrics/frozen-runtime-smoke.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package native release-shaped bundle
+      - name: Build per-user Windows installer
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/openoctopus-client -DestinationPath release/openoctopus-client-windows-x64.zip
+          Choco-Install -PackageName nsis -NoProgress
+          python packaging\build_windows_installer.py dist\openoctopus-client 0.0.1 release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload native release-shaped bundle
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-windows-x64
-          path: client/release/openoctopus-client-windows-x64.zip
+          name: openoctopus-client-windows-x64-installer
+          path: client/release/OpenOctopusClient-Setup-0.0.1-per-user.exe
           if-no-files-found: error
 
       - name: Upload native smoke metrics
@@ -271,16 +268,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download frozen client bundle
+      - name: Download Debian installer
         uses: actions/download-artifact@v7
         with:
-          name: openoctopus-client-linux-x64
+          name: openoctopus-client-linux-x64-deb
           path: client/release
 
-      - name: Extract frozen client bundle
+      - name: Extract the executable bundle from the installer
         run: |
-          mkdir -p ../client/dist
-          tar -C ../client/dist -xzf ../client/release/openoctopus-client-linux-x64.tar.gz
+          mkdir -p ../client/release/extract ../client/dist
+          dpkg-deb -x ../client/release/openoctopus-client_0.0.1_amd64.deb \
+            ../client/release/extract
+          cp -a ../client/release/extract/opt/OpenOctopus/openoctopus-client \
+            ../client/dist/openoctopus-client
 
       - name: Install server dependencies
         run: |

@@ -367,7 +367,7 @@ async def test_real_client_exec_pipe_tty_reconnect_and_chat_isolation(
             token = cast(str, created["token"])
             device_id = UUID(created["device"]["id"])
 
-            client_process = await _start_client(server_url, token)
+            client_process = await _start_client(server_url, token, workspace=str(workspace))
             await _wait_online(
                 http_client,
                 jwt,

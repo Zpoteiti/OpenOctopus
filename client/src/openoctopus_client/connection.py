@@ -425,8 +425,18 @@ class ClientRuntime:
         mcp_supervisor: McpSupervisor | None = None,
         hard_exit: Callable[[int], object] = os._exit,
         status_sink: Callable[[StatusEventMessage], None] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
-        self._config = config
+        self._config = (
+            config
+            if workspace_root is None
+            else ClientConfiguration(
+                server_url=config.server_url,
+                websocket_url=config.websocket_url,
+                token=config.token,
+                workspace_root=workspace_root,
+            )
+        )
         self._status_sink = status_sink
         self._terminal_reason: str = "stopped"
         self._hello_factory = hello_factory or self._new_hello
@@ -1345,6 +1355,7 @@ class ClientRuntime:
                 self._tool_dispatcher_factory,
                 device_name,
                 config,
+                self._config.workspace_root,
             )
         )
         self._track_config_task(task)
@@ -1382,6 +1393,7 @@ class ClientRuntime:
                     self._tool_dispatcher_factory,
                     device_name,
                     config,
+                    self._config.workspace_root,
                 )
             )
             self._track_config_task(prepare_task)
@@ -1708,8 +1720,11 @@ def _prepare_config_candidate(
     factory: Callable[[Path, bool, list[str]], LocalToolDispatcher],
     device_name: str,
     config: DeviceConfig,
+    workspace_root: Path | None = None,
 ) -> _PreparedConfigCandidate:
-    workspace = _prepare_workspace(config.workspace_path)
+    workspace = _prepare_workspace(
+        str(workspace_root) if workspace_root is not None else config.workspace_path
+    )
     dispatcher = factory(
         workspace,
         config.restrict_to_workspace,

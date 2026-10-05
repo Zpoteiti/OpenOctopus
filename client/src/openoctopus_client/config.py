@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
@@ -26,6 +27,7 @@ class ClientConfiguration:
     server_url: str
     websocket_url: str
     token: DeviceToken
+    workspace_root: Path | None = None
 
 
 def validate_server_url(value: str) -> str:
@@ -34,7 +36,11 @@ def validate_server_url(value: str) -> str:
     return _canonical_server_url(value)
 
 
-def configuration_from_startup(server_url: str, token: str) -> ClientConfiguration:
+def configuration_from_startup(
+    server_url: str,
+    token: str,
+    workspace_root: Path | None = None,
+) -> ClientConfiguration:
     """Build the runtime configuration from the private-pipe startup message.
 
     The token arrives only through the GUI's stdin pipe.  It is never read
@@ -48,6 +54,7 @@ def configuration_from_startup(server_url: str, token: str) -> ClientConfigurati
         server_url=_canonical_server_url(server_url),
         websocket_url=_websocket_url(server_url),
         token=DeviceToken(token),
+        workspace_root=workspace_root,
     )
 
 
