@@ -469,7 +469,23 @@ def test_pipe_concurrent_drain_unicode_cwd_stdin_non_tty_and_nonzero(tmp_path: P
     asyncio.run(asyncio.wait_for(run(), timeout=30))
 
 
-def test_pipe_ctrl_break_reaches_new_process_group_handler() -> None:
+@pytest.mark.parametrize("headless", [False, True])
+def test_pipe_ctrl_break_reaches_new_process_group_handler(headless: bool) -> None:
+    if headless:
+        completed = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import runpy, sys; "
+                "runpy.run_path(sys.argv[1])"
+                "['test_pipe_ctrl_break_reaches_new_process_group_handler'](False)",
+                str(Path(__file__).resolve()),
+            ],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW, like the tray's core
+            capture_output=True, text=True, timeout=30,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return
+
     async def run() -> None:
         script = "\n".join(
             (

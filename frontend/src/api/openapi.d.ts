@@ -2231,8 +2231,9 @@ export interface paths {
                  *     never returned again. Tokens are random bearer credentials with the
                  *     `openoctopus_dev_` prefix. Lost tokens require
                  *     `POST /api/devices/{name}/regenerate-token`.
-                 *     Client startup uses the token via the `OPENOCTOPUS_DEVICE_TOKEN` env
-                 *     var; the active device config (`workspace_path`,
+                 *     Client stores the token in the operating system credential store
+                 *     (managed by the tray Client) and presents it only in the WebSocket
+                 *     `Authorization` header; the active device config (`workspace_path`,
                  *     `restrict_to_workspace`, `ssrf_denylist`, `shell_timeout_max`,
                  *     `env_allowlist`) is fetched
                  *     from the server's `hello_ack` frame at the WebSocket handshake.

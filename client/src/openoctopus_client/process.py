@@ -432,7 +432,12 @@ def _new_session_kwargs() -> dict[str, Any]:
         creationflags = getattr(asyncio.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         if not creationflags:
             creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
-        return {"creationflags": creationflags | 0x08000000}  # CREATE_NO_WINDOW
+        startupinfo = getattr(subprocess, "STARTUPINFO")()
+        startupinfo.dwFlags |= 0x00000001  # STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        # Keep a console for CTRL_BREAK, but never show its window. A core
+        # launched by the tray has no console, so the child gets a hidden one.
+        return {"creationflags": creationflags, "startupinfo": startupinfo}
     return {"start_new_session": True}
 
 
@@ -503,7 +508,7 @@ class PipeProcessHandle:
             return True
         try:
             if os.name == "nt":
-                self.process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT))
+                _interrupt_windows(self.process)
             else:
                 _send_process_group_signal(self.pid, signal.SIGINT)
             return True
@@ -524,6 +529,29 @@ class PipeProcessHandle:
             complete = await _terminate_posix(self.process, self.pid)
             self.cleanup_incomplete = self.cleanup_incomplete or not complete
         return await self.wait()
+
+
+def _interrupt_windows(process: asyncio.subprocess.Process) -> None:
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+    kernel32.GetStdHandle.argtypes = [ctypes.c_ulong]
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    kernel32.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+    attached = not kernel32.GetConsoleWindow()
+    handles = {
+        channel: kernel32.GetStdHandle(channel) for channel in (-10, -11, -12)
+    }
+    if attached and not kernel32.AttachConsole(process.pid):
+        raise getattr(ctypes, "WinError")(getattr(ctypes, "get_last_error")())
+    try:
+        process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT))
+    finally:
+        if attached:
+            kernel32.FreeConsole()
+            # AttachConsole changes the process-wide standard handles. Keep
+            # the core's private pipes intact after this synchronous operation.
+            for channel, handle in handles.items():
+                kernel32.SetStdHandle(channel, handle)
 
 
 def _send_process_group_signal(pid: int, sig: int) -> None:

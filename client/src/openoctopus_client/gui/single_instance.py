@@ -10,16 +10,37 @@ not enough on their own).
 
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 _LOCK_NAME = "tray.lock"
-_SOCKET_NAME = "tray-instance.sock"
 _ACTIVATE_MESSAGE = b"activate\n"
 _ACTIVATE_READ_MAX = 64
+
+
+def _socket_name(directory: Path) -> str:
+    identity = hashlib.sha256(os.fsencode(directory.resolve())).hexdigest()[:24]
+    if os.name == "nt":
+        return f"openoctopus-client-{identity}"
+    # macOS limits Unix socket addresses to 104 bytes; configuration and
+    # temporary directories can already exceed that before adding a filename.
+    return f"/tmp/openoctopus-{os.getuid()}-{identity}/tray.sock"
+
+
+def _prepare_socket_directory(name: str) -> None:
+    if os.name == "nt":
+        return
+    directory = Path(name).parent
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError("single-instance directory is not owned by this user")
+    directory.chmod(0o700)
 
 
 class SingleInstance(QObject):
@@ -39,8 +60,8 @@ class SingleInstance(QObject):
         """Return ``True`` when this process owns the instance.
 
         When another instance owns it, send it one activation request and
-        return ``False``.  Stale locks and sockets are reclaimed via the
-        stale-lock timeout and ``removeServer``.
+        return ``False``. Qt reclaims locks owned by dead processes; the new
+        owner removes any stale socket before listening.
         """
 
         if self._lock is not None and self._lock.isLocked():
@@ -57,24 +78,31 @@ class SingleInstance(QObject):
             send_activation(self._directory)
             return False
         self._lock = lock
-        QLocalServer.removeServer(self._socket_path())
+        name = _socket_name(self._directory)
+        try:
+            _prepare_socket_directory(name)
+        except (OSError, RuntimeError):
+            self.release()
+            raise
+        QLocalServer.removeServer(name)
         server = QLocalServer(self)
         server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         server.newConnection.connect(self._on_connection)
-        if not server.listen(self._socket_path()):
+        if not server.listen(name):
             lock.unlock()
             self._lock = None
+            server.deleteLater()
             raise RuntimeError("could not open the single-instance channel")
         self._server = server
         return True
 
-    def _socket_path(self) -> str:
-        return str(self._directory / _SOCKET_NAME)
-
     def release(self) -> None:
         if self._server is not None:
             self._server.close()
+            self._server.deleteLater()
             self._server = None
+            if os.name != "nt":
+                Path(_socket_name(self._directory)).parent.rmdir()
         if self._lock is not None:
             self._lock.unlock()
             self._lock = None
@@ -84,21 +112,24 @@ class SingleInstance(QObject):
             socket = self._server.nextPendingConnection()
             socket.readyRead.connect(lambda s=socket: self._read_activation(s))
             socket.disconnected.connect(socket.deleteLater)
+            # Windows can buffer the request before newConnection is emitted.
+            self._read_activation(socket)
 
     def _read_activation(self, socket: QLocalSocket) -> None:
-        data = bytes(socket.read(_ACTIVATE_READ_MAX).data())
+        if not socket.canReadLine():
+            if socket.bytesAvailable() >= _ACTIVATE_READ_MAX:
+                socket.disconnectFromServer()
+            return
+        data = bytes(socket.readLine(_ACTIVATE_READ_MAX).data())
         if data == _ACTIVATE_MESSAGE:
             self.activate_requested.emit()
         socket.disconnectFromServer()
-
-
-
 
 def send_activation(directory: Path) -> bool:
     """Wake the running instance; never raises, result is advisory."""
 
     socket = QLocalSocket()
-    socket.connectToServer(str(directory / _SOCKET_NAME))
+    socket.connectToServer(_socket_name(directory))
     if not socket.waitForConnected(300):
         socket.abort()
         return False

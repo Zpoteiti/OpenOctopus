@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
-from openoctopus_client.gui.single_instance import SingleInstance, send_activation
+from openoctopus_client.gui.single_instance import (
+    SingleInstance,
+    _prepare_socket_directory,
+    _socket_name,
+    send_activation,
+)
 
 
 def _drain(milliseconds: int) -> None:
@@ -14,9 +21,12 @@ def _drain(milliseconds: int) -> None:
     loop.exec()
 
 
+@pytest.mark.parametrize("nested", [False, True])
 def test_first_instance_owns_and_second_activates_it(
-    qapp: QApplication, tmp_path: Path
+    qapp: QApplication, tmp_path: Path, nested: bool
 ) -> None:
+    if nested:
+        tmp_path = tmp_path / ("nested-" * 20)
     first = SingleInstance(tmp_path)
     assert first.try_become_primary() is True
     received: list[bool] = []
@@ -34,7 +44,10 @@ def test_first_instance_owns_and_second_activates_it(
 
 
 def test_stale_socket_is_reclaimed(qapp: QApplication, tmp_path: Path) -> None:
-    (tmp_path / "tray-instance.sock").write_bytes(b"stale")
+    if os.name != "nt":
+        name = _socket_name(tmp_path)
+        _prepare_socket_directory(name)
+        Path(name).write_bytes(b"stale")
     instance = SingleInstance(tmp_path)
     assert instance.try_become_primary() is True
     instance.release()
