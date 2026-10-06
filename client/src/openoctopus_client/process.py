@@ -432,7 +432,7 @@ def _new_session_kwargs() -> dict[str, Any]:
         creationflags = getattr(asyncio.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         if not creationflags:
             creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
-        return {"creationflags": creationflags}
+        return {"creationflags": creationflags | 0x08000000}  # CREATE_NO_WINDOW
     return {"start_new_session": True}
 
 
@@ -685,6 +685,7 @@ async def _terminate_windows(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW (Windows-only cleanup)
         )
         taskkill_complete = await asyncio.wait_for(killer.wait(), 2) == 0
     except (OSError, TimeoutError):

@@ -30,12 +30,6 @@ class ClientSettings:
     token_account: str | None
 
 
-def default_workspace_root() -> Path:
-    """The per-user workspace the tray hands to the core."""
-
-    return Path.home() / ".openoctopus" / "workspace"
-
-
 def default_settings_directory() -> Path:
     from PySide6.QtCore import QStandardPaths
 

@@ -226,3 +226,39 @@ def test_version_internal_mode_is_stable() -> None:
     )
     assert result.returncode == 0
     assert result.stdout == "0.0.1\n"
+
+
+def test_gui_startup_does_not_import_execution_dependencies() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from openoctopus_client.gui import app
+from openoctopus_client.launch import main
+app.gui_main = lambda: 0
+assert main() == 0
+assert 'openoctopus_client.document_convert' not in sys.modules
+assert 'openoctopus_client.mcp.runtime' not in sys.modules
+assert 'openoctopus_client.process' not in sys.modules
+"""], capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_command_burst_cannot_drop_owner_eof() -> None:
+    harness = _start_core()
+    try:
+        harness.send({
+            "type": "startup-config", "generation": 1,
+            "server_url": "http://127.0.0.1:1", "token": "openoctopus_dev_burst",
+        })
+        for _ in range(96):
+            harness.send_raw(b'{"unknown":"command"}\n')
+        harness.close_stdin()
+        while (event := harness.read_event())["type"] != "exit":
+            pass
+        return_code, _stdout, stderr = harness.wait()
+    finally:
+        _terminate(harness)
+    assert return_code == 0
+    assert event["reason"] == "owner_gone"
+    assert "QueueFull" not in stderr

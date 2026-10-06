@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from mcp import types
 from pydantic import SecretStr
@@ -33,15 +32,6 @@ from openoctopus_client.process import (
 
 _MCP_SMOKE_ENV_NAME = "MCP_FROZEN_SMOKE_SENTINEL"
 _MCP_SMOKE_ENV_VALUE = "openoctopus-mcp-stdio-smoke"
-
-
-def configure_utf8_stdio() -> None:
-    import sys
-
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            cast(Callable[..., Any], reconfigure)(encoding="utf-8", errors="strict")
 
 
 async def run_mcp_stdio_smoke(command: str, fixture: Path) -> None:
@@ -137,7 +127,6 @@ def spike_convert(path: Path, pages: str | None) -> int:
 
 
 __all__ = [
-    "configure_utf8_stdio",
     "conversion_worker_main",
     "exec_backend_smoke",
     "mcp_stdio_smoke",

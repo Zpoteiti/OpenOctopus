@@ -10,12 +10,10 @@ not enough on their own).
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, QProcess, Signal
+from PySide6.QtCore import QLockFile, QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 _LOCK_NAME = "tray.lock"
@@ -52,22 +50,16 @@ class SingleInstance(QObject):
         if os.name != "nt":
             os.chmod(self._directory, 0o700)
         lock = QLockFile(str(self._directory / _LOCK_NAME))
-        lock.setStaleLockTime(15_000)
+        # Long-lived ownership: Qt checks the recorded PID; elapsed time alone
+        # must not make a running application's lock stale.
+        lock.setStaleLockTime(0)
         if not lock.tryLock(200):
-            # Either a live owner (activate it) or a lock file left behind by
-            # a process that died inside the stale window.  QLockFile refuses
-            # the latter until the window passes, which would make a
-            # supervised relaunch look like "another instance is running";
-            # reclaim an orphaned lock file, then retry once.
-            if not self.clear_orphaned_lock():
-                send_activation(self._directory)
-                return False
-            if not lock.tryLock(5_000):
-                send_activation(self._directory)
-                return False
+            send_activation(self._directory)
+            return False
         self._lock = lock
         QLocalServer.removeServer(self._socket_path())
         server = QLocalServer(self)
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         server.newConnection.connect(self._on_connection)
         if not server.listen(self._socket_path()):
             lock.unlock()
@@ -78,35 +70,6 @@ class SingleInstance(QObject):
 
     def _socket_path(self) -> str:
         return str(self._directory / _SOCKET_NAME)
-
-    def clear_orphaned_lock(self) -> bool:
-        """Reclaim a lock file whose recorded owning process is gone.
-
-        ``QLockFile`` only classifies a lock as stale after the stale
-        timeout, which is too slow for a supervisor that deliberately
-        relaunches its own process tree (the smoke harness restarts the tray
-        while the stale window is still open).  The owning pid is read from
-        the lock payload; a live owner is never touched, and a dead owner's
-        orphaned lock file is reclaimed through ``QLockFile`` itself so a
-        concurrent relaunch can never both believe they own the instance.
-        """
-
-        lock_path = self._directory / _LOCK_NAME
-        try:
-            raw = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        pid = raw.get("pid") if isinstance(raw, dict) else None
-        if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
-            return False
-        if _process_is_alive(pid):
-            # A live owner keeps its lock; the caller activates it instead.
-            return False
-        probe = QLockFile(str(lock_path))
-        if probe.tryLock(2_000):
-            probe.unlock()
-            return True
-        return False
 
     def release(self) -> None:
         if self._server is not None:
@@ -124,41 +87,11 @@ class SingleInstance(QObject):
 
     def _read_activation(self, socket: QLocalSocket) -> None:
         data = bytes(socket.read(_ACTIVATE_READ_MAX).data())
-        if _ACTIVATE_MESSAGE in data or data == b"activate":
+        if data == _ACTIVATE_MESSAGE:
             self.activate_requested.emit()
         socket.disconnectFromServer()
 
 
-
-
-def _process_is_alive(pid: int) -> bool:
-    if os.name == "nt":
-        return _windows_process_is_alive(pid)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _windows_process_is_alive(pid: int) -> bool:
-    # ``os.kill(pid, 0)`` would terminate the process on Windows, so query a
-    # limited-information handle instead; a closed handle means the pid free.
-    import ctypes  # noqa: PLC0415 - platform-local probe
-
-    kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
-    handle = kernel32.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return False
-    try:
-        code = ctypes.c_ulong()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value != 259  # 259 == STILL_ACTIVE
-    finally:
-        kernel32.CloseHandle(handle)
 
 
 def send_activation(directory: Path) -> bool:
@@ -173,22 +106,3 @@ def send_activation(directory: Path) -> bool:
     socket.waitForBytesWritten(200)
     socket.disconnectFromServer()
     return True
-
-
-def wake_or_start(directory: Path) -> bool:
-    """Wake the running instance, or launch the program when none is up.
-
-    Used by the Windows per-user autostart entry so a logon that races a
-    manual launch never replaces the running device connection.
-    """
-
-    if send_activation(directory):
-        return True
-    program = (getattr(sys, "frozen", False) and sys.executable) or None
-    if program is None:
-        argv_zero = Path(sys.argv[0])
-        if argv_zero.is_file():
-            program = str(argv_zero)
-    if program is None:
-        return False
-    return QProcess.startDetached(program, [])[0]

@@ -26,14 +26,6 @@ internal modes (used by the tray and frozen smokes only):
 
 
 def main() -> int:
-    from openoctopus_client.internal_modes import (
-        configure_utf8_stdio,
-        conversion_worker_main,
-        exec_backend_smoke,
-        mcp_stdio_smoke,
-        spike_convert,
-    )
-
     argv = sys.argv[1:]
     command = argv[0] if argv else "gui"
     if command == "gui":
@@ -42,12 +34,17 @@ def main() -> int:
         from openoctopus_client.gui.app import gui_main
 
         return gui_main()
-    configure_utf8_stdio()
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
     if command == "_core-run":
         from openoctopus_client.core import core_main
 
         return core_main()
     if command == "_conversion-worker":
+        from openoctopus_client.document_convert import conversion_worker_main
+
         return conversion_worker_main()
     if command == "_pty-worker":
         from openoctopus_client.pty_worker import run as pty_worker_run
@@ -61,8 +58,12 @@ def main() -> int:
             _reject_internal_usage()
         return pty_worker_run(control_fd, events_fd)
     if command == "_exec-backend-smoke":
+        from openoctopus_client.internal_modes import exec_backend_smoke
+
         return exec_backend_smoke()
     if command == "_mcp-stdio-smoke":
+        from openoctopus_client.internal_modes import mcp_stdio_smoke
+
         if len(argv) != 3:
             _reject_internal_usage()
         from pathlib import Path
@@ -70,6 +71,8 @@ def main() -> int:
         return mcp_stdio_smoke(argv[1], Path(argv[2]))
     if command == "_spike-convert":
         from pathlib import Path
+
+        from openoctopus_client.internal_modes import spike_convert
 
         if len(argv) == 2:
             return spike_convert(Path(argv[1]), None)

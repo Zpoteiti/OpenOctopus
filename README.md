@@ -190,8 +190,8 @@ docker compose --env-file .env up -d --build --wait
    (未配置 / 连接中 / 在线 / 重连中 / 已停止 / 需要处理).
 
 The Server address must be an HTTP(S) origin without a path, query, or
-fragment. Use HTTPS/WSS for a remote Server. The Client's Workspace defaults
-to `~/.openoctopus/workspace`. See [client/README.md](client/README.md) for
+fragment. Use HTTPS/WSS for a remote Server. Configure the Client Workspace
+path in the device settings on the Server. See [client/README.md](client/README.md) for
 installer names, source installation, lifecycle, and Client policy details.
 
 ## Connect Discord or DingTalk

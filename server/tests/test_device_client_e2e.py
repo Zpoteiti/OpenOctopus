@@ -238,7 +238,7 @@ def _client_command() -> list[str]:
     return [sys.executable, "-m", "openoctopus_client"]
 
 
-def _startup_config_line(server_url: str, token: str, workspace: str | None) -> str:
+def _startup_config_line(server_url: str, token: str) -> str:
     import json
 
     payload: dict[str, object] = {
@@ -247,8 +247,6 @@ def _startup_config_line(server_url: str, token: str, workspace: str | None) -> 
         "server_url": server_url,
         "token": token,
     }
-    if workspace is not None:
-        payload["workspace_root"] = workspace
     return json.dumps(payload) + "\n"
 
 
@@ -291,11 +289,9 @@ def _client_creationflags() -> int:
 async def _start_client(
     server_url: str,
     token: str,
-    *,
-    workspace: str | None = None,
 ) -> asyncio.subprocess.Process:
     # The core runs as a separate process fed by the startup config on
-    # stdin (the same contract the tray uses).  Callers close stdout to end
+    # stdin (the same contract the tray uses).  Callers close stdin to end
     # ownership when the scenario reaches its stop step.
     argv = [*_client_command(), "_core-run"]
     process = await asyncio.create_subprocess_exec(
@@ -309,7 +305,7 @@ async def _start_client(
     )
     if process.stdin is not None:
         process.stdin.write(
-            _startup_config_line(server_url, token, workspace).encode("utf-8")
+            _startup_config_line(server_url, token).encode("utf-8")
         )
         await process.stdin.drain()
     return process
@@ -751,8 +747,8 @@ async def test_real_chat_runtime_source_client_read_write_and_offline(
             assert other_device_response.status_code == 201, other_device_response.text
             other_token = other_device_response.json()["token"]
 
-            owner_process = await _start_client(server_url, owner_token, workspace=str(owner_workspace))
-            other_process = await _start_client(server_url, other_token, workspace=str(other_workspace))
+            owner_process = await _start_client(server_url, owner_token)
+            other_process = await _start_client(server_url, other_token)
             client_processes.extend((owner_process, other_process))
             client_secrets[id(owner_process)] = owner_token
             client_secrets[id(other_process)] = other_token

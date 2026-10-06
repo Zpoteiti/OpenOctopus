@@ -223,7 +223,7 @@ async def test_windows_batch_spawn_uses_raw_line_without_blocking_loop(
                 "bufsize": 0,
                 "cwd": None,
                 "env": {},
-                "creationflags": 0x00000200,
+                "creationflags": 0x08000200,
             },
         )
     ]

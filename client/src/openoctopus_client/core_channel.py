@@ -67,7 +67,6 @@ class StartupConfigMessage(_StrictModel):
     generation: Annotated[int, Field(ge=0, le=2_147_483_647)]
     server_url: Annotated[str, Field(min_length=1, max_length=4096)]
     token: Annotated[str, Field(min_length=1, max_length=4096)]
-    workspace_root: Annotated[str, Field(min_length=1, max_length=4096)] | None = None
 
     def __repr__(self) -> str:
         return (
@@ -91,6 +90,7 @@ ExitReason = Literal[
     "config_rejected",
     "startup_config_invalid",
     "owner_gone",
+    "runtime_failed",
 ]
 
 
@@ -159,9 +159,10 @@ _CORE_EVENT_TYPES: dict[str, type[CoreEvent]] = {
 
 
 def _parse(raw: bytes | str, models: Mapping[str, type[BaseModel]], label: str) -> BaseModel:
+    size = len(raw) if isinstance(raw, bytes) else len(raw.encode("utf-8"))
+    if size > MAX_MESSAGE_BYTES:
+        raise ChannelError(f"{label} exceeds the size bound")
     if isinstance(raw, bytes):
-        if len(raw) > MAX_MESSAGE_BYTES:
-            raise ChannelError(f"{label} exceeds the size bound")
         try:
             text = raw.decode("utf-8", errors="strict")
         except UnicodeError as exc:

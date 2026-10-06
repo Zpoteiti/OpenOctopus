@@ -61,7 +61,6 @@ def test_core_run_ctrl_break_gracefully_shuts_down(tmp_path: object) -> None:
                 "generation": 1,
                 "server_url": f"http://127.0.0.1:{port}",
                 "token": "openoctopus_dev_native_shutdown",
-                "workspace_root": workspace,
             }
         )
         creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))

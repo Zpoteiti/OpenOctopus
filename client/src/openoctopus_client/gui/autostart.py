@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
-import shlex
+import plistlib
 import subprocess
 import sys
 from pathlib import Path
@@ -97,13 +97,14 @@ class AutostartController:
         return directory / _AUTOSTART_FILE_NAME
 
     def _desktop_contents(self) -> str:
-        executable = " ".join(shlex.quote(part) for part in self._command)
+        executable = _desktop_command(self._command)
         return (
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=OpenOctopus Client\n"
             "Comment=OpenOctopus tray client\n"
             f"Exec={executable}\n"
+            f"TryExec={self._command[0]}\n"
             "Terminal=false\n"
             "X-GNOME-Autostart-Destination=xdg\n"
         )
@@ -120,7 +121,7 @@ class AutostartController:
             return False
         if "Hidden=true" in text:
             return False
-        if f"Exec={' '.join(shlex.quote(part) for part in self._command)}" not in text:
+        if f"Exec={_desktop_command(self._command)}" not in text:
             return False
         return self._target_exists()
 
@@ -151,16 +152,17 @@ class AutostartController:
                 value, _ = _winreg.QueryValueEx(key, _WINDOWS_VALUE_NAME)
         except OSError:
             return False
-        return str(value).strip('"').lower() == self._command[0].lower()
+        # The entry is the full command, including source-launch arguments.
+        return str(value).casefold() == subprocess.list2cmdline(self._command).casefold()
 
     def _windows_enable(self) -> None:
         if not os.path.isfile(self._command[0]):
             raise AutostartError("the installed program target does not exist")
         try:
-            with _winreg.OpenKey(
+            with _winreg.CreateKeyEx(
                 _winreg.HKEY_CURRENT_USER, _WINDOWS_RUN_KEY, 0, _winreg.KEY_SET_VALUE
             ) as key:
-                value = f'"{self._command[0]}"'
+                value = subprocess.list2cmdline(self._command)
                 _winreg.SetValueEx(key, _WINDOWS_VALUE_NAME, 0, _winreg.REG_SZ, value)
         except OSError as exc:
             raise AutostartError("autostart entry could not be written") from exc
@@ -183,31 +185,23 @@ class AutostartController:
             return self._directory / f"{APP_ID}.plist"
         return Path.home() / "Library" / "LaunchAgents" / f"{APP_ID}.plist"
 
-    def _macos_plist(self) -> str:
-        return (
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-            "<plist version=\"1.0\">\n"
-            "<dict>\n"
-            f"  <key>Label</key><string>{APP_ID}</string>\n"
-            "  <key>ProgramArguments</key>\n"
-            "  <array>\n"
-            + "".join(f"    <string>{part}</string>\n" for part in self._command)
-            + "  </array>\n"
-            "  <key>RunAtLoad</key><true/>\n"
-            "  <key>KeepAlive</key><false/>\n"
-            "</dict>\n"
-            "</plist>\n"
-        )
+    def _macos_plist(self) -> bytes:
+        return plistlib.dumps({
+            "Label": APP_ID,
+            "ProgramArguments": self._command,
+            "RunAtLoad": True,
+            "KeepAlive": False,
+        })
 
     def _macos_is_enabled(self) -> bool:
-        path = self._launch_agent_path()
         try:
-            text = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError, UnicodeError):
+            contents = plistlib.loads(self._launch_agent_path().read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
             return False
-        return f"<string>{self._command[0]}</string>" in text and self._target_exists()
+        return (
+            contents.get("ProgramArguments") == self._command
+            and contents.get("RunAtLoad") is True and self._target_exists()
+        )
 
     def _macos_enable(self) -> None:
         if not self._target_exists():
@@ -215,29 +209,28 @@ class AutostartController:
         path = self._launch_agent_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(self._macos_plist(), encoding="utf-8")
+            temporary = path.with_suffix(".plist.tmp")
+            temporary.write_bytes(self._macos_plist())
+            os.replace(temporary, path)
         except OSError as exc:
             raise AutostartError("LaunchAgent could not be written") from exc
-        self._run_launchctl(["bootstrap", f"gui/{os.getuid()}", str(path)])
 
     def _macos_disable(self) -> None:
-        self._run_launchctl(["bootout", f"gui/{os.getuid()}/{APP_ID}"])
+        # The change applies at next login; bootout would kill this running GUI
+        # if it was started by launchd, bypassing the core's full stop flow.
         try:
             self._launch_agent_path().unlink(missing_ok=True)
         except OSError as exc:
             raise AutostartError("LaunchAgent could not be removed") from exc
 
-    @staticmethod
-    def _run_launchctl(arguments: list[str]) -> None:
-        try:
-            completed = subprocess.run(
-                ["launchctl", *arguments],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AutostartError("launchctl could not run") from exc
-        if completed.returncode != 0:
-            raise AutostartError("launchctl rejected the LaunchAgent change")
+
+def _desktop_command(command: list[str]) -> str:
+    # Desktop Entry Exec is not a shell command. Single quotes are literals;
+    # escape reserved characters in double quotes, then escape the value itself.
+    quoted = []
+    for part in command:
+        value = part.replace("%", "%%")
+        for character in ("\\", '"', "`", "$"):
+            value = value.replace(character, "\\" + character)
+        quoted.append('"' + value + '"')
+    return " ".join(quoted).replace("\\", "\\\\")

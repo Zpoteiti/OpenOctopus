@@ -378,7 +378,7 @@ async def test_real_client_validates_registers_and_runs_all_mcp_surfaces(
             token = cast(str, created["token"])
             device_id = UUID(created["device"]["id"])
 
-            client_process = await _start_client(server_url, token, workspace=str(workspace))
+            client_process = await _start_client(server_url, token)
             await _wait_online(client, jwt, device_name, online=True, process=client_process)
 
             patch_response = await client.patch(

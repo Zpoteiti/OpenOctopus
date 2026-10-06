@@ -6,10 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QProcess, QTimer
 from PySide6.QtWidgets import QApplication
 
-from openoctopus_client.core_channel import StartupConfigMessage
+from openoctopus_client.core_channel import ExitResultMessage, StartupConfigMessage
 from openoctopus_client.gui import core_process
 from openoctopus_client.gui.core_process import CoreController
 
@@ -131,3 +131,26 @@ def test_second_start_is_rejected_while_running(qapp: QApplication, fake_core: s
         controller.start(_startup())
     controller.stop()
     assert _drain_until(lambda: not controller.running and not controller.stopping)
+
+
+def test_old_exit_generation_cannot_confirm_new_core_cleanup(
+    qapp: QApplication, fake_core: str,
+) -> None:
+    controller = CoreController()
+    controller.start(_startup())
+    controller._accept_event(ExitResultMessage(
+        type="exit", generation=0, return_code=0, reason="stopped", cleanup_complete=True,
+    ))
+    assert controller._exit_result is None
+    controller.stop()
+    assert _drain_until(lambda: not controller.running)
+
+
+def test_repeated_runs_release_process_objects(qapp: QApplication, fake_core: str) -> None:
+    controller = CoreController()
+    for _ in range(3):
+        controller.start(_startup())
+        controller.stop()
+        assert _drain_until(lambda: not controller.running)
+        _drain(10)
+    assert controller.findChildren(QProcess) == []

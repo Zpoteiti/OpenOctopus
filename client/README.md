@@ -29,7 +29,7 @@ Download the installer for the target computer from
 | --- | --- | --- |
 | Linux x64 | `openoctopus-client_<version>_amd64.deb` | Installs to `/opt/OpenOctopus` with a `/usr/bin/openoctopus-client` launcher and a desktop entry |
 | Windows x64 | `OpenOctopusClient-Setup-<version>-per-user.exe` | Per-user installer (no admin rights); installs under `%LOCALAPPDATA%\Programs\OpenOctopusClient` |
-| macOS | `OpenOctopusClient-<version>.dmg` | Drag the `OpenOctopus Client.app` (LSUIElement; lives in the menu bar) into Applications |
+| macOS | `OpenOctopusClient-<version>-<arch>.dmg` | Drag the `OpenOctopus Client.app` (LSUIElement; lives in the menu bar) into Applications |
 
 Installers are unsigned. Launch the tray from the desktop entry, Start Menu,
 or `openoctopus-client`.
@@ -58,17 +58,15 @@ token never appears on a command line, in an environment variable, in a log,
 or in any event the core produces; it crosses the private pipe to the core
 in memory only.
 
-The tray keeps `~/.openoctopus/workspace` as the local Workspace root and
-passes it to the core, where it takes precedence over the Server-suggested
-`workspace_path`. Everything else the Server owns (path restriction,
-`ssrf_denylist`, `shell_timeout_max`, `env_allowlist`) applies as configured
-in the browser.
+The Server supplies the Workspace path and device policies configured in the
+browser. Changing that configuration takes effect through the existing device
+configuration handshake.
 
 Closing the settings window only hides it; the tray keeps running with the
 saved configuration. **打开网页** opens the Server web UI in the default
 browser. **停止客户端** stops the core; **登录后自动启动** toggles autostart
 (the desktop autostart entry, the `HKCU` Run key, or the macOS login item,
-respectively). Starting a second instance focuses the running tray instead of
+respectively). Autostart is off by default and changes apply at the next login. Starting a second instance focuses the running tray instead of
 launching a second one.
 
 ## Run from source
@@ -81,18 +79,17 @@ python -m openoctopus_client   # starts the same tray
 ```
 
 On Linux the tray needs a system tray (StatusNotifierItem/AppIndicator) or it
-falls back to a small resident window; on headless machines use a desktop
-session.
+shows the settings window and stops background connections. Retry tray detection
+or quit from that window. A desktop session is required.
 
 ## Connection lifecycle
 
-Before the first successful Protocol v3 hello/config acknowledgement, an
-unreachable Server is a startup failure and the tray shows 需要处理. After
-the core has reached online once, ordinary network disconnects retry with
-bounded exponential backoff (reconnecting). Authentication rejection,
-connection replacement, and invalid Server configuration are permanent
-failures that stop the core; the tray keeps its last state visible and
-restarts only on demand.
+An unreachable Server retries with bounded exponential backoff, including on
+first launch. Online is reported only after the Protocol v3 hello/config
+acknowledgement. Authentication rejection, connection replacement, and invalid
+Server configuration stop the core and leave the error visible in the tray.
+A confirmed clean stop permits a fresh start. An abnormal exit or unconfirmed
+cleanup requires attention and blocks replacement of the core in that session.
 
 Ordinary Server disconnects do not stop running exec sessions or MCP runtimes.
 Calls whose outcome became ambiguous are not replayed automatically. Stopping
@@ -104,7 +101,7 @@ core performs its full stop flow before exiting.
 
 The Server owns and sends these settings during the device handshake:
 
-- `workspace_path` (overridden by the tray's local root, above)
+- `workspace_path`
 - `restrict_to_workspace`
 - `ssrf_denylist`
 - `shell_timeout_max`
@@ -161,9 +158,9 @@ supported.
 
 ## Program modes
 
-The single program exposes the tray as its default mode and a set of
-underscore-prefixed internal modes used only by the tray itself, the smokes,
-and CI:
+The installed `openoctopus-client` starts the tray. Its sibling
+`openoctopus-core` provides private modes for the tray, helpers, and CI; both
+executables share the packaged dependencies:
 
 ```text
 openoctopus-client                 # the tray (the only user-facing mode)
@@ -199,8 +196,8 @@ packaging/build_deb.sh dist/openoctopus-client 0.0.1
 # Windows x64 -> per-user installer in dist-installer/ (requires NSIS)
 python packaging/build_windows_installer.py dist/openoctopus-client 0.0.1
 
-# macOS -> OpenOctopus Client-<version>.dmg in dist-dmg/ (requires hdiutil)
-packaging/build_dmg.sh dist/openoctopus-client 0.0.1
+# macOS -> OpenOctopusClient-<version>-<arch>.dmg in dist-dmg/ (requires hdiutil)
+packaging/build_dmg.sh "dist/OpenOctopus Client.app" 0.0.1
 ```
 
 Installers are unsigned, per-user/platform-native, and not code-reviewed by
@@ -219,7 +216,7 @@ python -m PyInstaller --noconfirm --clean openoctopus_client.spec
 Run both frozen smoke tests against every native bundle:
 
 ```bash
-export OO_CLIENT_BIN="$PWD/dist/openoctopus-client/openoctopus-client"
+export OO_CLIENT_BIN="$PWD/dist/openoctopus-client/openoctopus-core"
 export OO_DOCUMENT_CORPUS="$PWD/../server/tests/fixtures/documents"
 python tests/frozen_smoke.py
 python tests/frozen_runtime_smoke.py

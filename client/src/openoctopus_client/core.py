@@ -17,7 +17,6 @@ import os
 import sys
 import threading
 from collections.abc import Callable
-from pathlib import Path
 from typing import cast
 
 from openoctopus_client.config import ConfigurationError, configuration_from_startup
@@ -63,7 +62,7 @@ def _start_stdin_reader(lines: asyncio.Queue[bytes | None]) -> None:
     def read_lines() -> None:
         stream = sys.stdin.buffer if getattr(sys.stdin, "buffer", None) is not None else None
         if stream is None:
-            loop.call_soon_threadsafe(lines.put_nowait, None)
+            asyncio.run_coroutine_threadsafe(lines.put(None), loop).result()
             return
         while True:
             try:
@@ -71,9 +70,10 @@ def _start_stdin_reader(lines: asyncio.Queue[bytes | None]) -> None:
             except OSError:
                 raw = None
             if raw is None or raw == b"":
-                loop.call_soon_threadsafe(lines.put_nowait, None)
+                asyncio.run_coroutine_threadsafe(lines.put(None), loop).result()
                 return
-            loop.call_soon_threadsafe(lines.put_nowait, raw)
+            # Backpressure also bounds scheduled callbacks; EOF must never be dropped.
+            asyncio.run_coroutine_threadsafe(lines.put(raw), loop).result()
 
     threading.Thread(target=read_lines, name="oo-core-stdin", daemon=True).start()
 
@@ -146,31 +146,10 @@ async def run_core(
         )
         return 78
     generation = startup.generation
-    workspace_root: Path | None = None
-    if startup.workspace_root:
-        workspace_root = Path(startup.workspace_root).expanduser()
-        try:
-            workspace_root.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            _emit_stderr_diagnostic(
-                f"workspace directory could not be prepared: {type(exc).__name__}"
-            )
-            _write_event(
-                ExitResultMessage(
-                    type="exit",
-                    generation=generation,
-                    return_code=78,
-                    cleanup_complete=True,
-                    reason="startup_config_invalid",
-                )
-            )
-            return 78
-        workspace_root = workspace_root.resolve()
     try:
         configuration = configuration_from_startup(
             startup.server_url,
             startup.token,
-            workspace_root=workspace_root,
         )
     except ConfigurationError as exc:
         _emit_stderr_diagnostic(f"startup configuration rejected: {exc}")
@@ -189,24 +168,27 @@ async def run_core(
         runtime = ClientRuntime(
             configuration,
             status_sink=emit_status,
-            workspace_root=workspace_root,
         )
     else:
         runtime = runtime_factory(emit_status)
     owner_gone = {"value": False}
     follower = asyncio.create_task(_follow_up_commands(lines, runtime, owner_gone))
     installed = await runtime.install_signal_handlers()
+    runtime_failed = False
     try:
         return_code = await runtime.run()
     except Exception:
         LOGGER.exception("the core runtime failed unexpectedly")
         return_code = 1
+        runtime_failed = True
     finally:
         runtime.restore_signal_handlers(installed)
         follower.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await follower
     reason: str = "owner_gone" if owner_gone["value"] else runtime.terminal_reason
+    if runtime_failed:
+        reason = "runtime_failed"
     _write_event(
         ExitResultMessage(
             type="exit",

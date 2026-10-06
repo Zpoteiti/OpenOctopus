@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 from test_gui_credentials import RecordingBackend
 
 from openoctopus_client.core_channel import CoreState, StartupConfigMessage, StatusEventMessage
 from openoctopus_client.gui.app import TrayController, TrayState
 from openoctopus_client.gui.autostart import AutostartController
-from openoctopus_client.gui.background import DirectRunner
+from openoctopus_client.gui.background import DirectRunner, OnDone
 from openoctopus_client.gui.core_process import CoreController, CoreOutcome
 from openoctopus_client.gui.credentials import CredentialStore
 from openoctopus_client.gui.i18n import _EN, Translator
@@ -80,7 +81,8 @@ class Harness:
 
 
 @pytest.fixture
-def harness(tmp_path: Path) -> Harness:
+def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: True)
     return Harness(tmp_path)
 
 
@@ -218,3 +220,111 @@ def test_missing_saved_credential_needs_attention(
     controller._load_configuration()
     assert controller.current_state() == TrayState.ATTENTION
     assert not controller._core.running
+
+
+class DeferredRunner:
+    def __init__(self) -> None:
+        self.jobs: list[tuple[Callable[[], object], OnDone]] = []
+
+    def submit(self, action: Callable[[], object], on_done: OnDone) -> None:
+        self.jobs.append((action, on_done))
+
+    def finish(self) -> None:
+        action, callback = self.jobs.pop(0)
+        callback(action(), None)
+
+
+def test_failed_cleanup_cannot_commit_replacement(
+    qapp: QApplication, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = harness.controller
+    _save(controller, "https://a.example", "openoctopus_dev_alpha")
+    previous = harness.store.load()
+
+    def stop_without_cleanup() -> None:
+        harness.core._is_running = False
+        harness.core.core_finished.emit(CoreOutcome(0, "stopped", False, False, True))
+
+    monkeypatch.setattr(harness.core, "stop", stop_without_cleanup)
+    _save(controller, "https://b.example", "openoctopus_dev_beta")
+    assert harness.store.load() == previous
+    assert len(harness.core.started) == 1
+    assert controller.current_state() == TrayState.ATTENTION
+    assert not controller._start_action.isEnabled()
+    assert previous is not None
+    assert list(harness.backend.entries) == [("OpenOctopus Client", previous.token_account)]
+
+
+def test_crashed_core_blocks_restart_and_configuration_replacement(
+    qapp: QApplication, harness: Harness,
+) -> None:
+    controller = harness.controller
+    _save(controller, "https://a.example", "openoctopus_dev_alpha")
+    previous = harness.store.load()
+    harness.core._is_running = False
+    harness.core.core_finished.emit(CoreOutcome(-9, "process_crashed", None, True, False))
+    controller._start_requested()
+    _save(controller, "https://b.example", "openoctopus_dev_beta")
+    assert len(harness.core.started) == 1
+    assert harness.store.load() == previous
+    assert not controller._start_action.isEnabled()
+
+
+def test_no_tray_cannot_hide_settings_and_start_core(
+    qapp: QApplication, harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
+    harness.controller.startup()
+    _save(harness.controller, "https://a.example", "openoctopus_dev_alpha")
+    assert harness.core.started == []
+    assert harness.controller._window.isVisible()
+    assert not harness.store.path.exists()
+
+
+@pytest.mark.parametrize("cancel", ["stop", "quit", "tray_lost"])
+def test_late_credential_read_cannot_restart_after_cancellation(
+    qapp: QApplication, harness: Harness, monkeypatch: pytest.MonkeyPatch, cancel: str,
+) -> None:
+    controller = harness.controller
+    _save(controller, "https://a.example", "openoctopus_dev_alpha")
+    harness.core.stop()
+    runner = DeferredRunner()
+    controller._runner = runner
+    controller._start_requested()
+    controller._start_requested()
+    assert len(runner.jobs) == 1
+    if cancel == "stop":
+        controller._stop_core()
+    elif cancel == "quit":
+        controller._quit()
+    else:
+        monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
+        controller.reveal_settings_for_missing_tray()
+    runner.finish()
+    assert len(harness.core.started) == 1
+
+
+def test_quitting_during_credential_save_rolls_back_staged_token(
+    qapp: QApplication, harness: Harness,
+) -> None:
+    controller = harness.controller
+    runner = DeferredRunner()
+    controller._runner = runner
+    _save(controller, "https://a.example", "openoctopus_dev_alpha")
+    controller._quit()
+    while runner.jobs:
+        runner.finish()
+    assert harness.backend.entries == {}
+    assert not harness.store.path.exists()
+    assert harness.core.started == []
+
+
+def test_stopping_status_does_not_claim_cleanup_before_process_exit(
+    qapp: QApplication, harness: Harness,
+) -> None:
+    controller = harness.controller
+    _save(controller, "https://a.example", "openoctopus_dev_alpha")
+    controller._on_core_status(StatusEventMessage(
+        type="status", generation=0, state=CoreState.STOPPED,
+    ))
+    assert controller.current_state() != TrayState.STOPPED

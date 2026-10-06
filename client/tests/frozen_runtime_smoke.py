@@ -1,4 +1,4 @@
-"""Black-box smoke test for the frozen client runtime and CLI entry points."""
+"""Black-box smoke test for the frozen tray, core, and worker entry points."""
 
 from __future__ import annotations
 
@@ -211,11 +211,16 @@ def _run_tray_single_instance_check(binary: Path, psutil: Any) -> dict[str, obje
     running program and exit with 0 without starting another core.
     """
 
+    suffix = ".exe" if os.name == "nt" else ""
+    binary = binary.with_name(f"openoctopus-client{suffix}")
     with tempfile.TemporaryDirectory() as temporary:
         environment = {
             **os.environ,
             "QT_QPA_PLATFORM": "offscreen",
             "HOME": temporary,
+            "USERPROFILE": temporary,
+            "APPDATA": str(Path(temporary) / "config"),
+            "LOCALAPPDATA": str(Path(temporary) / "local"),
             "XDG_CONFIG_HOME": str(Path(temporary) / "config"),
             "XDG_CACHE_HOME": str(Path(temporary) / "cache"),
         }

@@ -5,8 +5,8 @@ Usage: build_windows_installer.py <path-to-onedir-dir> <version> [output-dir]
 
 Requires NSIS (makensis) on PATH.  The installer installs the one-folder
 bundle under %LOCALAPPDATA%\\Programs\\OpenOctopusClient (no admin rights),
-starts the tray on logon for the installing user via HKCU Run key, adds an
-uninstaller entry, and removes the Run key with the tray process first.
+adds a Start Menu shortcut and an uninstaller entry. Login autostart is off
+until the user enables it in the tray.
 """
 
 from __future__ import annotations
@@ -63,6 +63,8 @@ def _nsis_script(bundle: Path, version: str, out: Path) -> str:
 Name "OpenOctopus Client {version}"
 OutFile "{produced}"
 InstallDir "$LOCALAPPDATA\\Programs\\{NAME}"
+InstallDirRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
+  "InstallLocation"
 RequestExecutionLevel user
 Unicode True
 
@@ -74,27 +76,48 @@ Unicode True
 !insertmacro MUI_UNPAGE_INSTALLED
 !insertmacro MUI_LANGUAGE "English"
 
+!macro RequireClosed filename label
+  IfFileExists "$INSTDIR\\${{filename}}" 0 ${{label}}_done
+  ClearErrors
+  FileOpen $0 "$INSTDIR\\${{filename}}" a
+  IfErrors 0 ${{label}}_close
+  MessageBox MB_OK|MB_ICONEXCLAMATION "Please quit OpenOctopus Client before continuing." /SD IDOK
+  Abort
+  ${{label}}_close:
+  FileClose $0
+  ${{label}}_done:
+!macroend
+
 Section "Install"
+  SetShellVarContext current
+  !insertmacro RequireClosed "{APP}.exe" install_gui
+  !insertmacro RequireClosed "openoctopus-core.exe" install_core
   SetOutPath "$INSTDIR"
   File /r "{bundle}\\*.*"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" \
-    "{NAME}" '"$INSTDIR\\{APP}.exe"'
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
     "DisplayName" "OpenOctopus Client"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
     "DisplayVersion" "{version}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
+    "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
     "UninstallString" '"$INSTDIR\\Uninstall.exe"'
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
     "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}" \
     "NoRepair" 1
+  CreateDirectory "$SMPROGRAMS\\OpenOctopus Client"
+  CreateShortcut "$SMPROGRAMS\\OpenOctopus Client\\OpenOctopus Client.lnk" "$INSTDIR\\{APP}.exe"
   WriteUninstaller "$INSTDIR\\Uninstall.exe"
 SectionEnd
 
 Section "Uninstall"
-  ExecWait 'taskkill /IM {APP}.exe /T'
-  DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "{NAME}"
+  SetShellVarContext current
+  !insertmacro RequireClosed "{APP}.exe" uninstall_gui
+  !insertmacro RequireClosed "openoctopus-core.exe" uninstall_core
+  DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "OpenOctopus Client"
+  Delete "$SMPROGRAMS\\OpenOctopus Client\\OpenOctopus Client.lnk"
+  RMDir "$SMPROGRAMS\\OpenOctopus Client"
   DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{NAME}"
   RMDir /r "$INSTDIR"
 SectionEnd

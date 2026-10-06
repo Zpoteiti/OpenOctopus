@@ -8,6 +8,12 @@ import pytest
 from openoctopus_client.gui.autostart import AutostartController, AutostartError
 
 
+@pytest.fixture(autouse=True)
+def xdg_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unit tests own only temporary files, including on Windows/macOS runners.
+    monkeypatch.setattr("openoctopus_client.gui.autostart.sys.platform", "linux")
+
+
 def _executable(tmp_path: Path) -> Path:
     target = tmp_path / "openoctopus-client"
     target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -42,6 +48,8 @@ def test_enable_refuses_a_missing_target(tmp_path: Path) -> None:
 
 
 def test_a_deleted_target_disables_the_entry(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX execute permissions")
     target = _executable(tmp_path)
     controller = AutostartController(
         launch_command=[str(target)],
@@ -49,8 +57,6 @@ def test_a_deleted_target_disables_the_entry(tmp_path: Path) -> None:
     )
     controller.enable()
     assert controller.is_enabled() is True
-    if os.name == "nt":  # pragma: no cover
-        pytest.skip("POSIX permissions")
     target.chmod(0o644)
     assert controller.is_enabled() is False
 

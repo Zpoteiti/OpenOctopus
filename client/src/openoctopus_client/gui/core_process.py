@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
@@ -52,7 +53,8 @@ def core_command() -> list[str]:
     """
 
     if getattr(sys, "frozen", False):
-        return [sys.executable, "_core-run"]
+        suffix = ".exe" if sys.platform == "win32" else ""
+        return [str(Path(sys.executable).with_name(f"openoctopus-core{suffix}")), "_core-run"]
     return [sys.executable, "-m", "openoctopus_client", "_core-run"]
 
 
@@ -141,20 +143,22 @@ class CoreController(QObject):
         if process is None:
             return
         if self.running:
+            self._stop_requested = True
             process.closeWriteChannel()
             self._arm_escalation(process)
 
     def _arm_escalation(self, process: QProcess) -> None:
+        if self._escalation is not None:
+            return
         timer = QTimer(self)
         timer.setSingleShot(True)
 
         def escalate() -> None:
             if process.state() != QProcess.ProcessState.NotRunning:
-                timer2 = QTimer(self)
-                timer2.setSingleShot(True)
-                timer2.timeout.connect(lambda: self._force_kill(process))
+                timer.timeout.disconnect()
+                timer.timeout.connect(lambda: self._force_kill(process))
                 process.terminate()
-                timer2.start(_TERMINATE_GRACE_SECONDS)
+                timer.start(_TERMINATE_GRACE_SECONDS)
 
         timer.timeout.connect(escalate)
         timer.start(_STOP_GRACE_SECONDS)
@@ -169,8 +173,6 @@ class CoreController(QObject):
         if not isinstance(process, QProcess) or process is not self._process:
             return
         data = process.readAllStandardOutput().data()
-        if len(self._stdout_buffer) + len(data) > _STDOUT_BUFFER_MAX:
-            self._stdout_buffer.clear()
         self._stdout_buffer.extend(data)
         while True:
             newline = self._stdout_buffer.find(b"\n")
@@ -185,8 +187,13 @@ class CoreController(QObject):
             except ChannelError:
                 continue
             self._accept_event(event)
+        if len(self._stdout_buffer) > _STDOUT_BUFFER_MAX:
+            self._stdout_buffer.clear()
+            self.stop()
 
     def _accept_event(self, event: CoreEvent) -> None:
+        if event.generation != self._generation:
+            return
         if isinstance(event, StatusEventMessage):
             self.status_received.emit(event)
             return
@@ -203,11 +210,16 @@ class CoreController(QObject):
             del self._stderr_ring[: len(self._stderr_ring) - _STDERR_RING_MAX]
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        process = self.sender()
+        if not isinstance(process, QProcess) or process is not self._process:
+            return
         if self._escalation is not None:
             self._escalation.stop()
+            self._escalation.deleteLater()
             self._escalation = None
         # Flush any tail events that arrived with the last chunk.
         self._on_stdout()
+        self._on_stderr()
         exit_result = self._exit_result
         outcome = CoreOutcome(
             return_code=exit_code,
@@ -223,6 +235,7 @@ class CoreController(QObject):
         self._process = None
         self._exit_result = None
         self._stop_requested = False
+        process.deleteLater()
         self.core_finished.emit(outcome)
 
     def _on_error(self, error: QProcess.ProcessError) -> None:
@@ -231,6 +244,7 @@ class CoreController(QObject):
             if process is not None and process.state() == QProcess.ProcessState.NotRunning:
                 # ``finished`` is not emitted for FailedToStart on all platforms.
                 self._process = None
+                process.deleteLater()
                 self.core_finished.emit(
                     CoreOutcome(
                         return_code=None,

@@ -108,14 +108,14 @@ class SettingsWindow(QWidget):
         self._details.clear()
         self._details.setVisible(False)
 
-    def show_retry_entry(self) -> None:
-        self._retry.setVisible(True)
+    def show_retry_entry(self, visible: bool = True) -> None:
+        self._retry.setVisible(visible)
 
     def show_close_hint(self) -> None:
         self._hint.setVisible(True)
 
-    def prepare_for_quit(self) -> None:
-        self._quitting = True
+    def prepare_for_quit(self, quitting: bool = True) -> None:
+        self._quitting = quitting
 
     def set_close_means_quit(self, close_means_quit: bool) -> None:
         # Without a tray, hiding the only window would leave an unoperable

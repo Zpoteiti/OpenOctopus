@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
@@ -27,7 +26,6 @@ class ClientConfiguration:
     server_url: str
     websocket_url: str
     token: DeviceToken
-    workspace_root: Path | None = None
 
 
 def validate_server_url(value: str) -> str:
@@ -39,7 +37,6 @@ def validate_server_url(value: str) -> str:
 def configuration_from_startup(
     server_url: str,
     token: str,
-    workspace_root: Path | None = None,
 ) -> ClientConfiguration:
     """Build the runtime configuration from the private-pipe startup message.
 
@@ -54,12 +51,14 @@ def configuration_from_startup(
         server_url=_canonical_server_url(server_url),
         websocket_url=_websocket_url(server_url),
         token=DeviceToken(token),
-        workspace_root=workspace_root,
     )
 
 
 def _parsed_server_url(value: str) -> SplitResult:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ConfigurationError("server URL is invalid") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ConfigurationError("server URL must be an http(s) origin")
     if parsed.username is not None or parsed.password is not None:

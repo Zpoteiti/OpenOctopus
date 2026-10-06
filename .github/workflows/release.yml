@@ -122,16 +122,16 @@ jobs:
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           python -m PyInstaller --noconfirm --clean openoctopus_client.spec
-          export OO_CLIENT_BIN="${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client"
+          export OO_CLIENT_BIN="${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core"
           python tests/frozen_smoke.py
           python tests/frozen_runtime_smoke.py
 
       - name: Package installer
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          case "${{ matrix.platform }} in
+          case "${{ matrix.platform }}" in
             linux) bash packaging/build_deb.sh dist/openoctopus-client "$VERSION" release ;;
-            macos) bash packaging/build_dmg.sh dist/openoctopus-client "$VERSION" release ;;
+            macos) bash packaging/build_dmg.sh "dist/OpenOctopus Client.app" "$VERSION" release ;;
           esac
 
       - uses: actions/upload-artifact@v7
@@ -179,7 +179,7 @@ jobs:
 
       - name: Build and smoke frozen bundle
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core.exe
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           python -m PyInstaller --noconfirm --clean openoctopus_client.spec
@@ -191,7 +191,9 @@ jobs:
 
       - name: Package per-user Windows installer
         run: |
-          Choco-Install -PackageName nsis -NoProgress
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "${env:ProgramFiles(x86)}\NSIS;$env:PATH"
           $version = ($env:GITHUB_REF_NAME -replace '^v', '')
           python packaging\build_windows_installer.py dist\openoctopus-client $version release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
