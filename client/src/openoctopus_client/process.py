@@ -437,8 +437,8 @@ def _new_session_kwargs() -> dict[str, Any]:
         startupinfo = getattr(subprocess, "STARTUPINFO")()
         startupinfo.dwFlags |= 0x00000001  # STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 0  # SW_HIDE
-        # Keep a console for CTRL_BREAK, but never show its window. A core
-        # launched by the tray has no console, so the child gets a hidden one.
+        # Keep a console for CTRL_BREAK without showing its window. If no
+        # console is attached, create a hidden one for the child.
         return {"creationflags": creationflags, "startupinfo": startupinfo}
     return {"start_new_session": True}
 

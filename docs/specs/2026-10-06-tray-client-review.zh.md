@@ -19,9 +19,10 @@
 | macOS 的 `CFBundleExecutable` 指向目录，两个架构的 DMG 同名 | 交由 PyInstaller 创建 `.app`，DMG 保留应用结构并使用架构后缀 |
 | 自启的路径转义和 macOS 关闭行为有误 | XDG 使用 Desktop Entry 参数编码，macOS 使用 plist 序列化并只更改下次登录登记，Windows 保存完整命令 |
 | 自定义陈旧锁代码错误解析 Qt 锁格式，Windows 存活判断反向 | 使用 Qt 的长生命周期锁与内建进程存活检测，本地 socket 限制为当前用户 |
-| macOS 配置路径超过 Unix socket 地址长度，Windows 激活数据可能先于订阅到达 | 使用短地址与用户私有目录，连接建立时立即读取已缓冲数据；长路径与原生平台测试覆盖 |
+| macOS 配置路径超过 Unix socket 地址长度，原单实例测试在 Windows 阻塞双方共用的事件循环 | 使用短地址与用户私有目录，读取已缓冲数据；测试真正启动第二个进程并验证主实例收到唤起 |
 | Windows 的无控制台子进程无法接收执行中断 | 使用隐藏控制台与进程组；无控制台核心发送信号时短暂连接目标控制台并恢复自身标准句柄，原生测试覆盖后台启动场景 |
 | Linux CI 缺少 Qt 系统库，API 注释对应的前端类型未生成 | 安装明确的 Qt 运行依赖，重新生成 API 类型 |
+| Windows 安装器引用不存在的 NSIS 页面宏，无法编译 | 使用安装/卸载的 `INSTFILES` 页面宏，实际 NSIS 编译检查通过 |
 | Release 的 Bash `case` 缺少引号，Windows NSIS 安装命令依赖未定义函数 | 修复脚本，增加原生安装/卸载及 DMG 内程序烟测；所有 Bash 步骤通过语法检查 |
 
 Windows 标准流行为参见 [PyInstaller 说明](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html#sys-stdin-sys-stdout-and-sys-stderr-in-noconsole-windowed-applications-windows-only)；

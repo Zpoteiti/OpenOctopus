@@ -254,8 +254,11 @@ jobs:
           if (!(Test-Path "$target\openoctopus-client.exe")) { throw 'Tray executable missing' }
           $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'OpenOctopus Client\OpenOctopus Client.lnk'
           if (!(Test-Path $shortcut)) { throw 'Start Menu shortcut missing' }
-          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-          if ($run.PSObject.Properties.Name -contains 'OpenOctopus Client') { throw 'Autostart must default off' }
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (Test-Path $runKey) {
+            $run = Get-ItemProperty $runKey
+            if ($run.PSObject.Properties.Name -contains 'OpenOctopus Client') { throw 'Autostart must default off' }
+          }
           $env:OO_CLIENT_BIN = "$target\openoctopus-core.exe"
           $env:OO_DOCUMENT_CORPUS = '${{ github.workspace }}\server\tests\fixtures\documents'
           python tests/frozen_runtime_smoke.py
