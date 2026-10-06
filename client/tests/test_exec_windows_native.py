@@ -508,7 +508,11 @@ def test_pipe_ctrl_break_reaches_new_process_group_handler(headless: bool) -> No
         root = psutil.Process(handle.pid)
         try:
             await _read_until_bytes(handle.stdout, b"BREAK_READY", timeout=5)
-            assert await asyncio.wait_for(handle.interrupt(), timeout=5) is True
+            import ctypes
+
+            assert await asyncio.wait_for(handle.interrupt(), timeout=5) is True, (
+                "CTRL_BREAK delivery failed", getattr(ctypes, "get_last_error")(),
+            )
             output, error, result = await asyncio.wait_for(
                 asyncio.gather(handle.stdout.read(), handle.stderr.read(), handle.wait()),
                 timeout=8,

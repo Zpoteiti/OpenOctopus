@@ -432,6 +432,8 @@ def _new_session_kwargs() -> dict[str, Any]:
         creationflags = getattr(asyncio.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         if not creationflags:
             creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+        if not _windows_has_console():
+            creationflags |= 0x00000010  # CREATE_NEW_CONSOLE
         startupinfo = getattr(subprocess, "STARTUPINFO")()
         startupinfo.dwFlags |= 0x00000001  # STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 0  # SW_HIDE
@@ -531,13 +533,20 @@ class PipeProcessHandle:
         return await self.wait()
 
 
+def _windows_has_console() -> bool:
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    processes = (ctypes.c_ulong * 1)()
+    # A non-interactive console can have no HWND. Test console membership,
+    # rather than GetConsoleWindow, before attempting AttachConsole.
+    return bool(kernel32.GetConsoleProcessList(processes, 1))
+
+
 def _interrupt_windows(process: asyncio.subprocess.Process) -> None:
     kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
     kernel32.GetStdHandle.argtypes = [ctypes.c_ulong]
     kernel32.GetStdHandle.restype = ctypes.c_void_p
     kernel32.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
-    attached = not kernel32.GetConsoleWindow()
+    attached = not _windows_has_console()
     handles = {
         channel: kernel32.GetStdHandle(channel) for channel in (-10, -11, -12)
     }
