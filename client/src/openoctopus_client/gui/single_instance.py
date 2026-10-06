@@ -29,7 +29,7 @@ def _socket_name(directory: Path) -> str:
         return f"openoctopus-client-{identity}"
     # macOS limits Unix socket addresses to 104 bytes; configuration and
     # temporary directories can already exceed that before adding a filename.
-    return f"/tmp/openoctopus-{os.getuid()}-{identity}/tray.sock"
+    return f"/tmp/openoctopus-{getattr(os, 'getuid')()}-{identity}/tray.sock"
 
 
 def _prepare_socket_directory(name: str) -> None:
@@ -38,7 +38,7 @@ def _prepare_socket_directory(name: str) -> None:
     directory = Path(name).parent
     directory.mkdir(mode=0o700, exist_ok=True)
     info = directory.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != getattr(os, "getuid")():
         raise RuntimeError("single-instance directory is not owned by this user")
     directory.chmod(0o700)
 
