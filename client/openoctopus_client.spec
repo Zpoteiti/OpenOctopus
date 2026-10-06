@@ -1,10 +1,13 @@
 # ruff: noqa: F821
 
 import sys
+import tomllib
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
 
 is_win = sys.platform == "win32"
+with open("pyproject.toml", "rb") as project_file:
+    version = tomllib.load(project_file)["project"]["version"]
 
 _WINPTY_NATIVE_FILES = frozenset(
     {
@@ -31,6 +34,9 @@ def _assert_winpty_native_files(entries):
 
 datas = collect_data_files("magika", includes=["config/**", "models/**"])
 datas += copy_metadata("fastmcp-slim")
+# The tray reads credentials through the pinned keyring backends; their
+# metadata keeps entry-point discovery working inside the frozen bundle.
+datas += copy_metadata("keyring")
 binaries = collect_dynamic_libs("onnxruntime")
 if is_win:
     from PyInstaller.utils.hooks import collect_all
@@ -40,6 +46,11 @@ if is_win:
     binaries += winpty_binaries
 
 hiddenimports = winpty_hiddenimports if is_win else ["openoctopus_client.pty_worker"]
+hiddenimports += [
+    "keyring.backends.SecretService",
+    "keyring.backends.Windows",
+    "keyring.backends.macOS",
+]
 
 a = Analysis(
     ["src/openoctopus_client/__main__.py"],
@@ -52,12 +63,26 @@ a = Analysis(
 if is_win:
     _assert_winpty_native_files([*a.binaries, *a.datas])
 pyz = PYZ(a.pure)
+# The windowed Windows bootloader has no Python standard streams. Keep a
+# separate console-enabled core for the private pipe and conversion workers;
+# QProcess launches it with redirected handles and no console window.
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
     name="openoctopus-client",
-    console=True,
+    console=False,
 )
-coll = COLLECT(exe, a.binaries, a.zipfiles, a.datas, name="openoctopus-client")
+core = EXE(
+    pyz, a.scripts, [], exclude_binaries=True, name="openoctopus-core", console=True,
+)
+coll = COLLECT(exe, core, a.binaries, a.zipfiles, a.datas, name="openoctopus-client")
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="OpenOctopus Client.app",
+        version=version,
+        bundle_identifier="dev.openoctopus.client",
+        info_plist={"LSUIElement": True, "NSHighResolutionCapable": True},
+    )

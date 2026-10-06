@@ -231,6 +231,25 @@ async def _stop_server(
     await engine.dispose()
 
 
+def _client_command() -> list[str]:
+    executable = os.environ.get("OO_CLIENT_BIN")
+    if executable:
+        return [executable]
+    return [sys.executable, "-m", "openoctopus_client"]
+
+
+def _startup_config_line(server_url: str, token: str) -> str:
+    import json
+
+    payload: dict[str, object] = {
+        "type": "startup-config",
+        "generation": 1,
+        "server_url": server_url,
+        "token": token,
+    }
+    return json.dumps(payload) + "\n"
+
+
 def _client_environment(server_url: str, token: str) -> dict[str, str]:
     environment = os.environ.copy()
     for key in (
@@ -246,8 +265,10 @@ def _client_environment(server_url: str, token: str) -> dict[str, str]:
         "wss_proxy",
     ):
         environment.pop(key, None)
-    environment["OPENOCTOPUS_SERVER_URL"] = server_url
-    environment["OPENOCTOPUS_DEVICE_TOKEN"] = token
+    # The private core takes the startup configuration on stdin only;
+    # environment credentials no longer exist.
+    for key in ("OPENOCTOPUS_SERVER_URL", "OPENOCTOPUS_DEVICE_TOKEN"):
+        environment.pop(key, None)
     if environment.get("OO_CLIENT_BIN"):
         environment.pop("PYTHONPATH", None)
     else:
@@ -265,31 +286,29 @@ def _client_creationflags() -> int:
     return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
 
 
-async def _start_client(server_url: str, token: str) -> asyncio.subprocess.Process:
-    executable = os.environ.get("OO_CLIENT_BIN")
-    if executable:
-        return await asyncio.create_subprocess_exec(
-            executable,
-            "run",
-            cwd=_CLIENT_CWD,
-            env=_client_environment(server_url, token),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=_client_creationflags(),
-        )
-    return await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "openoctopus_client",
-        "run",
+async def _start_client(
+    server_url: str,
+    token: str,
+) -> asyncio.subprocess.Process:
+    # The core runs as a separate process fed by the startup config on
+    # stdin (the same contract the tray uses).  Callers close stdin to end
+    # ownership when the scenario reaches its stop step.
+    argv = [*_client_command(), "_core-run"]
+    process = await asyncio.create_subprocess_exec(
+        *argv,
         cwd=_CLIENT_CWD,
         env=_client_environment(server_url, token),
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=_client_creationflags(),
     )
+    if process.stdin is not None:
+        process.stdin.write(
+            _startup_config_line(server_url, token).encode("utf-8")
+        )
+        await process.stdin.drain()
+    return process
 
 
 async def _stop_client(
@@ -439,6 +458,9 @@ async def test_real_postgres_source_client_device_lifecycle(
             assert token not in repr(row)
 
             name = device["name"]
+            # No local workspace pin: this scenario verifies that a
+            # Server-side reconfiguration moves the device Workspace, which
+            # only holds while the Client has no tray-chosen override.
             first_process = await _start_client(server_url, token)
             client_processes.append(first_process)
             await _wait_online(http_client, jwt, name, online=True, process=first_process)

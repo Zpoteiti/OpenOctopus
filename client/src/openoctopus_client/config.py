@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-from collections.abc import MutableMapping
 from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -30,46 +28,47 @@ class ClientConfiguration:
     token: DeviceToken
 
 
-def load_config(environment: MutableMapping[str, str] | None = None) -> ClientConfiguration:
-    """Load required environment variables and consume the bearer token."""
+def validate_server_url(value: str) -> str:
+    """Return the canonical HTTP(S) origin or raise ``ConfigurationError``."""
 
-    values = os.environ if environment is None else environment
-    server_url = values.get("OPENOCTOPUS_SERVER_URL")
-    token = values.get("OPENOCTOPUS_DEVICE_TOKEN")
-    try:
-        if server_url is None or not server_url.strip():
-            raise ConfigurationError("OPENOCTOPUS_SERVER_URL is required")
-        websocket_url = _websocket_url(server_url)
-        if (
-            token is None
-            or not token.startswith("openoctopus_dev_")
-            or len(token) == len("openoctopus_dev_")
-        ):
-            raise ConfigurationError("OPENOCTOPUS_DEVICE_TOKEN is invalid")
-        return ClientConfiguration(
-            server_url=_canonical_server_url(server_url),
-            websocket_url=websocket_url,
-            token=DeviceToken(token),
-        )
-    finally:
-        # Even invalid startup input must not survive for future children.
-        values.pop("OPENOCTOPUS_DEVICE_TOKEN", None)
+    return _canonical_server_url(value)
+
+
+def configuration_from_startup(
+    server_url: str,
+    token: str,
+) -> ClientConfiguration:
+    """Build the runtime configuration from the private-pipe startup message.
+
+    The token arrives only through the GUI's stdin pipe.  It is never read
+    from an environment variable or a command-line argument, and the caller
+    must never place it on a child command line.
+    """
+
+    if not token.startswith("openoctopus_dev_") or len(token) == len("openoctopus_dev_"):
+        raise ConfigurationError("device token is invalid")
+    return ClientConfiguration(
+        server_url=_canonical_server_url(server_url),
+        websocket_url=_websocket_url(server_url),
+        token=DeviceToken(token),
+    )
 
 
 def _parsed_server_url(value: str) -> SplitResult:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ConfigurationError("server URL is invalid") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ConfigurationError("OPENOCTOPUS_SERVER_URL must be an http(s) origin")
+        raise ConfigurationError("server URL must be an http(s) origin")
     if parsed.username is not None or parsed.password is not None:
-        raise ConfigurationError("OPENOCTOPUS_SERVER_URL must not contain userinfo")
+        raise ConfigurationError("server URL must not contain userinfo")
     if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
-        raise ConfigurationError(
-            "OPENOCTOPUS_SERVER_URL must not contain a path, query, or fragment"
-        )
+        raise ConfigurationError("server URL must not contain a path, query, or fragment")
     try:
         _ = parsed.port
     except ValueError as exc:
-        raise ConfigurationError("OPENOCTOPUS_SERVER_URL has an invalid port") from exc
+        raise ConfigurationError("server URL has an invalid port") from exc
     return parsed
 
 

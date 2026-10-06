@@ -108,6 +108,10 @@ jobs:
           cache: pip
           cache-dependency-path: client/pyproject.toml
 
+      - name: Install Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0
+
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install ".[dev,build]"
 
@@ -122,21 +126,24 @@ jobs:
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           python -m PyInstaller --noconfirm --clean openoctopus_client.spec
-          export OO_CLIENT_BIN="${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client"
+          export OO_CLIENT_BIN="${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core"
           python tests/frozen_smoke.py
           python tests/frozen_runtime_smoke.py
 
-      - name: Package bundle
+      - name: Package installer
         run: |
-          mkdir -p release
-          tar -C dist -czf \
-            "release/openoctopus-client-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" \
-            openoctopus-client
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "${{ matrix.platform }}" in
+            linux) bash packaging/build_deb.sh dist/openoctopus-client "$VERSION" release ;;
+            macos) bash packaging/build_dmg.sh "dist/OpenOctopus Client.app" "$VERSION" release ;;
+          esac
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-client-${{ matrix.platform }}-${{ matrix.arch }}
-          path: client/release/*.tar.gz
+          path: |
+            client/release/*.deb
+            client/release/*.dmg
           if-no-files-found: error
 
   client-windows:
@@ -176,7 +183,7 @@ jobs:
 
       - name: Build and smoke frozen bundle
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core.exe
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           python -m PyInstaller --noconfirm --clean openoctopus_client.spec
@@ -186,16 +193,19 @@ jobs:
           python tests/frozen_runtime_smoke.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package bundle
+      - name: Package per-user Windows installer
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/openoctopus-client `
-            -DestinationPath "release/openoctopus-client-$env:GITHUB_REF_NAME-windows-x64.zip"
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "${env:ProgramFiles(x86)}\NSIS;$env:PATH"
+          $version = ($env:GITHUB_REF_NAME -replace '^v', '')
+          python packaging\build_windows_installer.py dist\openoctopus-client $version release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-client-windows-x64
-          path: client/release/*.zip
+          path: client/release/*-per-user.exe
           if-no-files-found: error
 
   server-verify:

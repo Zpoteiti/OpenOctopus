@@ -203,6 +203,11 @@ async def test_windows_batch_spawn_uses_raw_line_without_blocking_loop(
         "openoctopus_client.mcp.transport.os.path.isfile", lambda _path: True
     )
     monkeypatch.setattr("openoctopus_client.mcp.transport.subprocess.Popen", popen)
+    startupinfo = object()
+    monkeypatch.setattr(
+        "openoctopus_client.mcp.transport._new_session_kwargs",
+        lambda: {"creationflags": 0x00000200, "startupinfo": startupinfo},
+    )
     launch = _stdio_launch("server", ("a&b",), {"PATHEXT": ".CMD"})
 
     process = await _spawn_stdio_process(
@@ -224,6 +229,7 @@ async def test_windows_batch_spawn_uses_raw_line_without_blocking_loop(
                 "cwd": None,
                 "env": {},
                 "creationflags": 0x00000200,
+                "startupinfo": startupinfo,
             },
         )
     ]

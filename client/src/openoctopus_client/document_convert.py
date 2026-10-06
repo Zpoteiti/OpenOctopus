@@ -93,6 +93,7 @@ def _run_worker_request(request: dict[str, object]) -> str:
             encoding="utf-8",
             errors="strict",
             env=_minimal_worker_environment(),
+            creationflags=0x08000000 if os.name == "nt" else 0,
             timeout=TIMEOUT_SECONDS,
             check=False,
         )
@@ -114,6 +115,7 @@ async def _run_worker_request_async(request: dict[str, object]) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=_minimal_worker_environment(),
+            creationflags=0x08000000 if os.name == "nt" else 0,
         )
     except OSError as exc:
         raise ConversionError(

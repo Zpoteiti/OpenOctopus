@@ -180,30 +180,19 @@ docker compose --env-file .env up -d --build --wait
 
 1. In the browser, open **Devices**, create a device, and save the token shown
    once.
-2. Download the native one-folder bundle from
-   [GitHub Releases](https://github.com/Zpoteiti/OpenOctopus/releases), or run
-   the Client from source.
-3. Start it with the Server origin and device token.
+2. Download and run the installer for your platform from
+   [GitHub Releases](https://github.com/Zpoteiti/OpenOctopus/releases) (a
+   `.deb`, a per-user Windows `.exe`, or a macOS `.dmg`), or run the Client
+   from source.
+3. Open the tray menu's **连接设置** (connection settings), enter the Server
+   address and the device token, and click **保存并连接**. The token is kept
+   in the operating system's credential store; the tray shows the live status
+   (未配置 / 连接中 / 在线 / 重连中 / 已停止 / 需要处理).
 
-Linux and macOS:
-
-```bash
-export OPENOCTOPUS_SERVER_URL='http://127.0.0.1:8080'
-export OPENOCTOPUS_DEVICE_TOKEN='openoctopus_dev_...'
-./openoctopus-client/openoctopus-client run
-```
-
-Windows PowerShell:
-
-```powershell
-$env:OPENOCTOPUS_SERVER_URL = 'http://127.0.0.1:8080'
-$env:OPENOCTOPUS_DEVICE_TOKEN = 'openoctopus_dev_...'
-.\openoctopus-client\openoctopus-client.exe run
-```
-
-`OPENOCTOPUS_SERVER_URL` must be an HTTP(S) origin without a path, query, or
-fragment. Use HTTPS/WSS for a remote Server. See [client/README.md](client/README.md)
-for artifact names, source installation, lifecycle, and Client policy details.
+The Server address must be an HTTP(S) origin without a path, query, or
+fragment. Use HTTPS/WSS for a remote Server. Configure the Client Workspace
+path in the device settings on the Server. See [client/README.md](client/README.md) for
+installer names, source installation, lifecycle, and Client policy details.
 
 ## Connect Discord or DingTalk
 
@@ -252,8 +241,9 @@ a new Agent turn and try again.
   scanning.
 - The current Server uses one ASGI worker and process-local coordination. Do
   not run multiple workers or multiple Server replicas against one deployment.
-- The release bundles are unsigned, platform-native one-folder applications;
-  they are not installers, services, or single static binaries.
+- The release installers are unsigned, per-user, platform-native packages
+  (`.deb`, per-user `.exe`, `.dmg`); they are not services, and they are not
+  notarized or vendor-vetted.
 - PTY/ConPTY targets line-oriented REPLs and simple prompts. Full-screen TUI
   applications and reliable secret/password entry are outside the current
   support boundary.
@@ -328,9 +318,10 @@ npx playwright install --with-deps chromium
 npm run e2e
 ```
 
-CI verifies the Server on Python 3.12 and 3.13, native Client tests and frozen
-bundles on Linux x64, macOS arm64/x64, and Windows x64, the frontend unit and
-browser suites, and Linux amd64/arm64 Server images.
+CI verifies the Server on Python 3.12 and 3.13, native Client tests, frozen
+smokes, and installer packaging on Linux x64, macOS arm64/x64, and Windows
+x64, the frontend unit and browser suites, and Linux amd64/arm64 Server
+images.
 
 ## Reference
 

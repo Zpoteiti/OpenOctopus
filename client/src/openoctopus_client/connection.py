@@ -23,6 +23,11 @@ from websockets.asyncio.client import connect
 
 from openoctopus_client import __version__
 from openoctopus_client.config import ClientConfiguration
+from openoctopus_client.core_channel import (
+    CoreFailureCode,
+    CoreState,
+    StatusEventMessage,
+)
 from openoctopus_client.exec_sessions import ExecPolicy, ExecSessionManager
 from openoctopus_client.mcp.supervisor import McpInvocationLease, McpSupervisor
 from openoctopus_client.process import ShellInventory, discover_shells
@@ -419,8 +424,11 @@ class ClientRuntime:
         exec_session_manager: _RuntimeExecManager | None = None,
         mcp_supervisor: McpSupervisor | None = None,
         hard_exit: Callable[[int], object] = os._exit,
+        status_sink: Callable[[StatusEventMessage], None] | None = None,
     ) -> None:
         self._config = config
+        self._status_sink = status_sink
+        self._terminal_reason: str = "stopped"
         self._hello_factory = hello_factory or self._new_hello
         self._random_value = random_value
         self._path_locks = PathLocks()
@@ -463,6 +471,41 @@ class ClientRuntime:
         self._stopping.set()
         self._arm_shutdown_watchdog()
 
+    @property
+    def terminal_reason(self) -> str:
+        """Why the runtime loop stopped: stopped or a permanent failure name."""
+
+        return self._terminal_reason
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Whether the last shutdown confirmed all owned cleanup."""
+
+        return not self._shutdown_cleanup_incomplete
+
+    def _emit_status(
+        self,
+        state: CoreState,
+        *,
+        device_name: str | None = None,
+        error_code: CoreFailureCode | None = None,
+        retry_in_seconds: float | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        if self._status_sink is None:
+            return
+        self._status_sink(
+            StatusEventMessage(
+                type="status",
+                generation=0,
+                state=state,
+                device_name=device_name,
+                error_code=error_code,
+                retry_in_seconds=retry_in_seconds,
+                attempt=attempt,
+            )
+        )
+
     def _arm_shutdown_watchdog(self) -> None:
         with self._shutdown_watchdog_lock:
             if self._shutdown_watchdog is not None:
@@ -484,21 +527,24 @@ class ClientRuntime:
         if watchdog is not None:
             watchdog.cancel()
 
-    async def run(self) -> int:
-        attempt = 0
+    async def install_signal_handlers(self) -> list[signal.Signals]:
+        """Route SIGINT/SIGTERM (and SIGBREAK on Windows) to shutdown.
+
+        The core installs these so a supervisor that cannot write the stop
+        command can still stop it the classic way; the embedded runtime does
+        not install any, matching its library role.
+        """
+
         loop = asyncio.get_running_loop()
         installed_signals: list[signal.Signals] = []
         windows_break_signal = getattr(signal, "SIGBREAK", None)
-        previous_windows_break_handler: Any = None
-        windows_break_installed = False
         if os.name == "nt" and windows_break_signal is not None:
             try:
-                previous_windows_break_handler = signal.getsignal(windows_break_signal)
                 signal.signal(
                     windows_break_signal,
                     lambda _signum, _frame: self.request_shutdown(),
                 )
-                windows_break_installed = True
+                installed_signals.append(windows_break_signal)
             except (OSError, ValueError):
                 pass
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -509,9 +555,25 @@ class ClientRuntime:
                 # Unix source build gets an async wake-up for both signals.
                 continue
             installed_signals.append(signum)
+        return installed_signals
+
+    def restore_signal_handlers(self, installed_signals: list[signal.Signals]) -> None:
+        windows_break_signal = getattr(signal, "SIGBREAK", None)
+        for signum in installed_signals:
+            if windows_break_signal is not None and signum == windows_break_signal:
+                with contextlib.suppress(OSError, ValueError):
+                    signal.signal(signum, signal.SIG_DFL)
+                continue
+            with contextlib.suppress(NotImplementedError, OSError):
+                asyncio.get_running_loop().remove_signal_handler(signum)
+
+    async def run(self) -> int:
+        attempt = 0
         try:
             while not self._stopping.is_set():
                 retry_after: float | None = None
+                retry_error: CoreFailureCode | None = None
+                self._emit_status(CoreState.CONNECTING, attempt=attempt + 1)
                 attempt_task = asyncio.create_task(self._run_connection_attempt())
                 stop_task = asyncio.create_task(self._stopping.wait())
                 done, _ = await asyncio.wait(
@@ -519,8 +581,14 @@ class ClientRuntime:
                 )
                 if stop_task in done:
                     attempt_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
+                    try:
                         await attempt_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        # The user stopped while an attempt was failing; the
+                        # failure is moot and the stop result stands.
+                        pass
                     return 0
                 stop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -534,12 +602,15 @@ class ClientRuntime:
                     disposition_from_error = reconnect_disposition_from_exception(exc)
                     retry_after = retry_after_from_exception(exc)
                     if disposition_from_error == ReconnectDisposition.PERMANENT_AUTH:
+                        self._terminal_reason = "auth_rejected"
                         LOGGER.error("Device authentication was rejected")
                         return 1
                     if disposition_from_error == ReconnectDisposition.PERMANENT_REPLACED:
+                        self._terminal_reason = "connection_replaced"
                         LOGGER.error("This client was replaced by a newer device connection")
                         return 1
                     if disposition_from_error == ReconnectDisposition.PERMANENT_CONFIG:
+                        self._terminal_reason = "config_rejected"
                         detail = _sanitized_close_detail(exc)
                         suffix = f": {detail}" if detail else ""
                         LOGGER.error(
@@ -548,22 +619,30 @@ class ClientRuntime:
                         )
                         return 78
                     if not self._ever_ready:
-                        LOGGER.error("The initial device connection is unreachable")
-                        return 1
+                        # The first connection failing is not a startup
+                        # failure anymore; keep backing off until the user
+                        # stops or the failure turns permanent.
+                        retry_error = CoreFailureCode.SERVER_UNREACHABLE
+                        LOGGER.warning("The initial device connection is unreachable; retrying")
                 if disposition == CloseDisposition.SHUTDOWN or self._stopping.is_set():
                     return 0
-                if disposition == CloseDisposition.RETRY and not self._ever_ready:
-                    LOGGER.error("The initial device connection is unreachable")
-                    return 1
                 if not failed_attempt:
                     attempt = 0
                     retry_after = None if disposition is not None else retry_after
+                    if not self._ever_ready:
+                        retry_error = CoreFailureCode.SERVER_UNREACHABLE
                 delay = reconnect_delay(
                     attempt,
                     retry_after=retry_after,
                     random_value=self._random_value(),
                 )
                 attempt += 1
+                self._emit_status(
+                    CoreState.RECONNECTING,
+                    error_code=retry_error,
+                    retry_in_seconds=delay,
+                    attempt=attempt,
+                )
                 try:
                     await asyncio.wait_for(self._stopping.wait(), timeout=delay)
                 except TimeoutError:
@@ -578,13 +657,7 @@ class ClientRuntime:
             )
             if not self._shutdown_cleanup_incomplete:
                 self._cancel_shutdown_watchdog()
-            for signum in installed_signals:
-                with contextlib.suppress(NotImplementedError, OSError):
-                    loop.remove_signal_handler(signum)
-            if windows_break_installed:
-                assert windows_break_signal is not None
-                with contextlib.suppress(OSError, ValueError):
-                    signal.signal(windows_break_signal, previous_windows_break_handler)
+            self._emit_status(CoreState.STOPPED)
 
     async def _run_connection_attempt(self) -> CloseDisposition:
         async with connect(
@@ -869,6 +942,11 @@ class ClientRuntime:
                     mcp_attached = True
                     acknowledged = True
                     self._ever_ready = True
+                    # "Online" only after the matching hello/config-applied
+                    # acknowledgement completed, with the Server device name.
+                    self._emit_status(
+                        CoreState.ONLINE, device_name=pending_hello_ack.device_name
+                    )
                     continue
                 if pending_config_ack is not None:
                     if isinstance(frame, RegisterMcpAck):

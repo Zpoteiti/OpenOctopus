@@ -31,6 +31,9 @@ jobs:
           cache: pip
           cache-dependency-path: client/pyproject.toml
 
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0
+
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install ".[dev,build]"
 
@@ -48,31 +51,29 @@ jobs:
 
       - name: Smoke test frozen bundle against document corpus
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           set -o pipefail
           mkdir -p metrics
           python tests/frozen_smoke.py | tee metrics/frozen-smoke.json
 
-      - name: Smoke test frozen runtime, CLI, and multiprocessing child
+      - name: Smoke test frozen runtime, private core pipe, and tray
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Package release-shaped bundle
-        run: |
-          mkdir -p release
-          tar -C dist -czf release/openoctopus-client-linux-x64.tar.gz openoctopus-client
+      - name: Build Debian installer
+        run: bash packaging/build_deb.sh dist/openoctopus-client 0.0.1 release
 
-      - name: Upload release-shaped bundle
+      - name: Upload Debian installer
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-linux-x64
-          path: client/release/openoctopus-client-linux-x64.tar.gz
+          name: openoctopus-client-linux-x64-deb
+          path: client/release/openoctopus-client_0.0.1_amd64.deb
           if-no-files-found: error
 
       - name: Upload smoke metrics
@@ -129,7 +130,7 @@ jobs:
 
       - name: Smoke test native frozen bundle
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           set -o pipefail
@@ -138,22 +139,32 @@ jobs:
 
       - name: Smoke test native frozen runtime
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           set -o pipefail
           python tests/frozen_runtime_smoke.py | tee metrics/frozen-runtime-smoke.json
 
-      - name: Package native release-shaped bundle
-        run: |
-          mkdir -p release
-          tar -C dist -czf release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz openoctopus-client
+      - name: Build disk image
+        run: bash packaging/build_dmg.sh "dist/OpenOctopus Client.app" 0.0.1 release
 
-      - name: Upload native release-shaped bundle
+      - name: Verify the application inside the disk image
+        run: |
+          mkdir -p dmg-mount
+          hdiutil attach release/OpenOctopusClient-0.0.1-${{ matrix.arch }}.dmg -readonly -nobrowse -mountpoint "$PWD/dmg-mount"
+          trap 'hdiutil detach "$PWD/dmg-mount"' EXIT
+          APP="$PWD/dmg-mount/OpenOctopus Client.app"
+          test -f "$APP/Contents/MacOS/openoctopus-client"
+          /usr/libexec/PlistBuddy -c 'Print LSUIElement' "$APP/Contents/Info.plist" | grep -qx true
+          OO_CLIENT_BIN="$APP/Contents/MacOS/openoctopus-core" \
+            OO_DOCUMENT_CORPUS="${{ github.workspace }}/server/tests/fixtures/documents" \
+            python tests/frozen_runtime_smoke.py
+
+      - name: Upload disk image
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-macos-${{ matrix.arch }}
-          path: client/release/openoctopus-client-macos-${{ matrix.arch }}.tar.gz
+          name: openoctopus-client-macos-${{ matrix.arch }}-dmg
+          path: client/release/OpenOctopusClient-0.0.1-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
       - name: Upload native smoke metrics
@@ -204,7 +215,7 @@ jobs:
 
       - name: Smoke test native frozen bundle
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core.exe
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           New-Item -ItemType Directory -Force -Path metrics | Out-Null
@@ -213,23 +224,49 @@ jobs:
 
       - name: Smoke test native frozen runtime
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client.exe
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core.exe
           OO_DOCUMENT_CORPUS: ${{ github.workspace }}/server/tests/fixtures/documents
         run: |
           python tests/frozen_runtime_smoke.py | Tee-Object -FilePath metrics/frozen-runtime-smoke.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package native release-shaped bundle
+      - name: Build per-user Windows installer
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/openoctopus-client -DestinationPath release/openoctopus-client-windows-x64.zip
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "${env:ProgramFiles(x86)}\NSIS;$env:PATH"
+          python packaging\build_windows_installer.py dist\openoctopus-client 0.0.1 release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload native release-shaped bundle
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v7
         with:
-          name: openoctopus-client-windows-x64
-          path: client/release/openoctopus-client-windows-x64.zip
+          name: openoctopus-client-windows-x64-installer
+          path: client/release/OpenOctopusClient-Setup-0.0.1-per-user.exe
           if-no-files-found: error
+
+      - name: Verify per-user install and uninstall
+        run: |
+          $target = Join-Path $env:LOCALAPPDATA 'Programs\OpenOctopusClient'
+          $installer = Resolve-Path 'release\OpenOctopusClient-Setup-0.0.1-per-user.exe'
+          $process = Start-Process $installer -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Installer failed' }
+          if (!(Test-Path "$target\openoctopus-client.exe")) { throw 'Tray executable missing' }
+          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'OpenOctopus Client\OpenOctopus Client.lnk'
+          if (!(Test-Path $shortcut)) { throw 'Start Menu shortcut missing' }
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (Test-Path $runKey) {
+            $run = Get-ItemProperty $runKey
+            if ($run.PSObject.Properties.Name -contains 'OpenOctopus Client') { throw 'Autostart must default off' }
+          }
+          $env:OO_CLIENT_BIN = "$target\openoctopus-core.exe"
+          $env:OO_DOCUMENT_CORPUS = '${{ github.workspace }}\server\tests\fixtures\documents'
+          python tests/frozen_runtime_smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $process = Start-Process "$target\Uninstall.exe" -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Uninstaller failed' }
+          if (Test-Path "$target\openoctopus-client.exe") { throw 'Tray executable not removed' }
+          if (Test-Path $shortcut) { throw 'Start Menu shortcut not removed' }
 
       - name: Upload native smoke metrics
         if: always()
@@ -271,16 +308,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download frozen client bundle
+      - name: Download Debian installer
         uses: actions/download-artifact@v7
         with:
-          name: openoctopus-client-linux-x64
+          name: openoctopus-client-linux-x64-deb
           path: client/release
 
-      - name: Extract frozen client bundle
+      - name: Extract the executable bundle from the installer
         run: |
-          mkdir -p ../client/dist
-          tar -C ../client/dist -xzf ../client/release/openoctopus-client-linux-x64.tar.gz
+          mkdir -p ../client/release/extract ../client/dist
+          dpkg-deb -x ../client/release/openoctopus-client_0.0.1_amd64.deb \
+            ../client/release/extract
+          cp -a ../client/release/extract/opt/OpenOctopus/openoctopus-client \
+            ../client/dist/openoctopus-client
 
       - name: Install server dependencies
         run: |
@@ -312,7 +352,7 @@ jobs:
 
       - name: Run frozen device, MCP, tool, transfer, and relay E2E
         env:
-          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-client
+          OO_CLIENT_BIN: ${{ github.workspace }}/client/dist/openoctopus-client/openoctopus-core
           PY5_REAL_E2E: "1"
           PY6_REAL_E2E: "1"
           PY7_REAL_E2E: "1"

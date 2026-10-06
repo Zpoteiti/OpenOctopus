@@ -226,3 +226,8 @@ opencode.json
 # Browser test artifacts
 frontend/playwright-report/
 frontend/test-results/
+
+# packaging output
+dist-deb/
+dist-dmg/
+dist-installer/
